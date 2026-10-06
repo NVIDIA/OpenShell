@@ -342,3 +342,125 @@ async fn service_bearer_passthrough_preserves_authorization_header() {
 
     sandbox.cleanup().await;
 }
+
+async fn wait_for_health(sandbox: &str, state: &str, status: Option<u64>) -> Value {
+    timeout(READY_TIMEOUT, async {
+        loop {
+            let output = run_cli(&["service", "list", sandbox, "--output", "json"])
+                .await
+                .expect("read service health");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let service = &result["services"][0];
+            if service["health"]["state"] == state
+                && (status.is_none() || service["health"]["http_status_code"].as_u64() == status)
+            {
+                return service.clone();
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("service health should converge")
+}
+
+#[tokio::test]
+async fn service_readiness_continuously_observes_application_without_gating_routing() {
+    let name = format!("svc-ready-{}", std::process::id());
+    let server = r#"
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/toggle':
+            self.server.ready = not getattr(self.server, 'ready', True)
+            status = 200
+        else:
+            ready = self.path == '/readyz' and getattr(self.server, 'ready', True)
+            status = 200 if ready and not self.headers.get('Authorization') else 503
+        self.send_response(status)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    def log_message(self, *_args):
+        pass
+ThreadingHTTPServer(('127.0.0.1', 4500), Handler).serve_forever()
+"#;
+    let create = run_cli(&[
+        "sandbox",
+        "create",
+        "--name",
+        &name,
+        "--from",
+        E2E_WORKLOAD_IMAGE,
+        "--expose",
+        SERVICE_PORT,
+        "--expose-readiness-path",
+        "/readyz",
+        "--output",
+        "json",
+        "--detach",
+        "--no-tty",
+        "--",
+        "python3",
+        "-c",
+        server,
+    ])
+    .await
+    .expect("create sandbox with readiness check");
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let mut sandbox = SandboxGuard::manage_existing(name.clone());
+    let created: Value = serde_json::from_slice(&create.stdout).unwrap();
+    let target = ServiceTarget::from_url(created["service_urls"][""].as_str().unwrap()).unwrap();
+    let healthy = wait_for_health(&name, "healthy", Some(200)).await;
+    assert_eq!(healthy["readiness_check"]["path"], "/readyz");
+    assert!(healthy["health"]["last_checked_time"].is_string());
+
+    let mut control =
+        ServiceTarget::from_url(created["service_urls"][""].as_str().unwrap()).unwrap();
+    control.path = "/toggle".to_string();
+    assert_eq!(
+        request_service(&control, BEARER_TOKEN).await.unwrap().0,
+        StatusCode::OK
+    );
+    wait_for_health(&name, "unhealthy", Some(503)).await;
+    // Health reports the app failure while the route remains usable.
+    assert_eq!(
+        request_service(&target, BEARER_TOKEN).await.unwrap().0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    assert_eq!(
+        request_service(&control, BEARER_TOKEN).await.unwrap().0,
+        StatusCode::OK
+    );
+    wait_for_health(&name, "healthy", Some(200)).await;
+    let expose = run_cli(&["service", "expose", &name, SERVICE_PORT])
+        .await
+        .unwrap();
+    assert!(expose.status.success());
+    let healthy = wait_for_health(&name, "healthy", Some(200)).await;
+    assert_eq!(healthy["readiness_check"]["path"], "/readyz");
+
+    let expose = run_cli(&["service", "expose", &name, "4501"])
+        .await
+        .unwrap();
+    assert!(expose.status.success());
+    let failed = wait_for_health(&name, "unhealthy", None).await;
+    assert!(failed["health"]["http_status_code"].is_null());
+
+    let stop = run_cli(&["sandbox", "stop", &name]).await.unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    wait_for_health(&name, "unknown", None).await;
+    sandbox.cleanup().await;
+}

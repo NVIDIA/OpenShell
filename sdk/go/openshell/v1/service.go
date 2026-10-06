@@ -15,6 +15,22 @@ type ServiceEndpoint = types.ServiceEndpoint
 // ServiceExposure describes a loopback HTTP service to expose during sandbox creation.
 type ServiceExposure = types.ServiceExposure
 
+// HTTPReadinessCheck configures application readiness on a service.
+type HTTPReadinessCheck = types.HTTPReadinessCheck
+
+// ServiceHealth is a cached HTTP observation.
+type ServiceHealth = types.ServiceHealth
+
+// ServiceHealthState is the cached service health state.
+type ServiceHealthState = types.ServiceHealthState
+
+// Service health states.
+const (
+	ServiceHealthStateUnknown   = types.ServiceHealthStateUnknown
+	ServiceHealthStateHealthy   = types.ServiceHealthStateHealthy
+	ServiceHealthStateUnhealthy = types.ServiceHealthStateUnhealthy
+)
+
 // ServiceAuthorizationMode controls handling of an incoming application Authorization header.
 type ServiceAuthorizationMode = types.ServiceAuthorizationMode
 
@@ -28,6 +44,7 @@ const (
 // ExposeServiceOptions configures service exposure behavior.
 type ExposeServiceOptions struct {
 	AuthorizationMode ServiceAuthorizationMode
+	ReadinessCheck    *HTTPReadinessCheck
 }
 
 // ServiceInterface defines operations for managing sandbox service endpoints.

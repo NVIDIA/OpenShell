@@ -19,6 +19,17 @@ func ServiceEndpointFromProto(resp *pb.ServiceEndpointResponse) *types.ServiceEn
 	result := &types.ServiceEndpoint{
 		URL: resp.GetUrl(),
 	}
+	if h := resp.GetHealth(); h != nil {
+		result.Health = &types.ServiceHealth{
+			State:           types.ServiceHealthState(h.GetState()),
+			LastCheckedTime: TimePtrFromProto(h.GetLastCheckedTime()),
+			Message:         h.GetMessage(),
+		}
+		if h.HttpStatusCode != nil {
+			code := *h.HttpStatusCode
+			result.Health.HTTPStatusCode = &code
+		}
+	}
 
 	if ep := resp.GetEndpoint(); ep != nil {
 		result.SandboxID = ep.GetSandboxId()
@@ -27,6 +38,9 @@ func ServiceEndpointFromProto(resp *pb.ServiceEndpointResponse) *types.ServiceEn
 		result.TargetPort = ep.GetTargetPort()
 		result.Domain = ep.GetDomain()
 		result.AuthorizationMode = serviceAuthorizationModeFromProto(ep.GetAuthorizationMode())
+		if check := ep.GetReadinessCheck(); check != nil {
+			result.ReadinessCheck = &types.HTTPReadinessCheck{Path: check.GetPath()}
+		}
 
 		if m := ep.GetMetadata(); m != nil {
 			result.ID = m.GetId()
@@ -43,7 +57,7 @@ func ServiceEndpointToProto(se *types.ServiceEndpoint) *pb.ServiceEndpointRespon
 		return nil
 	}
 
-	return &pb.ServiceEndpointResponse{
+	result := &pb.ServiceEndpointResponse{
 		Endpoint: &pb.ServiceEndpoint{
 			Metadata: &dm.ObjectMeta{
 				Id:        se.ID,
@@ -58,6 +72,21 @@ func ServiceEndpointToProto(se *types.ServiceEndpoint) *pb.ServiceEndpointRespon
 		},
 		Url: se.URL,
 	}
+	if se.ReadinessCheck != nil {
+		result.Endpoint.ReadinessCheck = &pb.HttpReadinessCheck{Path: se.ReadinessCheck.Path}
+	}
+	if h := se.Health; h != nil {
+		result.Health = &pb.ServiceHealth{
+			State:           pb.ServiceHealthState(h.State),
+			LastCheckedTime: TimestampFromTimePtr(h.LastCheckedTime),
+			Message:         h.Message,
+		}
+		if h.HTTPStatusCode != nil {
+			code := *h.HTTPStatusCode
+			result.Health.HttpStatusCode = &code
+		}
+	}
+	return result
 }
 
 func serviceAuthorizationModeToProto(mode types.ServiceAuthorizationMode) pb.ServiceAuthorizationMode {

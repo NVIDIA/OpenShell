@@ -446,6 +446,7 @@ pub struct SandboxCreateConfig<'a> {
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
+    pub expose_readiness_path: Option<&'a str>,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -476,6 +477,7 @@ impl Default for SandboxCreateConfig<'_> {
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
+            expose_readiness_path: None,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -514,6 +516,7 @@ pub async fn sandbox_create(
         forward,
         expose,
         expose_authorization_mode,
+        expose_readiness_path,
         command,
         tty_override,
         auto_providers_override,
@@ -705,6 +708,11 @@ pub async fn sandbox_create(
                 service: String::new(),
                 target_port: u32::from(target_port),
                 authorization_mode: expose_authorization_mode as i32,
+                readiness_check: expose_readiness_path.map(|path| {
+                    openshell_core::proto::HttpReadinessCheck {
+                        path: path.to_string(),
+                    }
+                }),
             })
             .into_iter()
             .collect(),
@@ -4117,12 +4125,14 @@ async fn wait_for_lifecycle_phase(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_expose(
     server: &str,
     sandbox: &str,
     service: &str,
     target_port: u16,
     authorization_mode: ServiceAuthorizationMode,
+    readiness_path: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -4132,6 +4142,7 @@ pub async fn service_expose(
         service,
         target_port,
         authorization_mode,
+        readiness_path,
         workspace,
         tls,
     )
@@ -4160,12 +4171,14 @@ pub async fn service_expose(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors service exposure arguments
 async fn expose_service_endpoint(
     server: &str,
     sandbox: &str,
     service: &str,
     target_port: u16,
     authorization_mode: ServiceAuthorizationMode,
+    readiness_path: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<ServiceEndpointResponse> {
@@ -4178,6 +4191,9 @@ async fn expose_service_endpoint(
             target_port: u32::from(target_port),
             domain: true,
             authorization_mode: authorization_mode as i32,
+            readiness_check: readiness_path.map(|path| openshell_core::proto::HttpReadinessCheck {
+                path: path.to_string(),
+            }),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -4362,6 +4378,7 @@ fn print_service_endpoint_table(
                 service,
                 target,
                 authorization,
+                service_health_label(response),
                 url,
             ))
         })
@@ -4373,7 +4390,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -4382,52 +4399,54 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _, _)| service.len())
+        .map(|(_, _, service, _, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _, _)| target.len())
+        .map(|(_, _, _, target, _, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {:<12}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
             "AUTHORIZATION".bold(),
+            "HEALTH".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {:<12}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
             "AUTHORIZATION".bold(),
+            "HEALTH".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, authorization, url) in rows {
+    for (workspace, sandbox, service, target, authorization, health, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {health:<12}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {health:<12}  {url}"
             );
         }
     }
@@ -4455,7 +4474,41 @@ fn service_endpoint_to_json(
         "target_port": endpoint.target_port,
         "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
+        "readiness_check": endpoint.readiness_check.as_ref().map(|check| serde_json::json!({ "path": check.path })),
+        "health": response.health.as_ref().map(|health| serde_json::json!({
+            "state": service_health_state_name(health.state),
+            "last_checked_time": health.last_checked_time.as_ref().map(ToString::to_string),
+            "http_status_code": health.http_status_code,
+            "message": health.message,
+        })),
     }))
+}
+
+fn service_health_state_name(state: i32) -> &'static str {
+    use openshell_core::proto::ServiceHealthState;
+    match ServiceHealthState::try_from(state).unwrap_or(ServiceHealthState::Unknown) {
+        ServiceHealthState::Healthy => "healthy",
+        ServiceHealthState::Unhealthy => "unhealthy",
+        ServiceHealthState::Unknown | ServiceHealthState::Unspecified => "unknown",
+    }
+}
+
+fn service_health_label(response: &ServiceEndpointResponse) -> &'static str {
+    let state = response
+        .health
+        .as_ref()
+        .map_or("unknown", |health| service_health_state_name(health.state));
+    let readiness = response
+        .endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.readiness_check.is_some());
+    match (readiness, state) {
+        (true, "healthy") => "Ready",
+        (true, "unhealthy") => "Not ready",
+        (false, "healthy") => "Responsive",
+        (false, "unhealthy") => "Unresponsive",
+        _ => "Unknown",
+    }
 }
 
 fn service_display_name(service: &str) -> &str {
@@ -7069,6 +7122,7 @@ mod tests {
     #[test]
     fn service_endpoint_json_has_raw_fields_and_normalized_url() {
         let response = ServiceEndpointResponse {
+            health: None,
             endpoint: Some(ServiceEndpoint {
                 metadata: Some(ObjectMeta {
                     workspace: "team-a".to_string(),
@@ -7094,6 +7148,8 @@ mod tests {
                 "target_port": 8080,
                 "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
+                "readiness_check": null,
+                "health": null,
             })
         );
         assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());

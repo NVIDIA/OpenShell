@@ -61,6 +61,9 @@ target port, and an authorization mode; an empty name selects the unnamed
 endpoint. Authorization is stripped by default. Select `BearerPassthrough` only
 when the sandbox application validates its own bearer credential. The returned
 `SandboxRef::service_urls` map contains each routed URL under the same name.
+Set `ServiceExposure::readiness_path` to an HTTP path such as `/readyz` to
+require 2xx responses in continuous service health checks. Omission checks HTTP
+responsiveness at `/`. Read observations through the raw service API.
 
 Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`

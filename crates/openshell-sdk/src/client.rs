@@ -1357,6 +1357,9 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         service_exposures: service_exposures
             .into_iter()
             .map(|exposure| proto::SandboxServiceExposure {
+                readiness_check: exposure
+                    .readiness_path
+                    .map(|path| proto::HttpReadinessCheck { path }),
                 service: exposure.service,
                 target_port: u32::from(exposure.target_port),
                 authorization_mode: proto::ServiceAuthorizationMode::from(
@@ -1398,6 +1401,9 @@ fn create_sandbox_from_template_request(
         service_exposures: service_exposures
             .into_iter()
             .map(|exposure| proto::SandboxServiceExposure {
+                readiness_check: exposure
+                    .readiness_path
+                    .map(|path| proto::HttpReadinessCheck { path }),
                 service: exposure.service,
                 target_port: u32::from(exposure.target_port),
                 authorization_mode: proto::ServiceAuthorizationMode::from(

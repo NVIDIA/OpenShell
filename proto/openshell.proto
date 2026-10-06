@@ -1788,6 +1788,9 @@ message ExposeServiceRequest {
   string request_id = 6;
   // Application authorization behavior. Omission resolves to STRIP.
   ServiceAuthorizationMode authorization_mode = 7;
+  // Optional application readiness check. Omission preserves the existing
+  // check on update; a new endpoint without a check probes HTTP responsiveness.
+  HttpReadinessCheck readiness_check = 8;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -1856,12 +1859,47 @@ message ServiceEndpoint {
   bool domain = 6;
   // Effective application authorization behavior for ingress requests.
   ServiceAuthorizationMode authorization_mode = 7;
+  // When present, only HTTP 2xx responses indicate application readiness.
+  // Otherwise any HTTP response to GET / indicates listener responsiveness.
+  HttpReadinessCheck readiness_check = 8;
+}
+
+// Application readiness on the endpoint's existing loopback target_port.
+// Probes use HTTP GET without credentials or redirects. The gateway checks
+// every 5s, allows 1s per attempt, marks unhealthy after 3 consecutive failures,
+// and recovers after one success. Health is observational; routing and sandbox
+// lifecycle do not depend on it.
+message HttpReadinessCheck {
+  // Origin-form path beginning with /. Empty resolves to /. Queries and
+  // fragments are not accepted.
+  string path = 1;
+}
+
+// Gateway-local, cached observation. Unknown until a conclusive result, after
+// restart or configuration change, when the sandbox is unavailable, or after
+// 15s without an observation. A missing health field on an older gateway also
+// means unknown. Never use this observation to infer sandbox lifecycle.
+message ServiceHealth {
+  ServiceHealthState state = 1;
+  google.protobuf.Timestamp last_checked_time = 2;
+  // Informational summary of the latest attempt; clients branch on state.
+  string message = 3;
+  // Present only when the latest attempt received HTTP response headers.
+  optional uint32 http_status_code = 4;
+}
+
+enum ServiceHealthState {
+  SERVICE_HEALTH_STATE_UNSPECIFIED = 0;
+  SERVICE_HEALTH_STATE_UNKNOWN = 1;
+  SERVICE_HEALTH_STATE_HEALTHY = 2;
+  SERVICE_HEALTH_STATE_UNHEALTHY = 3;
 }
 
 // Response containing a service endpoint and, when available, its local URL.
 message ServiceEndpointResponse {
   ServiceEndpoint endpoint = 1;
   string url = 2;
+  ServiceHealth health = 3;
 }
 
 // Revoke SSH session request.
@@ -3875,6 +3913,8 @@ message SandboxServiceExposure {
   uint32 target_port = 2;
   // Application authorization behavior. Omission resolves to STRIP.
   ServiceAuthorizationMode authorization_mode = 3;
+  // Optional readiness check; otherwise the gateway probes HTTP responsiveness.
+  HttpReadinessCheck readiness_check = 4;
 }
 
 // Controls whether an exposed service receives the request's application

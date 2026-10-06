@@ -40,6 +40,7 @@ mod provider_refresh;
 mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
+mod service_health;
 mod service_routing;
 mod ssh_identity;
 mod ssh_sessions;
@@ -330,6 +331,9 @@ pub struct ServerState {
     /// alongside `gateway_ring` so a redirect can name a dialable address.
     pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
+    /// Cached continuous HTTP service health observations.
+    pub service_health: Arc<service_health::ServiceHealthCache>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -453,6 +457,8 @@ impl ServerState {
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+
+            service_health: Arc::new(service_health::ServiceHealthCache::default()),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -976,6 +982,8 @@ pub(crate) async fn run_server(
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
+    let service_health_task = service_health::spawn_monitor(state.clone(), shutdown_rx.clone());
+
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
@@ -984,6 +992,10 @@ pub(crate) async fn run_server(
 
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
+    }
+
+    if let Err(error) = service_health_task.await {
+        warn!(%error, "Service health monitor failed during shutdown");
     }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
