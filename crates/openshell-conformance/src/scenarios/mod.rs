@@ -8,6 +8,7 @@ mod policy_behavior;
 mod provider_auto_create;
 mod sandbox_lifecycle;
 mod sandbox_templates;
+mod settings_management;
 mod smoke;
 mod workspace_lifecycle;
 
@@ -25,5 +26,6 @@ pub use sandbox_templates::{
     SANDBOX_TEMPLATE_LIFECYCLE_SCENARIO, SANDBOX_TEMPLATE_MISSING_TEMPLATE_SCENARIO,
     SANDBOX_TEMPLATES_SCENARIO,
 };
+pub use settings_management::SETTINGS_MANAGEMENT_SCENARIO;
 pub use smoke::SMOKE_SCENARIO;
 pub use workspace_lifecycle::{WORKSPACE_LIFECYCLE_SCENARIO, WORKSPACE_TERMINATING_SCENARIO};
