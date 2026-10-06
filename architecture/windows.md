@@ -150,9 +150,16 @@ prevent another sandbox from using the OpenShell proxy, but they do not isolate
 unrelated host-loopback services or authenticate individual processes within
 one sandbox.
 
+ProcessContainer sandbox-local TCP uses a separate, explicit
+`pc_allow_loopback` grant. It permits `127.0.0.1/32` egress while leaving
+private-network ingress and host-loopback denied, independently of governed
+egress or sandbox network rules. Capability names alone do not override MXC's
+deny-default networking. All network compatibility settings default to false.
+
 Two gateway-wide ProcessContainer compatibility settings can deliberately
 broaden this boundary. `pc_network_allow` permits unrestricted outbound TCP, and
-`pc_allow_local_network` enables MXC local-network access. These are operator
+`pc_allow_local_network` enables loopback egress, private-network ingress, and
+host-loopback access. These are operator
 configuration choices, not sandbox policy grants, and they must not be treated
 as policy-governed egress.
 
@@ -190,6 +197,11 @@ multiplexes `forward_open`, `forward_read`, `forward_write`, and
 `forward_close` operations over the inherited control channel. A fresh nonce
 authenticates each host-side forward. This capability does not add interactive
 shell or general exec support.
+
+The relay needs sandbox-local TCP access to dial its target. Sandbox creation
+does not require that grant. Dynamic forwarding checks the gateway's explicit
+network grants and the sandbox's active proxy state before opening a relay
+listener, rejecting a missing grant with a diagnostic naming `pc_allow_loopback`.
 
 The implementation boundary spans
 `crates/openshell-driver-mxc/src/control_channel.rs`,

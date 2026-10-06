@@ -23,7 +23,7 @@
 #
 # Connectivity: entirely on-demand via `openshell forward service
 # --target-port 22000` (ForwardSink::open_dynamic_forward / the control
-# channel's "forward" op) -- there is no static/always-on bridge and no
+# channel's "forward_open" op) -- there is no static/always-on bridge and no
 # port pre-declared in this config beyond pc_relay_target_port's own
 # startup liveness check.
 #
@@ -43,16 +43,16 @@ wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 # One-shot AppContainer backend: genuinely default-deny at the OS level.
 backend = "process_container"
 
-# AppContainer capability required for the server to bind a TCP socket on
-# 0.0.0.0:22000.  "privateNetworkClientServer" allows the sandbox to act as
-# both a client and a server on private (home/work/loopback) networks.
-pc_capabilities = ["privateNetworkClientServer"]
+# The workload needs sandbox-local TCP, not private/LAN or host-loopback access.
+# AppContainer capabilities alone do not override MXC directional network policy.
+pc_capabilities = []
+pc_allow_loopback = true
 
 # process_container only: keep standard privilege level (not LPA).
 pc_least_privilege = false
 
-# No governed Internet egress is needed. The relay reaches the driver's
-# on-demand private-interface listener through privateNetworkClientServer above.
+# No governed Internet egress is needed. The control channel carries forwarding
+# traffic through inherited handles; the relay dials the target on sandbox loopback.
 egress_proxy      = false
 egress_proxy_addr = ""
 

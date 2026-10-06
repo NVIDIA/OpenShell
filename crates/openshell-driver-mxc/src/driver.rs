@@ -200,10 +200,13 @@ pub struct MxcComputeConfig {
     /// rejected instead of falling back from governed egress to unrestricted
     /// access.
     pub pc_network_allow: bool,
-    /// `processContainer` only: allow inbound/private-network and host-loopback
-    /// traffic through the MXC 1.0 directional ingress policy. Required for
-    /// node.js (and other runtimes that need loopback during DLL initialization)
-    /// to start inside a processcontainer.
+    /// `processContainer` only: permit sandbox-local `127.0.0.1` connections
+    /// while retaining deny-default external egress and host-loopback ingress.
+    /// Independent of governed egress and `AppContainer` capabilities.
+    pub pc_allow_loopback: bool,
+    /// `processContainer` only: broader compatibility access, permitting
+    /// private-network ingress and host loopback in addition to local loopback.
+    /// Prefer `pc_allow_loopback` for sandbox-local helper processes.
     pub pc_allow_local_network: bool,
     /// `processContainer` only: when `true`, start with an EMPTY process env
     /// (not even `MINIMAL_WINDOWS_BOOTSTRAP_ENV`) instead of the safe
@@ -689,6 +692,11 @@ fn governed_egress_addr(
     config: &MxcComputeConfig,
     policy: Option<&SandboxPolicy>,
 ) -> Result<Option<SocketAddr>, tonic::Status> {
+    if config.pc_allow_loopback && config.backend != MxcBackend::ProcessContainer {
+        return Err(tonic::Status::invalid_argument(
+            "mxc pc_allow_loopback requires backend = process_container",
+        ));
+    }
     let configured = configured_egress_addr(config)?;
     let policy_activates_egress = policy_activates_governed_egress(policy);
     if configured.is_some() && !policy_activates_egress && config.pc_network_allow {
@@ -697,6 +705,27 @@ fn governed_egress_addr(
         ));
     }
     Ok(configured.filter(|_| policy_activates_egress))
+}
+
+fn effective_network(config: &MxcComputeConfig, proxy: Option<SocketAddr>) -> Option<MxcNetwork> {
+    let process_container = config.backend == MxcBackend::ProcessContainer;
+    let local = process_container && config.pc_allow_local_network;
+    let loopback = process_container && config.pc_allow_loopback;
+    let unrestricted = process_container && config.pc_network_allow;
+    if proxy.is_none() && !local && !loopback && !unrestricted {
+        return None;
+    }
+    Some(MxcNetwork {
+        egress_default: if proxy.is_none() && unrestricted {
+            "allow"
+        } else {
+            "deny"
+        }
+        .into(),
+        proxy,
+        allow_loopback: loopback,
+        allow_local_network: local,
+    })
 }
 
 fn allocate_sandbox_proxy_addr(
@@ -1016,6 +1045,8 @@ impl MxcComputeBackend {
     pub fn forward_sink(&self) -> ForwardSink {
         ForwardSink {
             registry: self.registry.clone(),
+            requires_loopback_grant: self.config.backend == MxcBackend::ProcessContainer
+                && effective_network(&self.config, None).is_none(),
         }
     }
 
@@ -1595,6 +1626,9 @@ pub enum OpenDynamicForwardError {
 #[derive(Clone)]
 pub struct ForwardSink {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    /// `ProcessContainer` forwarding needs a grant from either the gateway's
+    /// explicit network settings or the sandbox's active governed-egress proxy.
+    requires_loopback_grant: bool,
 }
 
 impl ForwardSink {
@@ -1604,7 +1638,7 @@ impl ForwardSink {
     /// directly by the gateway process itself, no `AppContainer` boundary on
     /// that leg — a per-forward auth nonce the caller MUST send as the first
     /// bytes on its own connection to that address (see `relay.rs` module
-    /// docs: the relay is host-interface-bound, so another reachable process
+    /// docs: the relay is host-loopback-bound, so another local process
     /// could otherwise race to connect first and hijack the forward), and a
     /// [`relay::RelayHandle`] the caller must hold for as long as the
     /// forward should stay open, then `.stop()` (or just drop) to tear it
@@ -1613,7 +1647,7 @@ impl ForwardSink {
     /// Target host is always `127.0.0.1` inside the `AppContainer` (matching
     /// `TcpRelayTarget`'s existing loopback-only restriction at the gRPC
     /// layer), so there's no separate `target_host` parameter to thread
-    /// through — the sandbox-side `forward` op only ever dials loopback.
+    /// through — the sandbox-side `forward_open` op only ever dials loopback.
     pub async fn open_dynamic_forward(
         &self,
         sandbox_id: &str,
@@ -1629,11 +1663,18 @@ impl ForwardSink {
                 .control_channel
                 .clone()
                 .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
+            if self.requires_loopback_grant && entry.proxy_addr.is_none() {
+                return Err(OpenDynamicForwardError::Rejected(format!(
+                    "mxc dynamic forwarding to 127.0.0.1:{target_port} requires sandbox-local TCP \
+                     loopback; set [openshell.drivers.mxc] pc_allow_loopback = true and recreate \
+                     the sandbox. privateNetworkClientServer alone does not override \
+                     deny-default networking"
+                )));
+            }
             (channel, entry.sandbox.name.clone())
         };
 
-        // Fresh per forward -- see relay.rs module docs for why this matters
-        // on a host-interface listener.
+        // Fresh per forward -- authenticate the gateway to its host-loopback listener.
         let nonce: [u8; relay::NONCE_LEN] = rand::random();
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1833,11 +1874,7 @@ async fn run_lifecycle(
         env: env.clone(),
         timeout: 0,
     };
-    let network = proxy_addr.map(|addr| MxcNetwork {
-        egress_default: "deny".into(),
-        proxy: Some(addr),
-        allow_local_network: false,
-    });
+    let network = effective_network(&config, proxy_addr);
 
     let child = match config.backend {
         MxcBackend::IsolationSession => {
@@ -1896,47 +1933,13 @@ async fn run_lifecycle(
                 least_privilege: config.pc_least_privilege,
                 capabilities: config.pc_capabilities.clone(),
             };
-            // Build the effective network config:
-            // - egress_proxy: use the proxy-based network (already in `network`)
-            // - pc_network_allow: inject allow-all (fallback for builds without capability support)
-            // - pc_allow_local_network: deny-by-default egress plus permissive ingress so
-            //   intra-container loopback works and the spawner can reach the relay on the
-            //   host's route-selected private interface without a full egress proxy.
-            let effective_network = if network.is_none()
-                && (config.pc_allow_local_network || config.pc_network_allow)
-            {
-                // Both flags apply to the same no-proxy startup case and
-                // aren't mutually exclusive -- honor both instead of letting
-                // pc_allow_local_network's branch silently force
-                // egress_default back to "deny" and drop pc_network_allow's
-                // unrestricted-egress intent.
-                Some(MxcNetwork {
-                    egress_default: if config.pc_network_allow {
-                        "allow".into()
-                    } else {
-                        "deny".into()
-                    },
-                    proxy: None,
-                    allow_local_network: config.pc_allow_local_network,
-                })
-            } else {
-                // `network` is Some here (egress_proxy configured). Preserve
-                // config.pc_allow_local_network instead of unconditionally
-                // clearing it -- MxcNetwork already carries both `proxy` and
-                // `allow_local_network` together, so a proxy and local-network
-                // access aren't mutually exclusive.
-                network.map(|mut n| {
-                    n.allow_local_network = config.pc_allow_local_network;
-                    n
-                })
-            };
             match invoker
                 .run_oneshot(
                     &sandbox_id,
                     filesystem,
                     process_container,
                     process,
-                    effective_network,
+                    network,
                     ui,
                 )
                 .await
@@ -4053,6 +4056,150 @@ mod lifecycle_tests {
                 .delete_sandbox(&sandbox.id, &sandbox.name)
                 .await
                 .expect("delete after stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_grant_does_not_activate_host_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let (_, command) = long_running_command(&share);
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            pc_allow_loopback: true,
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        });
+        let sandbox = with_policy(
+            driver_sandbox_with_command("sb-loopback-only", &share, command),
+            fs_policy(&[&share]),
+        );
+        backend.create_sandbox(&sandbox).await.unwrap();
+        wait_for(&backend, &sandbox.name, |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+        })
+        .await
+        .expect("sandbox should reach Ready");
+        let recorded = crate::mxc::mock_recorded_config(&sandbox.id).unwrap();
+        assert_eq!(recorded["network"]["ingress"]["hostLoopback"], "deny");
+        let registry = backend.registry.lock().await;
+        let entry = registry.get(&sandbox.id).unwrap();
+        assert!(entry.proxy_addr.is_none() && entry.host_proxy.is_none());
+        drop(registry);
+        assert!(!tmp.path().join(".openshell-proxy").exists());
+        backend
+            .delete_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_without_loopback_is_accepted_at_sandbox_creation() {
+        let sandbox = with_policy(driver_sandbox("sb-relay-no-loopback"), fs_policy(&[]));
+        let config = MxcComputeConfig {
+            pc_relay_spawner_path: "C:/tools/openshell-supervisor-relay.exe".into(),
+            pc_relay_target_port: 22000,
+            pc_capabilities: vec!["privateNetworkClientServer".into()],
+            ..Default::default()
+        };
+        let backend = MxcComputeBackend::new_mocked(config);
+        backend
+            .validate_sandbox_create(&sandbox)
+            .expect("loopback is not required to validate sandbox creation");
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("loopback is not required to create a relay-wrapped sandbox");
+        assert!(backend.registry.lock().await.contains_key(&sandbox.id));
+        backend
+            .delete_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .expect("sandbox cleanup");
+    }
+
+    #[tokio::test]
+    async fn dynamic_forward_checks_sandbox_loopback_permission() {
+        let cases = [
+            (false, None, false),
+            (true, None, true),
+            (false, Some("127.0.0.1:18080".parse().unwrap()), true),
+        ];
+        // A closed control channel proves permission validation happens before
+        // any forward request is sent. Opening the host relay itself needs no
+        // sandbox-side response until a host client connects.
+        let mut child = tokio::process::Command::new(inbox_cmd())
+            .args(["/d", "/c", "exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let channel = Arc::new(ControlChannel::new(child.stdin.take().unwrap()));
+        assert!(child.wait().await.unwrap().success());
+        for (allow_loopback, proxy_addr, allowed) in cases {
+            let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+                pc_allow_loopback: allow_loopback,
+                pc_capabilities: vec!["privateNetworkClientServer".into()],
+                egress_proxy: true,
+                egress_proxy_addr: "127.0.0.1:18080".into(),
+                ..Default::default()
+            });
+            let sandbox = driver_sandbox("sb-forward-loopback");
+            backend.registry.lock().await.insert(
+                sandbox.id.clone(),
+                SandboxEntry {
+                    sandbox: sandbox.clone(),
+                    iso_sandbox_id: None,
+                    isolation_stopped: false,
+                    phase_state: PhaseState::Running,
+                    lifecycle_gate: Arc::new(Mutex::new(())),
+                    exec_child: None,
+                    shutdown_tx: None,
+                    terminated_rx: None,
+                    signal_file: None,
+                    trimmed_policy: None,
+                    proxy_addr,
+                    host_proxy: None,
+                    control_channel: Some(channel.clone()),
+                },
+            );
+            match backend
+                .forward_sink()
+                .open_dynamic_forward(&sandbox.id, 22000)
+                .await
+            {
+                Ok((_, _, handle)) => {
+                    handle.stop();
+                    assert!(allowed, "forward without a loopback grant must be rejected");
+                }
+                Err(error) => {
+                    assert!(!allowed, "permitted forward was rejected: {error}");
+                    assert!(matches!(error, OpenDynamicForwardError::Rejected(_)));
+                    let diagnostic = error.to_string();
+                    assert!(diagnostic.contains("127.0.0.1:22000"));
+                    assert!(diagnostic.contains("pc_allow_loopback = true"));
+                    assert!(diagnostic.contains("recreate the sandbox"));
+                    assert!(diagnostic.contains("privateNetworkClientServer alone"));
+                }
+            }
+            assert!(channel.pending_handle().lock().await.is_empty());
+        }
+    }
+
+    #[test]
+    fn loopback_grant_rejects_isolation_session_backend() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::IsolationSession,
+            pc_allow_loopback: true,
+            ..Default::default()
+        });
+        let sandbox = with_policy(driver_sandbox("sb-loopback-wrong-backend"), fs_policy(&[]));
+        let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("pc_allow_loopback requires backend")
         );
     }
 

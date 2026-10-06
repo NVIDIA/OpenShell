@@ -678,6 +678,8 @@ wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 backend                 = "process_container"
 pc_least_privilege      = false
 pc_capabilities         = []
+# Sandbox-local IPv4 TCP only; host-loopback and private ingress stay denied.
+pc_allow_loopback       = false
 # Pattern-C governed egress. The address is a loopback seed; the driver
 # allocates a unique ephemeral port for each sandbox.
 egress_proxy            = false
@@ -992,6 +994,8 @@ wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 backend = "process_container"
 pc_least_privilege = false
 pc_capabilities    = []
+# Allow sandbox-local 127.0.0.1 TCP without enabling host-loopback access.
+pc_allow_loopback  = false
 # Pattern C governed egress. MXC 1.0 denies direct Internet egress and permits
 # host loopback; proxy-aware clients receive HTTP_PROXY/HTTPS_PROXY and the host
 # CONNECT proxy enforces the trimmed network policy. Requires process_container.
@@ -1018,6 +1022,31 @@ requires both the user/group and AppContainer package/capability sides of an
 access check to grant the requested operation. The MXC real-binary integration
 suite verifies `TokenIsAppContainer`, `TokenAppContainerSid`, and denial of a
 non-mutating administrator-gated Service Control Manager open.
+
+Set `pc_allow_loopback = true` for a `process_container` workload that needs
+TCP connections between processes in the same sandbox, including a supervisor
+relay dialing its wrapped target. The default is `false`. This setting adds
+an MXC directional egress rule for `127.0.0.1/32` while keeping private-network
+ingress and host-loopback access denied. It requires an MXC build that supports
+directional CIDR rules; unsupported builds fail rather than fall back to broader
+access. IPv6 `::1` is outside this grant.
+
+Sandbox-local loopback does not require `egress_proxy` or a `network_policies`
+block, and it does not start a host proxy or inject proxy settings. Adding
+`privateNetworkClientServer` to `pc_capabilities` alone does not override MXC's
+deny-default network policy. Sandbox creation does not require this grant.
+For a dynamic forward, the driver checks the sandbox's effective loopback
+permission before opening a relay listener. A missing grant rejects the forward
+with an instruction to set `pc_allow_loopback = true` and recreate the sandbox.
+Configuring `egress_proxy` alone does not grant loopback when the sandbox's
+policy does not activate the proxy.
+
+The compatibility settings `pc_allow_local_network` and `pc_network_allow`
+also default to `false`. `pc_allow_local_network = true` adds loopback egress
+and allows private-network ingress and host-loopback access.
+`pc_network_allow = true` permits unrestricted egress. Use `pc_allow_loopback`
+when only sandbox-local communication is needed. These gateway settings apply
+to all ProcessContainer sandboxes; recreate existing sandboxes after changing them.
 
 Set `egress_proxy = true` with `egress_proxy_addr = "127.0.0.1:18080"` to enable the Windows Pattern C split. The address must be a `127.0.0.1:PORT` socket. The driver allocates a unique ephemeral port per sandbox, injects that listener through proxy environment variables, and stages the public proxy CA beneath the sandbox's configured `<cwd>/.openshell-proxy/<sandbox-id>/`. A non-empty per-sandbox `cwd` is therefore required when governed egress is enabled; sandbox-specific subdirectories prevent concurrent sandboxes from overwriting each other's trust files. MXC denies direct Internet egress but allows `127.0.0.1/32`; this permits dynamic forwarding but also means the sandbox can reach unrelated host services bound to loopback.
 

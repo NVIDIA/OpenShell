@@ -268,7 +268,8 @@ function Register-Cli {
 function Wait-PortOpen([int]$port, [int]$seconds) {
     $deadline = (Get-Date).AddSeconds($seconds)
     while ((Get-Date) -lt $deadline) {
-        if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+        if (@([System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+            Where-Object { $_.Port -eq $port }).Count -gt 0) {
             return $true
         }
         Start-Sleep -Milliseconds 500
@@ -279,7 +280,8 @@ function Wait-PortOpen([int]$port, [int]$seconds) {
 function Wait-PortClosed([int]$port, [int]$seconds) {
     $deadline = (Get-Date).AddSeconds($seconds)
     while ((Get-Date) -lt $deadline) {
-        if (-not (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)) {
+        if (@([System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+            Where-Object { $_.Port -eq $port }).Count -eq 0) {
             return $true
         }
         Start-Sleep -Milliseconds 500
@@ -424,12 +426,10 @@ try {
         }
         Ok "wxc-exec: $WxcExecPath"
 
-        # A real run exercises process_container with egress_proxy disabled
-        # (mxc-ws-gateway.toml). The sandbox connects directly to the driver's
-        # route-selected private-interface relay listener through the
-        # privateNetworkClientServer capability; the governed host CONNECT
-        # proxy is not part of this qualification path. Elevation is not
-        # required here; keep logging the elevation state for diagnostics only.
+        # A real run exercises process_container with pc_allow_loopback enabled
+        # and egress_proxy disabled. The sandbox relay dials its local target;
+        # gateway traffic uses inherited handles without a host-network callback.
+        # Keep logging elevation state for diagnostics only.
         $wid   = [Security.Principal.WindowsIdentity]::GetCurrent()
         $wp    = New-Object Security.Principal.WindowsPrincipal($wid)
         $admin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -612,6 +612,8 @@ try {
     if (-not $Mock) {
 
         Step "Wait for WebSocket server on port $WsPort"
+        # Host-to-sandbox loopback is denied. Observe the listener without
+        # connecting to it; the echo check below exercises the actual relay path.
         $serverUp = Wait-PortOpen -port $WsPort -seconds 30
         if ($serverUp) {
             Record "server-port-open" $true "port $WsPort is listening"
@@ -624,21 +626,12 @@ try {
             Record "server-port-open" $false $detail
         }
 
-        # Cross-check server-port-open against openshell-supervisor-relay's own
-        # confirmation, from inside the sandbox: it detects target-port
-        # readiness itself (wait_for_port_ready, gated by the "launch"
-        # handshake) and logs it, forwarded into the gateway log the same way
-        # as every other wxc-exec stdout/stderr line. No share_dir file
-        # needed -- this is the same information the marker file used to
-        # carry, just sourced from the spawner's own diagnostic instead.
+        # Cross-check the listener against the relay's acknowledgement of the
+        # driver's target_ready handshake. Readiness does not require the host
+        # to dial the sandbox's listener directly.
         if ($serverUp) {
             Step "Verify spawner's own port-ready confirmation (gateway log)"
-            # The spawner's own polling (wait_for_port_ready, 300ms interval)
-            # runs independently of this script's Wait-PortOpen above -- its
-            # log line can land a couple of seconds after the raw TCP connect
-            # already succeeded (observed up to ~2.3s). Poll for it rather
-            # than checking once immediately, or this races and fails spuriously.
-            $readyPattern = "port $WsPort ready after"
+            $readyPattern = "host confirmed target listener on port $WsPort"
             $readyDeadline = (Get-Date).AddSeconds(15)
             $readyOk = $false
             while ((Get-Date) -lt $readyDeadline -and -not $readyOk) {

@@ -8,10 +8,10 @@
 #   - Execute access to mxc-ws-agent.exe / openshell-supervisor-relay.exe and
 #     their runtime DLLs (provided by the AppContainer inheriting access to
 #     system paths and share_dir).
-#   - TCP socket binding on port 22000 (governed by pc_capabilities in the
-#     gateway TOML, not by filesystem policy here).
-#   - Private/loopback client access for openshell-supervisor-relay to dial
-#     the driver's on-demand relay — granted by pc_capabilities in the TOML.
+#   - Sandbox-local TCP on port 22000 so openshell-supervisor-relay can dial
+#     the wrapped target — granted by pc_allow_loopback in the gateway TOML.
+#     Private-network ingress and host-loopback access remain denied. Forwarding
+#     between the gateway and relay uses inherited stdin/stdout handles.
 #   - No writes to the host filesystem.
 #
 # workload directory (passed by run-ws-agent-test.ps1, default C:\work\openshell-mxc-ws)

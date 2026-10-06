@@ -194,6 +194,14 @@ architecture-appropriate task is therefore safe without real MXC hardware but
 must not be described as wholly skip-safe on supported hardware. Neither task
 is part of `windows:ci`'s ordered contract, so invoke it explicitly.
 
+The native suite also verifies `pc_allow_loopback` with no sandbox network
+rules or host proxy: same-sandbox TCP succeeds while host-loopback and the
+host's private interface remain blocked. Keep this distinct from broader
+`pc_allow_local_network` or governed-egress grants. The WebSocket lifecycle
+example uses `pc_allow_loopback = true`; capabilities alone do not supply it.
+Sandbox creation without the grant is allowed; a dynamic forward without an
+effective loopback grant is rejected before opening a relay listener.
+
 For GB300 Windows ARM64 qualification, do not use the skip-safe developer task
 as release evidence. `windows:test:mxc-gb300:arm64` runs the required
 ProcessContainer subset and fails on any required `SKIP`.

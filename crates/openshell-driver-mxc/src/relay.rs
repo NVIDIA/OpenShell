@@ -1,64 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! WebSocket relay embedded in the gateway for MXC `ProcessContainer` sandboxes.
+//! Dynamic TCP forwarding embedded in the gateway for MXC sandboxes.
 //!
-//! The `AppContainer` needs private-network client access (for example, the
-//! `privateNetworkClientServer` capability used by the qualification profile).
-//! The driver binds a relay listener on demand (`start_relay`, e.g. from
-//! `ForwardSink::open_dynamic_forward`) and tells the in-sandbox spawner its
-//! address over the stdin/stdout control channel; the spawner connects directly
-//! to it as a WebSocket CLIENT (Phase A). Governed egress and its host CONNECT
-//! proxy are not part of this relay path. Host clients connect as raw TCP
-//! (Phase B); the relay tunnels their bytes through Phase A so the in-sandbox
-//! agent can pipe them directly to the target service. Each relay is
-//! per-request and short-lived — bound fresh for each `openshell forward
-//! service` call, torn down when that forward ends.
+//! The current driver binds an authenticated host-loopback listener on demand
+//! and carries bytes through the inherited stdin/stdout control channel using
+//! `forward_open`, `forward_read`, `forward_write`, and `forward_close`. No
+//! sandbox-to-host callback connection or host proxy is required. The in-sandbox
+//! supervisor still needs local TCP permission to dial its wrapped target;
+//! `pc_allow_loopback` supplies this without granting host-loopback access.
 //!
 //! ```text
-//! host TCP client  ->  relay (gateway, raw TCP accept)
-//!                          |  tunnel via Phase A WS
-//!                      sandbox agent  ->  local service (openclaw:18889)
+//! host TCP client -> gateway listener -> inherited control channel
+//!                                            |
+//!                                     sandbox supervisor -> 127.0.0.1:target
 //! ```
 //!
-//! The listener is bound to the host's route-selected IPv4 interface rather
-//! than loopback. `AppContainer` fallback does not map its `127.0.0.1` to the
-//! host, so a loopback listener is unreachable unless traffic is sent through
-//! the CONNECT proxy; that proxy can also capture the bridge's separate
-//! sandbox-local target connection. Binding one concrete host interface keeps
-//! the target hop on sandbox loopback and lets the MXC 1.0 directional ingress
-//! policy authorize only the host callback. In principle another host or local process could
-//! race to connect before the real Phase A/B peer does and
-//! hijack or inject traffic into the forward. Both phases are authenticated
-//! against a fresh, unguessable per-forward nonce (`ForwardSink::
-//! open_dynamic_forward` generates it) instead of trusting connection order:
-//!
-//!   Phase A (sandbox spawner, WS client) must send `TEXT "AUTH:<hex
-//!            nonce>"` as its first message, before anything else is
-//!            accepted from that connection -- see openshell-supervisor-
-//!            relay's `run_relay_bridge`, which sends this immediately
-//!            after connecting.
-//!   Phase B (host client, raw TCP -- normally the gateway process itself,
-//!            connecting right after `open_dynamic_forward` returns) must
-//!            write the raw nonce bytes as the first bytes on the
-//!            connection, before any tunneled application data -- see
-//!            openshell-server's `ForwardTcp` handler.
-//!
-//! A connection that fails or times out on this check is closed and the
-//! relay keeps waiting for the real peer, rather than treating the first
-//! comer as authoritative or tearing the whole relay down (a wrong guess
-//! shouldn't be a viable way to deny service to the real caller either).
-//!
-//! Protocol over Phase A (WS connection from sandbox to relay), after auth:
-//!   TEXT  "`SESSION_START`" — relay opened a Phase B TCP connection
-//!   BINARY <bytes>        — bytes from Phase B TCP stream
-//!   TEXT  "`SESSION_END`"   — Phase B TCP connection closed
-//!   WS Close              — relay shutting down (`delete_sandbox` or error)
-//!
-//! Phase B (host client), after the nonce prefix, is a plain byte stream —
-//! no WS handshake — so the client's full byte stream (including any WS
-//! upgrade request and frames) is tunneled transparently to the in-sandbox
-//! service from that point on.
+//! Each host client must first send a fresh per-forward nonce. After
+//! authentication, its application bytes (including WebSocket handshakes) are
+//! tunneled transparently. Disconnect and shutdown close the sandbox session.
+//! This module also retains the legacy reverse-WebSocket bridge helpers.
 
 use crate::control_channel::ControlChannel;
 use base64::Engine;

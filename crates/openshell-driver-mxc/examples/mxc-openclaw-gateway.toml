@@ -22,6 +22,8 @@ version = 2
 wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 
 backend           = "process_container"
+# MXC derives effective network capabilities from its directional policy.
+# This capability alone does not permit sandbox-local loopback connections.
 pc_capabilities   = ["privateNetworkClientServer"]
 pc_least_privilege = false
 # UI capability is now a SandboxPolicy concern, not gateway TOML -- see

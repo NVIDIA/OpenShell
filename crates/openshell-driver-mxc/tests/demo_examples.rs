@@ -175,6 +175,26 @@ fn shipped_audit_and_websocket_configs_use_current_schema() {
 }
 
 #[test]
+fn websocket_demo_grants_only_sandbox_loopback_without_network_rules() {
+    let config: Value = toml::from_str(&read_example("mxc-ws-gateway.toml")).unwrap();
+    let mxc = &config["openshell"]["drivers"]["mxc"];
+    assert_eq!(mxc["pc_allow_loopback"].as_bool(), Some(true));
+    assert_eq!(mxc["egress_proxy"].as_bool(), Some(false));
+    assert!(mxc["pc_capabilities"].as_array().unwrap().is_empty());
+    assert_ne!(
+        mxc.get("pc_allow_local_network").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_ne!(
+        mxc.get("pc_network_allow").and_then(Value::as_bool),
+        Some(true)
+    );
+    let policy: serde_json::Value =
+        serde_yml::from_str(&read_example("e2e-policies/ws-agent.yaml")).unwrap();
+    assert!(policy.get("network_policies").is_none());
+}
+
+#[test]
 fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
@@ -330,6 +350,7 @@ fn shipped_runners_parse_in_windows_powershell() {
         "mxc-provider-credential-probe.ps1",
         "run-ocsf-audit.ps1",
         "run-mxc-e2e.ps1",
+        "run-ws-agent-test.ps1",
     ] {
         let path = examples_root().join(name);
         let script = r"

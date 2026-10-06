@@ -898,6 +898,203 @@ fn pc_oneshot_in_policy_write_succeeds() {
     );
 }
 
+/// Re-enter this test executable inside MXC to measure actual socket access.
+#[test]
+fn child_loopback_probe_entry() {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    if std::env::var("OPENSHELL_MXC_CHILD_LOOPBACK_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("sandbox listener");
+    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
+    let self_error = match TcpStream::connect_timeout(&local, Duration::from_secs(2)) {
+        Ok(mut client) => {
+            client.set_nodelay(true).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(b"echo").unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            server.set_nodelay(true).unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut payload = [0; 4];
+            server.read_exact(&mut payload).unwrap();
+            server.write_all(&payload).unwrap();
+            client.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"echo");
+            None
+        }
+        Err(error) => Some(error.raw_os_error().expect("native socket error")),
+    };
+    let mut results = serde_json::json!({"self_error": self_error});
+    for (key, variable) in [
+        ("host_loopback_error", "OPENSHELL_MXC_HOST_LOOPBACK"),
+        ("host_interface_error", "OPENSHELL_MXC_HOST_INTERFACE"),
+    ] {
+        let address: SocketAddr = std::env::var(variable).unwrap().parse().unwrap();
+        results[key] = match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+            Ok(_) => serde_json::Value::Null,
+            Err(error) => {
+                serde_json::json!({"kind": format!("{:?}", error.kind()), "code": error.raw_os_error()})
+            }
+        };
+    }
+    results["has_proxy_env"] = serde_json::json!(std::env::vars().any(|(key, _)| {
+        [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "CURL_CA_BUNDLE",
+            "SSL_CERT_FILE",
+        ]
+        .iter()
+        .any(|expected| key.eq_ignore_ascii_case(expected))
+    }));
+    std::fs::write(
+        std::env::var("OPENSHELL_MXC_LOOPBACK_RESULT").unwrap(),
+        results.to_string(),
+    )
+    .expect("write socket probe results");
+}
+
+/// Exercise the driver's opt-in without network rules, a proxy, or host access.
+#[tokio::test]
+#[ignore = "requires real wxc-exec"]
+async fn pc_loopback_without_network_policy_keeps_host_access_denied() {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+    // Route selection does not send a packet. Test a real non-loopback local
+    // interface as well as 127.0.0.1, with positive controls outside MXC.
+    let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    route.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+    let host_ip = route.local_addr().unwrap().ip();
+    assert!(!host_ip.is_loopback() && !host_ip.is_unspecified());
+    let host = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let port = host.local_addr().unwrap().port();
+    let host_loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let host_interface = SocketAddr::new(host_ip, port);
+    for address in [host_loopback, host_interface] {
+        TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            .expect("host positive control");
+    }
+    let test_exe = std::env::current_exe().unwrap();
+    for allow_loopback in [false, true] {
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("loopback.json");
+        let cwd = output_dir.path().to_string_lossy().into_owned();
+        let serde_json::Value::Object(driver_config) = serde_json::json!({
+            "command": [test_exe.to_string_lossy(), "--exact", "child_loopback_probe_entry", "--nocapture"],
+            "cwd": cwd,
+        }) else {
+            unreachable!();
+        };
+        let id = format!("pc-loopback-{}-{allow_loopback}", std::process::id());
+        let sandbox = DriverSandbox {
+            id: id.clone(),
+            name: id.clone(),
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(
+                        openshell_core::proto_struct::json_object_to_struct(driver_config).unwrap(),
+                    ),
+                    ..Default::default()
+                }),
+                environment: std::collections::HashMap::from([
+                    ("OPENSHELL_MXC_CHILD_LOOPBACK_PROBE".into(), "1".into()),
+                    (
+                        "OPENSHELL_MXC_LOOPBACK_RESULT".into(),
+                        output_path.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "OPENSHELL_MXC_HOST_LOOPBACK".into(),
+                        host_loopback.to_string(),
+                    ),
+                    (
+                        "OPENSHELL_MXC_HOST_INTERFACE".into(),
+                        host_interface.to_string(),
+                    ),
+                ]),
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        include_workdir: false,
+                        read_only: vec![test_exe.parent().unwrap().to_string_lossy().into_owned()],
+                        read_write: vec![cwd],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let backend = MxcComputeBackend::new(MxcComputeConfig {
+            wxc_exec_path: wxc.to_string_lossy().into_owned(),
+            pc_allow_loopback: allow_loopback,
+            pc_capabilities: vec!["privateNetworkClientServer".into()],
+            ..Default::default()
+        });
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("loopback sandbox create");
+        let mut terminal = None;
+        for _ in 0..600 {
+            if let Some(observed) = backend.get_sandbox(&id).await
+                && let Some(condition) = observed.status.and_then(|status| {
+                    status
+                        .conditions
+                        .into_iter()
+                        .find(|condition| condition.r#type == "Ready")
+                })
+                && matches!(
+                    condition.reason.as_str(),
+                    "AgentCompleted" | "ExecFailed" | "ProvisionFailed"
+                )
+            {
+                terminal = Some(condition);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        backend
+            .delete_sandbox(&id, &id)
+            .await
+            .expect("loopback sandbox cleanup");
+        let terminal = terminal.expect("loopback sandbox terminated");
+        assert_eq!(terminal.reason, "AgentCompleted", "{}", terminal.message);
+        let results: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+        assert_eq!(
+            results["self_error"],
+            if allow_loopback {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(10013)
+            }
+        );
+        assert!(
+            results["host_loopback_error"].is_object(),
+            "host loopback must stay blocked: {results}"
+        );
+        assert_eq!(
+            results["host_interface_error"]["code"], 10013,
+            "private interface must stay blocked: {results}"
+        );
+        assert_eq!(results["has_proxy_env"], false);
+        assert!(!output_dir.path().join(".openshell-proxy").exists());
+    }
+}
+
 /// Verify the default `ProcessContainer` token and an administrator-gated
 /// access attempt. `whoami /all` is not sufficient for this assertion: the
 /// package SID is exposed through `TokenAppContainerSid`, and `AppContainer`
@@ -1055,12 +1252,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         curl.display(),
         curl.display(),
     );
-    let command = vec![
-        cmd_string.clone(),
-        "/d".to_string(),
-        "/c".to_string(),
-        script,
-    ];
+    let command = vec![cmd_string, "/d".to_string(), "/c".to_string(), script];
     let serde_json::Value::Object(driver_config) = serde_json::json!({
         "command": command,
         "cwd": output_dir_string,
@@ -1088,6 +1280,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
+                // The proxy authorizes the socket-owning curl child, not its shell.
                 binaries: vec![NetworkBinary { path: curl_string }],
             },
         )]),

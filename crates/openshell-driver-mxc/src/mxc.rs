@@ -83,16 +83,15 @@ pub struct MxcFilesystem {
     pub denied_paths: Vec<String>,
 }
 
-/// Network redirect fragment emitted when governed egress is enabled.
+/// Directional network policy for governed egress or explicit local access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcNetwork {
     /// MXC 1.0 `network.egress.default` action.
     pub egress_default: String,
     pub proxy: Option<SocketAddr>,
-    /// When true, permits inbound/private-network and host-loopback traffic
-    /// through the MXC 1.0 directional `network.ingress` policy. Required for
-    /// node.js to initialize inside a processcontainer — without it, node.exe
-    /// DLL initialization fails with `STATUS_DLL_INIT_FAILED`.
+    /// Allow IPv4 TCP loopback inside the sandbox without opening host loopback.
+    pub allow_loopback: bool,
+    /// Broader compatibility grant: allow private-network ingress and host loopback.
     pub allow_local_network: bool,
 }
 
@@ -179,41 +178,25 @@ fn redact_env_for_debug(config: &serde_json::Value) -> serde_json::Value {
 }
 
 fn network_json(network: &MxcNetwork) -> serde_json::Value {
-    let mut value = if network.proxy.is_some() {
-        // Use direct loopback egress rather than runtimeConfig.networkProxy proxy
-        // mode. Proxy mode routes all outbound TCP through processmodel.dll's WFP
-        // redirect, which in practice blocks loopback connects from the relay to
-        // its target process (127.0.0.1:port) even with networkLoopback capability
-        // in the PSEC spec. Direct allow for 127.0.0.1/32 (not the broader 127.0.0.0/8
-        // range -- openshell-supervisor-relay only ever dials the literal
-        // 127.0.0.1, see imp.rs) lets the relay reach:
-        //   - the target it spawns (loopback inside AppContainer)
-        //   - the host relay listener (also 127.0.0.1 via egress allow)
-        // PSEC tier is still selected because requires_psec_networking() returns
-        // true when egress.allow is non-empty (no NetworkIsolationSetAppContainerConfig
-        // call needed — no elevation required).
-        //
-        // Deliberately no `ports` restriction: `openshell forward service`'s
-        // dynamic bridge (imp.rs's "forward" control-channel op) connects the
-        // relay out to a fresh, per-request ephemeral host port chosen at
-        // forward-call time (data.relay_addr), not a port known when this
-        // config is generated -- confirmed 2026-09-10 that scoping `ports` to
-        // just [proxy.port(), relay_target_port] breaks that dynamic forward
-        // (ws-echo failed with a "forbidden by access permissions" / 10013
-        // relay-connect error). Any-port-on-127.0.0.1 is the correct scope
-        // here, not a narrower static list.
-        serde_json::json!({
-            "egress": {
-                "default": "deny",
-                "allow": [{"to": [{"cidr": "127.0.0.1/32"}]}]
-            },
-            "ingress": { "default": "allow", "hostLoopback": "allow" },
-        })
-    } else {
-        serde_json::json!({ "egress": { "default": network.egress_default } })
-    };
-    if network.proxy.is_none() && network.allow_local_network {
+    let mut value = serde_json::json!({
+        "egress": { "default": network.egress_default }
+    });
+    let loopback = network.proxy.is_some() || network.allow_loopback || network.allow_local_network;
+    if loopback && network.egress_default == "deny" {
+        // Direct egress keeps sandbox-local TCP independent of the host proxy.
+        // Dynamic forwards may target any sandbox-local port. Host loopback is
+        // separately controlled by ingress.hostLoopback, so this CIDR alone
+        // does not authorize connections to unrelated host listeners.
+        value["egress"]["allow"] = serde_json::json!([
+            {"to": [{"cidr": "127.0.0.1/32"}]}
+        ]);
+    }
+    if network.proxy.is_some() || network.allow_local_network {
+        // The unpackaged host proxy and legacy compatibility setting require
+        // broader access. Preserve this grant only for those explicit paths.
         value["ingress"] = serde_json::json!({ "default": "allow", "hostLoopback": "allow" });
+    } else if network.allow_loopback {
+        value["ingress"] = serde_json::json!({ "default": "deny", "hostLoopback": "deny" });
     }
     value
 }
@@ -924,6 +907,7 @@ mod tests {
         let network = MxcNetwork {
             egress_default: "deny".into(),
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
+            allow_loopback: false,
             allow_local_network: false,
         };
         let value = network_json(&network);
@@ -937,6 +921,38 @@ mod tests {
         assert_eq!(value["ingress"]["hostLoopback"], "allow");
         assert!(value.get("proxy").is_none());
         assert!(value.get("defaultPolicy").is_none());
+    }
+
+    #[test]
+    fn loopback_only_network_keeps_host_and_private_ingress_denied() {
+        let network = MxcNetwork {
+            egress_default: "deny".into(),
+            proxy: None,
+            allow_loopback: true,
+            allow_local_network: false,
+        };
+        assert_eq!(
+            network_json(&network),
+            serde_json::json!({
+                "egress": {"default": "deny", "allow": [{"to": [{"cidr": "127.0.0.1/32"}]}]},
+                "ingress": {"default": "deny", "hostLoopback": "deny"},
+            })
+        );
+    }
+
+    #[test]
+    fn local_network_grant_also_allows_loopback_egress() {
+        let network = MxcNetwork {
+            egress_default: "deny".into(),
+            proxy: None,
+            allow_loopback: false,
+            allow_local_network: true,
+        };
+        let value = network_json(&network);
+        assert_eq!(value["egress"]["default"], "deny");
+        assert_eq!(value["egress"]["allow"][0]["to"][0]["cidr"], "127.0.0.1/32");
+        assert_eq!(value["ingress"]["default"], "allow");
+        assert_eq!(value["ingress"]["hostLoopback"], "allow");
     }
 
     #[test]

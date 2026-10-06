@@ -65,9 +65,11 @@ pc_minimal_env = false
 # A sandbox with egress_proxy enabled but no explicit network rules rejects
 # this fallback instead of silently changing governed egress to allow-all.
 pc_network_allow = false
-# processContainer only: emit permissive MXC 1.0 ingress and host-loopback
-# actions. This compatibility setting broadens network access and is not
-# required by the BaseContainer qualification profile.
+# processContainer only: sandbox-local 127.0.0.1 TCP, with host-loopback and
+# private-network ingress denied. Independent of egress_proxy/network rules.
+pc_allow_loopback = false
+# processContainer only: loopback egress plus private-network ingress and
+# host-loopback access. Prefer pc_allow_loopback for sandbox-local forwarding.
 pc_allow_local_network = false
 # Pattern C governed egress. Requires backend = "process_container".
 egress_proxy = false
@@ -98,6 +100,24 @@ fallback. If it is combined with `egress_proxy = true`, a sandbox policy
 without explicit network rules is rejected synchronously rather than falling
 through from governed egress to `network.egress.default = "allow"`.
 
+`pc_allow_loopback = true` permits TCP between processes in the same sandbox
+through an MXC directional `127.0.0.1/32` egress rule. It keeps
+`ingress.default = "deny"` and `ingress.hostLoopback = "deny"`; it does not
+grant private-network or host-loopback access. It requires a native MXC build
+supporting directional CIDR rules and covers IPv4 only. The default is `false`.
+Neither `egress_proxy` nor sandbox `network_policies` is required, and no proxy
+listener, proxy environment, or CA share is created for this setting.
+`pc_capabilities = ["privateNetworkClientServer"]` alone does not override
+deny-default networking. `pc_allow_local_network` is a broader opt-in that
+also enables private-network ingress and host-loopback access.
+
+Sandbox creation does not require a loopback grant. When a dynamic forward is
+requested, the driver checks whether this grant, an active governed-egress
+proxy, or a compatibility network grant supplies loopback access. Otherwise,
+the forward is rejected before opening a relay listener, with a diagnostic
+naming `pc_allow_loopback = true` and instructing the operator to recreate the
+sandbox after changing the gateway configuration.
+
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
 ```powershell
@@ -110,7 +130,7 @@ The `command` array is required and preserves Windows argument boundaries. `cwd`
 
 UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
 
-`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: for a sandbox policy with explicit network rules, the driver reserves a unique ephemeral loopback port. MXC 1.0 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. A policy without network rules keeps MXC's default network posture and receives neither a host listener nor proxy environment variables. The current governed-egress policy permits all loopback ports, so governed sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
+`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: for a sandbox policy with explicit network rules, the driver reserves a unique ephemeral loopback port. MXC 1.0 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. A policy without network rules receives neither a host listener nor proxy environment variables; its effective network posture follows the explicit ProcessContainer settings above. The current governed-egress policy permits all loopback ports, so governed sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
 
 When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
 session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
