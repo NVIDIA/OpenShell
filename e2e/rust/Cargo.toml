@@ -204,11 +204,6 @@ path = "tests/forward_proxy_jsonrpc_l7.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
-name = "workspace_lifecycle"
-path = "tests/workspace_lifecycle.rs"
-required-features = ["e2e"]
-
-[[test]]
 name = "sandbox_templates"
 path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]

@@ -7,6 +7,7 @@ mod file_transfer;
 mod policy_behavior;
 mod sandbox_lifecycle;
 mod smoke;
+mod workspace_lifecycle;
 
 pub use file_transfer::{
     FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
@@ -17,3 +18,4 @@ pub use policy_behavior::{
 };
 pub use sandbox_lifecycle::SANDBOX_LIFECYCLE_SCENARIO;
 pub use smoke::SMOKE_SCENARIO;
+pub use workspace_lifecycle::{WORKSPACE_LIFECYCLE_SCENARIO, WORKSPACE_TERMINATING_SCENARIO};

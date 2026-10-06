@@ -131,7 +131,6 @@ let
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
     "websocket_conformance"
-    "workspace_lifecycle"
   ];
   podmanE2eArchiveFilter =
     let
