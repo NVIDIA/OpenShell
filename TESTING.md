@@ -320,6 +320,13 @@ Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests
 nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
 ```
 
+The shared suite also runs in the existing ARM64 Docker E2E workflow for
+branch checks and both release workflows. That interim lane compiles the same
+test crate natively and uses the architecture-matched prebuilt candidate CLI
+and gateway plus the candidate multi-architecture sandbox and supervisor
+images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
+x86_64 artifacts; they do not replace ARM64 image coverage.
+
 Run it against a local gateway by naming the command that builds images into
 the gateway's image store:
 

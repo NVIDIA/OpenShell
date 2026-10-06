@@ -12,6 +12,7 @@
 //! is the command that builds images into the gateway's image store, such as
 //! `docker`, `podman`, or `sudo -n podman`.
 
+use std::future::Future;
 use std::process::Command;
 use std::time::Duration;
 
@@ -39,25 +40,32 @@ network_policies: {}
 /// keeps its ownership.
 #[tokio::test]
 async fn custom_workdir_with_named_user() {
-    run("oci-image/custom-workdir-named-user", async |runner| {
-        let image = TestImage::build(
-            "named-workdir",
-            &format!(
-                "FROM {BASE_IMAGE}
+    run(
+        "oci-image/custom-workdir-named-user",
+        async |runner, images| {
+            let image = TestImage::build(
+                images,
+                "named-workdir",
+                &format!(
+                    "FROM {BASE_IMAGE}
 RUN groupadd -g 1235 appstaff && useradd -m -u 1234 -g appstaff app
 WORKDIR /workspace/project
-RUN printf root-owned > root-owned.txt && chown app:appstaff .
+RUN printf root-owned > root-owned.txt && chown app:appstaff . && \
+    printf custom-image-e2e-marker > /etc/oci-image-marker
 USER app
 "
-            ),
-        )?;
-        let checks = format!(
-            "{} test \"$(stat -c %u:%g .)\" = 1234:1235;",
-            workspace_checks("1234:1235", "/workspace/project", true)
-        );
-        let sandbox = create_sandbox(runner, "named", "nu", &image, None, &checks).await?;
-        file_transfer_uses_workspace(runner, &sandbox).await
-    })
+                ),
+            )?;
+            let checks = format!(
+                "{} test \"$(stat -c %u:%g .)\" = 1234:1235; \
+             test \"$(cat /etc/oci-image-marker)\" = custom-image-e2e-marker; \
+             test \"$(stat -c %u:%g /etc/oci-image-marker)\" = 0:0;",
+                workspace_checks("1234:1235", "/workspace/project", true)
+            );
+            let sandbox = create_sandbox(runner, "named", "nu", image, None, &checks).await?;
+            file_transfer_uses_workspace(runner, &sandbox).await
+        },
+    )
     .await;
 }
 
@@ -66,11 +74,14 @@ USER app
 /// `process`, so the image `USER` is the only source of the sandbox identity.
 #[tokio::test]
 async fn custom_workdir_with_numeric_user_and_private_parents() {
-    run("oci-image/custom-workdir-numeric-user", async |runner| {
-        let image = TestImage::build(
-            "numeric-workdir",
-            &format!(
-                "FROM {BASE_IMAGE}
+    run(
+        "oci-image/custom-workdir-numeric-user",
+        async |runner, images| {
+            let image = TestImage::build(
+                images,
+                "numeric-workdir",
+                &format!(
+                    "FROM {BASE_IMAGE}
 RUN mkdir -p /home/app/project && \\
     chown 2345:2346 /home/app /home/app/project && \\
     chmod 0700 /home/app /home/app/project
@@ -78,21 +89,22 @@ WORKDIR /home/app/project
 RUN printf root-owned > root-owned.txt
 USER 2345:2346
 "
-            ),
-        )?;
-        let policy_file = tempfile::NamedTempFile::new()
-            .map_err(|error| format!("create policy file: {error}"))?;
-        std::fs::write(policy_file.path(), IMAGE_IDENTITY_POLICY)
-            .map_err(|error| format!("write policy file: {error}"))?;
-        let policy = policy_file
-            .path()
-            .to_str()
-            .ok_or("policy path is not UTF-8")?;
-        let checks = workspace_checks("2345:2346", "/home/app/project", true);
-        create_sandbox(runner, "numeric", "pu", &image, Some(policy), &checks)
-            .await
-            .map(drop)
-    })
+                ),
+            )?;
+            let policy_file = tempfile::NamedTempFile::new()
+                .map_err(|error| format!("create policy file: {error}"))?;
+            std::fs::write(policy_file.path(), IMAGE_IDENTITY_POLICY)
+                .map_err(|error| format!("write policy file: {error}"))?;
+            let policy = policy_file
+                .path()
+                .to_str()
+                .ok_or("policy path is not UTF-8")?;
+            let checks = workspace_checks("2345:2346", "/home/app/project", true);
+            create_sandbox(runner, "numeric", "pu", image, Some(policy), &checks)
+                .await
+                .map(drop)
+        },
+    )
     .await;
 }
 
@@ -100,13 +112,14 @@ USER 2345:2346
 /// by the image user, even when the image does not contain `/sandbox`.
 #[tokio::test]
 async fn default_workdir_uses_managed_workspace() {
-    run("oci-image/default-workdir", async |runner| {
+    run("oci-image/default-workdir", async |runner, images| {
         let image = TestImage::build(
+            images,
             "default-workdir",
             &format!("FROM {BASE_IMAGE}\nUSER 2345:2346\n"),
         )?;
         let checks = workspace_checks("2345:2346", "/sandbox", false);
-        create_sandbox(runner, "default", "dw", &image, None, &checks)
+        create_sandbox(runner, "default", "dw", image, None, &checks)
             .await
             .map(drop)
     })
@@ -119,46 +132,70 @@ async fn default_workdir_uses_managed_workspace() {
 /// reason.
 #[tokio::test]
 async fn unwritable_custom_workdir_is_rejected() {
-    run("oci-image/unwritable-workdir", async |runner| {
-        let image = TestImage::build(
-            "unwritable-workdir",
-            &format!(
-                "FROM {BASE_IMAGE}
+    run("oci-image/unwritable-workdir", async |runner, images| {
+        // First prove that this user, workspace and command can run. Only the
+        // directory owner differs between the control and rejected image.
+        for (suffix, owner, writable) in [("wc", "3234:3235", true), ("uw", "0:0", false)] {
+            let image = TestImage::build(
+                images,
+                suffix,
+                &format!(
+                    "FROM {BASE_IMAGE}
 RUN groupadd -g 3235 appstaff && useradd -m -u 3234 -g appstaff app
 WORKDIR /workspace/project
+RUN chown {owner} .
 USER app
 "
-            ),
-        )?;
-        let name = format!("oi-{}-uw", runner.id());
-        runner.track_sandbox(&name);
-        let create = runner
-            .step("unwritable/create")
-            .description("sandbox creation fails before the command runs")
-            .with_timeout(CREATE_TIMEOUT)
-            .run(&[
-                "sandbox",
-                "create",
-                "--name",
-                &name,
-                "--from",
-                &image.tag,
-                "--no-tty",
-                "--",
-                "sh",
-                "-c",
-                "echo should-not-run",
-            ])
-            .await
-            .map_err(|error| error.to_string())?;
-        if create.success() || create.stdout().contains("should-not-run") {
-            return Err(create.failure_diagnostic("sandbox creation fails before the command runs"));
-        }
-        let diagnostic = format!("{}\n{}", create.stdout(), create.stderr());
-        if !has_workspace_rejection_diagnostic(&diagnostic) {
-            return Err(create.failure_diagnostic(
+                ),
+            )?;
+            let name = format!("oi-{}-{suffix}", runner.id());
+            runner.track_sandbox(&name);
+            let create = runner
+                .step(format!("{suffix}/create"))
+                .description(if writable {
+                    "writable control runs the same command successfully"
+                } else {
+                    "sandbox creation fails before the command runs"
+                })
+                .with_timeout(CREATE_TIMEOUT)
+                .run(&[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    &name,
+                    "--from",
+                    &image.tag,
+                    "--no-tty",
+                    "--",
+                    "sh",
+                    "-c",
+                    "echo workspace-access-marker",
+                ])
+                .await
+                .map_err(|error| error.to_string())?;
+            if writable {
+                create.require_success()?;
+                if !create.stdout().contains("workspace-access-marker") {
+                    return Err(
+                        create.failure_diagnostic("writable control executes the command marker")
+                    );
+                }
+                continue;
+            }
+            if create.success()
+                || create.stdout().contains("workspace-access-marker")
+                || create.stderr().contains("workspace-access-marker")
+            {
+                return Err(
+                    create.failure_diagnostic("sandbox creation fails before the command runs")
+                );
+            }
+            let diagnostic = format!("{}\n{}", create.stdout(), create.stderr());
+            if !has_workspace_rejection_diagnostic(&diagnostic) {
+                return Err(create.failure_diagnostic(
                 "sandbox creation reports a workspace, permission, or workload startup rejection",
             ));
+            }
         }
         Ok(())
     })
@@ -167,6 +204,24 @@ USER app
 
 fn has_workspace_rejection_diagnostic(diagnostic: &str) -> bool {
     let diagnostic = diagnostic.to_ascii_lowercase();
+    // A successful control does not excuse a later connectivity or image-pull
+    // failure. Those are not evidence of workspace rejection, even if their
+    // messages happen to mention the workspace.
+    if [
+        "connection refused",
+        "connection reset",
+        "imagepull",
+        "image pull",
+        "failed to pull",
+        "pull access denied",
+        "manifest unknown",
+        "no such image",
+    ]
+    .iter()
+    .any(|message| diagnostic.contains(message))
+    {
+        return false;
+    }
     // The CLI may wrap the human message across lines with diagnostic gutters.
     // Match the existing startup reason and exit detail independently.
     if diagnostic.contains("containerexited") && diagnostic.contains("exited with code") {
@@ -200,22 +255,97 @@ fn workspace_rejection_diagnostics_do_not_require_one_condition_reason() {
         "",
         "gateway connection refused",
         "image pull failed",
+        "image pull failed for workspace fixture",
+        "gateway connection refused while creating workspace",
+        "ImagePullFailed: failed to pull image for WorkingDir test",
         "ContainerExited",
     ] {
         assert!(!has_workspace_rejection_diagnostic(diagnostic));
     }
 }
 
-async fn run(scenario: &str, test: impl AsyncFnOnce(&mut OpenShellRunner) -> Result<(), String>) {
+async fn run(
+    scenario: &str,
+    test: impl AsyncFnOnce(&mut OpenShellRunner, &mut Vec<TestImage>) -> Result<(), String>,
+) {
     let mut runner =
         OpenShellRunner::from_env(scenario).expect("candidate openshell CLI is available");
+    let mut images = Vec::new();
     let result = async {
         runner.check_gateway_status().await?;
-        test(&mut runner).await
+        test(&mut runner, &mut images).await
     }
     .await;
-    if let Err(error) = runner.finish(result).await {
+    if let Err(error) =
+        finish_with_image_cleanup(runner.finish(result), &images, TestImage::remove).await
+    {
         panic!("{scenario} failed:\n{error}");
+    }
+}
+
+/// Finish OpenShell sandbox cleanup before removing image tags. Non-forced
+/// image removal must report remaining users rather than deleting workloads
+/// behind the gateway's back. Keep functional/sandbox failures primary.
+async fn finish_with_image_cleanup<T>(
+    finish: impl Future<Output = Result<(), String>>,
+    images: &[T],
+    mut remove: impl FnMut(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    let result = finish.await;
+    let errors: Vec<_> = images
+        .iter()
+        .filter_map(|image| remove(image).err())
+        .collect();
+    if errors.is_empty() {
+        return result;
+    }
+    let cleanup = format!("image cleanup failed:\n{}", errors.join("\n"));
+    match result {
+        Ok(()) => Err(cleanup),
+        Err(primary) => Err(format!("{primary}\n{cleanup}")),
+    }
+}
+
+#[tokio::test]
+async fn sandbox_cleanup_precedes_image_removal_on_success_and_failure() {
+    use std::cell::RefCell;
+
+    for fail_scenario in [false, true] {
+        for fail_cleanup in [false, true] {
+            let events = RefCell::new(Vec::new());
+            let finish = async {
+                events.borrow_mut().push("sandbox delete");
+                if fail_scenario {
+                    Err("functional failure".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = finish_with_image_cleanup(finish, &["first", "second"], |image| {
+                events.borrow_mut().push(image);
+                if fail_cleanup {
+                    Err(format!("cannot remove {image}"))
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            assert_eq!(*events.borrow(), ["sandbox delete", "first", "second"]);
+            assert_eq!(result.is_err(), fail_scenario || fail_cleanup);
+            if fail_scenario {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .starts_with("functional failure")
+                );
+            }
+            if fail_cleanup {
+                let error = result.unwrap_err();
+                assert!(error.contains("cannot remove first"));
+                assert!(error.contains("cannot remove second"));
+            }
+        }
     }
 }
 
@@ -399,14 +529,18 @@ async fn file_transfer_uses_workspace(
     Ok(())
 }
 
-/// An image built into the gateway's image store and removed on drop.
+/// An image owned by `run`, kept alive until sandbox cleanup completes.
 struct TestImage {
     engine: Vec<String>,
     tag: String,
 }
 
 impl TestImage {
-    fn build(name: &str, containerfile: &str) -> Result<Self, String> {
+    fn build<'a>(
+        images: &'a mut Vec<Self>,
+        name: &str,
+        containerfile: &str,
+    ) -> Result<&'a Self, String> {
         let engine: Vec<String> = std::env::var(ENGINE_ENV)
             .map_err(|_| format!("{ENGINE_ENV} must name the gateway's container engine"))?
             .split_whitespace()
@@ -419,10 +553,11 @@ impl TestImage {
         let file = context.path().join("Containerfile");
         std::fs::write(&file, containerfile)
             .map_err(|error| format!("write Containerfile: {error}"))?;
-        let image = Self {
+        images.push(Self {
             engine,
             tag: format!("localhost/openshell-test-oci-{name}:{}", std::process::id()),
-        };
+        });
+        let image = images.last().expect("registered image");
         image.engine_command(&[
             "build",
             "--file",
@@ -432,6 +567,10 @@ impl TestImage {
             context.path().to_str().ok_or("context path is not UTF-8")?,
         ])?;
         Ok(image)
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        self.engine_command(&["image", "rm", &self.tag])
     }
 
     fn engine_command(&self, args: &[&str]) -> Result<(), String> {
@@ -450,11 +589,5 @@ impl TestImage {
             ));
         }
         Ok(())
-    }
-}
-
-impl Drop for TestImage {
-    fn drop(&mut self) {
-        let _ = self.engine_command(&["image", "rm", "--force", &self.tag]);
     }
 }
