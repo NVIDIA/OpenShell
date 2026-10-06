@@ -184,6 +184,15 @@ same parent-to-executed-child access shape used by mediated workloads.
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 
+### Socket peer addresses
+
+On outbound TCP connections relayed by OpenShell, `getpeername()` reports the
+local relay's loopback address (`127.0.0.1` or `::1`) and port rather than the
+upstream destination. Accepted sockets and directly connected local sockets
+report their actual peer address; inbound peer-address reporting retains its
+normal socket semantics. Connection authorization continues to use the requested
+destination, independently of the address reported by `getpeername()`.
+
 ## Agent Workloads
 
 OpenShell runs agents and tools that you install in a user-owned OCI image. The

@@ -346,8 +346,8 @@ fn run_capability_landlock_child(_args: &[String]) -> Result<()> {
 /// One dedicated launcher thread installs the non-TSYNC listener, moves the
 /// listener FD to this unfiltered broker through an in-process channel, then
 /// execs the child. The child proves that the injected open-file description
-/// survives dup and epoll registration before connect and that the broker can
-/// return the original peer rather than the local relay endpoint.
+/// survives dup and epoll registration before connect and that native
+/// getpeername reports the endpoint used by the probe connection.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn probe_socket_virtualization() -> Result<()> {
