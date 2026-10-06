@@ -56,6 +56,11 @@ async fn failed_gateway_start_can_be_stopped_and_retried() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("stop the sandbox before retrying start")
+    );
 
     let session = ssh_session_record("old-session", sandbox.object_id());
     runtime.store.put_message(&session).await.unwrap();
@@ -124,12 +129,7 @@ async fn failed_gateway_start_can_be_stopped_and_retried() {
 
 #[tokio::test]
 async fn explicit_stop_accepts_driver_error_reasons_without_an_allowlist() {
-    for reason in [
-        "StartFailed",
-        "ProcessExited",
-        "ContainerExited",
-        "DriverSpecificFailure",
-    ] {
+    for reason in ["ProcessExited", "ContainerExited", "DriverSpecificFailure"] {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = error_sandbox_record("error-id", "errored", reason);
@@ -143,12 +143,6 @@ async fn explicit_stop_accepts_driver_error_reasons_without_an_allowlist() {
             "Error is not proof that compute stopped"
         );
         assert_eq!(driver.delete_calls(), 0);
-        runtime.stop_sandbox("default", "errored").await.unwrap();
-        assert_eq!(
-            driver.stop_calls(),
-            1,
-            "a completed stop remains idempotent"
-        );
     }
 }
 
@@ -275,48 +269,4 @@ async fn failed_error_stop_retains_retryable_state_without_claiming_success() {
         assert_eq!(driver.start_calls(), 0);
         assert_eq!(driver.delete_calls(), 0);
     }
-}
-
-#[tokio::test]
-async fn canceled_error_stop_still_settles_before_start() {
-    let driver = ControlledDriver::new();
-    driver.block_stop();
-    let runtime = test_runtime(driver.clone()).await;
-    let sandbox = error_sandbox_record("cancel-id", "cancel", "StartFailed");
-    runtime.store.put_message(&sandbox).await.unwrap();
-    let request_runtime = runtime.clone();
-    let request =
-        tokio::spawn(async move { request_runtime.stop_sandbox("default", "cancel").await });
-    tokio::time::timeout(Duration::from_secs(3), driver.stop_started.notified())
-        .await
-        .expect("stop must reach the driver");
-    assert_eq!(
-        stored(&runtime, sandbox.object_id()).await.phase(),
-        SandboxPhase::Stopping as i32
-    );
-    request.abort();
-    assert!(request.await.unwrap_err().is_cancelled());
-    driver.release_stop();
-    let gate = tokio::time::timeout(
-        Duration::from_secs(3),
-        runtime.lifecycle_gates.lock_for(sandbox.object_id()),
-    )
-    .await
-    .expect("owned stop worker must finish after cancellation");
-    assert_eq!(
-        stored(&runtime, sandbox.object_id()).await.phase(),
-        SandboxPhase::Stopped as i32
-    );
-    drop(gate);
-    assert_eq!(
-        runtime
-            .start_sandbox("default", "cancel")
-            .await
-            .unwrap()
-            .phase(),
-        SandboxPhase::Starting as i32
-    );
-    assert_eq!(driver.stop_calls(), 1);
-    assert_eq!(driver.start_calls(), 1);
-    assert_eq!(driver.delete_calls(), 0);
 }

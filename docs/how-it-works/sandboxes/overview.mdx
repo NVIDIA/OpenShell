@@ -929,9 +929,9 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
-For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, repair the underlying problem, then run `sandbox stop` followed by `sandbox start`. Stop confirms that its compute has stopped and clears old sessions before start relaunches the command with fresh configuration admission. The sandbox and its persistent workspace are retained; recovery cannot restore deleted backend resources or storage. If stop fails or its outcome is unknown, inspect the reported state and retry stop before starting.
+If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
 
-Provisioning timeouts use a separate recovery path: wait for timeout cleanup to complete, then run `sandbox start` directly. Stop does not interrupt that cleanup. Any outstanding driver operation must settle before either recovery path can proceed.
+For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
 ## Delete Sandboxes
 
