@@ -132,7 +132,6 @@ function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
   return @{
     ExitCode = $process.ExitCode
     Text = $text
-    StdOut = $stdout.Result
   }
 }
 
@@ -156,6 +155,56 @@ function Get-MxcEtwSessions {
   }
 }
 
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+  "APPDATA",
+  "LOCALAPPDATA",
+  "XDG_CONFIG_HOME",
+  "XDG_STATE_HOME",
+  "XDG_DATA_HOME",
+  "OPENSHELL_GATEWAY",
+  "OPENSHELL_GATEWAY_ENDPOINT",
+  "OPENSHELL_GATEWAY_INSECURE",
+  "OPENSHELL_GATEWAY_CONFIG",
+  "OPENSHELL_GATEWAY_NAME"
+)
+
+function Enter-IsolatedCliEnvironment {
+  foreach ($name in $cliEnvironmentNames) {
+    $script:cliEnvironmentSnapshot[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+  }
+  $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-ocsf-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+  $isolatedPaths = @{
+    APPDATA = Join-Path $script:cliStateRoot "appdata"
+    LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+    XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+    XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+    XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+  }
+  try {
+    New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+    foreach ($entry in $isolatedPaths.GetEnumerator()) {
+      [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+    foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+      [Environment]::SetEnvironmentVariable($name, $null, "Process")
+    }
+  } catch {
+    Exit-IsolatedCliEnvironment
+    throw
+  }
+}
+
+function Exit-IsolatedCliEnvironment {
+  foreach ($name in $cliEnvironmentNames) {
+    [Environment]::SetEnvironmentVariable($name, $script:cliEnvironmentSnapshot[$name], "Process")
+  }
+  if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+    Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 $gateway = Resolve-Artifact $GatewayPath "openshell-gateway.exe"
 $cli     = Resolve-Artifact $CliPath "openshell.exe"
 $policySrc = Join-Path $here "ocsf-audit.yaml"
@@ -171,6 +220,8 @@ $proxyOn  = -not $NoProxy
 $oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 
 try {
+  Enter-IsolatedCliEnvironment
+
   # 1. Validate artifacts + privilege.
   Step "Validate package artifacts"
   foreach ($f in @($gateway, $cli, $policySrc, $tomlSrc)) {
@@ -323,42 +374,11 @@ try {
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
-  Remove-Item Env:OPENSHELL_GATEWAY -ErrorAction SilentlyContinue
   $expectedEndpoint = "http://127.0.0.1:$Port"
   $gatewayAdd = Invoke-Cli @("gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName) -AllowFailure
   if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
   if ($gatewayAdd.ExitCode -ne 0) {
-    $gatewayList = Invoke-Cli @("gateway", "list", "-o", "json") -AllowFailure
-    if ($gatewayList.ExitCode -ne 0) {
-      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text); gateway list also failed: $($gatewayList.Text)"
-    }
-    try {
-      $gateways = $gatewayList.StdOut | ConvertFrom-Json
-    } catch {
-      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text); could not parse gateway list JSON: $($_.Exception.Message)"
-    }
-    $existing = $gateways | Where-Object { $_.name -eq $GatewayName } | Select-Object -First 1
-    if ($null -eq $existing) {
-      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
-    }
-
-    $existingEndpoint = ([string]$existing.endpoint).TrimEnd('/')
-    $normalizedExpected = $expectedEndpoint.TrimEnd('/')
-    if ($existingEndpoint -ne $normalizedExpected) {
-      Info "'$GatewayName' points at '$existingEndpoint' instead of '$normalizedExpected'; replacing the stale registration"
-      $gatewayRemove = Invoke-Cli @("gateway", "remove", $GatewayName) -AllowFailure
-      if ($gatewayRemove.Text) { Info $gatewayRemove.Text }
-      if ($gatewayRemove.ExitCode -ne 0) {
-        throw "failed to remove stale gateway '$GatewayName' (exit $($gatewayRemove.ExitCode)): $($gatewayRemove.Text)"
-      }
-      $gatewayAdd = Invoke-Cli @("gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName) -AllowFailure
-      if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
-      if ($gatewayAdd.ExitCode -ne 0) {
-        throw "gateway registration failed after removing stale registration (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
-      }
-    } else {
-      Info "'$GatewayName' already points at '$normalizedExpected'; reusing it"
-    }
+    throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
   }
   $gatewaySelect = Invoke-Cli @("gateway", "select", $GatewayName)
   if ($gatewaySelect.Text) { Info $gatewaySelect.Text }
@@ -417,6 +437,7 @@ finally {
   } else {
     $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
   }
+  Exit-IsolatedCliEnvironment
 
   # ---- summarise the OCSF audit trail --------------------------------------
   $logText = @()

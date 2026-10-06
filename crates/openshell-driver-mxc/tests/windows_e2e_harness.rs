@@ -82,6 +82,26 @@ foreach ($name in $names) {
 }
 
 #[test]
+fn aggregate_and_ocsf_harnesses_preserve_caller_gateway_state() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in [
+        "windows-mxc-aggregate-e2e.ps1",
+        "windows-mxc-ocsf-audit-e2e.ps1",
+    ] {
+        let source = std::fs::read_to_string(repo_root.join("tasks/scripts").join(name))
+            .unwrap_or_else(|error| panic!("failed to read {name}: {error}"));
+        for required in [
+            "$sentinelEndpoint",
+            "OPENSHELL_GATEWAY_ENDPOINT",
+            "gateway list -o json",
+            "$sentinel.active",
+        ] {
+            assert!(source.contains(required), "{name} is missing {required}");
+        }
+    }
+}
+
+#[test]
 fn aggregate_harness_exercises_a_staging_path_with_spaces() {
     let harness = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tasks/scripts/windows-mxc-aggregate-e2e.ps1");

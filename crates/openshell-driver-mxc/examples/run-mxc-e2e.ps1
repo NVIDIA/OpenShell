@@ -144,7 +144,6 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     return @{
         ExitCode = $process.ExitCode
         Output = @($stdout.Result, $stderr.Result) | Where-Object { $_ }
-        StdOut = $stdout.Result
     }
 }
 
@@ -177,8 +176,57 @@ $script:registered = $false
 $tomlBase = $null
 $gwLog    = $null
 $gwErrLog = $null
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "OPENSHELL_GATEWAY",
+    "OPENSHELL_GATEWAY_ENDPOINT",
+    "OPENSHELL_GATEWAY_INSECURE",
+    "OPENSHELL_GATEWAY_CONFIG",
+    "OPENSHELL_GATEWAY_NAME"
+)
 
 # --- Helpers ------------------------------------------------------------------
+
+function Enter-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        $script:cliEnvironmentSnapshot[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+    }
+    $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-e2e-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $isolatedPaths = @{
+        APPDATA = Join-Path $script:cliStateRoot "appdata"
+        LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+        XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+        XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+        XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+        foreach ($entry in $isolatedPaths.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+            [Environment]::SetEnvironmentVariable($name, $null, "Process")
+        }
+    } catch {
+        Exit-IsolatedCliEnvironment
+        throw
+    }
+}
+
+function Exit-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name, $script:cliEnvironmentSnapshot[$name], "Process")
+    }
+    if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+        Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # Render host-runtime settings from the pristine base. Sandbox workload
 # settings are create-time driver config, not gateway-wide TOML.
@@ -234,7 +282,6 @@ function Stop-Gw($p) {
 
 function Register-Cli {
     if ($script:registered) { return }
-    Remove-Item Env:OPENSHELL_GATEWAY -ErrorAction SilentlyContinue
 
     $expectedEndpoint = "http://127.0.0.1:$Port"
     $addResult = Invoke-NativeCaptured $cli @(
@@ -243,39 +290,7 @@ function Register-Cli {
     $addText = ($addResult.Output -join "`n")
     if ($addText) { $addResult.Output | ForEach-Object { Info $_ } }
     if ($addResult.ExitCode -ne 0) {
-        $listResult = Invoke-NativeCaptured $cli @("gateway", "list", "-o", "json")
-        if ($listResult.ExitCode -ne 0) {
-            throw "gateway add failed (exit $($addResult.ExitCode)): $addText; gateway list also failed: $($listResult.Output -join "`n")"
-        }
-        try {
-            $gateways = $listResult.StdOut | ConvertFrom-Json
-        } catch {
-            throw "gateway add failed (exit $($addResult.ExitCode)): $addText; could not parse gateway list JSON: $($_.Exception.Message)"
-        }
-        $existing = $gateways | Where-Object { $_.name -eq $GatewayName } | Select-Object -First 1
-        if ($null -eq $existing) {
-            throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
-        }
-
-        $existingEndpoint = ([string]$existing.endpoint).TrimEnd('/')
-        $normalizedExpected = $expectedEndpoint.TrimEnd('/')
-        if ($existingEndpoint -ne $normalizedExpected) {
-            Info "'$GatewayName' points at '$existingEndpoint' instead of '$normalizedExpected'; replacing the stale registration"
-            $removeResult = Invoke-NativeCaptured $cli @("gateway", "remove", $GatewayName)
-            if ($removeResult.Output) { $removeResult.Output | ForEach-Object { Info $_ } }
-            if ($removeResult.ExitCode -ne 0) {
-                throw "failed to remove stale gateway '$GatewayName' (exit $($removeResult.ExitCode)): $($removeResult.Output -join "`n")"
-            }
-            $addResult = Invoke-NativeCaptured $cli @(
-                "gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName
-            )
-            if ($addResult.Output) { $addResult.Output | ForEach-Object { Info $_ } }
-            if ($addResult.ExitCode -ne 0) {
-                throw "gateway add failed after removing stale registration (exit $($addResult.ExitCode)): $($addResult.Output -join "`n")"
-            }
-        } else {
-            Info "'$GatewayName' already points at '$normalizedExpected'; reusing it"
-        }
+        throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
     }
 
     $selectResult = Invoke-NativeCaptured $cli @("gateway", "select", $GatewayName)
@@ -413,6 +428,8 @@ $backendProbe = @{ Live = $false; Reason = "not probed" }
 $runId = Get-Date -Format 'MMddHHmmss'
 
 try {
+    Enter-IsolatedCliEnvironment
+
     # Start the transcript inside the guarded region so a Start-Transcript failure
     # is caught and the results bundle is still produced. Pre-flight runs
     # immediately below, so the transcript still captures the whole run.
@@ -792,6 +809,8 @@ catch {
     Bad "harness error: $harnessError"
 }
 finally {
+    Exit-IsolatedCliEnvironment
+
     # --- Summary + results bundle ---------------------------------------------
     Step "Summary"
     $results | Format-Table -AutoSize

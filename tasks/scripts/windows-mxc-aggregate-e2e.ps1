@@ -97,17 +97,41 @@ try {
     $runner = Join-Path $StageDir "run-mxc-e2e.ps1"
     $demoDir = Join-Path $StageDir "demo"
     $port = Get-AvailablePort
+    $gatewayName = "openshell-mxc-aggregate-ci"
+    $sentinelEndpoint = "http://127.0.0.1:9"
+    $inheritedEndpoint = "http://127.0.0.1:1"
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $sentinelAdd = & $CliPath gateway add $sentinelEndpoint --local --name $gatewayName 2>&1
+        $sentinelAddExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($sentinelAddExitCode -ne 0) {
+        throw "failed to seed sentinel gateway '$gatewayName': $($sentinelAdd -join [Environment]::NewLine)"
+    }
+    $env:OPENSHELL_GATEWAY_ENDPOINT = $inheritedEndpoint
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner `
         -Mock `
         -GatewayPath $GatewayPath `
         -CliPath $CliPath `
         -DemoDir $demoDir `
         -Port $port `
-        -GatewayName "openshell-mxc-aggregate-ci" 2>&1
+        -GatewayName $gatewayName 2>&1
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Host $_ }
     if ($exitCode -ne 0) {
         throw "shipped aggregate MXC example failed in mock mode (exit $exitCode)"
+    }
+
+    $gateways = & $CliPath gateway list -o json | ConvertFrom-Json
+    $sentinel = $gateways | Where-Object { $_.name -eq $gatewayName } | Select-Object -First 1
+    if ($null -eq $sentinel -or $sentinel.endpoint -ne $sentinelEndpoint -or -not $sentinel.active) {
+        throw "aggregate runner changed the caller's sentinel gateway registration or active selection"
+    }
+    if ($env:OPENSHELL_GATEWAY_ENDPOINT -ne $inheritedEndpoint) {
+        throw "aggregate runner changed the caller's OPENSHELL_GATEWAY_ENDPOINT"
     }
 
     $resultDir = Get-ChildItem -LiteralPath $StageDir -Directory -Filter "results-e2e-*" |
