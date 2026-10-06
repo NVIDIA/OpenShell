@@ -3225,11 +3225,18 @@ message PeerConfigSandboxTarget {
   string session_id = 2;
 }
 
+// Sandboxes in a workspace that attach the named provider.
+message PeerConfigProviderTarget {
+  string workspace = 1;
+  string name = 2;
+}
+
 message PeerConfigUpdateHintRequest {
   oneof scope {
     PeerConfigSandboxTarget sandbox = 1;
     string workspace = 2;
     bool all_connected = 3;
+    PeerConfigProviderTarget provider = 6;
   }
   bool sandbox_config = 4;
   bool provider_environment = 5;
@@ -3238,8 +3245,6 @@ message PeerConfigUpdateHintRequest {
 message PeerConfigUpdateHintResponse {
   // The targeted session moved before the receiving replica accepted the hint.
   bool stale_owner = 1;
-  // The bounded local delivery or fanout queue could not accept the hint.
-  bool queue_full = 2;
 }
 
 // Supervisor reports the result of a relay open request.

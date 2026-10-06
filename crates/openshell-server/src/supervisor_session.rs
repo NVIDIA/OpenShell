@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,12 +33,13 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::config_delivery::{
-    DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfigMessage,
+    ConfigComponentKind, ConfigSlots, DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES,
+    SessionOutbound, SupervisorConfigMessage,
 };
 #[cfg(test)]
 use crate::config_delivery::{LocalSupervisorConfigRouter, SupervisorConfigRouter};
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
-use crate::persistence::ObjectId;
+use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
@@ -283,7 +284,8 @@ struct LiveSession {
     /// Uniquely identifies this session instance. Used by cleanup to avoid
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
-    config_push_capable: bool,
+    /// Present only for push-capable sessions on a gateway in push mode.
+    config_slots: Option<Arc<ConfigSlots>>,
     tx: mpsc::Sender<GatewayMessage>,
     config_sequences: ConfigSequences,
     /// Fires when this session is superseded by a reconnect so the old session
@@ -422,16 +424,16 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        self.register_with_config_push(sandbox_id, session_id, tx, shutdown, true)
+        self.register_with_config_slots(sandbox_id, session_id, tx, shutdown, None)
     }
 
-    pub fn register_with_config_push(
+    pub(crate) fn register_with_config_slots(
         &self,
         sandbox_id: String,
         session_id: String,
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
-        config_push_capable: bool,
+        config_slots: Option<Arc<ConfigSlots>>,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -440,7 +442,7 @@ impl SupervisorSessionRegistry {
             LiveSession {
                 sandbox_id,
                 session_id,
-                config_push_capable,
+                config_slots,
                 tx,
                 config_sequences: ConfigSequences::default(),
                 shutdown,
@@ -558,49 +560,36 @@ impl SupervisorSessionRegistry {
         true
     }
 
-    pub(crate) fn connected_sandbox_ids(&self) -> Vec<String> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, session)| session.config_push_capable)
-            .map(|(sandbox_id, _)| sandbox_id.clone())
-            .collect()
-    }
-
-    pub(crate) fn is_config_push_capable(&self, sandbox_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(sandbox_id)
-            .is_some_and(|session| session.config_push_capable)
-    }
-
+    /// Hand a snapshot to the session it was built for. A replacement session
+    /// received its own bootstrap and must not receive an older build.
     pub(crate) fn deliver_config(
         &self,
         sandbox_id: &str,
+        session_id: &str,
         message: SupervisorConfigMessage,
     ) -> DeliveryDisposition {
-        let component_name = message.component_name();
+        let component = message.component();
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get_mut(sandbox_id) else {
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
             return DeliveryDisposition::NoActiveSession;
         };
-        if !session.config_push_capable {
+        let Some(slots) = session.config_slots.clone() else {
             return DeliveryDisposition::UnsupportedSession;
-        }
-        let sequence = match &message {
-            SupervisorConfigMessage::SandboxConfig(_) => {
-                &mut session.config_sequences.sandbox_config
-            }
-            SupervisorConfigMessage::ProviderEnvironment(_) => {
+        };
+        let sequence = match component {
+            ConfigComponentKind::SandboxConfig => &mut session.config_sequences.sandbox_config,
+            ConfigComponentKind::ProviderEnvironment => {
                 &mut session.config_sequences.provider_environment
             }
         };
+        // Replacing an unsent snapshot leaves a gap in the sequence.
         *sequence = sequence.saturating_add(1);
         let component_sequence = *sequence;
 
-        let component = match message {
+        let snapshot = match message {
             SupervisorConfigMessage::SandboxConfig(snapshot) => {
                 config_update::Component::SandboxConfig(*snapshot)
             }
@@ -612,25 +601,19 @@ impl SupervisorSessionRegistry {
             payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
                 update_id: Uuid::new_v4().to_string(),
                 component_sequence,
-                component: Some(component),
+                component: Some(snapshot),
             })),
         };
 
         if gateway_message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
             return DeliveryDisposition::PayloadTooLarge;
         }
+        drop(sessions);
 
-        match session.tx.try_send(gateway_message) {
-            Ok(()) => DeliveryDisposition::Enqueued,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    component = component_name,
-                    "supervisor configuration queue is full"
-                );
-                DeliveryDisposition::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => DeliveryDisposition::SessionClosed,
+        if slots.replace(component, gateway_message) {
+            DeliveryDisposition::Replaced
+        } else {
+            DeliveryDisposition::Queued
         }
     }
 
@@ -1989,12 +1972,24 @@ pub async fn handle_connect_supervisor(
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
+    // Captured before reading any bootstrap input, including the sandbox
+    // record, so registration detects publications the bootstrap may miss.
+    let captured_seq = (state.config.config_delivery_mode
+        == openshell_core::config::ConfigDeliveryMode::Push
+        && hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION)
+        .then(|| state.config_delivery.current_seq());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
-    let bootstrap = if state.config.config_delivery_mode
-        == openshell_core::config::ConfigDeliveryMode::Poll
-        || hello.protocol_revision == LEGACY_SUPERVISOR_PROTOCOL_REVISION
-    {
+    let config_push = captured_seq.map(|captured_seq| ConfigPushSetup {
+        captured_seq,
+        workspace: sandbox.object_workspace().to_string(),
+        providers: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.iter().cloned().collect())
+            .unwrap_or_default(),
+    });
+    let bootstrap = if config_push.is_none() {
         None
     } else {
         match crate::config_delivery::build_config_bootstrap(state, &sandbox).await {
@@ -2034,6 +2029,7 @@ pub async fn handle_connect_supervisor(
         inbound,
         hello,
         bootstrap,
+        config_push,
         provider_readiness,
         session_lifetime,
     ))
@@ -2041,11 +2037,18 @@ pub async fn handle_connect_supervisor(
     .map_err(|error| Status::internal(format!("supervisor session setup failed: {error}")))?
 }
 
+struct ConfigPushSetup {
+    captured_seq: u64,
+    workspace: String,
+    providers: HashSet<String>,
+}
+
 async fn establish_supervisor_session(
     state: Arc<ServerState>,
     mut inbound: tonic::Streaming<SupervisorMessage>,
     hello: SupervisorHello,
     bootstrap: Option<openshell_core::proto::ConfigBootstrap>,
+    config_push: Option<ConfigPushSetup>,
     provider_readiness: ProviderReadinessEvidence,
     session_lifetime: OwnedRwLockReadGuard<()>,
 ) -> Result<
@@ -2109,6 +2112,16 @@ async fn establish_supervisor_session(
         };
         accepted_payload.bootstrap = None;
     }
+    let bootstrap_built = matches!(
+        &accepted.payload,
+        Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+            bootstrap: Some(_),
+            ..
+        }))
+    );
+    let config_slots = config_push
+        .as_ref()
+        .map(|_| Arc::new(ConfigSlots::default()));
     if tx.send(accepted).await.is_err() {
         if let Err(err) = owner_index.release_if_current(&owner_guard).await {
             warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %err, "supervisor session: failed to release owner after accept queue failure");
@@ -2116,12 +2129,12 @@ async fn establish_supervisor_session(
         return Err(Status::internal("failed to send session accepted"));
     }
 
-    let superseded = state.supervisor_sessions.register_with_config_push(
+    let superseded = state.supervisor_sessions.register_with_config_slots(
         sandbox_id.clone(),
         session_id.clone(),
         tx.clone(),
         shutdown_tx,
-        hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION,
+        config_slots.clone(),
     );
     if superseded {
         info!(
@@ -2210,6 +2223,20 @@ async fn establish_supervisor_session(
         .replay_pending_relays(&sandbox_id, &session_id, &tx)
         .await;
 
+    if let Some(setup) = config_push {
+        crate::config_delivery::register_session(
+            &state,
+            crate::config_delivery::Registration {
+                sandbox_id: sandbox_id.clone(),
+                session_id: session_id.clone(),
+                workspace: setup.workspace,
+                providers: setup.providers,
+                captured_seq: setup.captured_seq,
+                bootstrap_built,
+            },
+        );
+    }
+
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -2229,6 +2256,8 @@ async fn establish_supervisor_session(
         let terminal_finalized = state_clone
             .supervisor_sessions
             .remove_if_current(&sandbox_id_clone, &session_id);
+        // Every removal path ends this task, including supersede and disconnect.
+        crate::config_delivery::unregister_session(&state_clone, &sandbox_id_clone, &session_id);
         // Release only this exact ownership record. A newer supervisor session
         // may already have published replacement ownership on another replica.
         let owner_index = SupervisorOwnerIndex::new(state_clone.store.clone(), OWNER_TTL);
@@ -2264,10 +2293,12 @@ async fn establish_supervisor_session(
     });
 
     // Return the outbound stream.
-    let stream = ReceiverStream::new(rx);
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
-    > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
+    > = match config_slots {
+        Some(slots) => Box::pin(SessionOutbound::new(rx, slots)),
+        None => Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok)),
+    };
 
     Ok(Response::new(stream))
 }
@@ -2699,7 +2730,7 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status.message().contains("revision mismatch"));
-        assert!(state.supervisor_sessions.connected_sandbox_ids().is_empty());
+        assert!(!state.supervisor_sessions.has_session("sb-future"));
     }
 
     #[test]
@@ -2710,6 +2741,36 @@ mod tests {
         assert!(error.message().contains("revision mismatch"));
     }
 
+    fn register_push_session(
+        registry: &SupervisorSessionRegistry,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> (mpsc::Sender<GatewayMessage>, SessionOutbound) {
+        let (tx, rx) = mpsc::channel(4);
+        let slots = Arc::new(ConfigSlots::default());
+        registry.register_with_config_slots(
+            sandbox_id.into(),
+            session_id.into(),
+            tx.clone(),
+            make_shutdown(),
+            Some(Arc::clone(&slots)),
+        );
+        (tx, SessionOutbound::new(rx, slots))
+    }
+
+    fn component_sequence(message: GatewayMessage) -> (bool, u64) {
+        match message.payload {
+            Some(gateway_message::Payload::ConfigUpdate(update)) => (
+                matches!(
+                    update.component,
+                    Some(config_update::Component::SandboxConfig(_))
+                ),
+                update.component_sequence,
+            ),
+            other => panic!("expected config update, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn config_router_reports_missing_session() {
         let router = LocalSupervisorConfigRouter::new(Arc::new(SupervisorSessionRegistry::new()));
@@ -2717,6 +2778,7 @@ mod tests {
             router
                 .deliver(
                     "missing",
+                    "session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
@@ -2725,136 +2787,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_assigns_sequences_per_component() {
+    async fn config_router_keeps_the_latest_unsent_snapshot_per_component() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, mut rx) = mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (_tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
+        for expected in [DeliveryDisposition::Queued, DeliveryDisposition::Replaced] {
+            assert_eq!(
+                router
+                    .deliver(
+                        "sb-1",
+                        "session-1",
+                        SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    )
+                    .await,
+                expected
+            );
+        }
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::default()),
-                )
-                .await,
-            DeliveryDisposition::Enqueued
-        );
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::default()),
-                )
-                .await,
-            DeliveryDisposition::Enqueued
-        );
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::ProviderEnvironment(
                         ProviderEnvironmentSnapshot::default(),
                     ),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::Queued
         );
 
-        let first = rx.recv().await.expect("first config update");
-        let second = rx.recv().await.expect("second config update");
-        let third = rx.recv().await.expect("provider config update");
-        let sequence = |message: GatewayMessage| match message.payload {
-            Some(gateway_message::Payload::ConfigUpdate(update)) => update.component_sequence,
-            other => panic!("expected config update, got {other:?}"),
-        };
-        assert_eq!(sequence(first), 1);
-        assert_eq!(sequence(second), 2);
-        assert_eq!(sequence(third), 1);
+        let first = outbound.next().await.unwrap().unwrap();
+        let second = outbound.next().await.unwrap().unwrap();
+        assert_eq!(component_sequence(first), (true, 2));
+        assert_eq!(component_sequence(second), (false, 1));
     }
 
     #[tokio::test]
-    async fn config_router_uses_replacement_session() {
+    async fn config_router_never_crosses_into_a_replacement_session() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (old_tx, mut old_rx) = mpsc::channel(2);
-        let (old_shutdown_tx, _old_shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "old-session".into(), old_tx, old_shutdown_tx);
+        let (_old_tx, _old_outbound) = register_push_session(&registry, "sb-1", "old-session");
+        let (_new_tx, mut new_outbound) = register_push_session(&registry, "sb-1", "new-session");
 
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "old-session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::NoActiveSession
         );
-        let old_update = old_rx.recv().await.expect("old-session config update");
-        let Some(gateway_message::Payload::ConfigUpdate(old_update)) = old_update.payload else {
-            panic!("expected config update");
-        };
-        assert_eq!(old_update.component_sequence, 1);
-
-        let (new_tx, mut new_rx) = mpsc::channel(1);
-        let (new_shutdown_tx, _new_shutdown_rx) = oneshot::channel();
-        assert!(registry.register("sb-1".into(), "new-session".into(), new_tx, new_shutdown_tx,));
-
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "new-session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::Queued
         );
-        assert!(old_rx.try_recv().is_err());
-        let new_update = new_rx.try_recv().expect("new-session config update");
-        let Some(gateway_message::Payload::ConfigUpdate(new_update)) = new_update.payload else {
-            panic!("expected config update");
-        };
-        assert_eq!(new_update.component_sequence, 1);
+        let update = new_outbound.next().await.unwrap().unwrap();
+        assert_eq!(component_sequence(update), (true, 1));
     }
 
     #[tokio::test]
-    async fn config_router_reports_full_and_closed_queues() {
+    async fn config_router_skips_sessions_without_push() {
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, rx) = mpsc::channel(1);
-        tx.try_send(GatewayMessage::default()).unwrap();
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sb-1".into(), "session-1".into(), tx, make_shutdown());
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::QueueFull
-        );
-
-        drop(rx);
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::default()),
-                )
-                .await,
-            DeliveryDisposition::SessionClosed
+            DeliveryDisposition::UnsupportedSession
         );
     }
 
     #[tokio::test]
     async fn config_router_rejects_oversized_messages() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
         let snapshot = ProviderEnvironmentSnapshot {
             values: vec![ProviderEnvironmentValue {
@@ -2868,12 +2896,15 @@ mod tests {
             router
                 .deliver(
                     "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::ProviderEnvironment(snapshot),
                 )
                 .await,
             DeliveryDisposition::PayloadTooLarge
         );
-        assert!(rx.try_recv().is_err());
+        drop(tx);
+        registry.remove_if_current("sb-1", "session-1");
+        assert!(outbound.next().await.is_none());
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

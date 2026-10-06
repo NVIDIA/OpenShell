@@ -895,7 +895,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<PeerConfigUpdateHintRequest>,
     ) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
-        crate::config_delivery::handle_peer_config_update_hint(&self.state, request).await
+        crate::config_delivery::handle_peer_config_update_hint(&self.state, request)
     }
 }
 

@@ -304,8 +304,8 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
-    /// Per-sandbox scheduler for coalesced supervisor configuration delivery.
-    pub(crate) config_delivery_queue: config_delivery::ConfigDeliveryQueue,
+    /// Coalescing scheduler for supervisor configuration delivery.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Routing boundary for local or remote supervisor configuration delivery.
     pub(crate) supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter>,
@@ -435,8 +435,8 @@ impl ServerState {
         let supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter> = Arc::new(
             config_delivery::LocalSupervisorConfigRouter::new(Arc::clone(&supervisor_sessions)),
         );
-        let config_delivery_queue =
-            config_delivery::ConfigDeliveryQueue::for_db_connections(store.max_connections());
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -451,7 +451,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
-            config_delivery_queue,
+            config_delivery,
             supervisor_config_router,
             replica_id,
             peer_endpoint,

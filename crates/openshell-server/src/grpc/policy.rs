@@ -12746,14 +12746,8 @@ mod tests {
         sandbox.spec.as_mut().unwrap().policy = None;
         state.store.put_message(&sandbox).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-        state.supervisor_sessions.register(
-            "sb-published-policy".to_string(),
-            "session-1".to_string(),
-            tx,
-            shutdown_tx,
-        );
+        let mut session =
+            crate::config_delivery::register_test_push_session(&state, &sandbox, "session-1");
         let owner_index = crate::supervisor_owner::SupervisorOwnerIndex::new(
             Arc::clone(&state.store),
             crate::supervisor_owner::OWNER_TTL,
@@ -12790,7 +12784,10 @@ mod tests {
             .expect("committed policy");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let message = rx.recv().await.expect("configuration channel closed");
+                let message = tokio_stream::StreamExt::next(&mut session.outbound)
+                    .await
+                    .expect("configuration stream closed")
+                    .unwrap();
                 let Some(openshell_core::proto::gateway_message::Payload::ConfigUpdate(update)) =
                     message.payload
                 else {
