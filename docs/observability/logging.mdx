@@ -254,17 +254,19 @@ Set `landlock.compatibility` to `hard_requirement` in the policy to make these f
 
 ## Log File Location
 
-Inside the sandbox, logs are written to `/var/log/`:
+The supervisor writes logs to `/var/log/` in its own filesystem, separate from the sandbox workload:
 
 | File | Format | Rotation |
 |---|---|---|
 | `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
 | `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily, 3 files max |
 
-Both files rotate daily and retain the 3 most recent files to bound disk usage.
+Both files rotate daily and retain the 3 most recent files to bound disk usage. File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output.
+
+Docker and Podman use tmpfs for this directory; Kubernetes uses an `emptyDir` in the supervisor pod. Collect logs externally before rotation or teardown for durable retention. See [Accessing Logs](/observability/accessing-logs#direct-filesystem-access) for driver-specific access and storage lifetimes.
 
 ## Next Steps
 
-- [Access logs](/observability/accessing-logs) through the CLI, TUI, or sandbox filesystem.
+- [Access logs](/observability/accessing-logs) through the CLI, TUI, or supervisor resources.
 - [Enable OCSF JSON export](/observability/ocsf-json-export) for SIEM integration and compliance.
 - Learn about [network policies](/how-it-works/policies/overview) that generate these events.
