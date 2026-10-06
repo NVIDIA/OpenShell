@@ -29,7 +29,6 @@ const CONDITION_STARTING: &str = "ContainerStarting";
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
     CONDITION_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
-    WORKSPACE_VALIDATION_FAILED_MESSAGE,
 };
 
 pub type WatchStream =
@@ -391,12 +390,7 @@ pub async fn inspect_workload(
             // Both containers exist before initial start. A missing or exited
             // companion therefore requires containment, including after a
             // gateway restart that missed the original Podman exit event.
-            Ok(supervisor) => {
-                client.stop_container(&workload.id, 0).await?;
-                workload = client.inspect_container(&workload.id).await?;
-                workload.state.supervisor_exit_code = exited_exit_code(&supervisor.state);
-            }
-            Err(PodmanApiError::NotFound(_)) => {
+            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
                 client.stop_container(&workload.id, 0).await?;
                 workload = client.inspect_container(&workload.id).await?;
             }
@@ -408,15 +402,8 @@ pub async fn inspect_workload(
             .await
             .ok()
             .and_then(|logs| boundary_startup_termination_marker(&logs));
-        workload.state.supervisor_exit_code = supervisor
-            .ok()
-            .and_then(|supervisor| exited_exit_code(&supervisor.state));
     }
     Ok(workload)
-}
-
-fn exited_exit_code(state: &ContainerState) -> Option<i64> {
-    matches!(state.status.as_str(), "exited" | "stopped").then_some(state.exit_code)
 }
 
 /// Extract only fixed, OpenShell-owned startup diagnostics from container
@@ -566,12 +553,10 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
                     "OOMKilled",
                     "Container was killed by the OOM killer".to_string(),
                 )
-            } else if state.supervisor_exit_code
-                == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED))
-            {
+            } else if state.exit_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
                 (
                     CONDITION_WORKSPACE_VALIDATION_FAILED,
-                    WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string(),
+                    "OCI WorkingDir is not usable by the sandbox identity".to_string(),
                 )
             } else if matches!(state.exit_code, 137 | 143) {
                 (
@@ -707,7 +692,6 @@ mod tests {
             health: None,
             started_at: Some("2026-08-12T16:38:58Z".to_string()),
             finished_at: Some("2026-08-12T16:39:13Z".to_string()),
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
 
@@ -757,7 +741,6 @@ mod tests {
             }),
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
@@ -777,7 +760,6 @@ mod tests {
             health: None,
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
@@ -800,7 +782,6 @@ mod tests {
             }),
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
         let condition = condition_from_state(&state);
@@ -819,7 +800,6 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T11:00:00Z".to_string()),
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
@@ -838,7 +818,6 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
-            supervisor_exit_code: None,
             startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
@@ -857,7 +836,6 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
-            supervisor_exit_code: None,
             startup_diagnostic: boundary_startup_termination_marker(
                 b"untrusted workload output\nsandbox boundary received SIGTERM before supervisor confirmation\n",
             ),
@@ -882,30 +860,21 @@ mod tests {
 
     #[test]
     fn condition_workspace_validation_exit_is_reported_explicitly() {
-        // The supervisor exits with the reserved status and the watcher then
-        // stops the workload, so the workload itself reports SIGKILL.
-        let mut state = ContainerState {
+        let state = ContainerState {
             status: "exited".to_string(),
             running: false,
-            exit_code: 137,
+            exit_code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
             oom_killed: false,
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
-            supervisor_exit_code: Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
             startup_diagnostic: None,
         };
 
         let cond = condition_from_state(&state);
 
         assert_eq!(cond.reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
-        assert_eq!(cond.message, WORKSPACE_VALIDATION_FAILED_MESSAGE);
-
-        // A workload's own exit with the reserved status is not a supervisor
-        // workspace rejection.
-        state.exit_code = i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED);
-        state.supervisor_exit_code = Some(1);
-        assert_eq!(condition_from_state(&state).reason, CONDITION_EXITED);
+        assert!(cond.message.contains("WorkingDir"));
     }
 
     #[test]
@@ -923,7 +892,6 @@ mod tests {
                 health: None,
                 started_at: None,
                 finished_at: Some("2026-04-14T12:30:00Z".to_string()),
-                supervisor_exit_code: None,
                 startup_diagnostic: None,
             };
             let cond = condition_from_state(&state);

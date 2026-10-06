@@ -54,7 +54,7 @@ pub async fn spawn_workload(
         crate::process::validate_oci_workspace_as_effective_identity(std::path::Path::new(
             workspace_root,
         ))
-        .wrap_err(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT)?;
+        .wrap_err("image workspace validation failed")?;
     }
 
     #[cfg(target_os = "linux")]

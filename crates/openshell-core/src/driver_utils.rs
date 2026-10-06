@@ -58,21 +58,10 @@ pub const CONDITION_WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFail
 
 /// Supervisor exit status reserved for OCI workspace validation failures.
 ///
-/// Local container drivers translate a supervisor exit with this status into
+/// Local container drivers translate this status into
 /// [`CONDITION_WORKSPACE_VALIDATION_FAILED`] so users receive the specific
 /// provisioning failure rather than a generic container exit.
 pub const SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED: i32 = 78;
-
-/// Error context for a rejected image-provided OCI working directory.
-///
-/// The supervisor recognizes it in a failed agent start and exits with
-/// [`SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED`].
-pub const WORKSPACE_VALIDATION_ERROR_CONTEXT: &str = "image workspace validation failed";
-
-/// Driver condition message for [`CONDITION_WORKSPACE_VALIDATION_FAILED`].
-/// Fixed text, because supervisor output may contain secrets.
-pub const WORKSPACE_VALIDATION_FAILED_MESSAGE: &str =
-    "OCI WorkingDir is not usable by the sandbox identity";
 
 /// Ready-condition reason when a container was terminated by an external signal.
 ///
