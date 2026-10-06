@@ -35,6 +35,7 @@
 #                      processcontainer only.
 #   network-policy   - supervisor-owned network policy permits admission.
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
+#   service-forwarding - named HTTP service routing and endpoint deletion.
 
 [CmdletBinding()]
 param(
@@ -335,6 +336,70 @@ function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonc
     }
 }
 
+# Connect to the gateway only, setting the exposed service URL's Host header.
+# This avoids DNS requirements and cannot accidentally dial the workload directly.
+function Invoke-ServiceRequest([uri]$serviceUrl, [string]$target) {
+    if ($serviceUrl.Scheme -ne 'http' -or $serviceUrl.Port -ne $Port) {
+        throw "Unexpected E2E service URL: $serviceUrl"
+    }
+    $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port$target")
+    $request.Host = $serviceUrl.Authority
+    $request.Proxy = $null
+    $request.AllowAutoRedirect = $false
+    $request.KeepAlive = $false
+    $request.Timeout = 10000
+    $request.ReadWriteTimeout = 10000
+    $response = $null
+    $reader = $null
+    try {
+        try { $response = $request.GetResponse() }
+        catch [Net.WebException] {
+            if (-not $_.Exception.Response) { throw }
+            $response = $_.Exception.Response
+        }
+        $reader = New-Object IO.StreamReader($response.GetResponseStream())
+        return @{ Status = [int]$response.StatusCode; Body = $reader.ReadToEnd() }
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
+function Test-ServiceForwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
+    if (-not (Wait-File $readyFile 30)) { throw "MXC HTTP listener did not report readiness" }
+    $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
+    if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw "Invalid workload HTTP port" }
+    $exposed = $false
+    try {
+        $result = Invoke-NativeCaptured $cli @('service', 'expose', $sandboxName, "$targetPort", 'web') 15
+        $text = $result.Output -join "`n"
+        $text | Set-Content -LiteralPath (Join-Path $resultDir 'service.expose.log') -Encoding UTF8
+        if ($result.ExitCode -ne 0) { throw "service expose failed: $text" }
+        $exposed = $true
+        if ($text -notmatch 'URL:\s+(http://[^\s\x1b]+)') { throw "service expose returned no HTTP URL: $text" }
+        $serviceUrl = [uri]$Matches[1]
+        for ($exchange = 1; $exchange -le 2; $exchange++) {
+            $target = "/probe-$exchange?request=$([guid]::NewGuid().ToString('N'))"
+            $response = Invoke-ServiceRequest $serviceUrl $target
+            if ($response.Status -ne 200 -or $response.Body -ne "$nonce`:$target") {
+                throw "HTTP exchange $exchange failed: status=$($response.Status); body=$($response.Body)"
+            }
+            Info "service HTTP exchange ${exchange}: exact workload response verified"
+        }
+        $deleted = Invoke-NativeCaptured $cli @('service', 'delete', $sandboxName, 'web') 15
+        $deleted.Output | Set-Content -LiteralPath (Join-Path $resultDir 'service.delete.log') -Encoding UTF8
+        if ($deleted.ExitCode -ne 0) { throw "service delete failed: $($deleted.Output -join "`n")" }
+        $exposed = $false
+        $response = Invoke-ServiceRequest $serviceUrl '/after-delete'
+        if ($response.Status -ne 404) { throw "Deleted service still routes: status=$($response.Status)" }
+        Info 'deleted service returns HTTP 404'
+    } finally {
+        if ($exposed) {
+            try { Invoke-NativeCaptured $cli @('service', 'delete', $sandboxName, 'web') 15 | Out-Null } catch {}
+        }
+    }
+}
+
 # Detect an agent *launch* failure (binary not found / not implemented) vs a
 # legitimate policy denial. Used to avoid false-passing a deny scenario when the
 # agent never actually ran.
@@ -579,6 +644,13 @@ try {
             Backends = "process_container"; Kind = "forwarding"
             ReadyFile = (Join-Path $DemoDir "forwarding-port.txt")
             Description = "real MXC listener receives two TCP exchanges through authenticated OpenShell forwarding"
+        },
+        @{
+            Name = "service-forwarding"; PolicyFile = Join-Path $policyDir "forwarding.yaml"
+            SandboxId = "svc"
+            Backends = "process_container"; Kind = "service-forwarding"
+            ReadyFile = (Join-Path $DemoDir "service-forwarding-port.txt")
+            Description = "named HTTP service routes two requests into MXC and stops routing after deletion"
         }
     )
 
@@ -650,7 +722,7 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
-            } elseif ($sc.Kind -eq "forwarding") {
+            } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
                 Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
                 $forwardNonce = [guid]::NewGuid().ToString('N')
                 $fixture = Join-Path $BinaryDir 'mxc-forwarding-agent.exe'
@@ -663,6 +735,7 @@ try {
                 $workload = Join-Path $DemoDir 'mxc-forwarding-agent.exe'
                 Copy-Item -LiteralPath $fixture -Destination $workload -Force
                 $command = @($workload, $sc.ReadyFile, $forwardNonce)
+                if ($sc.Kind -eq "service-forwarding") { $command += 'http' }
             } else {
                 $command = @($cmdExe, "/c", "exit 0")
             }
@@ -719,12 +792,18 @@ try {
                     if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure (not a policy result)" }
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact absent" }
                 }
-            } elseif ($sc.Kind -eq "forwarding") {
+            } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
                 try {
                     if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
-                    Test-Forwarding $sandboxName $sc.ReadyFile $forwardNonce
-                    Ok "$($sc.Name): both forwarded request/reply exchanges succeeded"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "two exact TCP replies through OpenShell" }
+                    if ($sc.Kind -eq 'forwarding') {
+                        Test-Forwarding $sandboxName $sc.ReadyFile $forwardNonce
+                        $reason = 'two exact TCP replies through OpenShell'
+                    } else {
+                        Test-ServiceForwarding $sandboxName $sc.ReadyFile $forwardNonce
+                        $reason = 'two exact HTTP replies; deleted route returns 404'
+                    }
+                    Ok "$($sc.Name): $reason"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = $reason }
                 } catch {
                     Bad "$($sc.Name): $($_.Exception.Message)"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = $_.Exception.Message }
@@ -839,7 +918,8 @@ Files in this bundle ($resultDir):
 What PASS means: every selected scenario ran against real MXC and met its expected verdict - positive
 writes produced their artifact, deny writes were blocked with either a control
 write or driver-launch evidence, and forwarding verified two exact TCP replies
-through OpenShell. Missing coverage exits non-zero; network-policy proves
+through OpenShell. Service forwarding verifies two HTTP replies and HTTP 404
+after endpoint deletion. Missing coverage exits non-zero; network-policy proves
 admission and execution, not network enforcement. Forwarding proves managed
 ingress works, not that direct host ingress is blocked.
 "@

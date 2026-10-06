@@ -372,6 +372,10 @@ coverage, not evidence that direct host ingress is fenced. Use
 The E2E mise task and remote runner build the `mxc-forwarding-agent` Cargo example
 using `windows:build:mxc-fixtures` (or its `:x64` / `:arm64` variant). This fixture
 is not one of the four production deliverables; do not package it in releases.
+The `service-forwarding` scenario uses its HTTP mode to test named endpoint
+exposure, two exact GET responses through gateway routing, and HTTP 404 after
+endpoint deletion. This is distinct from `openshell forward service`; neither
+scenario tests file upload or exclusive ingress enforcement.
 
 When reporting `windows:ci`, distinguish these categories:
 

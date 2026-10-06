@@ -172,3 +172,9 @@ assigned. Its native echo agent is a test-only Cargo example, built automaticall
 by the E2E mise task and remote runner, not a shipped runtime binary. It verifies
 managed ingress, not denial of direct host-to-workload connections. Select it with
 `-Scenario forwarding` on the local harness or remote runner.
+
+The separate `service-forwarding` scenario runs the same native fixture in HTTP
+mode, exposes a named endpoint with `openshell service expose`, and verifies two
+unique GET responses through gateway host-based routing. It deletes the endpoint
+and requires HTTP 404 afterward. Requests connect only to the gateway with the
+exposed URL's Host header, so no wildcard DNS setup is required.
