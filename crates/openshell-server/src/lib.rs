@@ -22,6 +22,7 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_metrics;
 mod gateway_ocsf;
 mod grpc;
 mod http;
@@ -53,7 +54,6 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -536,59 +536,16 @@ pub(crate) async fn run_server(
     // startup Describe calls can authenticate with gateway-caller tokens.
     let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
-            let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT signing key from {}: {e}",
-                    jwt.signing_key_path.display()
-                ))
-            })?;
-            let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT public key from {}: {e}",
-                    jwt.public_key_path.display()
-                ))
-            })?;
-            let kid = std::fs::read_to_string(&jwt.kid_path)
-                .map_err(|e| {
-                    Error::config(format!(
-                        "failed to read sandbox JWT kid from {}: {e}",
-                        jwt.kid_path.display()
-                    ))
-                })?
-                .trim()
-                .to_string();
-            if kid.is_empty() {
-                return Err(Error::config(format!(
-                    "sandbox JWT kid file {} is empty",
-                    jwt.kid_path.display()
-                )));
-            }
-            let issuer = Arc::new(
-                auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
-                    &signing_pem,
-                    &public_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                    jwt.token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
-            let session_authority = Arc::new(
-                auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
-                    &signing_pem,
-                    &public_pem,
-                    kid,
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
+            let authorities = auth::launch_signing::load(jwt)?;
             info!(
                 gateway_id = %jwt.gateway_id,
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
                 "gateway-minted sandbox JWT enabled"
             );
-            (Some(issuer), Some(session_authority))
+            (
+                Some(authorities.extension),
+                Some(authorities.sandbox_session),
+            )
         } else {
             (None, None)
         };
@@ -894,9 +851,9 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle =
+            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
+                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -1266,6 +1223,21 @@ pub trait ComputeDriverFactory: Send + Sync {
     /// configuration without runtime side effects.
     fn supports_config_preflight(&self) -> bool {
         false
+    }
+
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
@@ -1711,6 +1683,9 @@ async fn build_compute_runtime(
 
     let runtime = runtime
         .with_admission_policy(admission)
+        .and_then(|runtime| {
+            runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }

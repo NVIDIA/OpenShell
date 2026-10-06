@@ -56,7 +56,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 
 type ProxyClient = tokio::io::BufReader<BoundaryDuplexStream>;
 type AcceptedProxyConnection = (
@@ -69,6 +69,7 @@ type AcceptedProxyConnection = (
 struct TransparentOpen {
     destination: SocketAddr,
     authorization: Option<(EgressDecision, destination::UpstreamConnector)>,
+    connect_span: Option<tracing::Span>,
 }
 
 enum ProxyAcceptError {
@@ -630,6 +631,7 @@ async fn preauthorize_transparent_open(
             Some(TransparentOpen {
                 destination,
                 authorization: None,
+                connect_span: None,
             }),
         ));
     }
@@ -679,6 +681,7 @@ async fn preauthorize_transparent_open(
             Some(TransparentOpen {
                 destination,
                 authorization: None,
+                connect_span: None,
             }),
         ));
     }
@@ -699,12 +702,16 @@ async fn preauthorize_transparent_open(
             }
         };
     let mapped_host = intent.is_some().then_some(host.as_str());
-    let supplied_authorization = authorize_supplied_identity_with_denial(
-        opa_engine,
-        identity_cache,
-        EgressIntent::connect(host.clone(), destination.port()),
-        &binary_identity,
-    );
+    let connect_intent = EgressIntent::connect(host.clone(), destination.port());
+    let connect_span = egress::connect_span(&connect_intent);
+    let supplied_authorization = connect_span.in_scope(|| {
+        authorize_supplied_identity_with_denial(
+            opa_engine,
+            identity_cache,
+            connect_intent,
+            &binary_identity,
+        )
+    });
     let mut decision = supplied_authorization.decision;
     if let NetworkAction::Deny { reason } = &decision.action {
         let (denial, status_detail) = supplied_authorization.denial.map_or(
@@ -813,6 +820,7 @@ async fn preauthorize_transparent_open(
         sandbox_entrypoint_pid: 0,
         plan,
     })
+    .instrument(egress::resolve_span(&connect_span))
     .await
     {
         Ok(connector) => connector,
@@ -839,6 +847,7 @@ async fn preauthorize_transparent_open(
         Some(TransparentOpen {
             destination,
             authorization: Some((decision, connector)),
+            connect_span: Some(connect_span),
         }),
     ))
 }
@@ -1117,11 +1126,13 @@ async fn handle_transparent_tcp_connection(
     let port = original.port();
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
     let intent = EgressIntent::transparent_tcp(host.clone(), port);
+    let connect_span = egress::connect_span(&intent);
     let engine = opa_engine.clone();
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
+    let parent = connect_span.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+        parent.in_scope(|| authorize_egress_intent(connection, &engine, &cache, &pid, intent))
     })
     .await
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
@@ -1214,9 +1225,13 @@ async fn handle_transparent_tcp_connection(
         return Ok(());
     };
 
-    let connector = mapping.connector_for(&endpoint_id).await.map_err(|error| {
-        miette::miette!("transparent TCP pinned destination is invalid: {error}")
-    })?;
+    let connector = mapping
+        .connector_for(&endpoint_id)
+        .instrument(egress::resolve_span(&connect_span))
+        .await
+        .map_err(|error| {
+            miette::miette!("transparent TCP pinned destination is invalid: {error}")
+        })?;
     let mut ctx = relay::http_context(
         &decision,
         None,
@@ -1242,10 +1257,15 @@ async fn handle_transparent_tcp_connection(
     }
     let approved_real_ip_candidates = connector.addrs().to_vec();
     generation_guard.ensure_current()?;
+    let dial_span = egress::dial_span(&connect_span);
     let mut upstream =
         dial_transparent_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
+            .instrument(dial_span.clone())
             .await
+            .inspect_err(|_| egress::mark_error(&dial_span))
             .into_diagnostic()?;
+    drop(dial_span);
+    drop(connect_span);
     let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
     let (connected_real_destination, dial_mode) = match upstream.connect_target() {
         Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
@@ -2440,35 +2460,39 @@ async fn handle_mediated_connection(
         .and_then(EndpointObservationSender::capture);
     let mut policy_local_transparent = false;
     let mut metadata_transparent = false;
-    let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
-        transparent_open
-    {
-        let destination = transparent.destination;
-        if openshell_core::google_cloud::is_metadata_destination(destination) {
-            metadata_transparent = true;
-            (None, None)
-        } else if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
-            && destination.port() == 80
-        {
-            policy_local_transparent = true;
-            (None, None)
+    let (mut preauthorized_decision, prevalidated_connector, preauthorized_span) =
+        if let Some(transparent) = transparent_open {
+            let destination = transparent.destination;
+            if openshell_core::google_cloud::is_metadata_destination(destination) {
+                metadata_transparent = true;
+                (None, None, None)
+            } else if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
+                && destination.port() == 80
+            {
+                policy_local_transparent = true;
+                (None, None, None)
+            } else {
+                let host = resolve_transparent_target(
+                    destination,
+                    policy_dns_store.as_ref(),
+                    &opa_engine,
+                )?
+                .host;
+                let (decision, connector) = transparent
+                    .authorization
+                    .map_or((None, None), |(decision, connector)| {
+                        (Some(decision), Some(connector))
+                    });
+                let authority = format!("{host}:{}", destination.port());
+                client = tokio::io::BufReader::new(virtual_connect_stream(
+                    client.into_inner(),
+                    authority,
+                ));
+                (decision, connector, transparent.connect_span)
+            }
         } else {
-            let host =
-                resolve_transparent_target(destination, policy_dns_store.as_ref(), &opa_engine)?
-                    .host;
-            let (decision, connector) = transparent
-                .authorization
-                .map_or((None, None), |(decision, connector)| {
-                    (Some(decision), Some(connector))
-                });
-            let authority = format!("{host}:{}", destination.port());
-            client =
-                tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
-            (decision, connector)
-        }
-    } else {
-        (None, None)
-    };
+            (None, None, None)
+        };
     let metadata_deadline = metadata_transparent
         .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
@@ -2611,12 +2635,15 @@ async fn handle_mediated_connection(
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
     let intent = EgressIntent::connect(host_lc.clone(), port);
+    let connect_span = preauthorized_span.unwrap_or_else(|| egress::connect_span(&intent));
     let mut decision = if let Some(decision) = preauthorized_decision.take() {
         decision
     } else if let Some(identity) = supplied_identity.as_ref() {
-        authorize_supplied_identity(&opa_engine, &identity_cache, intent, identity)
+        connect_span.in_scope(|| {
+            authorize_supplied_identity(&opa_engine, &identity_cache, intent, identity)
+        })
     } else if !opa_engine.binary_identity_required() {
-        evaluate_endpoint_only_opa(&opa_engine, intent)
+        connect_span.in_scope(|| evaluate_endpoint_only_opa(&opa_engine, intent))
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
@@ -2625,8 +2652,11 @@ async fn handle_mediated_connection(
         let opa_clone = opa_engine.clone();
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
+        let parent = connect_span.clone();
         tokio::task::spawn_blocking(move || {
-            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            parent.in_scope(|| {
+                authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            })
         })
         .await
         .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
@@ -2791,7 +2821,6 @@ async fn handle_mediated_connection(
         .expect("destination plan hydrated");
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
-    let dns_connect_start = std::time::Instant::now();
     let connector = if let Some(connector) = prevalidated_connector {
         connector
     } else {
@@ -2801,6 +2830,7 @@ async fn handle_mediated_connection(
             sandbox_entrypoint_pid,
             plan: destination_plan,
         })
+        .instrument(egress::resolve_span(&connect_span))
         .await
         {
             Ok(connector) => connector,
@@ -2932,8 +2962,10 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
+    let dial_span = egress::dial_span(&connect_span);
     let upstream_result = tokio::select! {
-        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs()) => Some(result),
+        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs())
+            .instrument(dial_span.clone()) => Some(result),
         () = connect_generation_guard.wait_until_stale() => None,
     };
     let Some(upstream_result) = upstream_result else {
@@ -2955,6 +2987,7 @@ async fn handle_mediated_connection(
     let mut upstream = match upstream_result {
         Ok(upstream) => upstream,
         Err(error) => {
+            egress::mark_error(&dial_span);
             if let Some(observer) = connect_endpoint_observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
@@ -2967,10 +3000,8 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
-    debug!(
-        "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
-        dns_connect_start.elapsed().as_millis()
-    );
+    drop(dial_span);
+    drop(connect_span);
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -3485,9 +3516,32 @@ fn resolve_process_identity(
     Ok(identity)
 }
 
+/// Authorize a proxied TCP connection inside an egress decision span.
+fn authorize_egress_intent(
+    connection: crate::procfs::WorkloadProxyTcpConnection,
+    engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    entrypoint_pid: &AtomicU32,
+    intent: EgressIntent,
+) -> EgressDecision {
+    egress::traced_authorization(
+        intent,
+        |intent| {
+            authorize_egress_intent_inner(
+                connection,
+                engine,
+                identity_cache,
+                entrypoint_pid,
+                intent,
+            )
+        },
+        |decision| decision,
+    )
+}
+
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
-fn authorize_egress_intent(
+fn authorize_egress_intent_inner(
     connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
@@ -3529,7 +3583,6 @@ fn authorize_egress_intent(
         );
     };
 
-    let total_start = std::time::Instant::now();
     let identity = match resolve_process_identity(proc_net_anchor_pid, connection, identity_cache) {
         Ok(id) => id,
         Err(err) => {
@@ -3561,7 +3614,7 @@ fn authorize_egress_intent(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    let result = match engine.authorize_egress(&input) {
+    match engine.authorize_egress(&input) {
         Ok(authorization) => EgressDecision {
             intent: intent.clone(),
             action: authorization.action.clone(),
@@ -3581,15 +3634,7 @@ fn authorize_egress_intent(
             ancestors,
             cmdline_paths,
         ),
-    };
-    debug!(
-        "authorize_egress_intent TOTAL: {}ms host={} port={} transport={:?}",
-        total_start.elapsed().as_millis(),
-        intent.destination.host,
-        intent.destination.port,
-        intent.transport,
-    );
-    result
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3598,6 +3643,14 @@ fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
 }
 
 fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
+    egress::traced_authorization(
+        intent,
+        |intent| evaluate_endpoint_only_opa_inner(engine, intent),
+        |decision| decision,
+    )
+}
+
+fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
     let input = crate::opa::NetworkInput {
         host: intent.destination.host.clone(),
         port: intent.destination.port,
@@ -3663,6 +3716,21 @@ struct SuppliedIdentityAuthorization {
 }
 
 fn authorize_supplied_identity_with_denial(
+    engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    intent: EgressIntent,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+) -> SuppliedIdentityAuthorization {
+    egress::traced_authorization(
+        intent,
+        |intent| {
+            authorize_supplied_identity_with_denial_inner(engine, identity_cache, intent, identity)
+        },
+        |authorization| &authorization.decision,
+    )
+}
+
+fn authorize_supplied_identity_with_denial_inner(
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     intent: EgressIntent,
@@ -3756,7 +3824,7 @@ fn authorize_supplied_identity_with_denial(
 
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
-fn authorize_egress_intent(
+fn authorize_egress_intent_inner(
     _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
@@ -5365,10 +5433,13 @@ async fn handle_forward_proxy(
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
+    let connect_span = egress::connect_span(&intent);
     let mut decision = if let Some(identity) = supplied_identity {
-        authorize_supplied_identity(&opa_engine, &identity_cache, intent, identity)
+        connect_span.in_scope(|| {
+            authorize_supplied_identity(&opa_engine, &identity_cache, intent, identity)
+        })
     } else if !opa_engine.binary_identity_required() {
-        evaluate_endpoint_only_opa(&opa_engine, intent)
+        connect_span.in_scope(|| evaluate_endpoint_only_opa(&opa_engine, intent))
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
@@ -5377,8 +5448,11 @@ async fn handle_forward_proxy(
         let opa_clone = opa_engine.clone();
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
+        let parent = connect_span.clone();
         tokio::task::spawn_blocking(move || {
-            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            parent.in_scope(|| {
+                authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            })
         })
         .await
         .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
@@ -6097,6 +6171,7 @@ async fn handle_forward_proxy(
         sandbox_entrypoint_pid,
         plan: destination_plan,
     })
+    .instrument(egress::resolve_span(&connect_span))
     .await
     {
         Ok(connector) => connector,
@@ -6468,10 +6543,12 @@ async fn handle_forward_proxy(
     // would need absolute-form requests rather than a CONNECT tunnel. Dial
     // only after every local authorization and transformation step so a
     // rejected WebSocket preflight cannot contact the destination.
-    let dial_result = connector.connect().await;
+    let dial_span = egress::dial_span(&connect_span);
+    let dial_result = connector.connect().instrument(dial_span.clone()).await;
     let mut upstream = match dial_result {
         Ok(s) => s,
         Err(e) => {
+            egress::mark_error(&dial_span);
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
@@ -6509,6 +6586,8 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    drop(dial_span);
+    drop(connect_span);
 
     if let Err(e) = forward_generation_guard.ensure_current() {
         warn!(
@@ -7491,6 +7570,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                         .parse()
                         .unwrap(),
                     authorization: None,
+                    connect_span: None,
                 }),
                 None,
                 engine,
@@ -13164,8 +13244,7 @@ network_policies:
             .await
             .expect_err("forward token grant failure should stop request rewriting");
 
-        assert!(err.to_string().contains("Token grant failed"));
-        assert!(err.to_string().contains("oauth unavailable"));
+        assert_eq!(err.to_string(), "Token grant failed");
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
@@ -13178,8 +13257,7 @@ network_policies:
             .await
             .expect_err("forward token exchange failure should stop request rewriting");
 
-        assert!(err.to_string().contains("Token grant failed"));
-        assert!(err.to_string().contains("oauth unavailable"));
+        assert_eq!(err.to_string(), "Token grant failed");
         fixture.assert_one_token_exchange_request(
             "api.example.test\t8080\t/v1/**\tprovider:access_token",
         );

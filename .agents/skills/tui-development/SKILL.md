@@ -330,6 +330,8 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
+The create form parses the optional Command field as shell words before starting creation. Preserve the parsed argument vector through post-create execution and shell-escape each argument at the SSH boundary. Quoting groups arguments; expansions and operators remain literal unless the user explicitly invokes a shell such as `sh -c`. Invalid quoting must leave the form open with an error and must not queue sandbox creation.
+
 ### Scrollable views follow k9s conventions
 
 Any scrollable content (logs, future long lists) should follow the k9s autoscroll pattern:
@@ -605,13 +607,9 @@ cargo fmt -p openshell-tui
 cargo clippy -p openshell-tui
 ```
 
-### Pre-commit
+### Verification
 
-Always run before committing:
-
-```bash
-mise run pre-commit
-```
+Follow Choose Verification for the Change in `CONTRIBUTING.md`. Select format, lint, and tests for the affected TUI behavior and its dependencies. Use `mise run pre-commit` when its broader scope is warranted.
 
 ### Gateway changes
 

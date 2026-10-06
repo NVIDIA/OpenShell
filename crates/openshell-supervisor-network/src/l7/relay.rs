@@ -5208,6 +5208,130 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn l7_rest_tls_relay_injects_multiple_grants() {
+        assert_multiple_grants_tls_relay(Ok("identity-token")).await;
+    }
+
+    #[tokio::test]
+    async fn l7_rest_tls_relay_second_grant_failure_forwards_nothing() {
+        assert_multiple_grants_tls_relay(Err("issuer echoed identity-secret")).await;
+    }
+
+    async fn token_grant_tls_pair() -> (
+        tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+        tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["api.example.test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let (client, server) = tokio::io::duplex(16384);
+        let (client, server) = tokio::join!(
+            connector.connect("api.example.test".try_into().unwrap(), client),
+            acceptor.accept(server),
+        );
+        (client.unwrap(), server.unwrap())
+    }
+
+    async fn assert_multiple_grants_tls_relay(identity_result: std::result::Result<&str, &str>) {
+        let (config, tunnel_engine, ctx, fixture) =
+            rest_token_grant_relay_context(Ok("service-token"));
+        let service_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let identity_key = "api.example.test\t8080\t/v1/**\tprovider:identity";
+        let mut identity = fixture.dynamic_credentials().read().unwrap()[service_key].clone();
+        identity.name = "identity".into();
+        identity.auth_style = "header".into();
+        identity.header_name = "X-Workload-Jwt".into();
+        fixture.add_credential(identity_key, identity, identity_result);
+        // Both sides verify a synthetic certificate: the test exercises encrypted
+        // application traffic, inspection and credential injection, then upstream TLS.
+        let (mut app, mut relay_client) = token_grant_tls_pair().await;
+        let (mut relay_upstream, mut upstream) = token_grant_tls_pair().await;
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        app.write_all(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer agent-token\r\nX-Workload-Jwt: agent-identity\r\nConnection: close\r\n\r\n")
+            .await.unwrap();
+        if identity_result.is_ok() {
+            let mut request = [0u8; 2048];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                upstream.read(&mut request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.contains("Authorization: Bearer service-token\r\n"));
+            assert!(request.contains("X-Workload-Jwt: identity-token\r\n"));
+            assert!(!request.contains("agent-token"));
+            assert!(!request.contains("agent-identity"));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), app.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains(if identity_result.is_ok() {
+            "204 No Content"
+        } else {
+            "502 Bad Gateway"
+        }));
+        assert!(!response.contains("service-token"));
+        assert!(!response.contains("identity-secret"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if identity_result.is_err() {
+            let mut request = [0u8; 128];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                upstream.read(&mut request),
+            )
+            .await
+            .unwrap()
+            {
+                Ok(n) => assert_eq!(n, 0, "failed grant must send no request bytes"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+            }
+        }
+        fixture.assert_requested_keys(&[service_key, identity_key]);
+    }
+
+    #[tokio::test]
     async fn l7_rest_relay_injects_token_grant_authorization_header() {
         let (config, tunnel_engine, ctx, fixture) =
             rest_token_grant_relay_context(Ok("grant-token"));

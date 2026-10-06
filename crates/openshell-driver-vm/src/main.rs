@@ -35,6 +35,9 @@ struct Args {
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
+    #[arg(long, hide = true)]
+    internal_prepare_image: Option<PathBuf>,
+
     #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
     vm_root_disk: Option<PathBuf>,
 
@@ -249,6 +252,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(request) = args.internal_prepare_image {
+        openshell_driver_vm::driver::run_image_preparation_worker(&request)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        return Ok(());
+    }
     if args.internal_run_vm {
         // The VM launcher arms procguard after resolving its runtime so its
         // libkrun worker cannot outlive the launcher.
@@ -288,6 +297,7 @@ async fn main() -> Result<()> {
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),

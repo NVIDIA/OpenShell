@@ -75,7 +75,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.selectorLabels" . | nindent 8 }}
+        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}
@@ -146,7 +146,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.selectorLabels" . | nindent 8 }}
+        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}

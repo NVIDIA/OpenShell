@@ -2404,6 +2404,31 @@ mod tests {
     // ---- Exec validation ----
 
     #[test]
+    fn validate_static_fields_rejects_independent_process_identity_changes() {
+        let baseline = ProtoSandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "1001".into(),
+            }),
+            ..Default::default()
+        };
+        for (user, group) in [
+            ("10000", "1001"),
+            ("sandbox", "10001"),
+            ("", "1001"),
+            ("sandbox", ""),
+        ] {
+            let mut changed = baseline.clone();
+            changed.process = Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: user.into(),
+                run_as_group: group.into(),
+            });
+            let error = validate_static_fields_unchanged(&baseline, &changed).unwrap_err();
+            assert!(error.message().contains("process policy cannot be changed"));
+        }
+    }
+
+    #[test]
     fn reject_control_chars_allows_normal_values() {
         assert!(reject_control_chars("hello world", "test").is_ok());
         assert!(reject_control_chars("$(cmd)", "test").is_ok());

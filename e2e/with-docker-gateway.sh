@@ -526,6 +526,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
 fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
+export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
 ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
 echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"

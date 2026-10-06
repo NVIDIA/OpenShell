@@ -120,7 +120,7 @@ Validate a gateway configuration before starting the daemon:
 
 With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
 variable is unset, it optionally validates an auto-discovered XDG config. The
-absence of either config succeeds. An explicit missing path, legacy schema-v1
+absence of either config still validates the effective daemon arguments. An explicit missing path, legacy schema-v1
 file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
 Preflight merges file and environment values and applies read-only startup checks
 for selector and socket normalization, registered compute-driver configuration,
@@ -133,6 +133,10 @@ reports that failed input was preserved.
 Arguments after **--** replace **--path** mode and are parsed as the exact gateway
 daemon invocation. Package wrappers use this form so command-line overrides are
 validated before the same arguments reach startup.
+
+An explicitly selected local **vm** driver also checks **mke2fs** or **mkfs.ext4**, **debugfs**, and **e2fsck**. Install e2fsprogs 1.43 or newer with the operating system's package manager, then run preflight with the gateway service's account, working directory, configuration, and environment. The command reports selected executable paths and versions. A restricted service **PATH** can select different tools from an interactive shell; include the installation's bin and sbin directories in that service's environment.
+
+Each executable receives only **-V**, with a five-second deadline and an 8 KiB output limit per stream. Missing, non-executable, unsupported, or failing tools return nonzero status with installation or repair guidance. Preflight creates no images or runtime state and does not start the VM driver. Other drivers do not require these tools. A remote driver endpoint reports that host tool checks were not performed; check a local VM configuration on that host in the driver service's environment.
 
 The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
@@ -170,6 +174,15 @@ need a custom bundle location.
 
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.
+
+The user service also reads *~/.config/openshell/gateway.env* for both config
+preflight and startup. **OPENSHELL_SANDBOX_RUNTIME_IMAGE** and
+**OPENSHELL_SUPERVISOR_IMAGE** accept complete tagged or digest-pinned OCI
+references for the built-in Docker, Podman, and Kubernetes drivers. These
+variables take precedence over explicit image fields in the selected driver's
+TOML table, which take precedence over compiled release defaults.
+These are trusted gateway inputs and cannot be supplied by sandbox requests.
+Do not embed registry credentials in image references.
 
 To persist the service across logouts:
 

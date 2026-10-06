@@ -539,6 +539,97 @@ if [[ -z $(find "$snap_user_tls" -maxdepth 0 -perm 700) ]]; then
   exit 1
 fi
 
+assert_user_gateway_service_failed() {
+  local name=$1
+  local unit_state=$2
+  local expected=$3
+  local actual=0
+
+  (
+    as_target_user() { printf '%s\n' "$unit_state"; }
+    user_gateway_service_failed
+  ) >/dev/null || actual=$?
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected status ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_user_gateway_service_failed "failed unit" $'ActiveState=failed\nSubState=failed' 0
+assert_user_gateway_service_failed "unit restarting after a failure" $'ActiveState=activating\nSubState=auto-restart' 0
+assert_user_gateway_service_failed "unit starting after a failure" $'ActiveState=activating\nSubState=start' 1
+assert_user_gateway_service_failed "running unit" $'ActiveState=active\nSubState=running' 1
+if (
+  as_target_user() { return 1; }
+  user_gateway_service_failed
+); then
+  echo "FAIL: unreachable user systemd must not count as a failed unit" >&2
+  exit 1
+fi
+
+# Runs the listener wait against an unreachable gateway and prints the number
+# of one second waits. The wait is expected to fail.
+run_listener_wait() {
+  local unit_state=$1
+  local sleeps_file="${tmpdir}/listener-sleeps"
+  shift
+
+  : >"$sleeps_file"
+  (
+    as_target_user() {
+      case "$1" in
+        systemctl) printf '%s\n' "$unit_state" ;;
+        *) return 7 ;;
+      esac
+    }
+    sleep() { printf '.' >>"$sleeps_file"; }
+    info() { :; }
+    dump_local_gateway_diagnostics() { echo "gateway diagnostics" >&2; }
+    TARGET_HOME="${tmpdir}/listener-home"
+    PLATFORM=linux
+    OPENSHELL_INSTALL_GATEWAY_TIMEOUT=5 wait_for_local_gateway_listener "$@"
+  ) >"$out" 2>"$err" && return 1
+  wc -c <"$sleeps_file" | tr -d ' '
+}
+
+listener_mtls_dir="${tmpdir}/listener-home/.config/openshell/gateways/openshell/mtls"
+mkdir -p "$listener_mtls_dir"
+: >"${listener_mtls_dir}/ca.crt"
+: >"${listener_mtls_dir}/tls.crt"
+: >"${listener_mtls_dir}/tls.key"
+
+restarting_unit=$'ActiveState=activating\nSubState=auto-restart'
+running_unit=$'ActiveState=active\nSubState=running'
+
+if [ "$(run_listener_wait "$restarting_unit" user_gateway_service_failed)" != "0" ]; then
+  echo "FAIL: a failed gateway service must stop the listener wait immediately" >&2
+  exit 1
+fi
+if [ "$(tail -n 1 "$err")" != "openshell: error: the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway" ]; then
+  echo "FAIL: a failed gateway service must end with the service error" >&2
+  cat "$err" >&2
+  exit 1
+fi
+if ! grep -Fq "gateway diagnostics" "$err"; then
+  echo "FAIL: a failed gateway service must dump diagnostics" >&2
+  exit 1
+fi
+
+if [ "$(run_listener_wait "$running_unit" user_gateway_service_failed)" != "5" ]; then
+  echo "FAIL: a running gateway service must not stop the listener wait" >&2
+  exit 1
+fi
+if ! grep -Fq "did not become reachable" "$err"; then
+  echo "FAIL: a running gateway service must end with the listener timeout" >&2
+  cat "$err" >&2
+  exit 1
+fi
+
+if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
+  echo "FAIL: the listener wait must ignore the service state without a check" >&2
+  exit 1
+fi
+
 if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://localhost:17670" ]; then
   echo "FAIL: macOS local gateway endpoint must use a TLS-compatible loopback hostname" >&2
   exit 1

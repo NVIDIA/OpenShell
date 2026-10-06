@@ -65,6 +65,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use opentelemetry::trace::TraceContextExt as _;
 use sha2::{Digest as _, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -177,6 +178,11 @@ pub struct DockerComputeConfig {
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
+
     /// Image containing the trusted `openshell-sandbox` binary.
     pub sandbox_runtime_image: Option<String>,
 
@@ -275,6 +281,7 @@ impl Default for DockerComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
             supervisor_image: None,
@@ -309,6 +316,7 @@ struct DockerDriverRuntimeConfig {
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
+    supervisor_otlp_endpoint: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
     gpu: DockerGpuRuntimeCapabilities,
@@ -938,6 +946,7 @@ impl DockerComputeDriver {
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
+                supervisor_otlp_endpoint: docker_config.supervisor_otlp_endpoint.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
                 gpu,
@@ -2968,7 +2977,7 @@ impl DockerComputeDriver {
         );
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
+                from_image: Some(normalize_pull_reference(image).into_owned()),
                 ..Default::default()
             }),
             None,
@@ -5092,6 +5101,7 @@ async fn spawn_docker_control_process(
             openshell_core::telemetry::enabled_env_value()
         ),
     ];
+    environment.extend(supervisor_tracing_environment(config));
     if config.guest_tls.is_some() {
         environment.push(format!(
             "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/ca.pem",
@@ -5531,6 +5541,17 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
         environment.remove(protected);
     }
     environment
+}
+
+/// Environment that lets the supervisor export spans and join the current trace.
+fn supervisor_tracing_environment(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+    let Some(endpoint) = &config.supervisor_otlp_endpoint else {
+        return Vec::new();
+    };
+    std::iter::once((openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint.clone()))
+        .chain(openshell_otel::current_trace_context_environment())
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect()
 }
 
 fn build_boundary_environment(
@@ -6298,6 +6319,43 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
 }
 
+/// Normalize an image reference for a pull request by appending `:latest`
+/// when it carries neither an explicit tag nor a digest.
+///
+/// The Docker daemon's `create_image` endpoint interprets a `fromImage` with
+/// no tag as "every tag in the repository" and pulls them all, so a bare
+/// `--from` reference such as `nicolaka/netshoot` must be resolved to a single
+/// tag the way `docker pull` (and the Podman driver) do.
+///
+/// Parsing mirrors [`openshell_core::driver_utils::supervisor_image_tag`]: only
+/// the final path component may carry a tag, so a registry port such as the
+/// `:5000` in `registry:5000/team/app` is not mistaken for one, and a
+/// digest-pinned reference (`...@sha256:...`) already names an exact image and
+/// is left untouched. A separate helper is needed because `supervisor_image_tag`
+/// resolves a bare reference to an implied `latest` and so cannot distinguish a
+/// reference that still needs a tag appended.
+///
+/// Examples:
+/// - `"nicolaka/netshoot"` → `"nicolaka/netshoot:latest"`
+/// - `"foo:1.2"` → `"foo:1.2"` (already tagged)
+/// - `"foo@sha256:abc"` → `"foo@sha256:abc"` (digest-pinned)
+/// - `"registry:5000/team/app"` → `"registry:5000/team/app:latest"`
+/// - `"registry:5000/team/app:v1"` → `"registry:5000/team/app:v1"`
+fn normalize_pull_reference(image: &str) -> Cow<'_, str> {
+    // A digest-pinned reference already identifies an exact image.
+    if image.contains('@') {
+        return Cow::Borrowed(image);
+    }
+    // A `:` only denotes a tag in the final path component; earlier ones are
+    // registry ports (e.g. `registry:5000/team/app`).
+    let last_component = image.rsplit('/').next().unwrap_or(image);
+    if last_component.contains(':') {
+        Cow::Borrowed(image)
+    } else {
+        Cow::Owned(format!("{image}:latest"))
+    }
+}
+
 /// Docker container names may not end with `-`, `.`, or `_`. Truncation can
 /// leave one of those trailing, so strip them before returning.
 fn trim_container_name_tail(mut value: String) -> String {
@@ -6329,7 +6387,7 @@ fn sanitize_docker_name(value: &str) -> String {
 async fn pull_runtime_image(docker: &Docker, image: &str, role: &str) -> CoreResult<()> {
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
-            from_image: Some(image.to_string()),
+            from_image: Some(normalize_pull_reference(image).into_owned()),
             ..Default::default()
         }),
         None,

@@ -605,7 +605,12 @@ async fn handle_create_sandbox_inner(
         .status
         .as_mut()
         .expect("status initialized")
-        .provisioning = Some(crate::compute::provisioning_deadline::new_record(now_ms));
+        .provisioning = Some(
+        crate::compute::provisioning_deadline::new_preparation_record(
+            now_ms,
+            state.config.image_preparation_timeout_seconds,
+        ),
+    );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
@@ -629,6 +634,9 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    state
+        .compute
+        .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
     state
         .compute
         .validate_sandbox_create(&sandbox)
@@ -3937,6 +3945,114 @@ mod tests {
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
 
+    #[tokio::test]
+    async fn missing_launch_signer_precedes_driver_validation_and_preserves_staged_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_server_state().await;
+        let mut metadata = openshell_core::extension_protocol::extension_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "test/launch-authentication",
+            "test",
+            [],
+        );
+        metadata
+            .required_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        let admission = openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        };
+        let driver = Arc::new(
+            crate::test_support::FakeComputeDriver::new().with_capabilities(
+                openshell_core::proto::compute::v1::GetCapabilitiesResponse {
+                    driver_name: "test".to_string(),
+                    default_image: "test/image:latest".to_string(),
+                    rootfs_tar_staging_dir: directory.path().to_string_lossy().into_owned(),
+                    rootfs_tar_max_bytes: 1024,
+                    resource_admission_policy: admission.acknowledgement(),
+                    extension: Some(metadata),
+                    ..Default::default()
+                },
+            ),
+        );
+        let compute = crate::compute::ComputeRuntime::from_driver(
+            "test".to_string(),
+            driver.clone(),
+            None,
+            state.store.clone(),
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap()
+        .with_admission_policy(admission)
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().compute = compute;
+        let staging = state.compute.rootfs_tar_staging();
+        let slot = staging
+            .begin("default", "dev-user", "rootfs.tar", 7)
+            .unwrap();
+        std::fs::write(&slot.upload_path, b"archive").unwrap();
+        let driver_config = Struct {
+            fields: std::iter::once((
+                "test".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: std::iter::once((
+                            crate::compute::rootfs_tar::STAGING_TOKEN_FIELD.to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(slot.token.clone())),
+                            },
+                        ))
+                        .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        };
+        driver.clear_calls();
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "missing-signer".to_string(),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        driver_config: Some(driver_config),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox launch signing"));
+        assert!(
+            driver.calls().is_empty(),
+            "driver validation must not precede signing preflight"
+        );
+        assert_eq!(
+            staging.peek(&slot.token).unwrap(),
+            std::path::PathBuf::from(&slot.upload_path)
+        );
+        assert_eq!(std::fs::read(&slot.upload_path).unwrap(), b"archive");
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "missing-signer")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     // ---- shell_escape ----
 
     #[test]
@@ -4427,7 +4543,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky under concurrent test execution"]
     async fn watch_producer_releases_request_span_when_client_disconnects() {
         use crate::otel_tracing::test_exporter;
         use tokio_stream::StreamExt as _;
@@ -4466,6 +4581,7 @@ mod tests {
 
         drop(request_span);
         stream.disconnect_and_wait().await;
+        traced.wait_for_span("disconnected_watch_request").await;
 
         assert_eq!(
             traced.spans_named("disconnected_watch_request").len(),

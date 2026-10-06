@@ -171,6 +171,10 @@ ocsf_emit!(event);
   test-only connections, though using it on any non-UDS TCP stream — tests
   included — is fine and preferred.
 
+## Branch Names
+
+Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-names).
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages

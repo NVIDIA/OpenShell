@@ -140,6 +140,13 @@ impl Default for FakeComputeDriver {
 }
 
 impl FakeComputeDriver {
+    /// Override the handshake response to exercise gateway capability admission.
+    #[must_use]
+    pub fn with_capabilities(self, capabilities: GetCapabilitiesResponse) -> Self {
+        self.with_state(|state| state.capabilities = capabilities);
+        self
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
