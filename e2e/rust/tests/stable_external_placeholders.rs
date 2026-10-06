@@ -247,16 +247,14 @@ impl FixtureImage {
 
 // These tests run serially against a wrapper-owned gateway. The public fixture
 // CA must be removed and the original supervisor restored before the next case.
-struct GatewayTrustConfig {
-    path: PathBuf,
-    original: String,
-    image_range: std::ops::Range<usize>,
+struct GatewayTrustFixture {
+    directory: PathBuf,
     supervisor_image: String,
     health_port: u16,
     restore_required: bool,
 }
 
-impl GatewayTrustConfig {
+impl GatewayTrustFixture {
     fn load() -> Result<Self, String> {
         if std::env::var_os("OPENSHELL_GATEWAY_ENDPOINT").is_some()
             || std::env::var_os("OPENSHELL_E2E_GATEWAY_BIN").is_none()
@@ -268,6 +266,10 @@ impl GatewayTrustConfig {
         }
         let args_file = std::env::var_os("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
             .ok_or("managed gateway argument metadata is missing")?;
+        let directory = Path::new(&args_file)
+            .parent()
+            .ok_or("managed gateway arguments have no parent directory")?
+            .to_path_buf();
         let raw =
             std::fs::read(args_file).map_err(|_| "could not read managed gateway arguments")?;
         let args = raw
@@ -284,17 +286,13 @@ impl GatewayTrustConfig {
             }
             Ok(value)
         };
-        let path = PathBuf::from(argument("--config")?);
         let health_port = argument("--health-port")?
             .parse::<u16>()
             .map_err(|_| "managed gateway health port is invalid")?;
-        let original = std::fs::read_to_string(&path)
-            .map_err(|_| "could not read managed gateway configuration")?;
-        let (image_range, supervisor_image) = docker_supervisor_image(&original)?;
+        let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+            .map_err(|_| "managed supervisor image is missing")?;
         Ok(Self {
-            path,
-            original,
-            image_range,
+            directory,
             supervisor_image,
             health_port,
             restore_required: false,
@@ -302,94 +300,32 @@ impl GatewayTrustConfig {
     }
 
     async fn apply(&mut self, image: &str) -> Result<(), String> {
-        let mut updated = self.original.clone();
-        updated.replace_range(self.image_range.clone(), image);
-        // Set the guard before the write: a failed write or restart must still
-        // flow through explicit restoration of the exact original bytes.
         self.restore_required = true;
-        std::fs::write(&self.path, updated)
-            .map_err(|_| "could not install fixture supervisor configuration")?;
-        restart_fixture_gateway(self.health_port).await
+        restart_fixture_gateway(self.health_port, Some(image)).await
     }
 
     async fn restore(&mut self) -> Result<(), String> {
         if !self.restore_required {
             return Ok(());
         }
-        std::fs::write(&self.path, &self.original)
-            .map_err(|_| "could not restore original gateway configuration")?;
-        restart_fixture_gateway(self.health_port)
+        restart_fixture_gateway(self.health_port, None)
             .await
-            .map_err(|_| "original gateway configuration was restored but restart failed")?;
+            .map_err(|_| "could not restore original gateway runtime")?;
         self.restore_required = false;
         Ok(())
     }
 }
 
-impl Drop for GatewayTrustConfig {
-    fn drop(&mut self) {
-        if self.restore_required {
-            // Cancellation/panic fallback restores disk state only. Normal
-            // Result paths explicitly restart and verify health; Drop never
-            // launches a subprocess or hides a failed restart as success.
-            let _ = std::fs::write(&self.path, &self.original);
-        }
-    }
-}
-
-fn docker_supervisor_image(config: &str) -> Result<(std::ops::Range<usize>, String), String> {
-    let mut in_docker = false;
-    let mut offset = 0;
-    let mut found = None;
-    for line in config.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_docker = trimmed == "[openshell.drivers.docker]";
-        } else if in_docker && let Some((key, value)) = trimmed.split_once('=') {
-            if key.trim() == "socket_path" {
-                return Err(
-                    "fixture cannot replace an external Docker driver configuration".to_string(),
-                );
-            }
-            if key.trim() == "supervisor_image" {
-                // Accept only the wrapper's single-line quoted OCI reference.
-                // Reject escapes/comments instead of treating general TOML as
-                // text and accidentally changing a different configuration key.
-                let image = value
-                    .trim()
-                    .strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                    .filter(|image| {
-                        !image.is_empty()
-                            && image.bytes().all(|byte| {
-                                byte.is_ascii_alphanumeric() || b"/:@._-".contains(&byte)
-                            })
-                    })
-                    .ok_or("managed supervisor image is not a simple quoted OCI reference")?;
-                let start = offset
-                    + line
-                        .find('"')
-                        .ok_or("managed supervisor image is not quoted")?
-                    + 1;
-                if found
-                    .replace((start..start + image.len(), image.to_string()))
-                    .is_some()
-                {
-                    return Err("managed Docker supervisor image is duplicated".to_string());
-                }
-            }
-        }
-        offset += line.len();
-    }
-    found.ok_or_else(|| "managed Docker supervisor image is missing".to_string())
-}
-
-async fn restart_fixture_gateway(health_port: u16) -> Result<(), String> {
-    let gateway = ManagedGateway::from_env()
+async fn restart_fixture_gateway(
+    health_port: u16,
+    supervisor_image: Option<&str>,
+) -> Result<(), String> {
+    let mut gateway = ManagedGateway::from_env()
         .map_err(|_| "could not load managed gateway restart metadata")?
         .ok_or("managed gateway restart metadata disappeared")?;
-    // ManagedGateway bounds graceful shutdown before force-kill. Keep it local:
-    // its Drop can start a stopped gateway, but never owns configuration restore.
+    if let Some(image) = supervisor_image {
+        gateway.set_supervisor_image(image);
+    }
     gateway
         .stop()
         .map_err(|_| "could not stop fixture gateway")?;
@@ -1103,17 +1039,13 @@ async fn ordinary_external_placeholder_keeps_revoked_assertion_after_rotation() 
 // Keep each lifecycle together so no phase can replace the retained client.
 #[allow(clippy::too_many_lines)]
 async fn external_caller_assertion_rotation(stable: bool) -> Result<(), String> {
-    let mut gateway_config = GatewayTrustConfig::load()?;
+    let mut gateway_fixture = GatewayTrustFixture::load()?;
     let name = format!("e2e{:016x}", rand::random::<u64>());
     let mut backend = BackendPair::new(&name)?;
     // The wrapper's directory is shared with the host Docker daemon in CI;
     // a job-container-local temporary path cannot back the TLS bind mount.
-    let fixture_parent = gateway_config
-        .path
-        .parent()
-        .ok_or("managed gateway configuration has no parent directory")?;
-    let directory =
-        TempDir::new_in(fixture_parent).map_err(|_| "could not allocate fixture directory")?;
+    let directory = TempDir::new_in(&gateway_fixture.directory)
+        .map_err(|_| "could not allocate fixture directory")?;
     let context = directory.path().join("image");
     std::fs::create_dir(&context).map_err(|_| "could not allocate public image context")?;
     let backend_tls = directory.path().join("backend-tls");
@@ -1141,8 +1073,8 @@ async fn external_caller_assertion_rotation(stable: bool) -> Result<(), String> 
     // default user and its original public trust roots.
     std::fs::write(&supervisor_dockerfile, format!(
         "FROM {} AS supervisor\nFROM {base} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/stable-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/stable-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
-        gateway_config.supervisor_image,
-        gateway_config.supervisor_image
+        gateway_fixture.supervisor_image,
+        gateway_fixture.supervisor_image
     )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
     let image = FixtureImage::new()?;
     let supervisor_image = FixtureImage::new()?;
@@ -1191,7 +1123,7 @@ async fn external_caller_assertion_rotation(stable: bool) -> Result<(), String> 
         supervisor_image
             .build(&supervisor_dockerfile, &context)
             .await?;
-        gateway_config.apply(supervisor_image.tag()).await?;
+        gateway_fixture.apply(supervisor_image.tag()).await?;
         write_profile(&profile, &name, &host, port, python, stable)?;
         write_policy(&policy, &host, &other_host, port, other_port, python)?;
         let configuration = json!({"host": host, "other_host": other_host, "port": port,
@@ -1397,7 +1329,7 @@ async fn external_caller_assertion_rotation(stable: bool) -> Result<(), String> 
     // Restore the original runtime before removing its replacement. Retain the
     // derived supervisor image if restoration fails, and report that failure
     // even when a lifecycle assertion already failed.
-    let gateway_restore = gateway_config.restore().await;
+    let gateway_restore = gateway_fixture.restore().await;
     let supervisor_cleanup = if gateway_restore.is_ok() {
         supervisor_image.remove().await
     } else {
