@@ -621,9 +621,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (312, 28),
+                (94, 22),
+                (82, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -769,6 +769,7 @@ mod tests {
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())
                 .expect("legacy policy payload must decode");
         assert!(policy_payload.policy.is_some());
+        assert!(policy_payload.policy.as_ref().unwrap().ui.is_none());
         assert_eq!(policy_payload.hash, "sha256");
         assert_eq!(policy_payload.load_error, "none");
         assert_eq!(policy_payload.loaded_at_ms, 300);

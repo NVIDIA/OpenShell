@@ -58,6 +58,19 @@ configuration validation live in `openshell_core::middleware`. Policy admission
 and the supervisor runtime consume the same contract without introducing a
 dependency from the policy crate to the supervisor implementation.
 
+## Extension Capabilities
+
+Extensions advertise namespaced string capabilities through `PeerMetadata`.
+Use shared constants in `extension_protocol` and pass optional capabilities to
+`extension_metadata`; do not add per-driver booleans for policy features.
+Negotiation validates and retains the extension's supported capability list.
+
+`POLICY_UI_V1` (`openshell.policy.ui.v1`) declares complete startup UI-policy
+support. The gateway checks the effective policy before driver validation or
+creation and rejects any explicit UI section when the capability is absent.
+Supporting drivers validate and enforce the concrete settings. Omitted UI
+preserves existing driver behavior; changing UI requires sandbox recreation.
+
 ## Protobuf Struct Conversion
 
 Use `openshell_core::proto_struct` when crossing between `serde_json` values and

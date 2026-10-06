@@ -16,6 +16,7 @@ use openshell_isolation_interface::contract::{
     NetworkMediationSource, OuterFenceGuarantee, OuterFenceGuarantees, PendingDnsQuery,
     PendingTcpOpen, ReadyBoundary, RunningBoundary, VerifiedBackendDescriptor,
 };
+#[cfg(unix)]
 use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
 
 const TEST_BACKEND: &str = "in-process-test";
@@ -185,17 +186,21 @@ impl PreparedBackend for TestLaunch {
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError> {
+    ) -> std::result::Result<BuiltBackend, BackendError> {
         self.observed.record("build");
         let services = Arc::new(services);
         *self.observed.services.lock().unwrap() = Arc::downgrade(&services);
-        Ok(Arc::new(TestBackend {
-            name: self.name,
-            observed: self.observed,
-            services,
-            generation: self.generation,
-            expected_session: self.expected_session,
-        }))
+        Ok(BuiltBackend {
+            payload: TEST_PAYLOAD.to_vec(),
+            proxy_listener: None,
+            backend: Arc::new(TestBackend {
+                name: self.name,
+                observed: self.observed,
+                services,
+                generation: self.generation,
+                expected_session: self.expected_session,
+            }),
+        })
     }
 }
 
@@ -467,7 +472,8 @@ async fn attachment_receives_live_supervisor_services() {
         .select()
         .attach(services, policy(), agent())
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let backend_services = setup.observed.services.lock().unwrap().upgrade().unwrap();
     assert!(Arc::ptr_eq(&ca_paths, &backend_services.ca_file_paths));
     assert!(Arc::ptr_eq(
