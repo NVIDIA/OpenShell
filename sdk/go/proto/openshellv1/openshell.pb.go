@@ -729,6 +729,7 @@ func (ProviderProfileCategory) EnumDescriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{10}
 }
 
+// Receivers treat UNSPECIFIED and unknown values as secret.
 type ProviderEnvironmentValueClassification int32
 
 const (
@@ -11213,7 +11214,9 @@ func (x *StaticCredentialBinding) GetWorkloadCredentialHandle() string {
 	return ""
 }
 
-// Get sandbox provider environment response.
+// Polling projection of ProviderEnvironmentSnapshot. The parallel maps below
+// are keyed by the same environment variable names. Removed with the polling
+// RPCs; new provider environment fields belong on the snapshot first.
 type GetSandboxProviderEnvironmentResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Provider credential environment variables.
@@ -11346,7 +11349,10 @@ func (x *GetSandboxProviderEnvironmentResponse) GetFiles() map[string]string {
 	return nil
 }
 
-// One environment value and all metadata that shares its key.
+// One environment value and all metadata that shares its key. Names are unique
+// within a snapshot. static_credential_binding is present exactly when
+// classification is STATIC_CREDENTIAL. Snapshots that violate either rule are
+// invalid.
 type ProviderEnvironmentValue struct {
 	state                   protoimpl.MessageState                 `protogen:"open.v1"`
 	Name                    string                                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -11354,7 +11360,7 @@ type ProviderEnvironmentValue struct {
 	Classification          ProviderEnvironmentValueClassification `protobuf:"varint,4,opt,name=classification,proto3,enum=openshell.v1.ProviderEnvironmentValueClassification" json:"classification,omitempty"`
 	StaticCredentialBinding *StaticCredentialBinding               `protobuf:"bytes,5,opt,name=static_credential_binding,json=staticCredentialBinding,proto3" json:"static_credential_binding,omitempty"`
 	// Absolute expiration time. Absence means no expiry.
-	ExpirationTime *timestamppb.Timestamp `protobuf:"bytes,103,opt,name=expiration_time,json=expirationTime,proto3" json:"expiration_time,omitempty"`
+	ExpirationTime *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=expiration_time,json=expirationTime,proto3" json:"expiration_time,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -11424,7 +11430,9 @@ func (x *ProviderEnvironmentValue) GetExpirationTime() *timestamppb.Timestamp {
 	return nil
 }
 
-// Complete provider environment state delivered to a supervisor. Dynamic
+// Complete provider environment state delivered to a supervisor. This is the
+// canonical provider environment shape; GetSandboxProviderEnvironmentResponse
+// is its polling projection and is removed with the polling RPCs. Dynamic
 // credentials are endpoint selectors rather than environment values and stay
 // in their own collection.
 type ProviderEnvironmentSnapshot struct {
@@ -13659,11 +13667,11 @@ type SupervisorHello struct {
 	ConnectionEpoch uint64 `protobuf:"varint,3,opt,name=connection_epoch,json=connectionEpoch,proto3" json:"connection_epoch,omitempty"`
 	// The supervisor can report credential, policy, and launch-environment installation.
 	SupportsProviderReadiness bool `protobuf:"varint,4,opt,name=supports_provider_readiness,json=supportsProviderReadiness,proto3" json:"supports_provider_readiness,omitempty"`
-	// Exact internal stream protocol revision implemented by this supervisor.
-	// Zero identifies a supervisor built before the handshake existed.
-	ProtocolRevision uint32 `protobuf:"varint,5,opt,name=protocol_revision,json=protocolRevision,proto3" json:"protocol_revision,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
+	// stream. Gateways send configuration payloads only when this is set.
+	SupportsConfigSnapshots bool `protobuf:"varint,5,opt,name=supports_config_snapshots,json=supportsConfigSnapshots,proto3" json:"supports_config_snapshots,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *SupervisorHello) Reset() {
@@ -13724,11 +13732,11 @@ func (x *SupervisorHello) GetSupportsProviderReadiness() bool {
 	return false
 }
 
-func (x *SupervisorHello) GetProtocolRevision() uint32 {
+func (x *SupervisorHello) GetSupportsConfigSnapshots() bool {
 	if x != nil {
-		return x.ProtocolRevision
+		return x.SupportsConfigSnapshots
 	}
-	return 0
+	return false
 }
 
 // Gateway accepts the supervisor session.
@@ -13736,11 +13744,11 @@ type SessionAccepted struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Gateway-assigned session ID for this connection.
 	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	// Complete gateway-owned configuration. During the staged rollout this may
-	// be omitted only when the gateway cannot build the projection.
+	// Complete gateway-owned configuration. Sent only to supervisors that set
+	// SupervisorHello.supports_config_snapshots. During the staged rollout this
+	// may also be omitted when push delivery is disabled or the gateway cannot
+	// build the projection.
 	Bootstrap *ConfigBootstrap `protobuf:"bytes,3,opt,name=bootstrap,proto3" json:"bootstrap,omitempty"`
-	// Exact internal stream protocol revision implemented by this gateway.
-	ProtocolRevision uint32 `protobuf:"varint,4,opt,name=protocol_revision,json=protocolRevision,proto3" json:"protocol_revision,omitempty"`
 	// Recommended heartbeat interval.
 	HeartbeatInterval *durationpb.Duration `protobuf:"bytes,102,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"`
 	unknownFields     protoimpl.UnknownFields
@@ -13789,13 +13797,6 @@ func (x *SessionAccepted) GetBootstrap() *ConfigBootstrap {
 		return x.Bootstrap
 	}
 	return nil
-}
-
-func (x *SessionAccepted) GetProtocolRevision() uint32 {
-	if x != nil {
-		return x.ProtocolRevision
-	}
-	return 0
 }
 
 func (x *SessionAccepted) GetHeartbeatInterval() *durationpb.Duration {
@@ -19683,13 +19684,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"FilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x03\x10\x04R\x18credential_expires_at_ms\"\xe5\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x03\x10\x04R\x18credential_expires_at_ms\"\xd0\x02\n" +
 	"\x18ProviderEnvironmentValue\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
 	"\x05value\x18\x02 \x01(\tB\x04\x88\xb5\x18\x01R\x05value\x12\\\n" +
 	"\x0eclassification\x18\x04 \x01(\x0e24.openshell.v1.ProviderEnvironmentValueClassificationR\x0eclassification\x12a\n" +
 	"\x19static_credential_binding\x18\x05 \x01(\v2%.openshell.v1.StaticCredentialBindingR\x17staticCredentialBinding\x12C\n" +
-	"\x0fexpiration_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x03\x10\x04R\rexpires_at_ms\"\xaa\x05\n" +
+	"\x0fexpiration_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\"\xaa\x05\n" +
 	"\x1bProviderEnvironmentSnapshot\x122\n" +
 	"\x15provider_env_revision\x18\x01 \x01(\x04R\x13providerEnvRevision\x12>\n" +
 	"\x06values\x18\x02 \x03(\v2&.openshell.v1.ProviderEnvironmentValueR\x06values\x12r\n" +
@@ -19877,20 +19878,19 @@ const file_openshell_proto_rawDesc = "" +
 	"\vrelay_close\x18\x05 \x01(\v2\x18.openshell.v1.RelayCloseH\x00R\n" +
 	"relayClose\x12A\n" +
 	"\rconfig_update\x18\x06 \x01(\v2\x1a.openshell.v1.ConfigUpdateH\x00R\fconfigUpdateB\t\n" +
-	"\apayload\"\xe9\x01\n" +
+	"\apayload\"\xf8\x01\n" +
 	"\x0fSupervisorHello\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
 	"instanceId\x12)\n" +
 	"\x10connection_epoch\x18\x03 \x01(\x04R\x0fconnectionEpoch\x12>\n" +
-	"\x1bsupports_provider_readiness\x18\x04 \x01(\bR\x19supportsProviderReadiness\x12+\n" +
-	"\x11protocol_revision\x18\x05 \x01(\rR\x10protocolRevision\"\x83\x02\n" +
+	"\x1bsupports_provider_readiness\x18\x04 \x01(\bR\x19supportsProviderReadiness\x12:\n" +
+	"\x19supports_config_snapshots\x18\x05 \x01(\bR\x17supportsConfigSnapshots\"\xd6\x01\n" +
 	"\x0fSessionAccepted\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12;\n" +
-	"\tbootstrap\x18\x03 \x01(\v2\x1d.openshell.v1.ConfigBootstrapR\tbootstrap\x12+\n" +
-	"\x11protocol_revision\x18\x04 \x01(\rR\x10protocolRevision\x12H\n" +
+	"\tbootstrap\x18\x03 \x01(\v2\x1d.openshell.v1.ConfigBootstrapR\tbootstrap\x12H\n" +
 	"\x12heartbeat_interval\x18f \x01(\v2\x19.google.protobuf.DurationR\x11heartbeatIntervalJ\x04\b\x02\x10\x03R\x17heartbeat_interval_secs\"\xc3\x01\n" +
 	"\x0fConfigBootstrap\x12R\n" +
 	"\x0esandbox_config\x18\x01 \x01(\v2+.openshell.sandbox.v1.SandboxConfigSnapshotR\rsandboxConfig\x12\\\n" +

@@ -136,7 +136,7 @@ mod tests {
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "fe0408efcdc1d6e485586223fe8f14ce6a5747959aa2d646c94be57e1fc8c665";
+        "26279ae924037ff79c531625b3051ed750eb502d4b9c63e0653f6f0deafc35a1";
     const DURABLE_SCHEMA_SHA256: &str =
         "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

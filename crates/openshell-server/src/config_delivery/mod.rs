@@ -1055,13 +1055,9 @@ mod tests {
         state: &Arc<ServerState>,
         sandbox_id: &str,
     ) -> (SupervisorStreamHarness, String) {
-        let mut harness = connect_supervisor_stream(
-            state,
-            sandbox_id,
-            openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .unwrap();
+        let mut harness = connect_supervisor_stream(state, sandbox_id, true)
+            .await
+            .unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
             .await
             .unwrap()
@@ -1322,13 +1318,9 @@ mod tests {
     async fn legacy_supervisor_keeps_polling_when_gateway_shadow_push_is_enabled() {
         let state = push_state().await;
         put_sandbox(&state, "legacy-sandbox", &[]).await;
-        let mut harness = connect_supervisor_stream(
-            &state,
-            "legacy-sandbox",
-            openshell_core::proto::LEGACY_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .unwrap();
+        let mut harness = connect_supervisor_stream(&state, "legacy-sandbox", false)
+            .await
+            .unwrap();
         let first = harness.inbound.message().await.unwrap().unwrap();
         let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
             panic!("expected SessionAccepted");
@@ -1394,11 +1386,7 @@ mod tests {
         put_sandbox(&state, "sandbox", &["provider"]).await;
         let (resolve_hit, _release_resolve) = state.credentials.gate_next_resolve();
         tokio::time::timeout(Duration::from_secs(10), async {
-            let connect = connect_supervisor_stream(
-                &state,
-                "sandbox",
-                openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
-            );
+            let connect = connect_supervisor_stream(&state, "sandbox", true);
             let (response, hit) = tokio::join!(connect, resolve_hit);
             hit.expect("bootstrap must reach the stalled credential driver");
             let mut harness = response.unwrap();

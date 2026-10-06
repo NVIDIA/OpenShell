@@ -215,6 +215,8 @@ type OpenShellClient interface {
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Polling projection of the sandbox configuration delivered over
+	// ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -239,7 +241,9 @@ type OpenShellClient interface {
 	ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(ctx context.Context, in *ReportSandboxConfigurationRequest, opts ...grpc.CallOption) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -253,8 +257,9 @@ type OpenShellClient interface {
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
 	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
-	// delivery. Peers must report the same exact protocol_revision during the
-	// handshake. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
 	// streams on the same connection), not over this stream.
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
@@ -1323,6 +1328,8 @@ type OpenShellServer interface {
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Polling projection of the sandbox configuration delivered over
+	// ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -1347,7 +1354,9 @@ type OpenShellServer interface {
 	ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(context.Context, *ReportSandboxConfigurationRequest) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -1361,8 +1370,9 @@ type OpenShellServer interface {
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
 	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
-	// delivery. Peers must report the same exact protocol_revision during the
-	// handshake. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
 	// streams on the same connection), not over this stream.
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.

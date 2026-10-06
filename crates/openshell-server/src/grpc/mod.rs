@@ -983,12 +983,12 @@ pub mod test_support {
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
-    /// carries the given protocol revision. Returns the gRPC status when the
-    /// gateway rejects the stream before accepting it.
+    /// advertises the given configuration snapshot support. Returns the gRPC
+    /// status when the gateway rejects the stream before accepting it.
     pub async fn connect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        supports_config_snapshots: bool,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1008,7 +1008,7 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    protocol_revision,
+                    supports_config_snapshots,
                     connection_epoch: 0,
                     supports_provider_readiness: false,
                 })),

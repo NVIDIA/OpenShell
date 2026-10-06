@@ -21,7 +21,6 @@ use openshell_core::proto::{
     RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
     SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
-use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
@@ -414,7 +413,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
-            protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+            supports_config_snapshots: true,
             connection_epoch,
             supports_provider_readiness: true,
         })),
@@ -448,7 +447,6 @@ async fn run_single_session(
         .as_ref()
         .and_then(|value| openshell_core::time::duration_to_std(value).ok())
         .map_or(5, |value| value.as_secs().max(5));
-    validate_gateway_protocol_revision(accepted.protocol_revision)?;
     if let Some(updates) = &config.session_id_updates {
         updates.send_replace(Some(accepted.session_id.clone()));
     }
@@ -508,24 +506,6 @@ async fn run_single_session(
                 }
             }
         }
-    }
-}
-
-fn validate_gateway_protocol_revision(
-    gateway_revision: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match gateway_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            warn!(
-                "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
-            );
-            Ok(())
-        }
-        other => Err(format!(
-            "supervisor protocol revision mismatch: supervisor requires {SUPERVISOR_PROTOCOL_REVISION}, gateway offered {other}"
-        )
-        .into()),
     }
 }
 
@@ -961,19 +941,6 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 #[cfg(test)]
 mod target_tests {
     use super::*;
-
-    #[test]
-    fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
-        assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-    }
-
-    #[test]
-    fn gateway_protocol_revision_rejects_unknown_peers() {
-        let error = validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION + 1)
-            .expect_err("version skew must be rejected");
-        assert!(error.to_string().contains("revision mismatch"));
-    }
 
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
         TcpRelayTarget {
