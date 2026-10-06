@@ -17,6 +17,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -37,6 +38,8 @@ _ClientCallDetailsBase = namedtuple(
 )
 
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
+_PAGER_MAX_CONSUMED_TOKENS = 10_000
+_PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
 T = TypeVar("T")
 
 
@@ -49,20 +52,46 @@ class Page(Generic[T]):
 
 
 class Pager(Generic[T]):
-    """Lazy, single-pass iterator that fetches one RPC page per advance."""
+    """Lazy, single-pass iterator over the continuation-token contract.
+
+    The repeated-token guard has bounded memory and raises ``SandboxError`` if
+    the traversal exceeds that guard's token-count or byte budget.
+    """
 
     def __init__(self, fetch: Callable[[str], Page[T]], page_token: str = "") -> None:
         self._fetch = fetch
         self._page_token: str | None = page_token
+        self._consumed_page_tokens: set[str] = set()
+        self._consumed_page_token_bytes = 0
 
     def __iter__(self) -> Pager[T]:
         return self
 
+    def _validate_page_token_budget(self, page_token: str) -> int:
+        if not page_token:
+            return 0
+        token_bytes = len(page_token.encode("utf-8"))
+        if (
+            len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
+            or self._consumed_page_token_bytes + token_bytes
+            > _PAGER_MAX_CONSUMED_TOKEN_BYTES
+        ):
+            raise SandboxError("pager continuation token history limit exceeded")
+        return token_bytes
+
     def __next__(self) -> Page[T]:
         if self._page_token is None:
             raise StopIteration
-        page = self._fetch(self._page_token)
-        self._page_token = page.next_page_token or None
+        page_token = self._page_token
+        token_bytes = self._validate_page_token_budget(page_token)
+        page = self._fetch(page_token)
+        if page_token:
+            self._consumed_page_tokens.add(page_token)
+            self._consumed_page_token_bytes += token_bytes
+        next_page_token = page.next_page_token
+        if next_page_token and next_page_token in self._consumed_page_tokens:
+            raise SandboxError("pager received a repeated continuation token")
+        self._page_token = next_page_token or None
         return page
 
     def all(self) -> builtins.list[T]:
@@ -87,6 +116,12 @@ def _service_exposure_messages(
         openshell_pb2.SandboxServiceExposure(
             service=exposure.service,
             target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
         )
         for exposure in exposures or ()
     ]
@@ -420,6 +455,16 @@ class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
+
+
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
 
 
 @dataclass(frozen=True)
@@ -428,6 +473,7 @@ class ServiceExposure:
 
     target_port: int
     service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -1738,6 +1784,13 @@ def _sandbox_ref(
             current_policy_version=status.current_policy_version if status else 0,
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
+            else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
+            else None,
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},

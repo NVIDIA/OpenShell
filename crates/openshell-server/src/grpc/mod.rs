@@ -51,7 +51,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -431,7 +432,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
-        sandbox::handle_exec_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     type ForwardTcpStream =
@@ -925,6 +926,13 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerConfigUpdateHintRequest>,
+    ) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
+        crate::config_delivery::handle_peer_config_update_hint(&self.state, request)
+    }
 }
 
 fn public_extension_info(extension: &NegotiatedExtension) -> NegotiatedExtensionInfo {
@@ -1012,22 +1020,42 @@ pub mod test_support {
         }
     }
 
+    /// Configuration stream features advertised by a test supervisor hello.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StreamFeatures {
+        /// Predates configuration snapshots.
+        Legacy,
+        /// Accepts shadow snapshots while polling stays authoritative.
+        Snapshots,
+        /// Applies and acknowledges streamed configuration.
+        Apply,
+    }
+
+    impl From<bool> for StreamFeatures {
+        fn from(supports_config_snapshots: bool) -> Self {
+            if supports_config_snapshots {
+                Self::Snapshots
+            } else {
+                Self::Legacy
+            }
+        }
+    }
+
     /// Serve `state` on loopback and open a supervisor stream whose hello
-    /// carries the given protocol revision. Returns the gRPC status when the
-    /// gateway rejects the stream before accepting it.
+    /// advertises the given configuration stream features. Returns the gRPC
+    /// status when the gateway rejects the stream before accepting it.
     pub async fn connect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        features: impl Into<StreamFeatures>,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        connect_supervisor_stream_with_image_policy(state, sandbox_id, protocol_revision, None)
-            .await
+        connect_supervisor_stream_with_image_policy(state, sandbox_id, features.into(), None).await
     }
 
     pub async fn connect_supervisor_stream_with_image_policy(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        features: StreamFeatures,
         image_policy: Option<SandboxPolicy>,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let result = image_policy.clone().map_or(
@@ -1037,7 +1065,7 @@ pub mod test_support {
         connect_supervisor_stream_with_image_policy_discovery(
             state,
             sandbox_id,
-            protocol_revision,
+            features,
             openshell_core::proto::ImagePolicyDiscovery {
                 result: Some(result),
             },
@@ -1048,13 +1076,13 @@ pub mod test_support {
     pub async fn connect_supervisor_stream_with_image_policy_discovery(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        features: StreamFeatures,
         image_policy_discovery: openshell_core::proto::ImagePolicyDiscovery,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         connect_supervisor_stream_with_optional_image_policy_discovery(
             state,
             sandbox_id,
-            protocol_revision,
+            features,
             Some(image_policy_discovery),
         )
         .await
@@ -1065,13 +1093,10 @@ pub mod test_support {
     pub async fn reconnect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        features: StreamFeatures,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         connect_supervisor_stream_with_optional_image_policy_discovery(
-            state,
-            sandbox_id,
-            protocol_revision,
-            None,
+            state, sandbox_id, features, None,
         )
         .await
     }
@@ -1079,18 +1104,9 @@ pub mod test_support {
     async fn connect_supervisor_stream_with_optional_image_policy_discovery(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        protocol_revision: u32,
+        features: StreamFeatures,
         image_policy_discovery: Option<openshell_core::proto::ImagePolicyDiscovery>,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        let image_policy = image_policy_discovery
-            .as_ref()
-            .and_then(|discovery| discovery.result.as_ref())
-            .and_then(|result| match result {
-                openshell_core::proto::image_policy_discovery::Result::Policy(policy) => {
-                    Some(policy.clone())
-                }
-                _ => None,
-            });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let principal = Principal::Sandbox(SandboxPrincipal {
@@ -1120,9 +1136,9 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    protocol_revision,
+                    supports_config_snapshots: features != StreamFeatures::Legacy,
+                    supports_config_apply: features == StreamFeatures::Apply,
                     connection_epoch: 0,
-                    image_policy,
                     image_policy_discovery,
                     supports_provider_readiness: false,
                 })),

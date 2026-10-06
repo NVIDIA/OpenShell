@@ -24,6 +24,14 @@ TCP opens, TCP byte streams, DNS requests/replies, and lifecycle operations
 share the authenticated gRPC channel. DNS is resolved and authorized by the
 supervisor. General UDP is unsupported.
 
+The driver mounts a read-only, driver-owned `/etc/resolv.conf` into the
+workload with `nameserver 127.0.0.53`. This prevents the disconnected Podman
+network namespace from replacing the policy-DNS relay with a runtime resolver.
+The supervisor answers `host.openshell.internal` with a trusted concrete
+destination: `127.0.0.1` on native Linux, the configured Podman Machine host
+address on macOS. That destination is part of the supervisor bootstrap and is
+reapplied when a sandbox restarts.
+
 ## Supervisor network
 
 The supervisor companion uses Podman's host network. On Linux it connects to
@@ -39,8 +47,8 @@ does not share the workload's PID, mount, or network namespaces.
 ## Troubleshooting
 
 Inspect both containers with the same sandbox-ID label, distinguishing
-`openshell.io/isolation-role=sandbox` from
-`openshell.io/isolation-role=supervisor`.
+`openshell.ai/isolation-role=sandbox` from
+`openshell.ai/isolation-role=supervisor`.
 
 - Sandbox fails its qualification probe: use its log to identify the denied
   kernel/runtime primitive. Do not add capabilities or disable runtime seccomp.

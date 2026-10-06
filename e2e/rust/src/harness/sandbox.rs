@@ -14,19 +14,21 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 
-use super::binary::openshell_cmd;
+use super::binary::{openshell_bin, openshell_cmd};
 use super::output::{extract_field, strip_ansi};
 
 /// Tool-capable workload image used by the E2E harness.
 ///
 /// Product defaults remain on the minimal NVIDIA Ubuntu image. Tests that
 /// explicitly pass `--from` or `--template` retain their requested workload.
-/// Docker setup builds this Noble-based fixture before running the tests.
-#[cfg(feature = "e2e-docker")]
+/// Docker and Podman setup build this Noble-based fixture before running the
+/// tests.
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
 
-/// Preserve the existing pullable fixture for non-Docker E2E lanes.
-#[cfg(not(feature = "e2e-docker"))]
+/// Preserve the existing pullable fixture for E2E lanes that cannot build the
+/// local container-engine fixture.
+#[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
 pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3";
 
 /// Extract the sandbox name from CLI create output.
@@ -65,13 +67,18 @@ fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str
     }
 }
 
+/// Generate a sandbox name that is unique within and across test processes.
+pub fn unique_sandbox_name() -> String {
+    format!(
+        "e2e-{}-{}",
+        std::process::id(),
+        NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
     if !has_explicit_sandbox_name(args) {
-        command.arg("--name").arg(format!(
-            "e2e-{}-{}",
-            std::process::id(),
-            NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
-        ));
+        command.arg("--name").arg(unique_sandbox_name());
     }
 }
 
@@ -611,7 +618,11 @@ impl SandboxGuard {
         for arg in argv {
             cmd.arg(arg);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Never share the test runner's stdin: parallel test processes share
+        // its open file description, and the command needs no input.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let output = cmd
             .output()
@@ -721,27 +732,22 @@ impl Drop for SandboxGuard {
             return;
         }
 
-        // We need to run async cleanup in a sync Drop. Use block_in_place to
-        // avoid blocking the tokio runtime. This is acceptable for test code.
-        let name = self.name.clone();
-        let mut child = self.child.take();
+        // A detached thread here would get killed along with the test
+        // process before the delete command finishes, leaking the sandbox.
+        // Use a blocking std::process::Command instead, matching the
+        // ManagedCleanup pattern in workspace_namespace_managed.rs, so
+        // cleanup completes before this function returns.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
 
-        // Attempt cleanup with a new runtime if we're not inside one, or
-        // block_in_place if we are.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("create cleanup runtime");
-            rt.block_on(async {
-                if let Some(ref mut child) = child {
-                    let _: Result<(), _> = child.kill().await;
-                    let _ = child.wait().await;
-                }
-
-                let mut cmd = openshell_cmd();
-                cmd.arg("sandbox").arg("delete").arg(&name);
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let _ = cmd.status().await;
-            });
-        });
+        let _ = std::process::Command::new(openshell_bin())
+            .arg("sandbox")
+            .arg("delete")
+            .arg(&self.name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

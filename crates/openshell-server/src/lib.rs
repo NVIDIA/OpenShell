@@ -23,10 +23,13 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_metrics;
+mod gateway_ocsf;
 mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+mod ocsf_log;
 mod otel_tracing;
 mod pagination;
 mod persistence;
@@ -50,9 +53,9 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -101,12 +104,8 @@ struct GatewayExtensionCredential {
     ttl: Duration,
 }
 
-fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    issuer
-        .sandbox_token_ttl()
-        .map_or(Duration::from_mins(15), |ttl| {
-            ttl.min(MAX_EXTENSION_TOKEN_TTL)
-        })
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::ExtensionJwtIssuer) -> Duration {
+    issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL)
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -116,7 +115,7 @@ fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration
 /// downgrades a security boundary, so it is reported once per registration at
 /// startup rather than being silently tolerated.
 fn mint_gateway_extension_credential(
-    issuer: &Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: &Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     kind: ExtensionKind,
     name: &str,
     audience: &str,
@@ -183,7 +182,7 @@ fn mint_gateway_extension_credential(
 }
 
 fn spawn_gateway_extension_token_refresh(
-    issuer: Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     credentials: Vec<GatewayExtensionCredential>,
 ) {
     if credentials.is_empty() {
@@ -309,8 +308,8 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
-    /// Per-sandbox scheduler for coalesced supervisor configuration delivery.
-    pub(crate) config_delivery_queue: config_delivery::ConfigDeliveryQueue,
+    /// Coalescing scheduler for supervisor configuration delivery.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Routing boundary for local or remote supervisor configuration delivery.
     pub(crate) supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter>,
@@ -335,19 +334,11 @@ pub struct ServerState {
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
-    /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
-    /// `Status::unavailable`. Populated at startup from the on-disk key
-    /// material that `certgen` writes.
-    pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
+    /// Typed extension JWT issuer and public verification metadata.
+    pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
-
-    /// Authenticator that validates gateway-minted sandbox JWTs on every
-    /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
-    /// presenting a freshly minted token are recognized.
-    pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
@@ -448,8 +439,8 @@ impl ServerState {
         let supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter> = Arc::new(
             config_delivery::LocalSupervisorConfigRouter::new(Arc::clone(&supervisor_sessions)),
         );
-        let config_delivery_queue =
-            config_delivery::ConfigDeliveryQueue::for_db_connections(store.max_connections());
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -465,7 +456,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
-            config_delivery_queue,
+            config_delivery,
             supervisor_config_router,
             replica_id,
             peer_endpoint,
@@ -474,9 +465,8 @@ impl ServerState {
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
-            sandbox_jwt_issuer: None,
+            extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
-            sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
             peer_authenticator: None,
             grpc_rate_limiter,
@@ -568,70 +558,20 @@ pub(crate) async fn run_server(
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
-    let (sandbox_jwt_issuer, sandbox_jwt_authenticator, sandbox_session_jwt_authority) =
+    let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
-            let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT signing key from {}: {e}",
-                    jwt.signing_key_path.display()
-                ))
-            })?;
-            let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT public key from {}: {e}",
-                    jwt.public_key_path.display()
-                ))
-            })?;
-            let kid = std::fs::read_to_string(&jwt.kid_path)
-                .map_err(|e| {
-                    Error::config(format!(
-                        "failed to read sandbox JWT kid from {}: {e}",
-                        jwt.kid_path.display()
-                    ))
-                })?
-                .trim()
-                .to_string();
-            if kid.is_empty() {
-                return Err(Error::config(format!(
-                    "sandbox JWT kid file {} is empty",
-                    jwt.kid_path.display()
-                )));
-            }
-            let issuer = Arc::new(
-                auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
-                    &signing_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
-            let authenticator = Arc::new(
-                auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
-                    &public_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                )
-                .map_err(Error::config)?,
-            );
-            let session_authority = Arc::new(
-                auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
-                    &signing_pem,
-                    &public_pem,
-                    kid,
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl().unwrap_or(Duration::from_mins(15)),
-                )
-                .map_err(Error::config)?,
-            );
+            let authorities = auth::launch_signing::load(jwt)?;
             info!(
                 gateway_id = %jwt.gateway_id,
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
                 "gateway-minted sandbox JWT enabled"
             );
-            (Some(issuer), Some(authenticator), Some(session_authority))
+            (
+                Some(authorities.extension),
+                Some(authorities.sandbox_session),
+            )
         } else {
-            (None, None, None)
+            (None, None)
         };
 
     let middleware_registrations = config_file
@@ -649,7 +589,7 @@ pub(crate) async fn run_server(
         .unwrap_or_default();
     let mut gateway_extension_credentials = Vec::new();
     let middleware_registry = Arc::new(
-        if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+        if let Some(issuer) = extension_jwt_issuer.as_ref() {
             let mut slots = HashMap::new();
             for registration in &middleware_registrations {
                 if let Some(credential) = mint_gateway_extension_credential(
@@ -729,7 +669,7 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+    let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
             let audience = interceptor.resolved_audience();
@@ -781,14 +721,15 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-    state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
-    state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
-    if let Some(issuer) = sandbox_jwt_issuer {
+    if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    if state.sandbox_jwt_issuer.is_some() && state.compute.supports_sandbox_authentication() {
+    if state.sandbox_session_jwt_authority.is_some()
+        && state.compute.supports_sandbox_authentication()
+    {
         state.compute_driver_authenticator = Some(Arc::new(
             auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
         ));
@@ -941,9 +882,9 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle =
+            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
+                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -998,9 +939,11 @@ pub(crate) async fn run_server(
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
-    state
-        .compute
-        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+    state.compute.spawn_watchers(
+        shutdown_rx.clone(),
+        startup_rx,
+        state.sandbox_session_jwt_authority.clone(),
+    );
 
     // Serve the gateway before reconciling persisted sandboxes so restored
     // supervisors can fetch policy and register their sessions.
@@ -1048,17 +991,26 @@ pub(crate) async fn run_server(
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
+    state.supervisor_sessions.close_admission();
     let _ = shutdown_tx.send(true);
 
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
 
-    state
-        .compute
-        .cleanup_on_shutdown()
-        .await
+    let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // A stopped supervisor may still have a detached task deleting its owner
+    // record. Drain it even when compute cleanup failed before exiting Tokio.
+    let session_cleanup = state
+        .supervisor_sessions
+        .shutdown(Duration::from_secs(10))
+        .await;
+    if let Err(err) = &session_cleanup {
+        warn!(error = %err, "Gateway supervisor session cleanup incomplete");
+    }
+    compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+    session_cleanup.map_err(Error::execution)?;
 
     Ok(())
 }
@@ -1306,6 +1258,21 @@ pub trait ComputeDriverFactory: Send + Sync {
         false
     }
 
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1317,8 +1284,6 @@ pub struct ComputeDriverRegistration {
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
-    local_singleplayer: bool,
-    supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
@@ -1349,8 +1314,6 @@ impl ComputeDriverRegistration {
             detect,
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
-            local_singleplayer: false,
-            supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
@@ -1376,17 +1339,10 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Mark a backend whose local deployment should use single-player defaults.
+    /// Compatibility no-op retained for existing factory registrations.
+    /// Gateway mTLS user authentication is independent of compute drivers.
     #[must_use]
-    pub fn with_local_singleplayer(mut self) -> Self {
-        self.local_singleplayer = true;
-        self
-    }
-
-    /// Mark a backend that requires user authentication other than mTLS.
-    #[must_use]
-    pub fn without_mtls_user_auth(mut self) -> Self {
-        self.supports_mtls_user_auth = false;
+    pub fn with_local_singleplayer(self) -> Self {
         self
     }
 
@@ -1398,16 +1354,6 @@ impl ComputeDriverRegistration {
     ) -> Self {
         self.in_process_tracing = Some(tracing);
         self
-    }
-
-    #[must_use]
-    pub(crate) fn is_local_singleplayer(&self) -> bool {
-        self.local_singleplayer
-    }
-
-    #[must_use]
-    pub(crate) fn supports_mtls_user_auth(&self) -> bool {
-        self.supports_mtls_user_auth
     }
 
     #[must_use]
@@ -1642,13 +1588,13 @@ impl ComputeDriverBuildContext<'_> {
         self.config.gateway_tls_enabled()
     }
 
-    /// Gateway client credentials that a local driver may mount into guests.
+    /// Gateway CA certificate that a local driver may provide to supervisors.
     #[must_use]
-    pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
+    pub fn guest_tls_ca(&self) -> Option<&Path> {
         self.config
             .driver_startup
             .guest_tls
-            .map(compute::driver_config::GuestTlsPaths::as_paths)
+            .map(compute::driver_config::GuestTlsPaths::as_path)
     }
 
     /// Deserialize the selected driver's merged TOML table.
@@ -1696,18 +1642,9 @@ async fn build_compute_runtime(
         false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
+    let admission =
+        compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
     info!(driver = %driver.name(), "Using compute driver");
-    if config
-        .gateway_jwt
-        .as_ref()
-        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
-        && !driver.is_local_singleplayer(registry)
-    {
-        warn!(
-            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted); set gateway_jwt.ttl_secs > 0 for shared deployments"
-        );
-    }
-
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -1777,6 +1714,12 @@ async fn build_compute_runtime(
         }
     };
 
+    let runtime = runtime
+        .with_admission_policy(admission)
+        .and_then(|runtime| {
+            runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
+        .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
 
@@ -1791,15 +1734,6 @@ impl ConfiguredComputeDriver {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
-        }
-    }
-
-    fn is_local_singleplayer(&self, registry: &ComputeDriverRegistry) -> bool {
-        match self {
-            Self::Registered(registration) => registration.is_local_singleplayer(),
-            Self::Remote { name } => registry
-                .get(name)
-                .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
         }
     }
 
@@ -1970,6 +1904,9 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     fn tls_enabled_config() -> Config {
         Config::new(Some(openshell_core::TlsConfig {
@@ -2025,17 +1962,18 @@ mod tests {
         record_detection_probe("third", true)
     }
 
-    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
-        extension_test_issuer_with_ttl(Some(Duration::from_mins(15)))
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
+        extension_test_issuer_with_ttl(Duration::from_mins(15))
     }
 
     fn extension_test_issuer_with_ttl(
-        ttl: Option<Duration>,
-    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        ttl: Duration,
+    ) -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
-            crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
                 ttl,
@@ -2045,17 +1983,17 @@ mod tests {
     }
 
     #[test]
-    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
-        let issuer = extension_test_issuer_with_ttl(None);
+    fn gateway_ttl_bounds_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(Duration::from_mins(15));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
     }
 
     #[test]
     fn extension_token_ttl_is_capped_at_one_hour() {
-        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_hours(24)));
+        let issuer = extension_test_issuer_with_ttl(Duration::from_hours(24));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
 
-        let short = extension_test_issuer_with_ttl(Some(Duration::from_mins(5)));
+        let short = extension_test_issuer_with_ttl(Duration::from_mins(5));
         assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
     }
 
@@ -2228,6 +2166,27 @@ mod tests {
             Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_is_mounted_only_when_enabled() {
+        let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
+        let response = super::http_router(state.clone())
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled = state;
+        Arc::get_mut(&mut enabled)
+            .unwrap()
+            .config
+            .enable_websocket_tunnel = true;
+        let response = super::http_router(enabled)
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn start_tls_gateway_listener(

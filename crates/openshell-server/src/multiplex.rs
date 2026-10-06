@@ -63,6 +63,16 @@ impl MakeRequestId for UuidRequestId {
     }
 }
 
+/// Paths called on a timer rather than by someone waiting on the result.
+const POLLED_PATHS: &[&str] = &[
+    "/health",
+    "/healthz",
+    "/readyz",
+    "/openshell.v1.OpenShell/GetSandboxConfig",
+    "/openshell.v1.OpenShell/ReportProviderReadiness",
+    "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+];
+
 /// Build a tracing span for an inbound request, recording the `request_id`
 /// header (set by [`UuidRequestId`] or supplied by the client).
 fn make_request_span<B>(req: &Request<B>) -> Span {
@@ -79,7 +89,7 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
     // the callsite name.
     let otel_name = otel_span_name(req.method(), path);
 
-    let span = if matches!(path, "/health" | "/healthz" | "/readyz") {
+    let span = if POLLED_PATHS.contains(&path) {
         tracing::debug_span!(
             "request",
             method = %req.method(),
@@ -135,11 +145,17 @@ fn log_response<B>(res: &Response<B>, latency: Duration, span: &Span) {
     if status.is_server_error() {
         crate::otel_tracing::mark_error(span);
     }
-    tracing::info!(
-        status = status.as_u16(),
-        latency_ms = latency.as_millis(),
-        "response"
-    );
+    // Polled requests get a DEBUG span, which is `None` when filtered out.
+    let polled = span
+        .metadata()
+        .is_none_or(|m| *m.level() == tracing::Level::DEBUG);
+    let server_error = status.is_server_error();
+    let (status, latency_ms) = (status.as_u16(), latency.as_millis());
+    match (polled, server_error) {
+        (false, _) => tracing::info!(status, latency_ms, "response"),
+        (true, true) => tracing::warn!(status, latency_ms, "response"),
+        (true, false) => tracing::debug!(status, latency_ms, "response"),
+    }
 }
 
 fn record_response_trailers(
@@ -676,7 +692,6 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 "source".to_string(),
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
-                    SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
                     SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
                 }
                 .to_string(),
@@ -867,20 +882,18 @@ where
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
 /// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
-///    JWTs against the durable sandbox identity. When configured, legacy
-///    unbound sandbox JWTs are deliberately not admitted.
-/// 4. `SandboxJwtAuthenticator` — legacy fallback used only when session JWT
-///    authentication is unavailable. Recognized via a distinctive `kid` so
-///    non-matching Bearer tokens fall through.
-/// 5. `OidcAuthenticator` — validates user Bearer tokens against the
+///    JWTs against the durable sandbox identity. Untyped legacy sandbox JWTs
+///    are not admitted.
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
 /// Once sandbox authentication is configured, callers must present an
 /// explicit credential for authenticated gRPC methods. Missing bearer auth
 /// is promoted to an mTLS user only when `mtls_auth.enabled` is configured
-/// for local single-user gateways, or to an unsafe local developer user when
-/// `auth.allow_unauthenticated_users` is explicitly enabled.
+/// and the connection presents a verified client certificate, or to an unsafe
+/// local developer user when `auth.allow_unauthenticated_users` is explicitly
+/// enabled.
 ///
 /// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
@@ -893,7 +906,6 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
     }
-    let session_authentication_enabled = state.sandbox_session_jwt_authority.is_some();
     if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
@@ -901,9 +913,6 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
                 state.store.clone(),
             ),
         ));
-    }
-    if !session_authentication_enabled && let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
-        authenticators.push(jwt);
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
@@ -2230,6 +2239,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn polled_paths_get_debug_request_spans() {
+        let _traced = crate::otel_tracing::test_exporter::install_traced();
+        let level = |path: &str| {
+            let req = Request::builder()
+                .uri(path)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            *make_request_span(&req)
+                .metadata()
+                .expect("span enabled")
+                .level()
+        };
+
+        for path in [
+            "/healthz",
+            "/openshell.v1.OpenShell/GetSandboxConfig",
+            "/openshell.v1.OpenShell/ReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+        ] {
+            assert_eq!(level(path), tracing::Level::DEBUG, "{path}");
+        }
+        assert_eq!(
+            level("/openshell.v1.OpenShell/CreateSandbox"),
+            tracing::Level::INFO
+        );
+    }
+
+    #[test]
+    fn polled_path_responses_log_at_debug() {
+        let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuf(log_buf.clone());
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false),
+                )
+        };
+        {
+            let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let respond = |path: &str, status: u16| {
+                let req = Request::builder()
+                    .uri(path)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                let res = Response::builder()
+                    .status(status)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                log_response(&res, Duration::from_millis(1), &make_request_span(&req));
+            };
+            respond("/openshell.v1.OpenShell/GetSandboxConfig", 200);
+            respond("/healthz", 200);
+            respond("/openshell.v1.OpenShell/CreateSandbox", 201);
+            respond("/healthz", 503);
+        }
+
+        let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "got: {output}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("status=201"),
+            "got: {output}"
+        );
+        assert!(
+            lines[1].contains("WARN") && lines[1].contains("status=503"),
+            "got: {output}"
+        );
+    }
+
     /// The `TraceLayer` creates the server span, so no gRPC handler needs
     /// `#[instrument]`. The request ID carries into it so a trace can be
     /// correlated with the gateway's logs.
@@ -2546,6 +2629,8 @@ mod tests {
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
         use tower::Service;
@@ -2643,6 +2728,36 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             })
+        }
+
+        #[derive(Serialize)]
+        struct LegacySandboxClaims {
+            sub: String,
+            iss: String,
+            aud: String,
+            iat: i64,
+            exp: i64,
+            sandbox_id: String,
+        }
+
+        fn legacy_sandbox_token(material: &openshell_bootstrap::jwt::JwtKeyMaterial) -> String {
+            let claims = LegacySandboxClaims {
+                sub: "spiffe://openshell/sandbox/sandbox-a".to_string(),
+                iss: "openshell-gateway:test".to_string(),
+                aud: "openshell-gateway:test".to_string(),
+                iat: 1,
+                exp: 0,
+                sandbox_id: "sandbox-a".to_string(),
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(material.kid.clone());
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_ed_pem(material.signing_key_pem.as_bytes())
+                    .expect("signing key"),
+            )
+            .expect("legacy token")
         }
 
         #[tokio::test]
@@ -2927,6 +3042,52 @@ mod tests {
             assert!(seen.lock().unwrap().is_none());
             // tonic sets grpc-status=16 (UNAUTHENTICATED) in trailers.
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn legacy_sandbox_jwt_cannot_reach_sensitive_sandbox_methods() {
+            let material = openshell_bootstrap::jwt::generate_jwt_key().expect("JWT key");
+            let authority = Arc::new(
+                crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                    material.signing_key_pem.as_bytes(),
+                    material.public_key_pem.as_bytes(),
+                    material.kid.clone(),
+                    "test",
+                    Some(Duration::from_mins(15)),
+                )
+                .expect("session authority"),
+            );
+            let store = Arc::new(
+                crate::persistence::Store::connect("sqlite::memory:")
+                    .await
+                    .expect("store"),
+            );
+            let token = legacy_sandbox_token(&material);
+
+            for path in [
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+                "/openshell.v1.OpenShell/ConnectSupervisor",
+            ] {
+                let authenticator = Arc::new(
+                    crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                        authority.clone(),
+                        store.clone(),
+                    ),
+                );
+                let chain = AuthenticatorChain::new(vec![authenticator]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+                let request = Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Full::new(Bytes::new()))
+                    .expect("request");
+
+                let response = router.call(request).await.expect("router response");
+
+                assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
+                assert_eq!(grpc_status(&response).as_deref(), Some("16"), "{path}");
+            }
         }
 
         #[tokio::test]

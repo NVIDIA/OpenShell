@@ -19,7 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::GpuResourceRequirements;
+use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -770,6 +770,22 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceAuthorizationMode {
+    #[default]
+    Strip,
+    BearerPassthrough,
+}
+
+impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
+    fn from(value: CliServiceAuthorizationMode) -> Self {
+        match value {
+            CliServiceAuthorizationMode::Strip => Self::Strip,
+            CliServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
@@ -1105,8 +1121,8 @@ enum ProfileCommands {
         global: bool,
     },
 
-    /// Import provider profiles from a file or directory.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    /// Import provider profiles from a file, directory, or HTTP URL.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Import {
         /// Profile file to import.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1115,6 +1131,10 @@ enum ProfileCommands {
         /// Directory containing profile files to import.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Import as platform-scoped profiles (ignores --workspace).
         #[arg(long)]
@@ -1137,7 +1157,7 @@ enum ProfileCommands {
     },
 
     /// Validate provider profile files without registering them.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Lint {
         /// Profile file to lint.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1146,6 +1166,10 @@ enum ProfileCommands {
         /// Directory containing profile files to lint.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Lint against platform scope (ignores --workspace).
         #[arg(long)]
@@ -1209,11 +1233,17 @@ impl ProfileCommands {
                 )
                 .await?;
             }
-            Self::Import { file, from, global } => {
+            Self::Import {
+                file,
+                from,
+                url,
+                global,
+            } => {
                 run::provider_profile_import(
                     endpoint,
                     file.as_deref(),
                     from.as_deref(),
+                    url.as_deref(),
                     profile_workspace(global),
                     tls,
                 )
@@ -1223,11 +1253,17 @@ impl ProfileCommands {
                 run::provider_profile_update(endpoint, &id, &file, profile_workspace(global), tls)
                     .await?;
             }
-            Self::Lint { file, from, global } => {
+            Self::Lint {
+                file,
+                from,
+                url,
+                global,
+            } => {
                 run::provider_profile_lint(
                     endpoint,
                     file.as_deref(),
                     from.as_deref(),
+                    url.as_deref(),
                     profile_workspace(global),
                     tls,
                 )
@@ -1423,8 +1459,10 @@ enum SandboxCommands {
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
         /// working directory.
-        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
-        /// upload everything.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1465,8 +1503,9 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
-        /// Validation behavior is not yet finalized.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Disabled unless the gateway administrator enables `allow_driver_config`.
+        /// External resource attachments still require approval labels.
         ///
         /// For Kubernetes, pass a value such as
         /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
@@ -1499,6 +1538,10 @@ enum SandboxCommands {
         )]
         expose: Option<u16>,
 
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t, requires = "expose")]
+        expose_authorization_mode: CliServiceAuthorizationMode,
+
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
         /// Use --tty to force a PTY even when auto-detection fails, or
@@ -1513,6 +1556,14 @@ enum SandboxCommands {
         /// Start the canonical main process without attaching to it.
         #[arg(long, conflicts_with = "editor")]
         detach: bool,
+
+        /// Restart behavior after the canonical main process exits.
+        #[arg(
+            long,
+            value_parser = ["never", "on-failure", "always"],
+            default_value = "never"
+        )]
+        restart_policy: String,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -1645,13 +1696,18 @@ enum SandboxCommands {
     /// For interactive shell sessions, use `sandbox connect` instead.
     ///
     /// Examples:
+    ///   openshell sandbox exec my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
     ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Exec {
         /// Sandbox name (defaults to last-used sandbox).
-        #[arg(long, short = 'n', add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Sandbox name; same as the positional argument.
+        #[arg(long, short = 'n', conflicts_with = "sandbox", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Working directory inside the sandbox.
@@ -1688,15 +1744,15 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
-        /// Command and arguments to execute.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Command and arguments to execute, after `--`.
+        #[arg(required = true, last = true)]
         command: Vec<String>,
     },
 
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
-    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
+    /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1710,6 +1766,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
@@ -1798,6 +1859,14 @@ enum SandboxProviderCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Maximum number of attached providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -1885,7 +1954,8 @@ enum SandboxTemplateCommands {
         #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
         gpu: Option<GpuCliRequest>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Requires administrator opt-in; resource admission still applies.
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
@@ -2326,6 +2396,10 @@ enum ServiceCommands {
 
         /// Service name.
         service: Option<String>,
+
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t)]
+        authorization_mode: CliServiceAuthorizationMode,
     },
 
     /// List exposed sandbox service endpoints.
@@ -2871,6 +2945,7 @@ async fn run_async() -> Result<()> {
                     sandbox,
                     service,
                     target_port,
+                    authorization_mode,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -2878,6 +2953,7 @@ async fn run_async() -> Result<()> {
                         &sandbox,
                         &service,
                         target_port,
+                        authorization_mode.into(),
                         &cli.workspace,
                         &tls,
                     )
@@ -3287,9 +3363,11 @@ async fn run_async() -> Result<()> {
                     policy,
                     forward,
                     expose,
+                    expose_authorization_mode,
                     tty,
                     no_tty,
                     detach,
+                    restart_policy,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3383,6 +3461,7 @@ async fn run_async() -> Result<()> {
                             policy: policy.as_deref(),
                             forward,
                             expose,
+                            expose_authorization_mode: expose_authorization_mode.into(),
                             command: &command,
                             tty_override,
                             auto_providers_override,
@@ -3392,6 +3471,7 @@ async fn run_async() -> Result<()> {
                             output: output.as_str(),
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
+                            restart_policy: &restart_policy,
                         },
                         &cli.workspace,
                         &tls,
@@ -3535,6 +3615,7 @@ async fn run_async() -> Result<()> {
                             let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }
                         SandboxCommands::Exec {
+                            sandbox,
                             name,
                             workdir,
                             timeout,
@@ -3544,7 +3625,8 @@ async fn run_async() -> Result<()> {
                             command,
                             no_login_shell,
                         } => {
-                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            let name =
+                                resolve_sandbox_name(name.or(sandbox), &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
                             let tty_override = if no_tty {
                                 Some(false)
@@ -3577,11 +3659,18 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name, output } => {
+                            SandboxProviderCommands::List {
+                                name,
+                                page_size,
+                                page_token,
+                                output,
+                            } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                                 run::sandbox_provider_list(
                                     endpoint,
                                     &name,
+                                    page_size,
+                                    &page_token,
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,
@@ -4368,6 +4457,89 @@ mod tests {
     }
 
     #[test]
+    fn exec_grammar_requires_separator_before_remote_command() {
+        use clap::error::ErrorKind;
+
+        // Returns (target, command, tty) or the clap error kind.
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["openshell", "sandbox", "exec"];
+            argv.extend(args);
+            let cli = Cli::try_parse_from(argv).map_err(|e| e.kind())?;
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Exec {
+                        sandbox,
+                        name,
+                        command,
+                        tty,
+                        ..
+                    }),
+            }) = cli.command
+            else {
+                panic!("expected sandbox exec command");
+            };
+            Ok::<_, ErrorKind>((name.or(sandbox), command, tty))
+        };
+        let check = |args: &[&str], target: Option<&str>, command: &[&str], tty: bool| {
+            let got = parse(args).unwrap_or_else(|kind| panic!("{args:?} failed: {kind:?}"));
+            let command = command.iter().map(ToString::to_string).collect();
+            assert_eq!(got, (target.map(str::to_string), command, tty), "{args:?}");
+        };
+
+        check(
+            &["a", "--", "echo", "hi"],
+            Some("a"),
+            &["echo", "hi"],
+            false,
+        );
+        check(&["-n", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--name", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--", "echo", "hi"], None, &["echo", "hi"], false);
+        // Flags on either side of the positional target.
+        check(&["--tty", "a", "--", "echo"], Some("a"), &["echo"], true);
+        check(&["a", "--tty", "--", "echo"], Some("a"), &["echo"], true);
+        check(
+            &["-n", "a", "--tty", "--", "echo"],
+            Some("a"),
+            &["echo"],
+            true,
+        );
+        // Hyphenated remote args are opaque.
+        check(&["a", "--", "ls", "-la"], Some("a"), &["ls", "-la"], false);
+        check(&["a", "--", "--tty"], Some("a"), &["--tty"], false);
+        check(&["--", "-n", "x"], None, &["-n", "x"], false);
+        // An inner delimiter belongs to the remote command.
+        let git = ["git", "log", "--", "path"];
+        check(
+            &["a", "--", "git", "log", "--", "path"],
+            Some("a"),
+            &git,
+            false,
+        );
+        check(&["--", "git", "log", "--", "path"], None, &git, false);
+
+        let err: &[(&[&str], ErrorKind)] = &[
+            // Target given twice.
+            (&["-n", "a", "b", "--", "echo"], ErrorKind::ArgumentConflict),
+            (&["b", "-n", "a", "--", "echo"], ErrorKind::ArgumentConflict),
+            // Missing `--`.
+            (&["a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["a", "--tty", "echo"], ErrorKind::UnknownArgument),
+            (&["-n", "a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["git", "log"], ErrorKind::UnknownArgument),
+            (&["a"], ErrorKind::MissingRequiredArgument),
+            (&[], ErrorKind::MissingRequiredArgument),
+            // Missing remote command.
+            (&["a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["-n", "a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["--"], ErrorKind::MissingRequiredArgument),
+        ];
+        for (args, kind) in err {
+            assert_eq!(parse(args).map(|_| ()), Err(*kind), "{args:?}");
+        }
+    }
+
+    #[test]
     fn provider_readiness_commands_have_bounded_waits_and_structured_output() {
         for action in ["attach", "detach", "status"] {
             let cli = Cli::try_parse_from([
@@ -5011,7 +5183,7 @@ mod tests {
     #[test]
     fn profile_import_and_lint_require_exactly_one_source() {
         for verb in ["import", "lint"] {
-            for source in ["-f", "--from"] {
+            for source in ["-f", "--from", "--url"] {
                 let cli = Cli::try_parse_from([
                     "openshell",
                     "profile",
@@ -5021,19 +5193,30 @@ mod tests {
                     "--global",
                 ])
                 .expect("profile source should parse");
-                let (file, from, global) = match cli.command {
+                let (file, from, url, global) = match cli.command {
                     Some(Commands::Profile {
                         command:
                             Some(
-                                ProfileCommands::Import { file, from, global }
-                                | ProfileCommands::Lint { file, from, global },
+                                ProfileCommands::Import {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                }
+                                | ProfileCommands::Lint {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                },
                             ),
-                    }) => (file, from, global),
+                    }) => (file, from, url, global),
                     other => panic!("unexpected profile command: {other:?}"),
                 };
                 assert!(global);
                 assert_eq!(file.is_some(), source == "-f");
                 assert_eq!(from.is_some(), source == "--from");
+                assert_eq!(url.is_some(), source == "--url");
             }
             assert!(Cli::try_parse_from(["openshell", "profile", verb]).is_err());
             assert!(
@@ -5967,6 +6150,51 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_restart_policy_defaults_to_never() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "never"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_accepts_on_failure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--restart-policy",
+            "on-failure",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "on-failure"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--restart-policy",
+                "unless-stopped",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn sandbox_create_detach_parses_with_main_command() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -6529,9 +6757,19 @@ mod tests {
 
         match cli.command {
             Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { expose, detach, .. }),
+                command:
+                    Some(SandboxCommands::Create {
+                        expose,
+                        expose_authorization_mode,
+                        detach,
+                        ..
+                    }),
             }) => {
                 assert_eq!(expose, Some(4500));
+                assert_eq!(
+                    expose_authorization_mode,
+                    CliServiceAuthorizationMode::Strip
+                );
                 assert!(detach);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6560,6 +6798,44 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_parses_bearer_passthrough_and_requires_expose() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--expose-authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("create-time authorization mode should parse with --expose");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        expose_authorization_mode,
+                        ..
+                    }),
+            }) => assert_eq!(
+                expose_authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--expose-authorization-mode",
+                "bearer-passthrough",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn service_expose_accepts_positional_target_port_and_service() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -6578,11 +6854,13 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        authorization_mode,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service.as_deref(), Some("api"));
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
@@ -6600,12 +6878,41 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        authorization_mode,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service, None);
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
             }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_parses_bearer_passthrough() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "expose",
+            "my-sandbox",
+            "4500",
+            "--authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("service authorization mode should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        authorization_mode, ..
+                    }),
+            }) => assert_eq!(
+                authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
             other => panic!("expected service expose command, got: {other:?}"),
         }
     }
@@ -6622,6 +6929,7 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");

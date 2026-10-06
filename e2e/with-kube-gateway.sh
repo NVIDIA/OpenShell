@@ -75,7 +75,7 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 # Upstream agent-sandbox release. The Kubernetes driver supports the v1beta1
 # Sandbox API introduced in v0.5.0 and falls back to v1alpha1 for v0.4.6
 # clusters. Override this env var to exercise the v1alpha1 controller release.
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v1.0.3}"
 
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
@@ -117,6 +117,8 @@ VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
+CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
+CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
@@ -520,6 +522,11 @@ cleanup() {
       --ignore-not-found >/dev/null 2>&1 || true
   fi
 
+  if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
+    kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+
   if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
     oc adm policy remove-scc-from-user privileged \
       --context "${KUBE_CONTEXT}" \
@@ -645,12 +652,10 @@ run_scenario() {
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
+    "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
+    "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
+    "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
     "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
@@ -933,6 +938,17 @@ else
   IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
+GATEWAY_IMAGE="$(e2e_resolve_image_reference "${GATEWAY_IMAGE:-${REGISTRY_VALUE}/gateway}" "${IMAGE_TAG_VALUE}")"
+SUPERVISOR_IMAGE="$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE:-${REGISTRY_VALUE}/supervisor}" "${IMAGE_TAG_VALUE}")"
+SANDBOX_RUNTIME_IMAGE="$(e2e_resolve_image_reference "${SANDBOX_IMAGE:-${REGISTRY_VALUE}/sandbox}" "${IMAGE_TAG_VALUE}")"
+BUILD_GATEWAY_IMAGE="${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}"
+BUILD_SUPERVISOR_IMAGE="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+# Each image carries its own registry; clear the chart's default so a
+# registry-less local tag is not rewritten to ghcr.io.
+GLOBAL_HELM_IMAGE_ARGS=(--set-string "global.image.registry=")
+GATEWAY_HELM_IMAGE_ARGS=(--set-string "gateway.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")" --set-string "gateway.image.repository=$(e2e_image_reference_repository_path "${GATEWAY_IMAGE}")" --set-string "gateway.image.tag=$(e2e_image_reference_tag "${GATEWAY_IMAGE}")" --set-string "gateway.image.digest=$(e2e_image_reference_digest "${GATEWAY_IMAGE}")")
+SUPERVISOR_HELM_IMAGE_ARGS=(--set-string "supervisor.image.registry=$(e2e_image_reference_registry "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.repository=$(e2e_image_reference_repository_path "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.tag=$(e2e_image_reference_tag "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.digest=$(e2e_image_reference_digest "${SUPERVISOR_IMAGE}")")
+SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e2e_image_reference_registry "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.repository=$(e2e_image_reference_repository_path "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.tag=$(e2e_image_reference_tag "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.digest=$(e2e_image_reference_digest "${SANDBOX_RUNTIME_IMAGE}")")
 
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
@@ -1025,7 +1041,7 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
 fi
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
-  echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,sandbox,supervisor}:${IMAGE_TAG_VALUE})..."
+  echo "Building local Kubernetes e2e images (${BUILD_GATEWAY_IMAGE}, ${BUILD_SUPERVISOR_IMAGE})..."
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     if [ "$(uname -s)" != "Linux" ]; then
       echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
@@ -1033,12 +1049,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     fi
     external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
     external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
-    # The test image uses a distroless runtime, so keep Z3 self-contained just
-    # like the production gateway image artifact. A host-linked debug binary
-    # would otherwise require libz3.so from the CI build machine at runtime.
     if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
       cargo build -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry,bundled-z3
+        --no-default-features --features telemetry,vendored-z3
     fi
     if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
       cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
@@ -1054,9 +1067,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     cp "${external_driver}" "${external_stage}/openshell-driver-kubernetes"
     docker build \
       --build-arg "TARGETARCH=${external_arch}" \
-      --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+      --build-arg "SUPERVISOR_IMAGE=${BUILD_SUPERVISOR_IMAGE}" \
       --build-arg "SANDBOX_RUNTIME_IMAGE=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
-      --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+      --tag "${BUILD_GATEWAY_IMAGE}" \
       --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
       "${ROOT}"
   else
@@ -1064,7 +1077,11 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
   fi
   sandbox_image="${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}"
-  supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  if [ "${GATEWAY_IMAGE}" != "${BUILD_GATEWAY_IMAGE}" ]; then
+    if e2e_image_reference_has_digest "${GATEWAY_IMAGE}"; then echo "ERROR: digest-pinned GATEWAY_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    docker tag "${BUILD_GATEWAY_IMAGE}" "${GATEWAY_IMAGE}"
+  fi
+  supervisor_image="${BUILD_SUPERVISOR_IMAGE}"
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${sandbox_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
@@ -1072,6 +1089,13 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   else
     reuse_sandbox_image=1
     echo "Reusing existing sandbox image ${sandbox_image}"
+  fi
+  if [ "${SANDBOX_RUNTIME_IMAGE}" != "${sandbox_image}" ]; then
+    if e2e_image_reference_has_digest "${SANDBOX_RUNTIME_IMAGE}"; then
+      echo "ERROR: digest-pinned SANDBOX_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2
+      exit 2
+    fi
+    docker tag "${sandbox_image}" "${SANDBOX_RUNTIME_IMAGE}"
   fi
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
@@ -1081,13 +1105,18 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     reuse_supervisor_image=1
     echo "Reusing existing supervisor image ${supervisor_image}"
   fi
+  if [ "${SUPERVISOR_IMAGE}" != "${BUILD_SUPERVISOR_IMAGE}" ]; then
+    if e2e_image_reference_has_digest "${SUPERVISOR_IMAGE}"; then echo "ERROR: digest-pinned SUPERVISOR_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    docker tag "${BUILD_SUPERVISOR_IMAGE}" "${SUPERVISOR_IMAGE}"
+  fi
 fi
 
 if [ -n "${import_cluster_name}" ]; then
   for image in \
-    "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+    "${GATEWAY_IMAGE}" \
     "${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
-    "${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"; do
+    "${SUPERVISOR_IMAGE}" \
+    "${SANDBOX_RUNTIME_IMAGE}"; do
     if docker image inspect "${image}" >/dev/null 2>&1; then
       echo "Importing ${image} into k3d cluster ${import_cluster_name}..."
       k3d image import "${image}" --cluster "${import_cluster_name}" \
@@ -1098,16 +1127,18 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
    && [[ "${KUBE_CONTEXT}" == kind-* ]] \
    && command -v kind >/dev/null 2>&1; then
   kind_cluster_name="${KUBE_CONTEXT#kind-}"
-  kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  kind_images=("${GATEWAY_IMAGE}")
   # The CI workflow loads its published sandbox archive before invoking this
-  # wrapper. Only load a sandbox image here when this script rebuilt it.
-  if [ "${reuse_sandbox_image}" != "1" ]; then
-    kind_images+=("${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}")
+  # wrapper. Load a replacement only when this script rebuilt or retagged it.
+  if [ "${reuse_sandbox_image}" != "1" ] \
+     || [ "${SANDBOX_RUNTIME_IMAGE}" != "${sandbox_image}" ]; then
+    kind_images+=("${SANDBOX_RUNTIME_IMAGE}")
   fi
   # The CI workflow loads its published supervisor archive before invoking this
   # wrapper. Only load a supervisor image here when this script rebuilt it.
-  if [ "${reuse_supervisor_image}" != "1" ]; then
-    kind_images+=("${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
+  if [ "${reuse_supervisor_image}" != "1" ] \
+     || [ "${SUPERVISOR_IMAGE}" != "${BUILD_SUPERVISOR_IMAGE}" ]; then
+    kind_images+=("${SUPERVISOR_IMAGE}")
   fi
   for image in "${kind_images[@]}"; do
     echo "Loading ${image} into kind cluster ${kind_cluster_name}..."
@@ -1196,9 +1227,15 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
     export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
   fi
   CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
+  # `https-ca` terminates TLS on the proxy listener itself, so the supervisor
+  # must trust the operator CA bundle before it can even issue CONNECT.
+  CORPORATE_PROXY_SCHEME="http"
+  if [ "${CORPORATE_PROXY_MODE}" = "https-ca" ]; then
+    CORPORATE_PROXY_SCHEME="https"
+  fi
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
 upstreamProxy:
-  url: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
+  url: ${CORPORATE_PROXY_SCHEME}://host.openshell.internal:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
@@ -1218,6 +1255,55 @@ EOF
       kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
         --from-literal=proxy-auth=malformed --dry-run=client -o yaml | kctl apply -f -
       CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    https-ca)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=proxyuser:proxypass --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+
+      # Mint a private CA and a listener leaf for the proxy. The leaf must be
+      # CA:FALSE with a serverAuth EKU, or rustls rejects it regardless of
+      # whether the issuing CA is trusted.
+      CORPORATE_PROXY_TLS_DIR="${WORKDIR}/corporate-proxy-tls"
+      mkdir -p "${CORPORATE_PROXY_TLS_DIR}"
+      openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -keyout "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        -subj "/CN=OpenShell E2E Corporate Proxy CA" >/dev/null 2>&1
+      openssl req -newkey rsa:2048 -nodes \
+        -keyout "${CORPORATE_PROXY_TLS_DIR}/proxy.key" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
+        -subj "/CN=host.openshell.internal" >/dev/null 2>&1
+      cat >"${CORPORATE_PROXY_TLS_DIR}/leaf.ext" <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:host.openshell.internal
+EXT
+      openssl x509 -req -days 1 \
+        -in "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
+        -CA "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        -CAkey "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
+        -CAcreateserial \
+        -extfile "${CORPORATE_PROXY_TLS_DIR}/leaf.ext" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.crt" >/dev/null 2>&1
+
+      # The CA ConfigMap belongs to the gateway release namespace: the gateway
+      # reads it and stages the bundle per sandbox, so it is never sourced
+      # from a workload namespace.
+      kctl -n "${NAMESPACE}" create configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
+        --from-file=ca.crt="${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=1
+      cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
+  caBundle:
+    configMapName: ${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}
+EOF
+      OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.crt")"
+      OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.key")"
+      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT
+      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY
       ;;
     missing-secret) ;;
     *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;
@@ -1299,12 +1385,10 @@ else
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
+    "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
+    "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
+    "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
@@ -1316,6 +1400,9 @@ else
       --docker-server=registry.example.test \
       --docker-username=e2e-user \
       --docker-password=e2e-password
+    kctl -n "${NAMESPACE}" label secret \
+      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      openshell.ai/sandbox-attachable=true
   fi
 
   if [ "${OPENSHIFT_DETECTED}" = "1" ]; then

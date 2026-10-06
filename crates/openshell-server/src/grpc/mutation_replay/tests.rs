@@ -7,7 +7,8 @@ use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
     CreateSandboxRequest, SandboxServiceExposure, SandboxSpec, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, WorkspaceMember, WorkspaceRole,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    WorkspaceMember, WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -113,6 +114,7 @@ async fn create_sandbox_replay_preserves_service_urls() {
         service_exposures: vec![SandboxServiceExposure {
             service: "web".into(),
             target_port: 8080,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         }],
         request_id: uuid::Uuid::new_v4().to_string(),
         ..Default::default()
@@ -124,13 +126,26 @@ async fn create_sandbox_replay_preserves_service_urls() {
         .unwrap()
         .into_inner();
     let replay = service
-        .create_sandbox(authed_request(request))
+        .create_sandbox(authed_request(request.clone()))
         .await
         .unwrap();
 
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
     assert_eq!(replay.get_ref().service_urls, original.service_urls);
     assert_eq!(replay.into_inner(), original);
+
+    let mut changed_authorization = request;
+    changed_authorization.service_exposures[0].authorization_mode =
+        ServiceAuthorizationMode::BearerPassthrough as i32;
+    assert_eq!(
+        reason(
+            &service
+                .create_sandbox(authed_request(changed_authorization))
+                .await
+                .unwrap_err()
+        ),
+        "REQUEST_ID_PAYLOAD_MISMATCH"
+    );
 }
 
 async fn exercise_backend(url: &str) {
@@ -733,6 +748,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         format_version: 1,
         payload_hash: "unused".into(),
         workspace_id: None,
+        target_id: None,
         success: None,
         completed_at_ms: None,
     };

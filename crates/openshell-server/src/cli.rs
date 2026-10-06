@@ -6,7 +6,7 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use openshell_core::config::{ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
@@ -180,10 +180,9 @@ struct RunArgs {
     )]
     oidc_jwks_allowed_origins: Vec<String>,
 
-    /// Enable mTLS client certificate authentication for local single-user gateways.
+    /// Enable mTLS client certificate authentication for gateway users.
     ///
-    /// When unset, this defaults on for drivers registered as local
-    /// single-player backends when client certificate verification is
+    /// When unset, this defaults on when client certificate verification is
     /// configured and no OIDC issuer is present.
     #[arg(
         long = "enable-mtls-auth",
@@ -240,6 +239,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
     grpc_rate_limit_window_seconds: Option<u64>,
 
+    /// Supervisor configuration delivery. Push sends shadow snapshots in this release.
+    #[arg(long, env = "OPENSHELL_CONFIG_DELIVERY_MODE")]
+    config_delivery_mode: Option<ConfigDeliveryMode>,
+
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[arg(
@@ -257,6 +260,15 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_loopback_service_http: bool,
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_ENABLE_WEBSOCKET_TUNNEL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_websocket_tunnel: bool,
 }
 
 pub fn command() -> Command {
@@ -278,7 +290,12 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
         Some(Commands::Config(args)) => match args.command {
             ConfigCommand::Preflight(args) => {
-                run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)
+                let driver =
+                    run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)?;
+                for report in preflight_host_tools(driver).await? {
+                    println!("{report}");
+                }
+                Ok(())
             }
         },
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
@@ -348,8 +365,6 @@ fn prepare_server_config_with_drivers(
     let compute_driver = compute_drivers
         .select(args.compute_driver.as_deref())
         .map_err(|error| miette::miette!("{error}"))?;
-    let selected_registration = compute_drivers.get(compute_driver.name());
-
     let local_tls = apply_runtime_defaults(args)?;
     let guest_tls = GuestTlsPaths::resolve(
         file.as_ref().map(|file| &file.openshell.gateway),
@@ -357,14 +372,20 @@ fn prepare_server_config_with_drivers(
         args.disable_tls,
     )
     .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
-    let local_jwt = defaults::complete_local_jwt_config()?;
+    // Explicit signing configuration must not depend on an unrelated, partial
+    // local bundle left by a package-managed installation.
+    let explicit_jwt = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.gateway_jwt.clone());
+    let gateway_jwt = match explicit_jwt {
+        Some(jwt) => Some(jwt),
+        None => defaults::complete_local_jwt_config()?,
+    };
 
     let bind = SocketAddr::new(args.bind_address, args.port);
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let has_oidc = args.oidc_issuer.is_some();
-    let mtls_auth_enabled =
-        resolve_mtls_auth_enabled(args, matches, file.as_ref(), selected_registration);
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file.as_ref());
 
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
@@ -381,14 +402,6 @@ fn prepare_server_config_with_drivers(
             "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
         ));
     }
-    if mtls_auth_enabled
-        && selected_registration.is_some_and(|registration| !registration.supports_mtls_user_auth())
-    {
-        return Err(miette::miette!(
-            "mTLS user authentication is not supported with the selected compute driver. Configure OIDC or a trusted fronting proxy for user authentication."
-        ));
-    }
-
     let tls = if args.disable_tls {
         None
     } else {
@@ -416,7 +429,11 @@ fn prepare_server_config_with_drivers(
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
-            require_client_auth: has_client_ca && !has_oidc,
+            // Sandboxes authenticate at the application layer with bearer
+            // identity, so TLS must permit clients without certificates.
+            // When present, CLI certificates are still verified and may be
+            // promoted to users by the independently configured mTLS policy.
+            require_client_auth: false,
             client_ca_path: args.tls_client_ca.clone(),
             external_cert_path: ext_cert,
             external_key_path: ext_key,
@@ -508,7 +525,8 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
-        .with_loopback_service_http(args.enable_loopback_service_http);
+        .with_loopback_service_http(args.enable_loopback_service_http)
+        .with_websocket_tunnel(args.enable_websocket_tunnel);
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -549,6 +567,25 @@ fn prepare_server_config_with_drivers(
     {
         config.policy_validation_failure_mode = mode;
     }
+    config.config_delivery_mode = args
+        .config_delivery_mode
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|f| f.openshell.gateway.config_delivery_mode)
+        })
+        .unwrap_or_default();
+
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.image_preparation_timeout_seconds)
+    {
+        if !(1..=86_400).contains(&seconds) {
+            return Err(miette::miette!(
+                "image_preparation_timeout_seconds must be between 1 and 86400"
+            ));
+        }
+        config.image_preparation_timeout_seconds = seconds;
+    }
 
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
@@ -568,14 +605,7 @@ fn prepare_server_config_with_drivers(
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
-    if let Some(jwt) = file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
-    {
-        config.gateway_jwt = Some(jwt);
-    } else if let Some(jwt) = local_jwt {
-        config.gateway_jwt = Some(jwt);
-    }
+    config.gateway_jwt = gateway_jwt;
 
     Ok(ServerStartupConfig {
         config,
@@ -593,7 +623,23 @@ async fn run_from_args(
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
 
+    // Initialize OCSF identity before tracing can emit gateway events.
+    let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
+        name: prepared.config.name.clone(),
+        hostname: crate::compute::lease::replica_id(),
+    };
+    if !crate::gateway_ocsf::set_identity(gateway_identity) {
+        tracing::debug!("gateway OCSF identity already initialized, keeping existing");
+    }
+
     let tracing_log_bus = TracingLogBus::new();
+    let ocsf_log = prepared
+        .config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.ocsf_log.clone())
+        .map(crate::ocsf_log::OcsfLog::start)
+        .transpose()
+        .into_diagnostic()?;
     let otlp_config = prepared
         .config_file
         .as_ref()
@@ -607,9 +653,11 @@ async fn run_from_args(
         &prepared.config.compute_driver_endpoints,
     );
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        &EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
+            .to_string(),
         &tracing_log_bus,
+        ocsf_log.as_ref(),
         otlp_config,
         compute_driver_tracing,
         gateway_resource,
@@ -677,6 +725,10 @@ async fn run_from_args(
 
     tracing_handle.shutdown();
 
+    if let Some(log) = ocsf_log {
+        log.shutdown().await;
+    }
+
     result.into_diagnostic()
 }
 
@@ -728,7 +780,7 @@ fn run_config_preflight(
         Some(detect_preflight_test_driver),
         PreflightTestFactory,
     )?)?;
-    run_config_preflight_with_drivers(args, run, matches, &registry)
+    run_config_preflight_with_drivers(args, run, matches, &registry).map(|_| ())
 }
 
 fn run_config_preflight_with_drivers(
@@ -736,7 +788,7 @@ fn run_config_preflight_with_drivers(
     run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     if args.gateway_args.is_empty() {
         return run_effective_config_preflight(args.path, run, matches, compute_drivers);
     }
@@ -751,7 +803,7 @@ fn run_config_preflight_with_drivers(
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(error) => return Err(miette::miette!("{error}")),
     };
@@ -760,7 +812,7 @@ fn run_config_preflight_with_drivers(
     if replay.command.is_some() {
         // A valid non-daemon action does not consume gateway startup
         // configuration. Let the immediately following invocation perform it.
-        return Ok(());
+        return Ok(None);
     }
     run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
 }
@@ -770,7 +822,7 @@ fn run_effective_config_preflight(
     mut run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     let path = if path_override.is_some() {
         path_override
     } else {
@@ -798,12 +850,9 @@ fn run_effective_config_preflight(
             .map(|driver| compute_drivers.select(Some(driver)))
             .transpose()
             .map_err(|error| miette::miette!("{error}"))?;
-        let selected_registration = selection
-            .as_ref()
-            .and_then(|selection| compute_drivers.get(selection.name()));
         let empty_file = ConfigFile::default();
         let semantic_file = file.as_ref().unwrap_or(&empty_file);
-        validate_preflight_semantics(&run, matches, semantic_file, selected_registration)?;
+        validate_preflight_semantics(&run, matches, semantic_file)?;
 
         let mut endpoint_overrides = BTreeMap::new();
         if let Some(selection) = selection.as_ref()
@@ -818,8 +867,9 @@ fn run_effective_config_preflight(
             gateway_tls_enabled: !run.disable_tls,
             endpoint_overrides: &endpoint_overrides,
         };
+        let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
-            crate::validate_compute_driver_config(
+            selected_driver = Some(crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
                 run.name.trim(),
@@ -827,7 +877,7 @@ fn run_effective_config_preflight(
                 &run.log_level,
                 driver_startup,
                 true,
-            )?;
+            )?);
         } else if file.is_some() {
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
@@ -849,11 +899,11 @@ fn run_effective_config_preflight(
                 )?;
             }
         }
-        Ok(())
+        Ok(selected_driver)
     })();
 
     match (validation, path.as_ref()) {
-        (Ok(()), _) => Ok(()),
+        (Ok(driver), _) => Ok(driver),
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
             config_file::ConfigPreflightError::invalid_current(path)
@@ -862,11 +912,60 @@ fn run_effective_config_preflight(
     }
 }
 
+/// Run executable probes outside the pure configuration-validation context.
+async fn preflight_host_tools(
+    driver: Option<crate::ConfiguredComputeDriver>,
+) -> Result<Vec<String>> {
+    match driver {
+        Some(crate::ConfiguredComputeDriver::Registered(registration)) => {
+            let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                // Register before polling the hook: a probe owns a separate
+                // process group, so default CLI termination cannot clean it up.
+                let mut interrupt = signal(SignalKind::interrupt())
+                    .map_err(|error| miette::miette!("register preflight SIGINT: {error}"))?;
+                let mut terminate = signal(SignalKind::terminate())
+                    .map_err(|error| miette::miette!("register preflight SIGTERM: {error}"))?;
+                let check = registration.factory.preflight_host_tools(cancellation_rx);
+                tokio::pin!(check);
+                let reason = tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                    result = &mut check => return result.map_err(|error| miette::miette!("{error}")),
+                };
+                cancellation_tx.send_replace(true);
+                // The hook owns its children. Await its cancellation cleanup
+                // before the short-lived CLI shuts down the Tokio runtime.
+                let _ = check.await;
+                Err(miette::miette!(
+                    "host tool preflight interrupted by {reason}"
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                let _cancellation_tx = cancellation_tx;
+                registration
+                    .factory
+                    .preflight_host_tools(cancellation_rx)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))
+            }
+        }
+        Some(crate::ConfiguredComputeDriver::Remote { name }) => Ok(vec![format!(
+            "compute driver '{name}': host tool checks not performed for a remote endpoint; run preflight on the driver host with its service account and environment"
+        )]),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn validate_preflight_semantics(
     args: &RunArgs,
     matches: &ArgMatches,
     file: &ConfigFile,
-    selected_registration: Option<&crate::ComputeDriverRegistration>,
 ) -> Result<()> {
     let gateway = &file.openshell.gateway;
     validate_grpc_rate_limit_args(
@@ -877,8 +976,7 @@ fn validate_preflight_semantics(
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let mtls_auth_enabled =
-        resolve_mtls_auth_enabled(args, matches, Some(file), selected_registration);
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, Some(file));
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
             "--disable-tls and --tls-client-ca are mutually exclusive"
@@ -890,13 +988,6 @@ fn validate_preflight_semantics(
     if mtls_auth_enabled && !has_client_ca {
         return Err(miette::miette!(
             "mTLS user authentication requires --tls-client-ca"
-        ));
-    }
-    if mtls_auth_enabled
-        && selected_registration.is_some_and(|registration| !registration.supports_mtls_user_auth())
-    {
-        return Err(miette::miette!(
-            "mTLS user authentication is not supported with the selected compute driver"
         ));
     }
     if !args.disable_tls && args.tls_cert.is_some() != args.tls_key.is_some() {
@@ -1089,6 +1180,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_loopback_service_http = enabled;
     }
+    if let Some(enabled) = file.enable_websocket_tunnel
+        && arg_defaulted(matches, "enable_websocket_tunnel")
+    {
+        args.enable_websocket_tunnel = enabled;
+    }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
     {
@@ -1203,15 +1299,10 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn is_singleplayer_driver(registration: Option<&crate::ComputeDriverRegistration>) -> bool {
-    registration.is_some_and(crate::ComputeDriverRegistration::is_local_singleplayer)
-}
-
 fn resolve_mtls_auth_enabled(
     args: &RunArgs,
     matches: &ArgMatches,
     file: Option<&ConfigFile>,
-    selected_registration: Option<&crate::ComputeDriverRegistration>,
 ) -> bool {
     let file_configured = file
         .and_then(|f| f.openshell.gateway.mtls_auth.as_ref())
@@ -1224,7 +1315,7 @@ fn resolve_mtls_auth_enabled(
         return false;
     }
 
-    is_singleplayer_driver(selected_registration)
+    true
 }
 
 #[cfg(test)]
@@ -1308,14 +1399,11 @@ mod tests {
         }
     }
 
-    fn test_registry(name: &str, singleplayer: bool, mtls: bool) -> crate::ComputeDriverRegistry {
+    fn test_registry(name: &str, singleplayer: bool) -> crate::ComputeDriverRegistry {
         let mut registration =
             crate::ComputeDriverRegistration::new(name, 100, None, TestFactory).unwrap();
         if singleplayer {
             registration = registration.with_local_singleplayer();
-        }
-        if !mtls {
-            registration = registration.without_mtls_user_auth();
         }
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
@@ -1438,6 +1526,30 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn websocket_tunnel_is_disabled_by_default_and_can_be_enabled_from_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_WEBSOCKET_TUNNEL");
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        assert!(!args.enable_websocket_tunnel);
+
+        let file = config_file_from_toml("[openshell.gateway]\nenable_websocket_tunnel = true\n");
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(args.enable_websocket_tunnel);
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-websocket-tunnel=false",
+        ]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(!args.enable_websocket_tunnel, "CLI flag must override file");
     }
 
     #[test]
@@ -1611,7 +1723,7 @@ mod tests {
             "sqlite::memory:",
             "--disable-tls",
         ]);
-        let registry = test_registry("podman", true, true);
+        let registry = test_registry("podman", true);
 
         let prepared =
             super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
@@ -1897,7 +2009,7 @@ mod tests {
         let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
         let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "podman,docker");
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
-        let registry = test_registry("podman", true, true);
+        let registry = test_registry("podman", true);
 
         let error = super::run_config_preflight_with_drivers(
             super::ConfigPreflightArgs::default(),
@@ -2086,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn config_preflight_applies_selected_driver_mtls_capability() {
+    fn config_preflight_allows_driver_independent_mtls() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2108,16 +2220,15 @@ mod tests {
             "--enable-mtls-auth",
             "true",
         ]);
-        let registry = test_registry("shared", false, false);
+        let registry = test_registry("shared", false);
 
-        let error = super::run_config_preflight_with_drivers(
+        super::run_config_preflight_with_drivers(
             super::ConfigPreflightArgs::default(),
             run,
             &matches,
             &registry,
         )
-        .expect_err("selected shared driver must reject mTLS user authentication");
-        assert!(error.to_string().contains("not supported"));
+        .expect("gateway mTLS authentication is independent of the selected driver");
     }
 
     #[test]
@@ -2251,7 +2362,7 @@ mod tests {
             ),
             (
                 "guest-tls",
-                "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\n",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\ndisable_tls = true\n",
             ),
             (
                 "external-tls",
@@ -2346,7 +2457,7 @@ mod tests {
         let path = dir.path().join("gateway.toml");
         std::fs::write(
             &path,
-            "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/future/ca.pem'\nguest_tls_cert = '/future/client.pem'\nguest_tls_key = '/future/client-key.pem'\n",
+            "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/future/ca.pem'\n",
         )
         .unwrap();
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
@@ -2558,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_client_certificate_requirement_is_derived_from_ca_and_oidc() {
+    fn tls_accepts_bearer_clients_with_and_without_oidc() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2566,9 +2677,9 @@ mod tests {
         let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
         let _config_path = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
         let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
-        let registry = test_registry("shared", false, false);
+        let registry = test_registry("shared", false);
 
-        for (oidc_issuer, expected) in [(None, true), (Some("https://idp.example.com"), false)] {
+        for (oidc_issuer, expected) in [(None, false), (Some("https://idp.example.com"), false)] {
             let mut startup_args = vec![
                 "openshell-gateway",
                 "--db-url",
@@ -2598,7 +2709,7 @@ mod tests {
     }
 
     #[test]
-    fn mtls_auth_auto_defaults_for_local_tls_driver() {
+    fn mtls_auth_auto_defaults_when_client_ca_is_configured() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2618,12 +2729,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            test_registry("local", true, true).get("local")
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -2658,11 +2764,20 @@ mod tests {
         assert_eq!(prepared.compute_driver.name(), "local");
         assert!(prepared.config.compute_driver.is_none());
         assert!(prepared.config.mtls_auth.enabled);
+        assert!(
+            !prepared
+                .config
+                .tls
+                .as_ref()
+                .expect("TLS config")
+                .require_client_auth,
+            "sandbox bearer clients must be allowed through the TLS handshake"
+        );
         assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn mtls_auth_does_not_auto_default_for_shared_driver() {
+    fn mtls_auth_default_is_driver_independent() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2682,12 +2797,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(!super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            test_registry("shared", false, false).get("shared")
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -2722,8 +2832,7 @@ enabled = false
         assert!(!super::resolve_mtls_auth_enabled(
             &args,
             &matches,
-            Some(&file),
-            test_registry("local", true, true).get("local")
+            Some(&file)
         ));
     }
 
@@ -3029,15 +3138,6 @@ ssh_session_ttl_secs = 1234
     }
 
     #[test]
-    fn singleplayer_behavior_comes_from_registration() {
-        let local = test_registry("local", true, true);
-        assert!(super::is_singleplayer_driver(local.get("local")));
-
-        let shared = test_registry("shared", false, true);
-        assert!(!super::is_singleplayer_driver(shared.get("shared")));
-    }
-
-    #[test]
     fn compute_driver_socket_flag_uses_explicit_driver_name() {
         let _lock = ENV_LOCK
             .lock()
@@ -3231,6 +3331,7 @@ version = 2
 
 [openshell.gateway]
 policy_validation_failure_mode = "retain_last_valid"
+image_preparation_timeout_seconds = 2400
 
 [openshell.drivers.docker]
 unknown_docker_key = true
@@ -3256,6 +3357,7 @@ mem_mib = "not-a-number"
             super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
 
         assert_eq!(prepared.config.compute_driver.as_deref(), Some("podman"));
+        assert_eq!(prepared.config.image_preparation_timeout_seconds, 2400);
         assert_eq!(
             prepared.config.policy_validation_failure_mode,
             openshell_core::PolicyValidationFailureMode::RetainLastValid
@@ -3263,5 +3365,88 @@ mem_mib = "not-a-number"
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_image_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _tls = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+        let config_path = state.path().join("gateway.toml");
+        for seconds in [0, 86_401] {
+            std::fs::write(&config_path, format!(
+                "[openshell]\nversion = 2\n[openshell.gateway]\nimage_preparation_timeout_seconds = {seconds}\n"
+            )).unwrap();
+            let (mut args, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "podman",
+                "--disable-tls",
+            ]);
+            let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                panic!("unbounded preparation must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("image_preparation_timeout_seconds must be between 1 and 86400")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_launch_signing_config_ignores_partial_local_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", directory.path().to_str().unwrap());
+        let _local = EnvVarGuard::set(
+            "OPENSHELL_LOCAL_TLS_DIR",
+            directory.path().to_str().unwrap(),
+        );
+        std::fs::create_dir(directory.path().join("jwt")).unwrap();
+        std::fs::write(
+            directory.path().join("jwt/signing.pem"),
+            "incomplete local bundle",
+        )
+        .unwrap();
+        let config_path = directory.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/explicit/signing.pem"
+public_key_path = "/explicit/public.pem"
+kid_path = "/explicit/kid"
+gateway_id = "explicit-gateway"
+"#,
+        )
+        .unwrap();
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+        let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+        assert_eq!(
+            prepared.config.gateway_jwt.unwrap().gateway_id,
+            "explicit-gateway"
+        );
     }
 }

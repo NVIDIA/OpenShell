@@ -16,6 +16,10 @@ use openshell_core::policy::{
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
+use openshell_policy_schema::{
+    FilesystemPolicy as AuthoredFilesystemPolicy, LandlockPolicy as AuthoredLandlockPolicy,
+    ProcessPolicy as AuthoredProcessPolicy,
+};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -24,6 +28,8 @@ use std::sync::{
 };
 use tokio::sync::watch;
 use tracing::info;
+
+mod raw_schema;
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -73,6 +79,8 @@ pub struct MatchedEndpoint {
 pub struct PolicyDnsEligibilitySnapshot {
     pub endpoints: Vec<MatchedEndpoint>,
     pub generation: u64,
+    /// The generation is a fail-closed quarantine, so every name is refused.
+    pub fail_closed: bool,
 }
 
 /// Atomic policy result used to authorize and materialize one egress request.
@@ -645,7 +653,7 @@ impl OpaEngine {
     /// The owned endpoint records and generation are captured while holding
     /// the engine lock, so reloads cannot mix data from one generation with
     /// the generation number of another. Fail-closed quarantine produces an
-    /// empty snapshot for its quarantine generation.
+    /// empty snapshot, marked `fail_closed`, for its quarantine generation.
     pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
         let mut engine = self
             .engine
@@ -662,6 +670,7 @@ impl OpaEngine {
             return Ok(PolicyDnsEligibilitySnapshot {
                 endpoints: Vec::new(),
                 generation,
+                fail_closed: true,
             });
         }
 
@@ -679,6 +688,7 @@ impl OpaEngine {
         Ok(PolicyDnsEligibilitySnapshot {
             endpoints,
             generation,
+            fail_closed: false,
         })
     }
 
@@ -921,22 +931,24 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        // Query filesystem policy
+        // Evaluation errors can include authored Rego source. Regorus may
+        // evaluate other rules while resolving any one query, so report the
+        // static-settings operation without attributing it to a single rule.
         let fs_val = engine
             .eval_rule("data.openshell.sandbox.filesystem_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let filesystem = parse_filesystem_policy(&fs_val);
 
         // Query landlock policy
         let ll_val = engine
             .eval_rule("data.openshell.sandbox.landlock_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let landlock = parse_landlock_policy(&ll_val);
 
         // Query process policy
         let proc_val = engine
             .eval_rule("data.openshell.sandbox.process_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let process = parse_process_policy(&proc_val);
 
         Ok(SandboxConfig {
@@ -1478,6 +1490,48 @@ fn validate_opa_object_array<'a>(
     Ok(entries)
 }
 
+/// Validate static sections with the authored types while retaining OPA-only data.
+/// Keep schema errors and their source chains out of load diagnostics because
+/// they can contain authored keys, paths, or values.
+fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
+    if let Some(filesystem) = data.get_mut("filesystem_policy") {
+        let settings: AuthoredFilesystemPolicy = serde_json::from_value(filesystem.clone())
+            .map_err(|_| miette::miette!("invalid filesystem policy settings"))?;
+        openshell_policy::validate_filesystem_paths(&settings.read_only, &settings.read_write)
+            .map_err(|violations| {
+                miette::miette!(render_bounded_validation_diagnostics(
+                    "invalid filesystem policy settings",
+                    violations.iter().map(redacted_policy_violation_category),
+                ))
+            })?;
+        // A present stanza defaults to false; an absent stanza must stay absent
+        // so Rego's undefined result retains the runtime workdir default.
+        filesystem["include_workdir"] = settings.include_workdir.into();
+    }
+    if let Some(landlock) = data.get_mut("landlock") {
+        let settings: AuthoredLandlockPolicy = serde_json::from_value(landlock.clone())
+            .map_err(|_| miette::miette!("invalid Landlock policy settings"))?;
+        // Serde also accepts a map for a unit enum variant. Runtime consumers
+        // read a string, so retain the validated meaning in canonical form.
+        *landlock = serde_json::to_value(settings)
+            .map_err(|_| miette::miette!("failed to serialize Landlock policy settings"))?;
+    }
+    if let Some(process) = data.get("process") {
+        let settings = serde_json::from_value::<AuthoredProcessPolicy>(process.clone())
+            .map_err(|_| miette::miette!("invalid process policy settings"))?;
+        // Omitted identities are resolved by the compute runtime. Explicit
+        // values follow the same non-root identity contract as typed policy.
+        for identity in [&settings.run_as_user, &settings.run_as_group] {
+            if !identity.is_empty() && !openshell_policy::is_valid_sandbox_identity(identity) {
+                return Err(miette::miette!(
+                    "invalid process policy settings: invalid process identity"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Select a fixed category without formatting authored fields or nested reasons.
 /// Keep this match exhaustive so new validator variants require an explicit
 /// decision before their diagnostics can cross the supervisor load boundary.
@@ -1593,6 +1647,8 @@ fn preprocess_yaml_data(
         )
     })?;
     validate_opa_data_structure(&data)?;
+    raw_schema::validate_network_settings(&data)?;
+    validate_opa_static_settings(&mut data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
     normalize_endpoint_protocols(&mut data);
 
@@ -1807,13 +1863,8 @@ fn normalize_l7_config_alias(
     let Some(config) = ep.get(key).cloned() else {
         return;
     };
-    if config.is_null() {
-        ep.remove(key);
-        if stanza == L7ConfigStanza::Mcp {
-            errors.push(format!("{loc}.{key}: mcp config must be an object"));
-        }
-        return;
-    }
+    // Explicit null must reach the canonical parser: it is invalid authored
+    // configuration, while an omitted stanza may select protocol defaults.
     match openshell_policy::l7_config_alias_runtime_fields(stanza, config) {
         Ok(fields) => {
             ep.remove(key);
@@ -4033,6 +4084,7 @@ process:
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
 
         assert_eq!(snapshot.generation, engine.current_generation());
+        assert!(!snapshot.fail_closed);
         assert_eq!(snapshot.endpoints.len(), 4);
         assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
         assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
@@ -4068,6 +4120,7 @@ process:
 
         assert_eq!(snapshot.generation, generation);
         assert!(snapshot.endpoints.is_empty());
+        assert!(snapshot.fail_closed);
     }
 
     #[test]
@@ -4248,6 +4301,442 @@ process:
             !decision.allowed,
             "percent-encoded dot should not be decoded by OPA glob"
         );
+    }
+
+    /// The typed schema gives an absent `filesystem_policy` the platform
+    /// default, `include_workdir: true`, and gives a present but empty stanza
+    /// `include_workdir: false`. Loading the same YAML directly into OPA must
+    /// agree in both cases, and versionless OPA data must follow the same rule
+    /// for a present empty stanza.
+    #[test]
+    fn yaml_and_proto_filesystem_policy_have_include_workdir_parity() {
+        for (data, expected) in [
+            ("version: 1\n", true),
+            ("version: 1\nfilesystem_policy: {}\n", false),
+        ] {
+            let proto = openshell_policy::parse_sandbox_policy(data)
+                .expect("fixture must parse into the typed schema");
+            let proto_config = OpaEngine::from_proto(&proto)
+                .expect("engine from protobuf")
+                .query_sandbox_config()
+                .expect("config from protobuf");
+            let yaml_config = OpaEngine::from_strings(TEST_POLICY, data)
+                .expect("engine from YAML")
+                .query_sandbox_config()
+                .expect("config from YAML");
+            assert_eq!(
+                proto_config.filesystem.include_workdir, expected,
+                "typed contract for {data:?}"
+            );
+            assert_eq!(
+                yaml_config.filesystem.include_workdir, expected,
+                "raw OPA loading for {data:?}"
+            );
+        }
+
+        let versionless = OpaEngine::from_strings(TEST_POLICY, "filesystem_policy: {}\n")
+            .expect("versionless OPA data must load")
+            .query_sandbox_config()
+            .expect("config from versionless OPA data");
+        assert!(
+            !versionless.filesystem.include_workdir,
+            "raw OPA loading of a versionless empty filesystem stanza"
+        );
+    }
+
+    #[test]
+    fn yaml_and_proto_landlock_policy_have_compatibility_parity() {
+        for (stanza, hard_requirement) in [
+            ("{}", false),
+            ("{compatibility: best_effort}", false),
+            ("{compatibility: hard_requirement}", true),
+            ("{compatibility: {best_effort: null}}", false),
+            ("{compatibility: {hard_requirement: null}}", true),
+        ] {
+            let versionless = format!("landlock: {stanza}\n");
+            let versioned = format!("version: 1\n{versionless}");
+            let proto = openshell_policy::parse_sandbox_policy(&versioned)
+                .expect("valid typed Landlock representation");
+            let typed = OpaEngine::from_proto(&proto)
+                .expect("typed engine")
+                .query_sandbox_config()
+                .expect("typed sandbox config");
+            assert_eq!(
+                matches!(
+                    typed.landlock.compatibility,
+                    LandlockCompatibility::HardRequirement
+                ),
+                hard_requirement,
+                "typed contract for {stanza}"
+            );
+            for data in [&versioned, &versionless] {
+                let raw = OpaEngine::from_strings(TEST_POLICY, data)
+                    .expect("valid raw Landlock representation")
+                    .query_sandbox_config()
+                    .expect("raw sandbox config");
+                assert_eq!(
+                    matches!(
+                        raw.landlock.compatibility,
+                        LandlockCompatibility::HardRequirement
+                    ),
+                    hard_requirement,
+                    "raw OPA loading for {data}"
+                );
+            }
+        }
+    }
+
+    /// Nested values that the typed schema rejects must also be rejected when
+    /// the same policy is loaded directly into OPA, with or without a
+    /// `version` key, instead of being replaced by defaults
+    /// (`include_workdir: true`, best-effort Landlock) or dropped. Each case
+    /// has a valid twin that both paths accept, so the test cannot pass by
+    /// rejecting valid input.
+    #[test]
+    fn raw_opa_loading_rejects_nested_values_the_typed_schema_rejects() {
+        const JSON_RPC_ENDPOINT: &str = r"network_policies:
+  rpc:
+    name: rpc
+    endpoints:
+      - host: jsonrpc.parity.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc: JSON_RPC_OPTIONS
+        rules:
+          - allow: { method: status.get }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+        // Each case is (name, invalid body, valid twin body). Bodies omit
+        // `version` so each invalid body is also loaded as versionless OPA data.
+        let cases = [
+            (
+                "string include_workdir",
+                "filesystem_policy: {include_workdir: \"false\"}\n".to_owned(),
+                "filesystem_policy: {include_workdir: false}\n".to_owned(),
+            ),
+            (
+                "non-string read_only entry",
+                "filesystem_policy: {read_only: [7]}\n".to_owned(),
+                "filesystem_policy: {read_only: [\"/usr\"]}\n".to_owned(),
+            ),
+            (
+                "non-string read_write entry",
+                "filesystem_policy: {read_write: [false]}\n".to_owned(),
+                "filesystem_policy: {read_write: [\"/tmp\"]}\n".to_owned(),
+            ),
+            (
+                "unknown filesystem field",
+                "filesystem_policy: {private_typo: false}\n".to_owned(),
+                "filesystem_policy: {}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock compatibility",
+                "landlock: {compatibility: required}\n".to_owned(),
+                "landlock: {compatibility: hard_requirement}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock field",
+                "landlock: {private_typo: true}\n".to_owned(),
+                "landlock: {}\n".to_owned(),
+            ),
+            (
+                "non-string process identity",
+                "process: {run_as_user: 7}\n".to_owned(),
+                "process: {run_as_user: sandbox}\n".to_owned(),
+            ),
+            (
+                "null process group",
+                "process: {run_as_group: null}\n".to_owned(),
+                "process: {run_as_group: sandbox}\n".to_owned(),
+            ),
+            (
+                "unknown process field",
+                "process: {private_typo: sandbox}\n".to_owned(),
+                "process: {}\n".to_owned(),
+            ),
+            (
+                "explicit null json_rpc options",
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "null"),
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "{ max_body_bytes: 32768 }"),
+            ),
+        ];
+
+        // Check every fixture before failing, so one run reports each input the
+        // raw loader accepts instead of stopping at the first.
+        let mut accepted_by_raw_opa = Vec::new();
+        for (case, invalid, valid) in &cases {
+            let valid = format!("version: 1\n{valid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&valid).is_ok(),
+                "typed schema must accept the valid {case} twin"
+            );
+            assert!(
+                OpaEngine::from_strings(TEST_POLICY, &valid).is_ok(),
+                "raw OPA loading must accept the valid {case} twin"
+            );
+
+            let versioned = format!("version: 1\n{invalid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned).is_err(),
+                "typed schema must reject the {case} fixture"
+            );
+            for (form, data) in [("versioned", versioned.as_str()), ("versionless", invalid)] {
+                match OpaEngine::from_strings(TEST_POLICY, data) {
+                    Ok(_) => accepted_by_raw_opa.push(format!("{case} ({form})")),
+                    Err(error) => assert_safe_load_error(&error, &["private_typo"]),
+                }
+            }
+        }
+
+        let hard_requirement = OpaEngine::from_strings(
+            TEST_POLICY,
+            "version: 1\nlandlock: {compatibility: hard_requirement}\n",
+        )
+        .expect("valid Landlock twin must load")
+        .query_sandbox_config()
+        .expect("config from valid Landlock twin");
+        assert!(matches!(
+            hard_requirement.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ));
+
+        assert!(
+            accepted_by_raw_opa.is_empty(),
+            "raw OPA loading accepted fixtures that the typed schema rejects: {accepted_by_raw_opa:?}"
+        );
+    }
+
+    #[test]
+    fn raw_opa_network_leaves_reject_typed_schema_errors() {
+        let valid = opa_container_policy();
+        let mut accepted = Vec::new();
+        for (field, invalid, control) in [
+            (
+                "allow_encoded_slash",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            (
+                "websocket_credential_rewrite",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            ("port", serde_json::json!("443"), serde_json::json!(443)),
+            (
+                "deny_rules",
+                serde_json::json!([{"method": ["DELETE"], "path": "/admin/**"}]),
+                serde_json::json!([{"method": "DELETE", "path": "/admin/**"}]),
+            ),
+        ] {
+            let mut policy = valid.clone();
+            policy["version"] = 1.into();
+            policy["network_policies"]["admin"]["endpoints"][0][field] = control;
+            openshell_policy::parse_sandbox_policy(&policy.to_string()).expect("typed valid twin");
+            OpaEngine::from_strings(TEST_POLICY, &policy.to_string()).expect("raw valid twin");
+            policy["network_policies"]["admin"]["endpoints"][0][field] = invalid;
+            assert!(
+                openshell_policy::parse_sandbox_policy(&policy.to_string()).is_err(),
+                "typed {field}"
+            );
+            for versioned in [true, false] {
+                if !versioned {
+                    policy.as_object_mut().expect("object").remove("version");
+                }
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(format!("{field} (versioned={versioned})")),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"]);
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted invalid network fields: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn raw_opa_static_semantics_match_typed_validation() {
+        let mut accepted = Vec::new();
+        for invalid in [
+            serde_json::json!({"process": {"run_as_user": "root"}}),
+            serde_json::json!({"process": {"run_as_group": "0"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967295"}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["/"]}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["///"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["relative-private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/tmp/../private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4096))]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 257]}}),
+        ] {
+            let mut versioned = invalid.clone();
+            versioned["version"] = 1.into();
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned.to_string()).map_or(
+                    true,
+                    |policy| openshell_policy::validate_sandbox_policy(&policy).is_err()
+                ),
+                "typed invalid static settings"
+            );
+            for policy in [&invalid, &versioned] {
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(invalid.clone()),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["root", "private-path", "4294967295"]);
+                    }
+                }
+            }
+        }
+        for valid in [
+            serde_json::json!({"process": {}}),
+            serde_json::json!({"process": {"run_as_user": "sandbox", "run_as_group": "1"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967294", "run_as_group": "sandbox"}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/"], "read_write": ["/tmp"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 256]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4095))]}}),
+        ] {
+            let mut versioned = valid.clone();
+            versioned["version"] = 1.into();
+            let typed = openshell_policy::parse_sandbox_policy(&versioned.to_string())
+                .expect("typed static control");
+            openshell_policy::validate_sandbox_policy(&typed).expect("valid typed static settings");
+            for policy in [&valid, &versioned] {
+                OpaEngine::from_strings(TEST_POLICY, &policy.to_string())
+                    .expect("raw static control")
+                    .query_sandbox_config()
+                    .expect("static config");
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted {} invalid static policies",
+            accepted.len()
+        );
+    }
+
+    #[test]
+    fn startup_evaluation_errors_discard_authored_rego_and_sources() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("private-rules.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&data_path, "{}").expect("write data");
+        for rule in ["filesystem_policy", "landlock_policy", "process_policy"] {
+            for repetitions in [1, 20] {
+                let marker = "private-eval-marker-".repeat(repetitions);
+                let rules = format!(
+                    "package openshell.sandbox\n{rule} := {{\"value\": \"{marker}one\"}}\n{rule} := {{\"value\": \"{marker}two\"}}\n"
+                );
+                std::fs::write(&rules_path, &rules).expect("write conflicting rules");
+                for engine in [
+                    OpaEngine::from_strings(&rules, "{}").expect("conflict is an evaluation error"),
+                    OpaEngine::from_files(&rules_path, &data_path).expect("file rules compile"),
+                ] {
+                    let error = engine
+                        .query_sandbox_config()
+                        .err()
+                        .expect("conflicting complete rules must fail");
+                    assert_safe_load_error(
+                        &error,
+                        &["private-eval-marker", "private-rules.rego", "value"],
+                    );
+                    assert_eq!(
+                        error.to_string(),
+                        "failed to evaluate static sandbox settings"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_opa_nested_validation_preserves_file_loads_and_rejected_reload() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("policy.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).expect("write policy rules");
+        let valid = opa_container_policy();
+        std::fs::write(&data_path, valid.to_string()).expect("write valid policy");
+        let engine = OpaEngine::from_files(&rules_path, &data_path).expect("valid file policy");
+        let proxy = OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+            .expect("valid endpoint-only policy");
+        for loaded in [&engine, &proxy] {
+            assert!(
+                !loaded
+                    .query_sandbox_config()
+                    .expect("filesystem config")
+                    .filesystem
+                    .include_workdir,
+                "file loaders must retain the typed default for an empty filesystem stanza"
+            );
+        }
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        let generation = engine.current_generation();
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+
+        // Malformed nested settings must fail before replacing any installed
+        // decisions or notifying consumers of a new generation.
+        for (pointer, replacement) in [
+            (
+                "/filesystem_policy",
+                serde_json::json!({"include_workdir": "private-value-秘密".repeat(1024)}),
+            ),
+            (
+                "/landlock",
+                serde_json::json!({"compatibility": "private-value-秘密".repeat(1024)}),
+            ),
+            ("/process", serde_json::json!({"run_as_user": 7})),
+            ("/process", serde_json::json!({"run_as_user": "root"})),
+            (
+                "/filesystem_policy",
+                serde_json::json!({"read_write": ["/"]}),
+            ),
+            (
+                "/network_policies/admin/endpoints/0/deny_rules/0/method",
+                serde_json::json!(["DELETE"]),
+            ),
+            (
+                "/network_policies/admin/binaries/0/path",
+                serde_json::json!(["/usr/bin/curl"]),
+            ),
+        ] {
+            let mut malformed = valid.clone();
+            *malformed
+                .pointer_mut(pointer)
+                .expect("existing static section") = replacement;
+            let data = malformed.to_string();
+            std::fs::write(&data_path, &data).expect("write malformed policy");
+            for error in [
+                OpaEngine::from_files(&rules_path, &data_path)
+                    .err()
+                    .expect("file loader must reject malformed nested values"),
+                OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+                    .err()
+                    .expect("endpoint-only file loader must reject malformed nested values"),
+                engine
+                    .reload(TEST_POLICY, &data)
+                    .expect_err("reload must reject malformed nested values"),
+            ] {
+                assert_safe_load_error(&error, &["private-value", "秘密", "admin.example.test"]);
+            }
+            assert_eq!(engine.current_generation(), generation);
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+
+        let mut repaired = valid;
+        repaired["network_policies"]["admin"]["endpoints"][0]["deny_rules"][0]["path"] =
+            "/other/**".into();
+        engine
+            .reload(TEST_POLICY, &repaired.to_string())
+            .expect("valid replacement after rejected reloads");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(eval_l7(&engine, &denied));
     }
 
     #[test]
@@ -4812,7 +5301,8 @@ process:
                 "path": path,
                 "query_params": {},
                 "jsonrpc": {
-                    "method": method
+                    "method": method,
+                    "mcp_method_classification": "available"
                 }
             }
         })
@@ -4916,6 +5406,31 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         val == regorus::Value::from(true)
+    }
+
+    fn assert_l7_denial(
+        engine: &OpaEngine,
+        input: &serde_json::Value,
+        deny_rule_matches: bool,
+        expected_reason: &str,
+    ) {
+        let mut eng = engine.engine.lock().unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.allow_request".into())
+                .expect("evaluate allow_request"),
+            regorus::Value::from(false),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.deny_request".into())
+                .expect("evaluate deny_request"),
+            regorus::Value::from(deny_rule_matches),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .expect("evaluate one unambiguous denial reason"),
+            regorus::Value::from(expected_reason),
+        );
     }
 
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
@@ -6264,10 +6779,34 @@ network_policies:
             "tools/call",
             serde_json::json!({"name": "blocked_action"}),
         );
-        assert!(!eval_l7(&engine, &blocked));
+        assert_l7_denial(
+            &engine,
+            &blocked,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
+        );
+
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "private_tool_name", "arguments.secret": "private-value"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
 
         let list_tools = l7_jsonrpc_input("mcp.params.test", 8000, "/mcp", "tools/list");
-        assert!(!eval_l7(&engine, &list_tools));
+        assert_l7_denial(
+            &engine,
+            &list_tools,
+            false,
+            "MCP core method is not permitted by policy; ask the policy owner to review rules for this method in the selected MCP revision",
+        );
     }
 
     #[test]
@@ -6303,6 +6842,185 @@ network_policies:
 
         let list_tools = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "tools/list");
         assert!(eval_l7(&engine, &list_tools));
+
+        let mut extension = l7_jsonrpc_input(
+            "mcp.default.test",
+            8000,
+            "/mcp",
+            "vendor/private_method_name",
+        );
+        extension["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &extension,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
+        );
+    }
+
+    #[test]
+    fn l7_mcp_extension_requires_an_exact_method_literal() {
+        let data = r#"
+network_policies:
+  exact_extension:
+    name: exact_extension
+    endpoints:
+      - host: mcp.extension-exact.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+    binaries:
+      - { path: /usr/bin/curl }
+  wildcard_extension:
+    name: wildcard_extension
+    endpoints:
+      - host: mcp.extension-wildcard.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+  denied_extension:
+    name: denied_extension
+    endpoints:
+      - host: mcp.extension-denied.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+        deny_rules:
+          - method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        let mut exact = l7_jsonrpc_input("mcp.extension-exact.test", 8000, "/mcp", "tools/vendor");
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert!(eval_l7(&engine, &exact));
+
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("unavailable");
+        assert!(
+            !eval_l7(&engine, &exact),
+            "known methods unavailable in the selected profile must fail closed"
+        );
+
+        let mut wildcard =
+            l7_jsonrpc_input("mcp.extension-wildcard.test", 8000, "/mcp", "tools/vendor");
+        wildcard["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &wildcard,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
+        );
+
+        let mut denied =
+            l7_jsonrpc_input("mcp.extension-denied.test", 8000, "/mcp", "tools/vendor");
+        denied["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &denied,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
+        );
+    }
+
+    #[test]
+    fn l7_mcp_denial_reason_matches_request_path_and_protocol() {
+        let data = r#"
+network_policies:
+  mixed:
+    name: mixed
+    endpoints:
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        rules: [{allow: {method: reports.list}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rest
+        protocol: rest
+        enforcement: enforce
+        rules: [{allow: {method: GET, path: /rest}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules: [{allow: {tool: read_status}}]
+    binaries:
+      - {path: /usr/bin/curl}
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Select the explanation by the current request path, not the first
+        // configured endpoint for this host and port.
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.reasons.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "other_tool"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
+        for path in ["/rest", "/rpc", "/other"] {
+            assert_l7_denial(
+                &engine,
+                &l7_jsonrpc_input("mcp.reasons.test", 8000, path, "tools/call"),
+                false,
+                &format!("POST {path} not permitted by policy"),
+            );
+        }
+
+        // Batch envelopes have no selected call until the relay evaluates
+        // each member. Protocol failures also remain outside policy hints.
+        for field in ["method", "error", "mcp_method_classification"] {
+            let mut input = unmatched_tool.clone();
+            input["request"]["jsonrpc"][field] = match field {
+                "method" => serde_json::Value::Null,
+                "error" => serde_json::json!("invalid MCP request"),
+                _ => serde_json::json!("unavailable"),
+            };
+            assert_l7_denial(&engine, &input, false, "POST /mcp not permitted by policy");
+        }
+
+        assert_l7_denial(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/rpc"),
+            true,
+            "JSON-RPC response frames are not permitted from client to server",
+        );
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/mcp")
+        ));
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.reasons.test", 8000, "/mcp", "tools/list")
+        ));
     }
 
     #[test]
@@ -9626,7 +10344,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9669,7 +10386,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9717,7 +10433,6 @@ network_policies:
         ports: [8080, 9090]
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET

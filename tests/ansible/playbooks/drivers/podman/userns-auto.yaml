@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- import_playbook: userns-profile.yaml
+  vars:
+    podman_userns_profile: auto
+    podman_userns_config: "{{ openshell_podman_userns_auto_config }}"
+    podman_userns_reference_args: [--userns, auto]

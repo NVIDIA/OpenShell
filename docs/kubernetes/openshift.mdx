@@ -5,7 +5,7 @@ title: "OpenShift"
 sidebar-title: "OpenShift"
 description: "Install the OpenShell Helm chart on OpenShift with capability-free sandbox workloads."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
-position: 6
+position: 7
 ---
 
 The Kubernetes driver resolves the UID range assigned to each OpenShift
@@ -19,6 +19,12 @@ process to install a nested seccomp user-notification filter and use Landlock.
 OpenShell fails sandbox startup when either capability-free runtime probe fails.
 </Warning>
 
+## Node kernel
+
+OpenShell requires OpenShift 4.19 or later. The RHCOS kernels in OpenShift 4.16
+through 4.18 (RHEL 9.4, 5.14.0-427) are built without Landlock, so sandbox
+startup fails its Landlock probe on those releases.
+
 ## Prerequisites
 
 - OpenShift 4.x cluster with `oc` configured.
@@ -26,17 +32,23 @@ OpenShell fails sandbox startup when either capability-free runtime probe fails.
 - [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs.
 - A CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces.
 
+<Warning>
+Your cluster MUST enforce ingress and egress `NetworkPolicy` in every sandbox
+namespace. OpenShell creates the policies, but Kubernetes does not verify that
+the CNI applies them. Without enforcement, sandbox workloads may bypass
+supervisor network policy through direct connections.
+</Warning>
+
 ## Install OpenShell
 
 Pre-create the namespace, then install the chart. Keep the default restricted
-security posture and acknowledge NetworkPolicy only after validating the CNI.
+security posture.
 
 ```shell
 oc create ns openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --namespace openshell
 ```
 
 The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and
@@ -51,6 +63,19 @@ oc -n openshell rollout status statefulset/openshell
 ```
 
 If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
+
+## Managed workspace namespaces
+
+In managed workspace mode, the Kubernetes driver creates one namespace per
+workspace. On OpenShift, the driver leaves SCC annotations unset so the cluster's
+namespace allocator can assign each workspace its own MCS, UID range, and
+supplemental-group range. The driver waits for those annotations before it
+provisions the workspace ServiceAccount or sandbox Pods.
+
+Namespaces created by an earlier version may have a UID range but no MCS
+annotation. OpenShift does not allocate a new MCS for a namespace that already
+has a UID range, so preserve any needed workspace data and recreate that
+workspace namespace before retrying sandbox creation.
 
 ## Connect to the Gateway
 

@@ -80,7 +80,8 @@ identifies the service being exposed.
 - When removing or renaming a field, reserve its old number and source name. Do
   not reuse either for a different meaning.
 - Review changes against both the public descriptor closure and durable stored
-  protobuf closure described in [the gateway architecture](../architecture/gateway.md#protobuf-api-and-storage-boundaries).
+  protobuf closure. The `public_and_durable_schema_inventories_are_complete`
+  test in `openshell-server` owns both inventories.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.

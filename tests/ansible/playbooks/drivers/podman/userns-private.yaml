@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- import_playbook: userns-profile.yaml
+  vars:
+    podman_userns_profile: private
+    podman_userns_config: "{{ openshell_podman_userns_private_config }}"
+    podman_userns_reference_args:
+      # Podman infers a private namespace from explicit maps; its CLI rejects
+      # combining --userns private with --uidmap/--gidmap.
+      - --uidmap
+      - 0:0:1
+      - --uidmap
+      - 1:1:65535
+      - --gidmap
+      - 0:0:1
+      - --gidmap
+      - 1:1:65535

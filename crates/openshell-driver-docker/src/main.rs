@@ -14,6 +14,9 @@ use tracing::info;
 #[derive(Debug, Parser)]
 #[command(name = "openshell-driver-docker", version = VERSION)]
 struct Args {
+    /// Override the operator admission policy in the driver TOML file.
+    #[arg(long, env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON")]
+    admission_config_json: Option<openshell_core::resource_admission::DriverAdmissionConfig>,
     /// Public compute-driver Unix socket used by the gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: PathBuf,
@@ -21,6 +24,14 @@ struct Args {
     /// TOML file containing a serialized `DockerComputeConfig` table.
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
+
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    supervisor_image: Option<String>,
 
     /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
@@ -54,7 +65,19 @@ async fn main() -> Result<()> {
     );
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
-    let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
+    let mut docker_config: DockerComputeConfig =
+        toml::from_str(&config_source).into_diagnostic()?;
+    if let Some(policy) = args.admission_config_json {
+        docker_config.allow_driver_config = policy.allow_driver_config;
+        docker_config.resource_admission = policy.resource_admission;
+    }
+    if let Some(image) = args.sandbox_runtime_image {
+        docker_config.sandbox_runtime_image = Some(image);
+    }
+    if let Some(image) = args.supervisor_image {
+        docker_config.supervisor_image = Some(image);
+    }
+    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;

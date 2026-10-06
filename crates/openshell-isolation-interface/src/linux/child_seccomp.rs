@@ -29,6 +29,7 @@ const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 const CLOSE_RANGE_UNSHARE_FLAG: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC_FLAG: u32 = 1 << 2;
 const F_SETOWN_COMMAND: u32 = 8;
 const F_SETSIG_COMMAND: u32 = 10;
 const F_SETOWN_EX_COMMAND: u32 = 15;
@@ -53,6 +54,7 @@ impl ChildHardeningProgram {
     /// The caller must invoke this from the post-fork child after all
     /// sandbox-wide TSYNC work and the launcher's `NEW_LISTENER` filter.
     pub fn install(&mut self) -> io::Result<()> {
+        mark_inherited_descriptors_close_on_exec()?;
         set_no_new_privileges()?;
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
@@ -88,13 +90,43 @@ impl ChildHardeningProgram {
     }
 }
 
+/// Mark every descriptor above stdio close-on-exec in the post-fork child.
+///
+/// Workloads receive INET sockets only through broker injection, which binds
+/// them to loopback first. A descriptor the sandbox process inherited from its
+/// container runtime, or opened without `O_CLOEXEC`, must never cross `exec`
+/// as an unconfined socket. The command's stdio is already installed on 0-2
+/// when `pre_exec` hooks run. This is a single async-signal-safe syscall.
+///
+/// # Errors
+///
+/// Returns the kernel error; kernels without `CLOSE_RANGE_CLOEXEC` (before
+/// Linux 5.11) fail closed.
+pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
+    // SAFETY: close_range takes scalar arguments and only sets FD_CLOEXEC.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            CLOSE_RANGE_CLOEXEC_FLAG,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Build the same-UID workload self-protection program before `fork`.
 ///
 /// `sandbox_tgid` is the sandbox PID as visible from its workload namespace.
 /// The filter blocks thread-targeting operations that name the trusted sandbox
 /// leader and blocks process-directed operations with the same target. The
-/// ordinary workload listener additionally mediates `kill`, `tkill`, and
-/// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
+/// ordinary workload listener additionally mediates `kill`, `tkill`,
+/// `rt_sigqueueinfo`, and `SIGCONT` sent with `tgkill` or
+/// `rt_tgsigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
@@ -351,6 +383,48 @@ fn set_no_new_privileges() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_sockets_are_marked_close_on_exec_but_stdio_is_not() {
+        // The sweep changes every descriptor in the calling process, so run
+        // it in a fresh copy of this test binary rather than the harness.
+        const CHILD_MARKER: &str = "OPENSHELL_CLOEXEC_SWEEP_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let socket = rustix::net::socket(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::STREAM,
+                None,
+            )
+            .expect("inheritable socket");
+            assert!(
+                !rustix::io::fcntl_getfd(&socket)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            mark_inherited_descriptors_close_on_exec().expect("sweep descriptors");
+            assert!(
+                rustix::io::fcntl_getfd(&socket)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            assert!(
+                !rustix::io::fcntl_getfd(io::stderr())
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "linux::child_seccomp::tests::inherited_sockets_are_marked_close_on_exec_but_stdio_is_not",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated sweep test");
+        assert!(status.success(), "isolated sweep test failed");
+    }
 
     #[test]
     fn rejects_zero_sandbox_tgid() {

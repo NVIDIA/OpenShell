@@ -3,12 +3,14 @@
 
 //! Shared supervisor-session ownership index for HA gateway replicas.
 
-use crate::persistence::{PersistenceError, Store, WriteCondition};
+use crate::persistence::{ObjectCursor, ObjectRecord, PersistenceError, Store, WriteCondition};
 use openshell_core::time::now_ms;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::warn;
 
 const OWNER_OBJECT_TYPE: &str = "supervisor_session_owner";
 
@@ -211,18 +213,48 @@ impl SupervisorOwnerIndex {
             return Ok(None);
         };
 
-        let payload: OwnerPayload = serde_json::from_slice(&record.payload)
-            .map_err(|err| PersistenceError::Decode(err.to_string()))?;
-        Ok(Some(OwnerRecord {
-            session_id: payload.session_id,
-            supervisor_instance_id: payload.supervisor_instance_id,
-            connection_epoch: payload.connection_epoch,
-            owner_replica_id: payload.owner_replica_id,
-            owner_peer_endpoint: payload.owner_peer_endpoint,
-            connected_at_ms: payload.connected_at_ms,
-            updated_at_ms: record.updated_at_ms,
-            resource_version: record.resource_version,
-        }))
+        Ok(Some(decode_owner_record(&record)?.1))
+    }
+
+    /// Return distinct reachable peer endpoints from fresh owner records.
+    /// The scan uses bounded pages and retains only one endpoint per peer.
+    pub async fn list_fresh_peer_endpoints(
+        &self,
+        local_replica_id: &str,
+    ) -> Result<Vec<String>, OwnerError> {
+        const PAGE_SIZE: u32 = 256;
+        let mut after = None;
+        let mut endpoints = HashSet::new();
+        loop {
+            let page = self
+                .store
+                .list_by_type_after(OWNER_OBJECT_TYPE, after.as_ref(), PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(ObjectCursor::from);
+            for record in &page {
+                match decode_owner_record(record) {
+                    Ok((_, owner))
+                        if owner.is_fresh(self.ttl)
+                            && owner.owner_replica_id != local_replica_id
+                            && (owner.owner_peer_endpoint.starts_with("http://")
+                                || owner.owner_peer_endpoint.starts_with("https://")) =>
+                    {
+                        endpoints.insert(owner.owner_peer_endpoint);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(record_id = %record.id, error = %error, "skipping invalid supervisor owner record");
+                    }
+                }
+            }
+            if page.len() < PAGE_SIZE as usize {
+                break;
+            }
+        }
+        Ok(endpoints.into_iter().collect())
     }
 
     async fn write_payload(
@@ -253,6 +285,29 @@ impl SupervisorOwnerIndex {
             Err(err) => Err(OwnerError::Store(err)),
         }
     }
+}
+
+fn decode_owner_record(record: &ObjectRecord) -> Result<(String, OwnerRecord), OwnerError> {
+    let payload: OwnerPayload = serde_json::from_slice(&record.payload)
+        .map_err(|err| PersistenceError::Decode(err.to_string()))?;
+    if payload.sandbox_id != record.name || record.id != owner_object_id(&payload.sandbox_id) {
+        return Err(OwnerError::Store(PersistenceError::Decode(
+            "supervisor owner identity mismatch".to_string(),
+        )));
+    }
+    Ok((
+        payload.sandbox_id,
+        OwnerRecord {
+            session_id: payload.session_id,
+            supervisor_instance_id: payload.supervisor_instance_id,
+            connection_epoch: payload.connection_epoch,
+            owner_replica_id: payload.owner_replica_id,
+            owner_peer_endpoint: payload.owner_peer_endpoint,
+            connected_at_ms: payload.connected_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            resource_version: record.resource_version,
+        },
+    ))
 }
 
 fn can_supersede(
@@ -346,6 +401,33 @@ mod tests {
         let record = index.read("sbx").await.unwrap().unwrap();
         assert_eq!(record.session_id, guard.session_id);
         assert_eq!(record.owner_replica_id, "gw-1");
+    }
+
+    #[tokio::test]
+    async fn fresh_peer_scan_deduplicates_and_excludes_local_owner() {
+        let index = test_index(OWNER_TTL).await;
+        for (sandbox, replica, endpoint) in [
+            ("sbx-1", "gw-1", "http://gw-1"),
+            ("sbx-2", "gw-2", "http://gw-2"),
+            ("sbx-3", "gw-2", "http://gw-2"),
+            ("sbx-4", "gw-3", "local://unreachable"),
+        ] {
+            index
+                .publish(sandbox, "session", sandbox, 1, replica, endpoint)
+                .await
+                .unwrap();
+        }
+        for index_number in 0..260 {
+            let sandbox = format!("paged-sandbox-{index_number}");
+            index
+                .publish(&sandbox, "session", &sandbox, 1, "gw-2", "http://gw-2")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            index.list_fresh_peer_endpoints("gw-1").await.unwrap(),
+            vec!["http://gw-2"]
+        );
     }
 
     #[tokio::test]

@@ -91,11 +91,19 @@ func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxSer
 	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
 	for _, exposure := range exposures {
 		result = append(result, &pb.SandboxServiceExposure{
-			Service:    exposure.Service,
-			TargetPort: exposure.TargetPort,
+			Service:           exposure.Service,
+			TargetPort:        exposure.TargetPort,
+			AuthorizationMode: serviceAuthorizationModeToProto(exposure.AuthorizationMode),
 		})
 	}
 	return result
+}
+
+func serviceAuthorizationModeToProto(mode types.ServiceAuthorizationMode) pb.ServiceAuthorizationMode {
+	if mode == 0 {
+		return pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP
+	}
+	return pb.ServiceAuthorizationMode(mode)
 }
 
 func validateTemplateCreateSpec(spec *SandboxSpec) error {
@@ -228,20 +236,39 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 	}, nil
 }
 
-func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
-	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	})
+func (s *sandboxClient) ListProviders(workspace, sandboxName string, opts ...ListOptions) (*Pager[*Provider], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	pageToken := ""
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Provider], error) {
+		resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
+			Sandbox:        sandboxName,
+			WorkspaceScope: namedWorkspaceScope(workspace),
+			PageSize:       pageSize,
+			PageToken:      pageToken,
+		})
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		providers := make([]*Provider, 0, len(resp.GetProviders()))
+		for _, proto := range resp.GetProviders() {
+			providers = append(providers, converter.ProviderFromProto(proto))
+		}
+		return &Page[*Provider]{Items: providers, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	providers := make([]*Provider, 0, len(resp.GetProviders()))
-	for _, proto := range resp.GetProviders() {
-		providers = append(providers, converter.ProviderFromProto(proto))
+func (s *sandboxClient) ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*Provider, error) {
+	pager, err := s.ListProviders(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return providers, nil
+	return pager.All(ctx)
 }
 
 func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {

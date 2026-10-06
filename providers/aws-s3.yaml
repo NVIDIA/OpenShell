@@ -93,7 +93,6 @@ endpoints:
   - host: "*.s3.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4
@@ -101,7 +100,6 @@ endpoints:
   - host: "s3.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4
@@ -109,7 +107,6 @@ endpoints:
   - host: "*.s3.*.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4
@@ -117,7 +114,6 @@ endpoints:
   - host: "s3.*.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4
@@ -125,7 +121,6 @@ endpoints:
   - host: "*.s3.dualstack.*.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4
@@ -133,7 +128,6 @@ endpoints:
   - host: "s3.dualstack.*.amazonaws.com"
     port: 443
     protocol: rest
-    tls: terminate
     access: read-write
     enforcement: enforce
     credential_signing: sigv4

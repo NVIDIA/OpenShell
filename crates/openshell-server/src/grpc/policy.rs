@@ -80,14 +80,11 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    VERSION,
     endpoint_path::EndpointPathPattern,
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
     compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
@@ -105,7 +102,7 @@ use openshell_prover::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -357,7 +354,7 @@ fn emit_gateway_policy_audit_log(
     version: i64,
     policy_hash: &str,
 ) {
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         state_label,
@@ -365,12 +362,7 @@ fn emit_gateway_policy_audit_log(
         version,
         policy_hash,
         &[],
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
 /// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
@@ -395,7 +387,7 @@ fn emit_gateway_policy_auto_approve_audit_log(
         ("prover_delta", "empty".to_string()),
         ("resolved_from", resolved_from.to_string()),
     ];
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         "approved",
@@ -403,15 +395,10 @@ fn emit_gateway_policy_auto_approve_audit_log(
         version,
         policy_hash,
         &extra,
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
-fn build_gateway_policy_audit_message(
+fn build_gateway_policy_audit_event(
     sandbox_id: &str,
     sandbox_name: &str,
     state_label: &str,
@@ -419,16 +406,8 @@ fn build_gateway_policy_audit_message(
     version: i64,
     policy_hash: &str,
     extra_fields: &[(&str, String)],
-) -> String {
-    let ctx = EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    };
+) -> OcsfEvent {
+    let ctx = crate::gateway_ocsf::context(sandbox_id, sandbox_name);
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Other, state_label)
         .severity(SeverityId::Informational)
@@ -443,8 +422,7 @@ fn build_gateway_policy_audit_message(
     for (key, value) in extra_fields {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    builder.build()
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -1261,6 +1239,148 @@ async fn reconcile_pending_chunks_after_policy_change(
         .await
 }
 
+/// Upper bound on pending proposals re-evaluated after one policy change.
+/// Pending queues are agent-driven and unbounded; proposals past this bound
+/// keep their stored evaluation and are refreshed by the approval check, which
+/// still refuses a stale review token.
+const MAX_PENDING_REFRESH_PER_POLICY_CHANGE: usize = 32;
+
+/// Re-evaluate the still-pending chunks (at most
+/// [`MAX_PENDING_REFRESH_PER_POLICY_CHANGE`], newest first) against the live
+/// policy inputs and persist the result, so the review surface
+/// (`GetDraftPolicy`) shows the prover result and review token an approval
+/// will be checked against.
+///
+/// Without this, a policy change leaves other pending chunks carrying the
+/// evaluation from before the change, and the refresh only happens inside
+/// the next approval, which then fails with "proposal inputs changed".
+/// Approval still rejects a token that does not match the stored one, so a
+/// reviewer holding an evaluation from before the refresh must refetch.
+async fn refresh_pending_chunk_evaluations(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+) -> Result<u32, Status> {
+    let pending = state
+        .store
+        .list_draft_chunks(sandbox.object_id(), Some("pending"))
+        .await
+        .map_err(|error| Status::internal(format!("list pending chunks failed: {error}")))?;
+    if pending.len() > MAX_PENDING_REFRESH_PER_POLICY_CHANGE {
+        debug!(
+            sandbox_id = %sandbox.object_id(),
+            pending = pending.len(),
+            limit = MAX_PENDING_REFRESH_PER_POLICY_CHANGE,
+            "refreshing only the newest pending proposals after policy change"
+        );
+    }
+    let mut refreshed = 0;
+    for chunk in pending
+        .into_iter()
+        .take(MAX_PENDING_REFRESH_PER_POLICY_CHANGE)
+    {
+        match refresh_pending_chunk_evaluation(state, workspace, sandbox, &chunk).await {
+            Ok(true) => refreshed += 1,
+            Ok(false) => {}
+            Err(error) => warn!(
+                sandbox_id = %sandbox.object_id(),
+                chunk_id = %chunk.id,
+                error = %error.message(),
+                "failed to refresh pending proposal evaluation after policy change"
+            ),
+        }
+    }
+    Ok(refreshed)
+}
+
+/// Refresh pending proposals after an operator decision (approve, remove,
+/// undo). These paths hold no gateway-wide lock, and refreshing before the
+/// response lets the operator's next `rule get` and approval see the current
+/// evaluation. Failures are logged; the next approval still re-checks the
+/// proposal against live inputs.
+async fn refresh_pending_chunk_evaluations_best_effort(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+) {
+    if let Err(error) = refresh_pending_chunk_evaluations(state, workspace, sandbox).await {
+        warn!(
+            sandbox_id = %sandbox.object_id(),
+            error = %error,
+            "failed to refresh pending policy proposals after policy change"
+        );
+    }
+}
+
+/// Sandboxes with a background refresh running, mapped to whether another
+/// policy change arrived meanwhile and the refresh must run once more.
+fn background_pending_refreshes() -> &'static std::sync::Mutex<HashMap<String, bool>> {
+    static REFRESHES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    REFRESHES.get_or_init(Default::default)
+}
+
+/// Refresh pending proposals off the request path. Used where the policy
+/// change runs under the gateway-wide sandbox sync guard (`UpdateConfig`) or
+/// is driven by the sandbox itself (auto-approval), so the refresh neither
+/// extends the guard nor adds agent-controlled work to the response. At most
+/// one refresh runs per sandbox; changes that arrive meanwhile coalesce into
+/// a single rerun.
+fn spawn_pending_chunk_refresh(state: &Arc<ServerState>, workspace: &str, sandbox: &Sandbox) {
+    let sandbox_id = sandbox.object_id().to_string();
+    {
+        let mut running = background_pending_refreshes()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rerun) = running.get_mut(&sandbox_id) {
+            *rerun = true;
+            return;
+        }
+        running.insert(sandbox_id.clone(), false);
+    }
+    let state = state.clone();
+    let workspace = workspace.to_string();
+    let sandbox = sandbox.clone();
+    tokio::spawn(async move {
+        loop {
+            refresh_pending_chunk_evaluations_best_effort(&state, &workspace, &sandbox).await;
+            let mut running = background_pending_refreshes()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match running.get_mut(&sandbox_id) {
+                Some(rerun) if *rerun => *rerun = false,
+                _ => {
+                    running.remove(&sandbox_id);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn refresh_pending_chunk_evaluation(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+    chunk: &DraftChunkRecord,
+) -> Result<bool, Status> {
+    // Reuse the cached prover result to compute the live token cheaply; run
+    // the prover again only when the inputs behind the token changed.
+    let reuse = (!chunk.review_token.is_empty()).then_some(chunk.validation_result.as_str());
+    let live =
+        evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, reuse).await?;
+    let evaluation = if reuse.is_none() || live.review_token != chunk.review_token {
+        evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, None).await?
+    } else if live.application_error != chunk.application_error {
+        live
+    } else {
+        return Ok(false);
+    };
+    // A concurrent edit or evaluation of this chunk wins; its own path owns
+    // the evaluation it stored.
+    store_refreshed_evaluation(state, chunk, &evaluation).await
+}
+
 /// Auto-reject any pending chunks for the same sandbox that share the
 /// `(host, port, binary)` of the newly-submitted chunk. Mode-agnostic: the
 /// rule is "the latest submission for this endpoint wins; older pending
@@ -1570,27 +1690,54 @@ async fn evaluate_stored_chunk_against_live_inputs(
     ))
 }
 
-async fn persist_refreshed_evaluation(
+/// Store a re-evaluation of `chunk` only if the stored proposal is still the
+/// one it was computed from; returns `false` when an edit, another
+/// evaluation, or a decision changed it after `chunk` was read.
+async fn store_refreshed_evaluation(
     state: &Arc<ServerState>,
     chunk: &DraftChunkRecord,
     evaluation: &ProposalEvaluation,
-) -> Result<DraftChunkRecord, Status> {
-    let mut refreshed = chunk.clone();
+) -> Result<bool, Status> {
+    store_evaluation_if_unchanged(state, chunk, chunk, evaluation).await
+}
+
+/// Store `evaluation` of `evaluated` (the stored proposal, or an edit of it)
+/// only if the stored proposal still matches `expected`, the record the
+/// caller read before evaluating.
+async fn store_evaluation_if_unchanged(
+    state: &Arc<ServerState>,
+    expected: &DraftChunkRecord,
+    evaluated: &DraftChunkRecord,
+    evaluation: &ProposalEvaluation,
+) -> Result<bool, Status> {
+    let mut refreshed = evaluated.clone();
     apply_evaluation_to_chunk(&mut refreshed, evaluation);
+    let chunk = expected;
     let updated = state
         .store
-        .update_draft_chunk_evaluation(&refreshed)
+        .update_draft_chunk_evaluation_if_unchanged(expected, &refreshed)
         .await
         .map_err(|error| {
             Status::internal(format!("persist proposal evaluation failed: {error}"))
         })?;
-    if !updated {
-        return Err(Status::failed_precondition(
-            "proposal is no longer pending; refetch before deciding",
-        ));
+    if updated {
+        state.sandbox_watch_bus.notify(&chunk.sandbox_id);
     }
-    state.sandbox_watch_bus.notify(&chunk.sandbox_id);
-    Ok(refreshed)
+    Ok(updated)
+}
+
+async fn persist_refreshed_evaluation(
+    state: &Arc<ServerState>,
+    chunk: &DraftChunkRecord,
+    evaluation: &ProposalEvaluation,
+) -> Result<(), Status> {
+    if store_refreshed_evaluation(state, chunk, evaluation).await? {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "proposal changed or is no longer pending; refetch and review again",
+        ))
+    }
 }
 
 async fn persist_pending_application_error(
@@ -1811,6 +1958,7 @@ async fn auto_approve_chunk(
             "failed to reconcile pending policy proposals after auto-approval"
         );
     }
+    spawn_pending_chunk_refresh(state, context.workspace, context.sandbox);
 
     let source_label = if context.source.is_empty() {
         "unspecified"
@@ -2900,7 +3048,7 @@ pub async fn build_sandbox_config_snapshot(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
-        state.sandbox_jwt_issuer.is_some(),
+        state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_binding_context(
@@ -2940,7 +3088,7 @@ pub async fn build_sandbox_config_snapshot(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
-        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
+        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
             .as_ref()
@@ -3590,10 +3738,10 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    Ok(Response::new(
+    let environment =
         load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
-            .await?,
-    ))
+            .await?;
+    Ok(Response::new(environment))
 }
 
 /// Materialize a privileged provider snapshot after the caller has authorized
@@ -3757,6 +3905,7 @@ pub async fn build_provider_environment_snapshot(
     Ok(ProviderEnvironmentSnapshot {
         provider_env_revision,
         values,
+        files: provider_environment.files,
         dynamic_credentials: provider_environment.dynamic_credentials,
         provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
         policy_hash: deterministic_policy_hash(&effective_policy),
@@ -3792,6 +3941,7 @@ fn provider_environment_response(
     }
     GetSandboxProviderEnvironmentResponse {
         environment,
+        files: snapshot.files,
         provider_env_revision: snapshot.provider_env_revision,
         credential_expiration_times,
         dynamic_credentials: snapshot.dynamic_credentials,
@@ -4473,6 +4623,7 @@ async fn handle_update_config_inner(
             operation_count = merge_ops.len(),
             "UpdateConfig: merged incremental policy operations"
         );
+        spawn_pending_chunk_refresh(state, &workspace, &sandbox);
         emit_config_update_policy_success(sandbox_caller);
 
         if let Some(operation_id) = operation_id {
@@ -4702,6 +4853,10 @@ async fn handle_update_config_inner(
     };
     drop(config_guard);
     state.sandbox_watch_bus.notify(&sandbox_id);
+    // The committed revision changed what pending proposals were evaluated
+    // against. Schedule the refresh here: the matching-revision check below
+    // returns before the end of this handler for every committed write.
+    spawn_pending_chunk_refresh(state, &workspace, &sandbox);
 
     if backfill_policy.is_some() {
         info!(
@@ -4716,6 +4871,7 @@ async fn handle_update_config_inner(
         policy_hash = %hash,
         "UpdateConfig: new policy version persisted"
     );
+    spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
     finish_config_update_operation(state, &operation_id, consistency, wait_timeout).await
@@ -4975,7 +5131,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     .map_err(Status::internal)?;
     if crate::compute::provisioning_deadline::timed_out(&sandbox) {
         return Err(Status::failed_precondition(
-            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+            "provisioning deadline expired; explicitly start the sandbox after cleanup",
         ));
     }
     let current = sandbox
@@ -5061,10 +5217,10 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .claim_provisioning_timeout(&sandbox, now_ms)
                 .await
                 .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "provisioning repair window expired",
-            ));
+            return Err(Status::failed_precondition("provisioning deadline expired"));
         }
+        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
+            .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
             crate::compute::provisioning_deadline::record_rejection(record, now_ms)
                 .map_err(Status::internal)?;
@@ -5267,7 +5423,7 @@ pub(super) async fn handle_get_sandbox_logs(
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
                 if let Some(since_time) = since_time.as_ref() {
                     let event_time = log.event_time.as_ref()?;
@@ -5731,7 +5887,9 @@ pub(super) async fn handle_submit_policy_analysis(
             })
             && let Some(existing) = existing_mechanistic.as_ref()
         {
-            persist_refreshed_evaluation(state, existing, &evaluation).await?;
+            // Losing a race here means another path already stored a newer
+            // evaluation for this chunk; the submission itself succeeded.
+            store_refreshed_evaluation(state, existing, &evaluation).await?;
         }
         accepted += 1;
 
@@ -6008,6 +6166,7 @@ async fn handle_approve_draft_chunk_inner(
             "failed to reconcile pending policy proposals after approval"
         );
     }
+    refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
     emit_gateway_policy_audit_log(
         &sandbox_id,
         sandbox.object_name(),
@@ -6138,6 +6297,9 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    if was_approved {
+        refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
+    }
     emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
@@ -6429,6 +6591,7 @@ async fn handle_approve_all_draft_chunks_inner(
             "failed to reconcile pending policy proposals after bulk approval"
         );
     }
+    refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
     emit_gateway_policy_audit_log(
         &sandbox_id,
         sandbox.object_name(),
@@ -6512,7 +6675,11 @@ pub(super) async fn handle_edit_draft_chunk(
     let evaluation =
         evaluate_stored_chunk_against_live_inputs(state, &workspace, &sandbox, &edited_chunk, None)
             .await?;
-    persist_refreshed_evaluation(state, &edited_chunk, &evaluation).await?;
+    if !store_evaluation_if_unchanged(state, &chunk, &edited_chunk, &evaluation).await? {
+        return Err(Status::failed_precondition(
+            "proposal changed while it was being edited; refetch and edit again",
+        ));
+    }
 
     info!(
         chunk_id = %req.chunk_id,
@@ -6617,6 +6784,7 @@ async fn handle_undo_draft_chunk_inner(
         policy_hash = %hash,
         "UndoDraftChunk: rule removed, chunk reverted to pending"
     );
+    refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
     emit_sandbox_policy_update_success();
     emit_policy_decision_success(PolicyDecisionOperation::Undo, 1);
 
@@ -8392,6 +8560,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_registration_starts_repair_once_after_a_cold_start() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        use openshell_core::time::timestamp_to_millis;
+        let state = test_server_state().await;
+        let sandbox_id = "sb-cold-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "cold-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let request = || {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: instance_id.clone(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            )
+        };
+        // A duplicate report racing the initial registration must share one
+        // persisted transition; either may acquire the lifecycle fence first.
+        let (first, duplicate) = tokio::join!(
+            handle_report_sandbox_configuration(&state, request()),
+            handle_report_sandbox_configuration(&state, request()),
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        let saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let record = saved
+            .status
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            record.preparation_deadline,
+            preparation.preparation_deadline
+        );
+        let start = timestamp_to_millis(record.admission_start_time.as_ref().unwrap()).unwrap();
+        let deadline = timestamp_to_millis(record.deadline.as_ref().unwrap()).unwrap();
+        assert_eq!(deadline - start, 300_000);
+        handle_report_sandbox_configuration(&state, request())
+            .await
+            .unwrap();
+        let repeated = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repeated
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_expiry_rejects_registration_before_the_scanner_runs() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-expired-preparation";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "expired-preparation",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let expired = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        let status = expired.status.unwrap();
+        assert!(status.provisioning.unwrap().admission_start_time.is_none());
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ImagePreparationTimedOut")
+        );
+    }
+
+    #[tokio::test]
     async fn provisioning_timeout_rejects_supervisor_registration() {
         use openshell_core::proto::{
             ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
@@ -8429,7 +8734,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("repair window expired"));
+        assert!(error.message().contains("provisioning deadline expired"));
     }
 
     #[tokio::test]
@@ -10694,14 +10999,12 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn l7_scope_policy() -> ProtoSandboxPolicy {
         let endpoint = NetworkEndpoint {
             host: "api.example.com".to_string(),
             port: 443,
             ports: vec![443, 8443],
             protocol: "rest".to_string(),
-            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
             access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
@@ -11657,7 +11960,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = 2;
         endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -11970,6 +12272,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "generic".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -12063,6 +12366,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -12134,6 +12438,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -12967,7 +13272,11 @@ mod tests {
 
     #[tokio::test]
     async fn committed_policy_update_publishes_complete_snapshot() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
         let mut sandbox = test_sandbox(
             "sb-published-policy",
             "published-policy",
@@ -12977,14 +13286,23 @@ mod tests {
         sandbox.spec.as_mut().unwrap().policy = None;
         state.store.put_message(&sandbox).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-        state.supervisor_sessions.register(
-            "sb-published-policy".to_string(),
-            "session-1".to_string(),
-            tx,
-            shutdown_tx,
+        let mut session =
+            crate::config_delivery::register_test_push_session(&state, &sandbox, "session-1");
+        let owner_index = crate::supervisor_owner::SupervisorOwnerIndex::new(
+            Arc::clone(&state.store),
+            crate::supervisor_owner::OWNER_TTL,
         );
+        owner_index
+            .publish(
+                "sb-published-policy",
+                "session-1",
+                "test-supervisor",
+                1,
+                &state.replica_id,
+                "local://test",
+            )
+            .await
+            .unwrap();
 
         handle_update_config(
             &state,
@@ -13006,7 +13324,10 @@ mod tests {
             .expect("committed policy");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let message = rx.recv().await.expect("configuration channel closed");
+                let message = tokio_stream::StreamExt::next(&mut session.outbound)
+                    .await
+                    .expect("configuration stream closed")
+                    .unwrap();
                 let Some(openshell_core::proto::gateway_message::Payload::ConfigUpdate(update)) =
                     message.payload
                 else {
@@ -13522,6 +13843,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-policy".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -13736,6 +14058,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_files_do_not_block_legacy_provider_environment_requests() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileFile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-config-only".to_string(),
+                    name: "config-only".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "config-only".to_string(),
+                    display_name: "Config only".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    files: vec![ProviderProfileFile {
+                        path: "client.toml".to_string(),
+                        content: "endpoint = '{{config.endpoint}}'".to_string(),
+                        env_var: "CLIENT_CONFIG_FILE".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let mut file_provider = test_provider("work-config", "config-only");
+        file_provider.credentials.clear();
+        file_provider
+            .config
+            .insert("endpoint".to_string(), "https://config.example".to_string());
+        state.store.put_message(&file_provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-files-and-credentials",
+                "files-and-credentials",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-config".to_string(), "work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        // An older supervisor sends this request without a provider-file
+        // capability field and ignores the additive files response field.
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-files-and-credentials".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert_eq!(
+            response.environment.get("CLIENT_CONFIG_FILE"),
+            Some(&"/run/openshell/providers/work-config/client.toml".to_string())
+        );
+        assert_eq!(
+            response
+                .files
+                .get("/run/openshell/providers/work-config/client.toml"),
+            Some(&"endpoint = 'https://config.example'".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
         let state = test_server_state().await;
         state
@@ -13943,7 +14348,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
-        bound_endpoint.tls = 2;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store
@@ -14425,6 +14829,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn annotated_profile_has_stable_provider_environment_revision() {
+        let state = test_server_state().await;
+        let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+        profile.annotations = (0..8)
+            .map(|index| (format!("key-{index}"), format!("value-{index}")))
+            .collect();
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile,
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-stable-provider-revision",
+            "stable-provider-revision",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut revisions = HashSet::new();
+        for _ in 0..16 {
+            let config = load_sandbox_config(&state, &sandbox).await.unwrap();
+            let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                config.provider_env_revision,
+                environment.provider_env_revision
+            );
+            revisions.insert(config.provider_env_revision);
+        }
+        assert_eq!(revisions.len(), 1);
+    }
+
+    #[tokio::test]
     async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
@@ -14633,6 +15079,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-token".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -14963,6 +15410,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
+                        files: Vec::new(),
                         id: "custom-api".to_string(),
                         resource_version: 0,
                         annotations: HashMap::new(),
@@ -17391,6 +17839,455 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_refreshes_other_pending_proposals_for_sequential_review() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-sequential-approve";
+        let sandbox_name = "sequential-approve";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: [("alpha", "alpha.example.com"), ("beta", "beta.example.com")]
+                    .into_iter()
+                    .map(|(name, host)| PolicyChunk {
+                        rule_name: name.to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: name.to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: host.to_string(),
+                                port: 443,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunk_ids.len(), 2);
+        let (alpha_id, beta_id) = (&submit.accepted_chunk_ids[0], &submit.accepted_chunk_ids[1]);
+
+        let draft_chunk = |chunk_id: String| {
+            let state = state.clone();
+            async move {
+                handle_get_draft_policy(
+                    &state,
+                    with_user(Request::new(GetDraftPolicyRequest {
+                        sandbox: sandbox_name.to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
+                        status_filter: "pending".to_string(),
+                    })),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+                .chunks
+                .into_iter()
+                .find(|chunk| chunk.id == chunk_id)
+                .expect("pending chunk")
+            }
+        };
+        let approve = |chunk_id: String, review_token: String| {
+            let state = state.clone();
+            async move {
+                handle_approve_draft_chunk(
+                    &state,
+                    with_user(Request::new(ApproveDraftChunkRequest {
+                        request_id: String::new(),
+                        sandbox: sandbox_name.to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
+                        chunk_id,
+                        review_token,
+                    })),
+                )
+                .await
+            }
+        };
+
+        let alpha = draft_chunk(alpha_id.clone()).await;
+        let beta_before = draft_chunk(beta_id.clone()).await;
+        approve(alpha_id.clone(), alpha.review_token)
+            .await
+            .expect("first approval");
+
+        // Approving alpha changed the policy beta was evaluated against. The
+        // review surface must now show beta's refreshed evaluation.
+        let beta_after = draft_chunk(beta_id.clone()).await;
+        assert_ne!(beta_after.review_token, beta_before.review_token);
+
+        // A reviewer still holding the pre-approval evaluation must refetch.
+        let outdated = approve(beta_id.clone(), beta_before.review_token)
+            .await
+            .expect_err("pre-refresh token must not approve");
+        assert_eq!(outdated.code(), Code::FailedPrecondition);
+        assert!(outdated.message().contains("refetch and review again"));
+
+        // Approving the evaluation the review surface shows succeeds first time.
+        approve(beta_id.clone(), beta_after.review_token)
+            .await
+            .expect("approval of the refreshed evaluation");
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(beta_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+    }
+
+    /// Submit one agent-authored proposal per host and return their ids.
+    async fn submit_host_proposals(
+        state: &Arc<ServerState>,
+        sandbox_name: &str,
+        hosts: &[String],
+    ) -> Vec<String> {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        handle_submit_policy_analysis(
+            state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: hosts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, host)| PolicyChunk {
+                        rule_name: format!("rule{index}"),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: format!("rule{index}"),
+                            endpoints: vec![NetworkEndpoint {
+                                host: host.clone(),
+                                port: 443,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .accepted_chunk_ids
+    }
+
+    /// Store a policy revision that changes the inputs every pending proposal
+    /// was evaluated against.
+    async fn change_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str, version: i64) {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            format!("unrelated{version}"),
+            NetworkPolicyRule {
+                name: format!("unrelated{version}"),
+                endpoints: vec![NetworkEndpoint {
+                    host: format!("unrelated{version}.example"),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/wget".to_string(),
+                }],
+            },
+        );
+        let hash = deterministic_policy_hash(&policy);
+        state
+            .store
+            .put_policy_revision(
+                &format!("{sandbox_id}-revision-{version}"),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &hash,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_does_not_revert_concurrent_proposal_edit() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-refresh-edit-race";
+        let sandbox_name = "refresh-edit-race";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_name,
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let chunk_id =
+            submit_host_proposals(&state, sandbox_name, &["original.example.com".into()])
+                .await
+                .remove(0);
+
+        // A refresh reads the proposal and evaluates it against a new policy.
+        let read_by_refresh = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        change_sandbox_policy(&state, sandbox_id, 1).await;
+        let evaluation = evaluate_stored_chunk_against_live_inputs(
+            &state,
+            "default",
+            &sandbox,
+            &read_by_refresh,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Before the refresh stores that result, an operator edits the rule.
+        handle_edit_draft_chunk(
+            &state,
+            with_user(Request::new(EditDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(NetworkPolicyRule {
+                    name: "rule0".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "edited.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                    }],
+                }),
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !store_refreshed_evaluation(&state, &read_by_refresh, &evaluation)
+                .await
+                .unwrap(),
+            "a refresh computed before the edit must not be stored"
+        );
+        let stored = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_rule = NetworkPolicyRule::decode(stored.proposed_rule.as_slice()).unwrap();
+        assert_eq!(stored_rule.endpoints[0].host, "edited.example.com");
+    }
+
+    #[tokio::test]
+    async fn policy_change_refreshes_a_bounded_number_of_pending_proposals() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-bounded-refresh";
+        let sandbox_name = "bounded-refresh";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_name,
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let hosts = (0..MAX_PENDING_REFRESH_PER_POLICY_CHANGE + 5)
+            .map(|index| format!("host{index}.example.com"))
+            .collect::<Vec<_>>();
+        submit_host_proposals(&state, sandbox_name, &hosts).await;
+        let tokens_before = state
+            .store
+            .list_draft_chunks(sandbox_id, Some("pending"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|chunk| (chunk.id, chunk.review_token))
+            .collect::<HashMap<_, _>>();
+
+        change_sandbox_policy(&state, sandbox_id, 1).await;
+        let refreshed = refresh_pending_chunk_evaluations(&state, "default", &sandbox)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed as usize, MAX_PENDING_REFRESH_PER_POLICY_CHANGE);
+        let changed = state
+            .store
+            .list_draft_chunks(sandbox_id, Some("pending"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| tokens_before[&chunk.id] != chunk.review_token)
+            .count();
+        assert_eq!(changed, MAX_PENDING_REFRESH_PER_POLICY_CHANGE);
+    }
+
+    #[tokio::test]
+    async fn background_refresh_updates_pending_proposals_and_coalesces() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-background-refresh";
+        let sandbox_name = "background-refresh";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_name,
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let chunk_id = submit_host_proposals(&state, sandbox_name, &["bg.example.com".into()])
+            .await
+            .remove(0);
+        let before = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+
+        change_sandbox_policy(&state, sandbox_id, 1).await;
+        spawn_pending_chunk_refresh(&state, "default", &sandbox);
+        spawn_pending_chunk_refresh(&state, "default", &sandbox);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let idle = !background_pending_refreshes()
+                .lock()
+                .unwrap()
+                .contains_key(sandbox_id);
+            let token = state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .review_token;
+            if idle && token != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background refresh did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn full_policy_update_refreshes_pending_proposals() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-policy-set-refresh";
+        let sandbox_name = "policy-set-refresh";
+        let baseline = test_policy_with_rule("baseline", "baseline.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-set-refresh-v1",
+                sandbox_id,
+                "default",
+                1,
+                &baseline.encode_to_vec(),
+                &deterministic_policy_hash(&baseline),
+            )
+            .await
+            .unwrap();
+        let chunk_id = submit_host_proposals(&state, sandbox_name, &["pending.example.com".into()])
+            .await
+            .remove(0);
+        let before = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+
+        // `openshell policy set`: a full policy replacement through UpdateConfig.
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(test_policy_with_rule("replaced", "replaced.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let token = state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .review_token;
+            if token != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full policy update did not refresh the pending proposal"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn policy_change_reconciles_pending_chunk_already_covered_by_live_policy() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
 
@@ -18636,6 +19533,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -19880,8 +20778,8 @@ mod tests {
     }
 
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
+    fn build_gateway_policy_audit_event_formats_ocsf_config_line() {
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "merged",
@@ -19889,7 +20787,8 @@ mod tests {
             7,
             "sha256:testhash",
             &[],
-        );
+        )
+        .format_shorthand();
 
         assert_eq!(
             message,
@@ -19904,13 +20803,13 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+    fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
             ("auto", "true".to_string()),
             ("source", "agent_authored".to_string()),
             ("prover_delta", "empty".to_string()),
         ];
-        let message = build_gateway_policy_audit_message(
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "approved",
@@ -19918,7 +20817,8 @@ mod tests {
             12,
             "sha256:autohash",
             &extra,
-        );
+        )
+        .format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
@@ -19939,6 +20839,58 @@ mod tests {
             message.contains("prover_delta:empty"),
             "missing prover_delta field: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
+        use tracing_subscriber::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let config = toml::from_str(&format!(
+            "path = {:?}\nrotation = 'never'\n",
+            path.display().to_string()
+        ))
+        .unwrap();
+        let log = crate::ocsf_log::OcsfLog::start(config).unwrap();
+        let subscriber = tracing_subscriber::registry().with(log.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            emit_gateway_policy_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "approved",
+                "approved chunk abc",
+                7,
+                "sha256:manual",
+            );
+            emit_gateway_policy_auto_approve_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "auto-approved: no new prover findings",
+                8,
+                "sha256:auto",
+                "mechanistic",
+                "gateway",
+            );
+        });
+        log.shutdown().await;
+
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
+            assert_eq!(event["container"]["uid"], "sb-123");
+            assert!(event["container"].get("image").is_none());
+        }
+        assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
+        assert!(events[0]["unmapped"].get("auto").is_none());
+        assert_eq!(events[1]["unmapped"]["policy_hash"], "sha256:auto");
+        assert_eq!(events[1]["unmapped"]["auto"], "true");
+        assert_eq!(events[1]["unmapped"]["resolved_from"], "gateway");
     }
 
     #[test]

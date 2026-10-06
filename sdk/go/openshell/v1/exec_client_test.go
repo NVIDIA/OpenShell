@@ -52,7 +52,10 @@ func (r *stubSandboxResolver) AttachProvider(context.Context, string, string, st
 func (r *stubSandboxResolver) DetachProvider(context.Context, string, string, string, uint64) (*DetachProviderResult, error) {
 	panic("not implemented")
 }
-func (r *stubSandboxResolver) ListProviders(context.Context, string, string) ([]*Provider, error) {
+func (r *stubSandboxResolver) ListProviders(string, string, ...ListOptions) (*Pager[*Provider], error) {
+	panic("not implemented")
+}
+func (r *stubSandboxResolver) ListAllProviders(context.Context, string, string, ...ListOptions) ([]*Provider, error) {
 	panic("not implemented")
 }
 func (r *stubSandboxResolver) WaitReady(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {

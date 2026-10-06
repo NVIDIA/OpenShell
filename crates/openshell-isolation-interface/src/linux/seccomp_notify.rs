@@ -20,7 +20,6 @@ use std::time::Duration;
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
-const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 5;
 
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
@@ -141,8 +140,6 @@ pub struct Notification {
 /// kernel, outer seccomp profile, and LSM posture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationProbeReport {
-    /// Whether `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` was accepted.
-    pub wait_killable_recv: bool,
     features: NotificationProbeFeatures,
 }
 
@@ -162,25 +159,23 @@ impl NotificationProbeReport {
         self.features.0 & 2 != 0
     }
 
-    /// Whether process-VM read and write syscalls are admitted for same-process
-    /// memory, before the stronger child-credential probe runs in a driver.
-    #[must_use]
-    pub fn task_memory_copy(self) -> bool {
-        self.features.0 & 4 != 0
-    }
-
     /// Whether connected null-destination `sendto` bypassed notification while
     /// destination-bearing and unsafe-flag variants remained mediated.
     #[must_use]
     pub fn connected_send_fast_path(self) -> bool {
-        self.features.0 & 8 != 0
+        self.features.0 & 4 != 0
     }
 }
 
 /// Owned listener returned by `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+///
+/// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
+/// same on every kernel. A signal can interrupt a notified syscall, which the
+/// kernel then restarts or fails with `EINTR`; broker handlers check the
+/// notification is still live before acting and answer a repeated operation
+/// as the kernel would.
 pub struct NotificationListener {
     fd: OwnedFd,
-    wait_killable_recv: bool,
 }
 
 impl NotificationListener {
@@ -188,12 +183,6 @@ impl NotificationListener {
     #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-
-    /// Whether the listener was installed with killable receive waits.
-    #[must_use]
-    pub fn wait_killable_recv(&self) -> bool {
-        self.wait_killable_recv
     }
 
     /// Receive the next kernel notification.
@@ -330,16 +319,7 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    install_listener_with_flags(syscalls, true).map_err(|error| {
-        if error.raw_os_error() == Some(libc::EINVAL) {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "seccomp WAIT_KILLABLE_RECV is required (Linux 5.19 or newer)",
-            )
-        } else {
-            error
-        }
-    })
+    install_notification_filter(syscalls)
 }
 
 /// Install the capability-free workload networking listener on the calling
@@ -347,24 +327,31 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 ///
 /// The filter mediates every syscall that can create, select, or materially
 /// reconfigure an INET endpoint. Connected `send()`/null-destination
-/// `sendto()` retains the audited cBPF fast path.
+/// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
+/// natively: the broker binds every INET socket to loopback before injecting
+/// it, and accepted sockets inherit their listener's binding.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
-    install_listener(&[
+    #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
+    let mut syscalls = vec![
         libc::SYS_socket,
         libc::SYS_connect,
         libc::SYS_bind,
         libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
         libc::SYS_sendto,
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
-        libc::SYS_getpeername,
         libc::SYS_setsockopt,
         libc::SYS_kill,
         libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_rt_tgsigqueueinfo,
         libc::SYS_rt_sigqueueinfo,
-    ])
+        libc::SYS_openat,
+        libc::SYS_openat2,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    syscalls.push(libc::SYS_open);
+    install_listener(&syscalls)
 }
 
 /// Run a no-capability conformance probe.
@@ -373,31 +360,28 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
 /// one dedicated thread and moved to an unfiltered broker thread through an
 /// in-process channel.
 pub fn probe_notification_api() -> io::Result<NotificationProbeReport> {
-    let wait_killable_recv = probe_scalar_round_trip()?;
+    probe_scalar_round_trip()?;
     probe_addfd_send()?;
-    probe_task_memory_copy()?;
     probe_connected_sendto_fast_path()?;
     Ok(NotificationProbeReport {
-        wait_killable_recv,
-        features: NotificationProbeFeatures(1 | 2 | 4 | 8),
+        features: NotificationProbeFeatures(1 | 2 | 4),
     })
 }
 
-fn probe_scalar_round_trip() -> io::Result<bool> {
+fn probe_scalar_round_trip() -> io::Result<()> {
     const PROBE_VALUE: libc::c_long = 0x5a17;
     let (sender, receiver) = mpsc::sync_channel(1);
     let launcher = thread::spawn(move || -> io::Result<libc::c_long> {
         let listener = install_listener(&[libc::SYS_getppid])?;
-        let wait_killable = listener.wait_killable_recv();
         sender
-            .send((listener, wait_killable))
+            .send(listener)
             .map_err(|_| io::Error::other("notification broker disappeared"))?;
         // SAFETY: getppid has no pointer arguments. The installed filter causes
         // the kernel to block here until the broker validates and responds.
         Ok(unsafe { libc::syscall(libc::SYS_getppid) })
     });
 
-    let (listener, wait_killable) = receiver
+    let listener = receiver
         .recv()
         .map_err(|_| io::Error::other("notification launcher disappeared"))?;
     let notification = match receive_probe_notification(&listener) {
@@ -417,7 +401,7 @@ fn probe_scalar_round_trip() -> io::Result<bool> {
     if observed != PROBE_VALUE {
         return Err(io::Error::other("seccomp response value was not delivered"));
     }
-    Ok(wait_killable)
+    Ok(())
 }
 
 fn probe_addfd_send() -> io::Result<()> {
@@ -492,32 +476,6 @@ fn probe_addfd_send() -> io::Result<()> {
     launcher
         .join()
         .map_err(|_| io::Error::other("ADDFD launcher panicked"))??;
-    Ok(())
-}
-
-fn probe_task_memory_copy() -> io::Result<()> {
-    let source = 0x1122_3344_5566_7788_u64;
-    let tid = std::process::id();
-    let mut source_bytes = [0_u8; size_of::<u64>()];
-    crate::linux::task_memory::read_exact(
-        tid,
-        std::ptr::addr_of!(source) as u64,
-        &mut source_bytes,
-    )?;
-    let mut copied = u64::from_ne_bytes(source_bytes);
-    if copied != source {
-        return Err(io::Error::other("task-memory probe read wrong value"));
-    }
-
-    let replacement = 0xaabb_ccdd_eeff_0011_u64;
-    crate::linux::task_memory::write_exact(
-        tid,
-        std::ptr::addr_of_mut!(copied) as u64,
-        &replacement.to_ne_bytes(),
-    )?;
-    if copied != replacement {
-        return Err(io::Error::other("task-memory probe wrote wrong value"));
-    }
     Ok(())
 }
 
@@ -697,10 +655,7 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_listener_with_flags(
-    syscalls: &[i64],
-    wait_killable_recv: bool,
-) -> io::Result<NotificationListener> {
+fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListener> {
     let mut program = build_filter(syscalls)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
@@ -708,12 +663,7 @@ fn install_listener_with_flags(
         len: length,
         filter: program.as_mut_ptr(),
     };
-    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER
-        | if wait_killable_recv {
-            SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
-        } else {
-            0
-        };
+    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
     // SAFETY: `fprog` points to a live classic-BPF program for the duration of
     // the syscall. The returned nonnegative value is a newly owned FD.
     let result = unsafe {
@@ -731,10 +681,7 @@ fn install_listener_with_flags(
         .map_err(|_| io::Error::other("seccomp listener FD does not fit RawFd"))?;
     // SAFETY: successful NEW_LISTENER returns one newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(NotificationListener {
-        fd,
-        wait_killable_recv,
-    })
+    Ok(NotificationListener { fd })
 }
 
 fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
@@ -757,6 +704,10 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
     for syscall in syscalls {
         if syscall == libc::SYS_sendto {
             append_sendto_filter(&mut program)?;
+            continue;
+        }
+        if matches!(syscall, libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo) {
+            append_resume_signal_filter(&mut program, syscall)?;
             continue;
         }
         let syscall = u32::try_from(syscall)
@@ -793,6 +744,27 @@ fn append_sendto_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> 
         stmt(BPF_LD_W_ABS, argument_word_offset(3, 0)),
         stmt(BPF_ALU_AND_K, !CONNECTED_SEND_FLAGS),
         jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+    ]);
+    Ok(())
+}
+
+/// Notify a thread-group signal only when it sends `SIGCONT`, which the broker
+/// refuses while the workload is frozen. Every other signal (for example Go's
+/// preemption signal) stays in the kernel.
+fn append_resume_signal_filter(
+    program: &mut Vec<libc::sock_filter>,
+    syscall: i64,
+) -> io::Result<()> {
+    let syscall = u32::try_from(syscall)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
+    let resume = u32::try_from(libc::SIGCONT)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative signal number"))?;
+    program.extend([
+        jump(BPF_JMP_JEQ_K, syscall, 0, 4),
+        stmt(BPF_LD_W_ABS, argument_word_offset(2, 0)),
+        jump(BPF_JMP_JEQ_K, resume, 0, 1),
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
     ]);
@@ -901,7 +873,11 @@ fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
+
+    const NONDUMPABLE_PROBE_CHILD: &str = "OPENSHELL_NONDUMPABLE_PROBE_CHILD";
 
     #[test]
     fn filter_rejects_empty_syscall_set() {
@@ -914,8 +890,91 @@ mod tests {
         let report = probe_notification_api().expect("active notification probe");
         assert!(report.notification_round_trip());
         assert!(report.addfd_send());
-        assert!(report.task_memory_copy());
         assert!(report.connected_send_fast_path());
+    }
+
+    #[test]
+    fn notification_probe_ignores_unavailable_self_task_memory() {
+        if std::env::var_os(NONDUMPABLE_PROBE_CHILD).is_some() {
+            // Match the production broker posture and Kata kernels that omit
+            // CONFIG_CROSS_MEMORY_ATTACH. The notification API probe must not
+            // inspect this trusted process through /proc/self/mem: a
+            // nondumpable non-root process cannot open that file, while the
+            // separately qualified dumpable workload child remains readable.
+            if unsafe { libc::geteuid() } == 0 {
+                // SAFETY: this disposable subprocess permanently drops its
+                // supplementary groups and root identity before probing.
+                assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
+                assert_eq!(unsafe { libc::setgid(65_534) }, 0);
+                assert_eq!(unsafe { libc::setuid(65_534) }, 0);
+            }
+            // SAFETY: PR_SET_DUMPABLE accepts one scalar flag and only
+            // tightens this disposable test process.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            let self_mem_error = std::fs::File::open("/proc/self/mem")
+                .expect_err("nondumpable unprivileged self memory must be inaccessible");
+            assert_eq!(self_mem_error.kind(), io::ErrorKind::PermissionDenied);
+            install_process_vm_enosys_filter().expect("install process-VM ENOSYS filter");
+            probe_notification_api().expect("probe notification API without self task memory");
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::seccomp_notify::tests::notification_probe_ignores_unavailable_self_task_memory")
+            .arg("--nocapture")
+            .env(NONDUMPABLE_PROBE_CHILD, "1")
+            .status()
+            .expect("run disposable nondumpable probe process");
+        assert!(status.success(), "nondumpable probe child failed: {status}");
+    }
+
+    fn install_process_vm_enosys_filter() -> io::Result<()> {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let syscall_number = |number: libc::c_long| {
+            u32::try_from(number).map_err(|_| io::Error::other("syscall number does not fit u32"))
+        };
+        let mut instructions = [
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+            jump(
+                BPF_JMP_JEQ_K,
+                syscall_number(libc::SYS_process_vm_readv)?,
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS.unsigned_abs()),
+            jump(
+                BPF_JMP_JEQ_K,
+                syscall_number(libc::SYS_process_vm_writev)?,
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS.unsigned_abs()),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        ];
+        let length = u16::try_from(instructions.len())
+            .map_err(|_| io::Error::other("test seccomp filter is too large"))?;
+        let mut program = libc::sock_fprog {
+            len: length,
+            filter: instructions.as_mut_ptr(),
+        };
+        set_no_new_privileges()?;
+        // SAFETY: program references the complete live test filter. No flags
+        // are required because the disposable process has one calling thread.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::addr_of_mut!(program),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     #[test]
@@ -928,7 +987,6 @@ mod tests {
         let listener = NotificationListener {
             // SAFETY: successful dup returned a new owned descriptor.
             fd: unsafe { OwnedFd::from_raw_fd(duplicated) },
-            wait_killable_recv: false,
         };
         let error = listener
             .respond_errno(1, 0)

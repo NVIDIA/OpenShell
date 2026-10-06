@@ -112,12 +112,7 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
     let mut pos = 0usize;
 
     loop {
-        let size_line_end = loop {
-            if let Some(end) = find_crlf(&raw, pos) {
-                break end;
-            }
-            read_more(client, &mut raw, max_body_bytes).await?;
-        };
+        let size_line_end = read_chunked_line(client, &mut raw, pos, max_body_bytes).await?;
         let size_line = std::str::from_utf8(&raw[pos..size_line_end])
             .into_diagnostic()
             .map_err(|_| miette!("Invalid UTF-8 in HTTP chunk-size line"))?;
@@ -139,12 +134,7 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
 
         if chunk_size == 0 {
             loop {
-                let trailer_end = loop {
-                    if let Some(end) = find_crlf(&raw, pos) {
-                        break end;
-                    }
-                    read_more(client, &mut raw, max_body_bytes).await?;
-                };
+                let trailer_end = read_chunked_line(client, &mut raw, pos, max_body_bytes).await?;
                 let trailer_line = &raw[pos..trailer_end];
                 pos = trailer_end + 2;
                 if trailer_line.is_empty() {
@@ -162,7 +152,8 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
             .checked_add(2)
             .ok_or_else(|| miette!("HTTP chunk size overflow"))?;
         while raw.len() < chunk_with_crlf_end {
-            read_more(client, &mut raw, max_body_bytes).await?;
+            let remaining = chunk_with_crlf_end - raw.len();
+            read_more(client, &mut raw, max_body_bytes, remaining).await?;
         }
         decoded.extend_from_slice(&raw[pos..chunk_end]);
         if raw.get(chunk_end..chunk_with_crlf_end) != Some(&b"\r\n"[..]) {
@@ -172,10 +163,30 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
     }
 }
 
+async fn read_chunked_line<C: AsyncRead + Unpin>(
+    client: &mut C,
+    raw: &mut Vec<u8>,
+    start: usize,
+    max_body_bytes: usize,
+) -> Result<usize> {
+    let mut scan_start = start;
+    loop {
+        if let Some(end) = find_crlf(raw, scan_start) {
+            return Ok(end);
+        }
+        // Retain a possible trailing CR without rescanning the entire line.
+        scan_start = raw.len().saturating_sub(1).max(start);
+        // Framing has no known length. Stop at CRLF so the connection's reader
+        // retains any following request for its own inspection and policy check.
+        read_more(client, raw, max_body_bytes, 1).await?;
+    }
+}
+
 async fn read_more<C: AsyncRead + Unpin>(
     client: &mut C,
     raw: &mut Vec<u8>,
     max_body_bytes: usize,
+    remaining: usize,
 ) -> Result<()> {
     if raw.len() > max_body_bytes.saturating_mul(2).max(max_body_bytes) {
         return Err(miette!(
@@ -183,7 +194,9 @@ async fn read_more<C: AsyncRead + Unpin>(
         ));
     }
     let mut buf = [0u8; READ_BUF_SIZE];
-    let n = client.read(&mut buf).await.into_diagnostic()?;
+    // Payload reads stop at the declared chunk boundary, including its CRLF.
+    let to_read = remaining.min(buf.len());
+    let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
     if n == 0 {
         return Err(miette!("HTTP chunked body ended before terminator"));
     }
@@ -196,4 +209,130 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|p| start + p)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn chunked_request() -> L7Request {
+        L7Request {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: HashMap::new(),
+            raw_header:
+                b"POST /mcp HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec(),
+            body_length: BodyLength::Chunked,
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_inspection_preserves_pipelined_request() {
+        let next = b"DELETE /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        wire.extend_from_slice(next);
+        let (mut sender, receiver) = tokio::io::duplex(8192);
+        sender.write_all(&wire).await.unwrap();
+        sender.shutdown().await.unwrap();
+        let mut reader = BufReader::with_capacity(8192, receiver);
+        let mut request = chunked_request();
+
+        let body = read_body_for_inspection(&mut reader, &mut request, 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, b"hello");
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, next, "inspection consumed the next request");
+    }
+
+    #[tokio::test]
+    async fn chunked_inspection_preserves_boundary_with_fragmentation_and_buffered_prefix() {
+        let next = b"GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let encoded = b"2;ext=value\r\nhe\r\n3\r\nllo\r\n0\r\nX-Checksum: ignored\r\n\r\n";
+        for capacity in [1, 2, 8192] {
+            for prefix_len in 0..=encoded.len() {
+                let mut request = chunked_request();
+                request.raw_header.extend_from_slice(&encoded[..prefix_len]);
+                let mut wire = encoded[prefix_len..].to_vec();
+                wire.extend_from_slice(next);
+                let mut reader = BufReader::with_capacity(capacity, wire.as_slice());
+                let body = read_body_for_inspection(&mut reader, &mut request, 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(body, b"hello");
+                assert!(matches!(request.body_length, BodyLength::ContentLength(5)));
+                assert_eq!(
+                    request.raw_header,
+                    b"POST /mcp HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello"
+                );
+                let mut remaining = Vec::new();
+                reader.read_to_end(&mut remaining).await.unwrap();
+                assert_eq!(remaining, next, "capacity={capacity}, prefix={prefix_len}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_inspection_preserves_request_after_empty_body() {
+        let next = b"GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut wire = b"0\r\n\r\n".to_vec();
+        wire.extend_from_slice(next);
+        let mut reader = BufReader::new(wire.as_slice());
+        let mut request = chunked_request();
+        assert!(
+            read_body_for_inspection(&mut reader, &mut request, 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, next);
+    }
+
+    #[tokio::test]
+    async fn chunked_inspection_rejects_malformed_or_incomplete_framing() {
+        for (encoded, expected) in [
+            (b"z\r\n".as_slice(), "Invalid HTTP chunk size token"),
+            (b"\xff\r\n", "Invalid UTF-8 in HTTP chunk-size line"),
+            (b"1\r\nx!!", "HTTP chunk payload missing terminating CRLF"),
+            (b"1\r", "HTTP chunked body ended before terminator"),
+            (b"5\r\nhe", "HTTP chunked body ended before terminator"),
+            (
+                b"0\r\nX-Trailer: unfinished",
+                "HTTP chunked body ended before terminator",
+            ),
+        ] {
+            let mut reader = BufReader::with_capacity(2, encoded);
+            let error = read_body_for_inspection(&mut reader, &mut chunked_request(), 1024)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_inspection_enforces_body_and_framing_limits() {
+        let mut reader = b"11\r\n".as_slice();
+        let error = read_body_for_inspection(&mut reader, &mut chunked_request(), 16)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("16 byte inspection limit"));
+
+        for encoded in [
+            format!("0;{}\r\n\r\n", "x".repeat(64)),
+            format!("0\r\nX-Trailer: {}\r\n\r\n", "x".repeat(64)),
+        ] {
+            let mut reader = encoded.as_bytes();
+            let error = read_body_for_inspection(&mut reader, &mut chunked_request(), 16)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("inspection framing limit"));
+        }
+    }
 }

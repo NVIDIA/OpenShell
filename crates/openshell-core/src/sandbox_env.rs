@@ -26,6 +26,9 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// OTLP/gRPC collector endpoint for supervisor trace export.
+pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in
@@ -185,7 +188,7 @@ pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
 /// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
 pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
-/// Path to the CA certificate for mTLS communication with the gateway.
+/// Path to the CA certificate used to authenticate the gateway TLS endpoint.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 
 /// Path to the client certificate for mTLS communication with the gateway.

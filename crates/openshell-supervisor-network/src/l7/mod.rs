@@ -307,32 +307,6 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     let tls = match tls_value.as_str() {
         "skip" => TlsMode::Skip,
-        "terminate" => {
-            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Other, "deprecated")
-                .message(
-                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        "passthrough" => {
-            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Other, "deprecated")
-                .message(
-                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
         "" => TlsMode::Auto,
         _ => unreachable!("endpoint modes were validated above"),
     };
@@ -474,7 +448,6 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
     }
 }
@@ -1277,6 +1250,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             );
             let loc = format!("{name}.endpoints[{i}]");
 
+            errors.extend(
+                validate_endpoint_modes(tls, enforcement, access)
+                    .into_iter()
+                    .map(|reason| format!("{loc}: {reason}")),
+            );
+
             if protocol == "mcp" {
                 if host.trim().is_empty() {
                     errors.push(format!(
@@ -1493,13 +1472,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            // Deprecated tls values: warn but don't error
-            if tls == "terminate" || tls == "passthrough" {
-                warnings.push(format!(
-                    "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
-                ));
-            }
-
             // tls: skip with L7 on port 443 won't work
             if tls == "skip" && !protocol.is_empty() && ports.contains(&443) {
                 warnings.push(format!(
@@ -1513,10 +1485,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: SQL enforcement requires full SQL parsing (not available in v1). Use `enforcement: audit`."
                 ));
             }
-
-            // port 443 + rest + tls: skip — L7 won't work (already handled above)
-            // The old warning about missing `tls: terminate` is no longer needed
-            // because TLS termination is now automatic.
 
             // Per-rule deny_rules validation (semantic checks handled by
             // shared validator above).
@@ -1957,12 +1925,11 @@ mod tests {
     #[test]
     fn parse_l7_config_rest_enforce() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "tls": "terminate", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
+            r#"{"protocol": "rest", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        // "terminate" is deprecated and treated as Auto.
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Enforce);
     }
@@ -3425,30 +3392,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_terminate_deprecated_warning() {
-        let data = serde_json::json!({
-            "network_policies": {
-                "test": {
-                    "endpoints": [{
-                        "host": "api.example.com",
-                        "port": 443,
-                        "tls": "terminate",
-                        "protocol": "rest",
-                        "access": "full"
-                    }],
-                    "binaries": []
+    fn validate_rejects_unknown_endpoint_modes_without_warning() {
+        for (field, value) in [
+            ("tls", "terminate"),
+            ("tls", "passthrough"),
+            ("enforcement", "enforcee"),
+            ("access", "read_only"),
+        ] {
+            let mut endpoint = serde_json::json!({
+                "host": "api.example.com",
+                "port": 443,
+                "protocol": "rest",
+                "access": "full"
+            });
+            endpoint[field] = value.into();
+            let data = serde_json::json!({
+                "network_policies": {
+                    "test": { "endpoints": [endpoint], "binaries": [] }
                 }
-            }
-        });
-        let (errors, warnings) = validate_l7_policies(&data);
-        assert!(
-            errors.is_empty(),
-            "deprecated tls should not error: {errors:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("deprecated")),
-            "should warn about deprecated tls: {warnings:?}"
-        );
+            });
+
+            let (errors, warnings) = validate_l7_policies(&data);
+            assert!(
+                errors.iter().any(|e| e.contains("test.endpoints[0]")
+                    && e.contains(&format!("unknown {field} value '{value}'"))),
+                "{field}: {value} should be rejected: {errors:?}"
+            );
+            assert!(
+                !warnings.iter().any(|w| w.contains("deprecated")),
+                "{field}: {value} should not warn: {warnings:?}"
+            );
+        }
     }
 
     #[test]

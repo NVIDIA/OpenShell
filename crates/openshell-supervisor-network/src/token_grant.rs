@@ -901,6 +901,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_credentials_cache_and_expire_independently() {
+        let cache = TokenCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scopes = vec!["read".to_string()];
+        let service = "api.example.test\t443\t/v1/**\trev:1\tprovider:service";
+        let identity = "api.example.test\t443\t/v1/**\trev:1\tprovider:identity";
+        for (key, expected) in [(service, "token-1"), (identity, "token-2")] {
+            let token = obtain_counted_test_token(CountedTokenGrantInput {
+                cache: &cache,
+                provider_name: key,
+                token_endpoint: "https://auth.example.com/token",
+                jwt_svid_audience: "https://auth.example.com",
+                audience: "api://resource",
+                scopes: &scopes,
+                cache_ttl_override: None,
+                expires_in: 120,
+                grant_calls: calls.clone(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(token, expected);
+        }
+        let identity_cache_key = token_cache_key(TokenCacheKeyInput {
+            provider_name: identity,
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "api://resource",
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: ACCESS_TOKEN_TYPE,
+        });
+        cache.set(identity_cache_key, "expired".into(), current_time_ms() - 1);
+        let service_token = obtain_token_without_grant_call(
+            &cache,
+            service,
+            "https://auth.example.com/token",
+            "https://auth.example.com",
+            "api://resource",
+            &scopes,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(service_token, "token-1");
+        let identity_token = obtain_counted_test_token(CountedTokenGrantInput {
+            cache: &cache,
+            provider_name: identity,
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: None,
+            expires_in: 120,
+            grant_calls: calls.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(identity_token, "token-3");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn obtain_provider_token_uses_cache_for_same_key() {
         let cache = TokenCache::new();
         let grant_calls = Arc::new(AtomicUsize::new(0));

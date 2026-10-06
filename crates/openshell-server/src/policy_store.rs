@@ -262,6 +262,17 @@ pub trait PolicyStoreExt {
         chunk: &DraftChunkRecord,
     ) -> PersistenceResult<bool>;
 
+    /// Store `evaluated`'s evaluation fields only if the proposal is still the
+    /// one `expected` recorded: same rule name, proposed rule, and review
+    /// token. Every other field keeps its current stored value, so a
+    /// concurrent edit or observation is never reverted. Returns `false` when
+    /// the proposal changed or is no longer pending or rejected.
+    async fn update_draft_chunk_evaluation_if_unchanged(
+        &self,
+        expected: &DraftChunkRecord,
+        evaluated: &DraftChunkRecord,
+    ) -> PersistenceResult<bool>;
+
     async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> PersistenceResult<u64>;
 
     async fn get_draft_version(&self, sandbox_id: &str) -> PersistenceResult<i64>;
@@ -494,6 +505,25 @@ impl PolicyStoreExt for Store {
         }
     }
 
+    async fn update_draft_chunk_evaluation_if_unchanged(
+        &self,
+        expected: &DraftChunkRecord,
+        evaluated: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .update_draft_chunk_evaluation_if_unchanged(expected, evaluated)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .update_draft_chunk_evaluation_if_unchanged(expected, evaluated)
+                    .await
+            }
+        }
+    }
+
     async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> PersistenceResult<u64> {
         match self {
             Self::Postgres(store) => store.delete_draft_chunks(sandbox_id, status).await,
@@ -599,6 +629,43 @@ pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceR
         candidate_effective_policy: chunk.candidate_effective_policy.clone(),
     }
     .encode_to_vec())
+}
+
+/// Whether `current` is still the proposal an evaluation was computed from.
+pub fn draft_chunk_evaluation_inputs_match(
+    current: &DraftChunkRecord,
+    expected: &DraftChunkRecord,
+) -> bool {
+    current.rule_name == expected.rule_name
+        && current.proposed_rule == expected.proposed_rule
+        && current.review_token == expected.review_token
+}
+
+/// Copy the policy-dependent evaluation fields from `evaluated` onto the
+/// currently stored record, leaving edits and observation counters as stored.
+pub fn apply_draft_chunk_evaluation(current: &mut DraftChunkRecord, evaluated: &DraftChunkRecord) {
+    current.rule_name.clone_from(&evaluated.rule_name);
+    current.proposed_rule.clone_from(&evaluated.proposed_rule);
+    current
+        .validation_result
+        .clone_from(&evaluated.validation_result);
+    current
+        .application_error
+        .clone_from(&evaluated.application_error);
+    current.review_token.clone_from(&evaluated.review_token);
+    current
+        .current_effective_policy_hash
+        .clone_from(&evaluated.current_effective_policy_hash);
+    current
+        .candidate_effective_policy_hash
+        .clone_from(&evaluated.candidate_effective_policy_hash);
+    current
+        .current_effective_policy
+        .clone_from(&evaluated.current_effective_policy);
+    current
+        .candidate_effective_policy
+        .clone_from(&evaluated.candidate_effective_policy);
+    current.last_seen_ms = evaluated.last_seen_ms;
 }
 
 pub fn draft_chunk_record_from_parts(

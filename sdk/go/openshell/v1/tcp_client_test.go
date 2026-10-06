@@ -1011,7 +1011,10 @@ func (r *flippableResolver) AttachProvider(context.Context, string, string, stri
 func (r *flippableResolver) DetachProvider(context.Context, string, string, string, uint64) (*DetachProviderResult, error) {
 	panic("not implemented")
 }
-func (r *flippableResolver) ListProviders(context.Context, string, string) ([]*Provider, error) {
+func (r *flippableResolver) ListProviders(string, string, ...ListOptions) (*Pager[*Provider], error) {
+	panic("not implemented")
+}
+func (r *flippableResolver) ListAllProviders(context.Context, string, string, ...ListOptions) ([]*Provider, error) {
 	panic("not implemented")
 }
 func (r *flippableResolver) WaitReady(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {

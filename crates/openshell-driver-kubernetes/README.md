@@ -2,6 +2,14 @@
 
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
+Caller driver config is disabled by default. External resource references need
+administrator-controlled approval labels in every workspace mode, including
+before restart and scheduling-gate release. GPU devices are temporarily exempt.
+Image-pull Secrets are operator-selected gateway configuration rather than caller
+attachments. Managed mode stages an immutable copy for each sandbox runtime
+generation.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:
@@ -9,8 +17,12 @@ workspace namespace modes via `workspace_mode`:
 - **Shared** (default): All sandboxes render into a single static namespace.
   Resource names use `{workspace}--{name}` for collision avoidance.
 - **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
-  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
-  and copies OpenShift SCC annotations from the gateway namespace when present.
+  (`openshell-{gateway_id}-{workspace_name}`) and creates a ServiceAccount in
+  each. On OpenShift, it leaves SCC annotations to the namespace allocator and
+  waits for the namespace's own MCS, UID-range, and supplemental-group
+  annotations before provisioning sandbox resources. An existing namespace with
+  a UID range but no MCS must be recreated so OpenShift can allocate a complete
+  set of SCC annotations.
 - **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
@@ -67,20 +79,29 @@ The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
 
+When the gateway exports OTLP traces, the driver sets
+`OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
+`TRACEPARENT` to the trace context of the operation that created the Pod. The
+supervisor exports its spans there and parents its startup span on that
+context. The endpoint is not configurable in driver TOML.
+
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
 and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
 authenticated Sandbox Protocol binds each connection to the exact sandbox and
 supervisor Pod identities. Supervisors have normal egress for gateway, DNS,
 and policy-approved upstream connections unless an operator policy restricts
-them. Set
-`sandbox_runtime.network_policy_enforced = true` only after verifying that the cluster
-CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
+them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
+sandbox namespace. Kubernetes accepts policy objects without confirming
+enforcement, so operators must verify CNI support before running sandboxes.
 
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
-supervisor. The TLS channel binds the namespace, Sandbox CR, workload Pod,
+supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
+corporate proxy CA bundle, which the gateway reads from its own filesystem so
+the anchor stays in the gateway's trust domain rather than the sandbox
+namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
 supervisor Pod, and shared network-policy identities. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. The shared network fence remains for
@@ -146,7 +167,10 @@ UID. Restart requires exactly one matching Sandbox resource and preserves its
 namespace and UID while rotating the supervisor Pod UID. The gateway requires
 the authenticated identity to match the durable binding before returning the
 generation-bound session JWT used by the supervisor. The sandbox Pod receives
-neither token.
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.
@@ -167,6 +191,13 @@ credentials after launch and must inspect its same-identity descendants.
 The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
+
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
 
 ## GPU Support
 

@@ -1596,7 +1596,7 @@ fn validate_supported_endpoint_extensions(
     context: &str,
     endpoint: &Endpoint,
 ) -> Result<(), UnsupportedFeature> {
-    if !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
+    if !endpoint.tls.is_empty()
         || endpoint.allow_encoded_slash
         || endpoint.websocket_credential_rewrite
         || endpoint.request_body_credential_rewrite
@@ -3184,17 +3184,20 @@ network_policies:
     }
 
     #[test]
-    fn deprecated_tls_spelling_does_not_change_authority() {
-        let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n    binaries: [{ path: /usr/bin/curl }]\n",
-        );
-        let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**' }\n    binaries: [{ path: /usr/bin/curl }]\n",
-        );
-        assert!(matches!(
-            check_within_boundary(&boundary, &candidate, options()),
-            CheckResult::Within(_)
-        ));
+    fn removed_tls_spelling_is_outside_the_authority_model() {
+        for tls in ["terminate", "passthrough"] {
+            let policy = parse(&format!(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: {tls}\n        enforcement: enforce\n        access: read-only\n    binaries: [{{ path: /usr/bin/curl }}]\n"
+            ));
+            assert!(
+                matches!(
+                    check_within_boundary(&policy, &policy, options()),
+                    CheckResult::Unsupported(ref evidence)
+                        if evidence.reason().contains("outside the initial model")
+                ),
+                "tls: {tls}"
+            );
+        }
     }
 
     #[test]

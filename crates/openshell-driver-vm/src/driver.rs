@@ -3,9 +3,13 @@
 
 #![allow(unsafe_code)]
 
+#[path = "preparation.rs"]
+mod preparation;
+
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
+use crate::layer_applier::apply_layer_dir_to_rootfs;
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
@@ -51,11 +55,12 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
-    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, WorkloadIdentityRequest, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -77,6 +82,8 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -84,7 +91,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -154,10 +161,6 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 #[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 #[allow(dead_code)]
-const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
-#[allow(dead_code)]
-const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
-#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
@@ -197,7 +200,7 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v4";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v5";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
@@ -212,11 +215,9 @@ static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RuntimeImagePlan {
     root_disk: PathBuf,
     image_disk: Option<PathBuf>,
@@ -246,7 +247,17 @@ enum GuestImagePayloadSource {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmDriverConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    #[serde(default)]
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    #[serde(default)]
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -300,6 +311,7 @@ impl std::fmt::Debug for VmDriverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
+            .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -363,6 +375,10 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
             default_image: String::new(),
@@ -422,6 +438,16 @@ impl VmDriverConfig {
         Ok(())
     }
 
+    pub fn validate_bootstrap_image_config(&self) -> Result<(), String> {
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(
+                "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_rootfs_tar_config(&self) -> Result<(), String> {
         if self
             .rootfs_tar_staging_dir
@@ -475,15 +501,16 @@ impl VmDriverConfig {
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
-        let provided = [
-            self.guest_tls_ca.as_ref(),
-            self.guest_tls_cert.as_ref(),
-            self.guest_tls_key.as_ref(),
-        ];
-        if provided.iter().all(Option::is_none) {
+        if self.guest_tls_cert.is_some() || self.guest_tls_key.is_some() {
+            return Err(
+                "sandbox client certificates are no longer supported; remove OPENSHELL_VM_TLS_CERT and OPENSHELL_VM_TLS_KEY"
+                    .to_string(),
+            );
+        }
+        if self.guest_tls_ca.is_none() {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA so the host supervisor can authenticate the gateway"
                         .to_string(),
                 )
             } else {
@@ -496,18 +523,7 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.guest_tls_cert.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
-            );
-        };
-        let Some(key) = self.guest_tls_key.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
-            );
-        };
-
-        for path in [&ca, &cert, &key] {
+        for path in [&ca] {
             if !path.is_file() {
                 return Err(format!(
                     "TLS material '{}' does not exist or is not a file",
@@ -516,7 +532,7 @@ impl VmDriverConfig {
             }
         }
 
-        Ok(Some(VmDriverTlsPaths { ca, cert, key }))
+        Ok(Some(VmDriverTlsPaths { ca }))
     }
 }
 
@@ -572,6 +588,7 @@ struct SandboxRecord {
     state_dir: PathBuf,
     process: Option<Arc<Mutex<VmProcess>>>,
     provisioning_task: Option<JoinHandle<()>>,
+    preparation: Option<Arc<Mutex<preparation::Attempt>>>,
     gpu_bdf: Option<String>,
     deleting: bool,
 }
@@ -605,13 +622,13 @@ fn resolve_record_id(
     Ok(first)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum OverlayPreparation {
     Fresh,
     PreserveExisting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SandboxOwnerIdentity {
     uid: u32,
     gid: u32,
@@ -654,9 +671,12 @@ fn provisioning_span(
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
+    socket_root: PathBuf,
+    socket_root_fd: Arc<OwnedFd>,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     image_cache_lock: Arc<Mutex<()>>,
+    preparation_root: Option<PathBuf>,
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
     lifecycle_extensions: Arc<LifecycleExtensionRegistry>,
@@ -671,11 +691,13 @@ impl VmDriver {
         mut config: VmDriverConfig,
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
+        config.resource_admission.validate()?;
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
@@ -697,7 +719,7 @@ impl VmDriver {
             )
         })?;
         let image_cache_root = image_cache_root_dir(&config.state_dir);
-        tokio::fs::create_dir_all(&image_cache_root)
+        create_private_dir_all(&image_cache_root)
             .await
             .map_err(|err| {
                 format!(
@@ -732,16 +754,24 @@ impl VmDriver {
             None
         };
 
+        let (socket_root, socket_root_fd) = allocate_socket_root()
+            .map_err(|err| format!("failed to allocate socket root in /tmp: {err}"))?;
+
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let driver = Self {
             config,
+            socket_root,
+            socket_root_fd: Arc::new(socket_root_fd),
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory,
             lifecycle_extensions: Arc::new(lifecycle_extensions),
         };
+        preparation::reconcile(&image_cache_root_dir(&driver.config.state_dir))
+            .map_err(|error| format!("reconcile image preparation staging: {error}"))?;
         driver.restore_persisted_sandboxes().await;
         Ok(driver)
     }
@@ -824,17 +854,21 @@ impl VmDriver {
         if validate_host_supervisor(&destination).is_ok() {
             return Ok(destination);
         }
-        let _cache_guard = self.image_cache_lock.lock().await;
+        let cache_guard = self.image_cache_lock.clone().lock_owned().await;
         if validate_host_supervisor(&destination).is_ok() {
             return Ok(destination);
         }
         let destination_for_extract = destination.clone();
-        tokio::task::spawn_blocking(move || extract_host_supervisor(&destination_for_extract))
-            .await
-            .map_err(|error| {
-                Status::internal(format!("host supervisor extraction panicked: {error}"))
-            })?
-            .map_err(Status::failed_precondition)?;
+        tokio::task::spawn_blocking(move || {
+            // This atomic shared-cache write does not target sandbox state.
+            // Retain its lock until the write finishes even if provisioning is
+            // cancelled, so a later caller cannot start a competing extractor.
+            let _cache_guard = cache_guard;
+            extract_host_supervisor(&destination_for_extract)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("host supervisor extraction panicked: {error}")))?
+        .map_err(Status::failed_precondition)?;
         validate_host_supervisor(&destination).map_err(Status::failed_precondition)?;
         Ok(destination)
     }
@@ -921,7 +955,7 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                state_dir.join("ssh.sock"),
+                sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
             )
             .env(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -944,6 +978,11 @@ impl VmDriver {
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
             );
+        if let Some(endpoint) = &self.config.supervisor_otlp_endpoint {
+            command
+                .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
+                .envs(openshell_otel::current_trace_context_environment());
+        }
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -952,10 +991,7 @@ impl VmDriver {
         }
         configure_main_exit_marker(&mut command, state_dir);
         if let Some(tls) = tls_paths {
-            command
-                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
-                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
-                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+            command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
         #[cfg(unix)]
         let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
@@ -1009,7 +1045,21 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
+        let mut extension = openshell_core::extension_protocol::extension_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "openshell/vm",
+            openshell_core::VERSION,
+            [],
+        );
+        extension
+            .required_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         GetCapabilitiesResponse {
+            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: self.config.allow_driver_config,
+                resource_admission: self.config.resource_admission.clone(),
+            }
+            .acknowledgement(),
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
@@ -1034,12 +1084,7 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
-                "openshell/vm",
-                openshell_core::VERSION,
-                [],
-            )),
+            extension: Some(extension),
         }
     }
 
@@ -1047,6 +1092,10 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )?;
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
         let has_rootfs_tar =
             VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
@@ -1062,6 +1111,13 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
+        self.validate_sandbox(sandbox)?;
+        decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        )?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1104,6 +1160,7 @@ impl VmDriver {
                     state_dir: state_dir.clone(),
                     process: None,
                     provisioning_task: None,
+                    preparation: None,
                     gpu_bdf: None,
                     deleting: false,
                 },
@@ -1125,10 +1182,20 @@ impl VmDriver {
             return Err(Status::internal(format!("create state dir failed: {err}")));
         }
 
+        if let Err(err) =
+            create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+        {
+            let mut registry = self.registry.lock().await;
+            registry.remove(&sandbox.id);
+            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            return Err(Status::internal(format!("create socket dir failed: {err}")));
+        }
+
         if let Err(err) = self.ensure_extension_state_dirs(&state_dir).await {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
             return Err(err);
         }
 
@@ -1136,6 +1203,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
             return Err(Status::internal(format!(
                 "write sandbox start metadata failed: {err}"
             )));
@@ -1211,6 +1279,7 @@ impl VmDriver {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 }
+                remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox_id);
                 return;
             }
 
@@ -1240,6 +1309,14 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
+        // Launch credentials are independent of the image. Validate them before
+        // resolving registry references, preparing disks, or publishing progress.
+        let launch_authentication = decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        )?;
         let is_gpu = sandbox
             .spec
             .as_ref()
@@ -1275,10 +1352,11 @@ impl VmDriver {
                         "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
                     ))
                 })?;
-            let bootstrap_image_ref = self.bootstrap_image_ref(&image_ref);
+            let bootstrap_image_ref = self.bootstrap_image_ref()?;
             let bootstrap_image_identity = self
-                .ensure_cached_bootstrap_rootfs_image(&sandbox.id, &bootstrap_image_ref)
-                .await?;
+                .prepare_images_in_worker(&sandbox.id, &bootstrap_image_ref, None, true)
+                .await?
+                .bootstrap_image_identity;
             let root_disk =
                 image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
             let image_disk = image_cache_rootfs_image(&self.config.state_dir, &persisted_identity);
@@ -1289,8 +1367,13 @@ impl VmDriver {
                 bootstrap_image_identity,
             }
         } else {
-            self.prepare_runtime_images(&sandbox.id, &image_ref, rootfs_tar_path.as_deref())
-                .await?
+            self.prepare_images_in_worker(
+                &sandbox.id,
+                &image_ref,
+                rootfs_tar_path.as_deref(),
+                false,
+            )
+            .await?
         };
         let image_identity = image_plan.image_identity.clone();
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -1319,29 +1402,6 @@ impl VmDriver {
                     )));
                 }
             };
-        let launch_authentication = sandbox
-            .spec
-            .as_ref()
-            .filter(|spec| !spec.launch_authentication.is_empty())
-            .ok_or_else(|| {
-                Status::failed_precondition("VM sandbox launch authentication is required")
-            })
-            .and_then(|spec| {
-                serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
-                    &spec.launch_authentication,
-                )
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "decode VM sandbox launch authentication: {error}"
-                    ))
-                })
-            })?;
-        launch_authentication.validate().map_err(|error| {
-            Status::failed_precondition(format!(
-                "validate VM sandbox launch authentication: {error}"
-            ))
-        })?;
-
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -1352,11 +1412,14 @@ impl VmDriver {
             ),
         );
         let sandbox_owner_state = self
-            .prepare_runtime_overlay(
-                &state_dir,
-                &overlay_disk,
+            .prepare_overlay_in_worker(
+                &sandbox.id,
                 &owner_source_disk,
                 overlay_preparation,
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.workload_identity.as_ref()),
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
@@ -1482,7 +1545,10 @@ impl VmDriver {
         }
 
         let console_output = state_dir.join("rootfs-console.log");
-        let control_socket = state_dir.join(VM_CONTROL_SOCKET);
+        create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+            .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?;
+        let control_socket =
+            sandbox_socket_dir(&self.socket_root, &sandbox.id).join(VM_CONTROL_SOCKET);
         let session_id = launch_authentication.supervisor.session_id;
         let channel_tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1537,6 +1603,7 @@ impl VmDriver {
             agent_uid: sandbox_owner_state.uid,
             agent_gid: sandbox_owner_state.gid,
             child_env: merged_environment(&sandbox),
+            gpu_requested: is_gpu,
         }
         .provision()
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -1685,6 +1752,18 @@ impl VmDriver {
                 Some(record) if !record.deleting => {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
+                    let identity = &runtime_descriptor.workload_identity;
+                    record
+                        .snapshot
+                        .status
+                        .get_or_insert_with(SandboxStatus::default)
+                        .resolved_identity = Some(ResolvedWorkloadIdentity {
+                        uid: identity.uid,
+                        gid: identity.gid,
+                        supplementary_gids: identity.supplementary_gids.clone(),
+                        source: identity.source.clone(),
+                        resource_digest: identity.resource_digest.clone(),
+                    });
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -1770,7 +1849,11 @@ impl VmDriver {
 
         if let Some(task) = provisioning_task {
             task.abort();
+            // Wait for the future to drop its worker I/O before taking the
+            // registered attempt. Aborting alone does not stop its subprocess.
+            let _ = task.await;
         }
+        self.cleanup_image_preparation(&record_id).await?;
         if let Some(process) = process {
             let mut process = process.lock().await;
             process.deleting = true;
@@ -1826,6 +1909,11 @@ impl VmDriver {
             let record = registry
                 .get(&id)
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            if record.preparation.is_some() && record.provisioning_task.is_none() {
+                return Err(Status::failed_precondition(
+                    "image preparation cleanup is still in progress",
+                ));
+            }
             (
                 id,
                 record.state_dir.clone(),
@@ -1850,6 +1938,18 @@ impl VmDriver {
             if launch_authentication.is_empty() {
                 return Ok(());
             }
+        }
+        // An invalid replacement must not stop the active VM or remove the
+        // previous generation's credentials. Preserve the empty idempotent
+        // replay above, which does not request a new launch.
+        decode_launch_authentication(&launch_authentication)?;
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+            })?;
+        self.validate_sandbox(&sandbox)?;
+        if already_running {
             // The gateway keeps launch sessions in memory. A non-empty bundle
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
@@ -1870,22 +1970,6 @@ impl VmDriver {
         )
         .await
         .map_err(|error| Status::internal(format!("persist VM start generation: {error}")))?;
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
-            .map_err(|err| {
-                Status::internal(format!("read sandbox start metadata failed: {err}"))
-            })?;
-        let authentication = serde_json::from_slice::<
-            openshell_core::jwt::SandboxLaunchAuthentication,
-        >(&launch_authentication)
-        .map_err(|error| {
-            Status::failed_precondition(format!("decode VM sandbox launch authentication: {error}"))
-        })?;
-        authentication.validate().map_err(|error| {
-            Status::failed_precondition(format!(
-                "validate VM sandbox launch authentication: {error}"
-            ))
-        })?;
         let spec = sandbox
             .spec
             .as_mut()
@@ -1971,7 +2055,11 @@ impl VmDriver {
 
         if let Some(task) = provisioning_task {
             task.abort();
+            // Wait for the future to drop its worker I/O before taking the
+            // registered attempt. Aborting alone does not stop its subprocess.
+            let _ = task.await;
         }
+        self.cleanup_image_preparation(&record_id).await?;
 
         if let Some(process) = process {
             let mut process = process.lock().await;
@@ -1990,6 +2078,7 @@ impl VmDriver {
         }
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
+        remove_sandbox_socket_dir(&self.socket_root_fd, &record_id);
 
         {
             let mut registry = self.registry.lock().await;
@@ -2111,44 +2200,48 @@ impl VmDriver {
                 continue;
             }
 
-            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+            let inactive_condition = if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok()
             {
-                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
-                let mut registry = self.registry.lock().await;
-                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
-                    snapshot: snapshot.clone(),
-                    state_dir: state_dir.clone(),
-                    process: None,
-                    provisioning_task: None,
-                    gpu_bdf: None,
-                    deleting: false,
-                });
-                drop(registry);
-                self.publish_snapshot(snapshot);
-                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
-                continue;
-            }
-
-            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                Some(stopped_condition())
+            } else if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
                 .await
                 .unwrap_or(false)
             {
-                let snapshot = sandbox_snapshot(
-                    &sandbox,
-                    error_condition(
-                        "ProcessExited",
-                        "Canonical main process exited before VM driver restart",
-                    ),
-                    false,
-                );
+                Some(error_condition(
+                    "ProcessExited",
+                    "Canonical main process exited before VM driver restart",
+                ))
+            } else {
+                None
+            };
+            if let Some(condition) = inactive_condition {
+                // These sandboxes do not run the launch path that publishes
+                // identity. Recover it from the same validated owner marker
+                // before either GetSandbox or WatchSandboxes can observe them.
+                let identity = match read_persisted_workload_identity(&state_dir).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(sandbox_id = %sandbox.id, %error, "vm driver: ignoring invalid persisted workload identity");
+                        // Keep inactive resources manageable even when their
+                        // identity cannot be trusted. Explicit deletion still
+                        // needs this registry entry to remove persisted state.
+                        None
+                    }
+                };
+                let mut snapshot = sandbox_snapshot(&sandbox, condition, false);
+                snapshot
+                    .status
+                    .get_or_insert_with(SandboxStatus::default)
+                    .resolved_identity = identity;
                 let mut registry = self.registry.lock().await;
                 registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
                     snapshot: snapshot.clone(),
                     state_dir: state_dir.clone(),
                     process: None,
                     provisioning_task: None,
+                    preparation: None,
                     gpu_bdf: None,
                     deleting: false,
                 });
@@ -2156,7 +2249,7 @@ impl VmDriver {
                 self.publish_snapshot(snapshot);
                 info!(
                     sandbox_id = %sandbox.id,
-                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                    "vm driver: restored inactive sandbox without launching compute"
                 );
                 continue;
             }
@@ -2177,6 +2270,21 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
+        // Startup recovery bypasses create/start admission. Validate saved
+        // credentials before host preparation, extension hooks, or state changes.
+        if let Err(error) = decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        ) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
+            return false;
+        }
+        if let Err(error) = self.validate_sandbox(&sandbox) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
+            return false;
+        }
         let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
             .is_ok_and(|c| c.rootfs_tar_path.is_some());
 
@@ -2244,27 +2352,22 @@ impl VmDriver {
                     state_dir: state_dir.clone(),
                     process: None,
                     provisioning_task: None,
+                    preparation: None,
                     gpu_bdf: None,
                     deleting: false,
                 },
             );
         }
 
-        if clear_stop_marker {
-            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    self.registry.lock().await.remove(&sandbox.id);
-                    warn!(
-                        sandbox_id = %sandbox.id,
-                        state_dir = %state_dir.display(),
-                        error = %err,
-                        "vm driver: cannot clear stop marker for persisted sandbox restore"
-                    );
-                    return false;
-                }
-            }
+        if clear_stop_marker && let Err(err) = clear_explicit_start_markers(&state_dir).await {
+            self.registry.lock().await.remove(&sandbox.id);
+            warn!(
+                sandbox_id = %sandbox.id,
+                state_dir = %state_dir.display(),
+                error = %err,
+                "vm driver: cannot clear lifecycle markers for persisted sandbox restore"
+            );
+            return false;
         }
 
         self.publish_platform_event(
@@ -2317,6 +2420,12 @@ impl VmDriver {
             task.abort();
         }
         true
+    }
+
+    /// Best-effort removal of the per-driver socket root. VM children are
+    /// `kill_on_drop`, so no socket is live once the server has stopped.
+    pub fn remove_socket_root(&self) {
+        let _ = fs::remove_dir_all(&self.socket_root);
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -2591,7 +2700,7 @@ impl VmDriver {
         remove_state: bool,
     ) {
         self.release_gpu(sandbox_id);
-        let snapshot = {
+        let (snapshot, may_remove_state) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(sandbox_id) else {
                 return;
@@ -2606,11 +2715,18 @@ impl VmDriver {
                 error_condition(reason, message),
                 false,
             ));
-            Some(record.snapshot.clone())
+            // A failed cleanup leaves the attempt registered. Preserve all
+            // sandbox state until its worker and descendants are confirmed
+            // stopped, even when provisioning itself has already failed.
+            (
+                Some(record.snapshot.clone()),
+                remove_state && record.preparation.is_none(),
+            )
         };
 
-        if remove_state {
+        if may_remove_state {
             let _ = tokio::fs::remove_dir_all(state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, sandbox_id);
         }
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -2624,6 +2740,235 @@ impl VmDriver {
         if let Some(snapshot) = snapshot {
             self.publish_snapshot(snapshot);
         }
+    }
+
+    /// Keep every image write in a process owned by the sandbox record. The
+    /// registry retains the attempt when this future is cancelled so lifecycle
+    /// cleanup can kill and reap it before removing any staging or state.
+    #[tracing::instrument(
+        name = "vm.prepare_images",
+        skip(self),
+        fields(otel.name = "vm.prepare_images", otel.status_code = tracing::field::Empty, sandbox.id = %sandbox_id, image.ref = %image_ref)
+    )]
+    async fn prepare_images_in_worker(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        rootfs_tar: Option<&Path>,
+        bootstrap_only: bool,
+    ) -> Result<RuntimeImagePlan, Status> {
+        match self
+            .run_preparation_in_worker(sandbox_id, image_ref, rootfs_tar, bootstrap_only, None)
+            .await?
+        {
+            preparation::Output::Images(plan) => Ok(plan),
+            preparation::Output::Overlay(_) => {
+                Err(Status::internal("image worker returned an overlay result"))
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        name = "vm.prepare_overlay",
+        skip(self),
+        fields(otel.name = "vm.prepare_overlay", otel.status_code = tracing::field::Empty, sandbox.id = %sandbox_id)
+    )]
+    async fn prepare_overlay_in_worker(
+        &self,
+        sandbox_id: &str,
+        owner_source_disk: &Path,
+        preparation: OverlayPreparation,
+        requested_identity: Option<&WorkloadIdentityRequest>,
+    ) -> Result<SandboxOwnerIdentity, Status> {
+        let overlay = preparation::OverlayRequest {
+            source_disk: owner_source_disk.to_path_buf(),
+            preparation,
+            requested_identity: requested_identity
+                .map(preparation::WorkloadIdentitySelectors::from),
+        };
+        match self
+            .run_preparation_in_worker(sandbox_id, "", None, false, Some(overlay))
+            .await?
+        {
+            preparation::Output::Overlay(owner) => Ok(owner),
+            preparation::Output::Images(_) => {
+                Err(Status::internal("overlay worker returned an image result"))
+            }
+        }
+    }
+
+    /// The worker resolves the owner from the same state directory it will
+    /// modify, then rejects selectors that conflict with that owner before
+    /// preparing or repairing the writable disk.
+    async fn prepare_requested_overlay(
+        &self,
+        sandbox_id: &str,
+        overlay: preparation::OverlayRequest,
+    ) -> Result<SandboxOwnerIdentity, Status> {
+        if !overlay
+            .source_disk
+            .starts_with(image_cache_root_dir(&self.config.state_dir))
+        {
+            return Err(Status::invalid_argument(
+                "overlay source must be a cached image",
+            ));
+        }
+        let state_dir = sandbox_state_dir(&self.config.state_dir, sandbox_id)?;
+        let overlay_disk = sandbox_runtime_disk_paths(&state_dir).overlay_disk;
+        let requested_identity = overlay
+            .requested_identity
+            .map(WorkloadIdentityRequest::from);
+        self.prepare_runtime_overlay(
+            &state_dir,
+            &overlay_disk,
+            &overlay.source_disk,
+            overlay.preparation,
+            requested_identity.as_ref(),
+        )
+        .await
+        .map_err(Status::internal)
+    }
+
+    async fn run_preparation_in_worker(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        rootfs_tar: Option<&Path>,
+        bootstrap_only: bool,
+        overlay: Option<preparation::OverlayRequest>,
+    ) -> Result<preparation::Output, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        // Keep the driver trace continuous across the worker boundary. The
+        // first Pulled event completes bootstrap resolution; later events
+        // belong to the requested workload image.
+        let mut bootstrap_span = overlay.is_none().then(|| {
+            tracing::info_span!(
+                "vm.resolve_bootstrap_image",
+                otel.name = "vm.resolve_bootstrap_image",
+                otel.status_code = tracing::field::Empty,
+                sandbox.id = %sandbox_id,
+                image.ref = %bootstrap_image_ref,
+            )
+        });
+        // Independent attempts can prepare images and private overlays at the
+        // same time. Workers serialize only shared cache publication.
+        let (attempt, stdout) = {
+            let mut registry = self.registry.lock().await;
+            let record = registry
+                .get_mut(sandbox_id)
+                .filter(|record| !record.deleting)
+                .ok_or_else(|| Status::cancelled("sandbox provisioning cancelled"))?;
+            if record.preparation.is_some() {
+                return Err(Status::failed_precondition(
+                    "sandbox image preparation is already active",
+                ));
+            }
+            let mut attempt =
+                preparation::Attempt::create(&image_cache_root_dir(&self.config.state_dir))
+                    .map_err(|error| {
+                        Status::internal(format!("create image preparation attempt: {error}"))
+                    })?;
+            let stdout = attempt.spawn(
+                &self.launcher_bin,
+                preparation::Request {
+                    config: self.config.clone(),
+                    sandbox_id: sandbox_id.to_string(),
+                    image_ref: image_ref.to_string(),
+                    rootfs_tar: rootfs_tar.map(Path::to_path_buf),
+                    bootstrap_only,
+                    overlay,
+                    lease_fd: -1,
+                    parent_pid: 0,
+                },
+            );
+            let attempt = Arc::new(Mutex::new(attempt));
+            record.preparation = Some(attempt.clone());
+            (attempt, stdout)
+        };
+        let _cleanup = preparation::CleanupOnDrop(attempt.clone());
+        let outcome = async {
+            let stdout = stdout.map_err(|error| {
+                Status::internal(format!("start image preparation worker: {error}"))
+            })?;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            let mut result = None;
+            while let Some(line) = lines.next_line().await.map_err(|error| {
+                Status::internal(format!("read image preparation progress: {error}"))
+            })? {
+                match serde_json::from_str::<preparation::Message>(&line).map_err(|error| {
+                    Status::internal(format!("decode image preparation progress: {error}"))
+                })? {
+                    preparation::Message::Event(bytes) => {
+                        let event =
+                            WatchSandboxesEvent::decode(bytes.as_slice()).map_err(|error| {
+                                Status::internal(format!("decode image preparation event: {error}"))
+                            })?;
+                        if matches!(event.payload.as_ref(), Some(watch_sandboxes_event::Payload::PlatformEvent(value))
+                            if value.event.as_ref().is_some_and(|event| event.reason == "Pulled")) {
+                            bootstrap_span.take();
+                        }
+                        let _ = self.events.send(event);
+                    }
+                    preparation::Message::Complete(value) => result = Some(value),
+                }
+            }
+            let status = attempt.lock().await.wait().await.map_err(|error| {
+                Status::internal(format!("wait for image preparation: {error}"))
+            })?;
+            if !status.success() {
+                return Err(Status::failed_precondition(format!(
+                    "image preparation worker exited with {status}"
+                )));
+            }
+            result
+                .ok_or_else(|| {
+                    Status::internal("image preparation worker exited without a result")
+                })?
+                .map_err(Status::failed_precondition)
+        }
+        .await;
+        if outcome.is_err()
+            && let Some(span) = bootstrap_span.as_ref()
+        {
+            span.record("otel.status_code", "ERROR");
+        }
+        self.cleanup_image_preparation(sandbox_id).await?;
+        span_status.finish(outcome)
+    }
+
+    async fn cleanup_image_preparation(&self, sandbox_id: &str) -> Result<(), Status> {
+        let attempt = self
+            .registry
+            .lock()
+            .await
+            .get(sandbox_id)
+            .and_then(|record| record.preparation.clone());
+        if let Some(attempt) = attempt {
+            attempt.lock().await.cleanup().await?;
+            if let Some(record) = self.registry.lock().await.get_mut(sandbox_id)
+                && record
+                    .preparation
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &attempt))
+            {
+                record.preparation = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn image_staging_dir(&self, image_identity: &str) -> PathBuf {
+        self.preparation_root.as_ref().map_or_else(
+            || image_cache_staging_dir(&self.config.state_dir, image_identity),
+            |root| {
+                root.join(format!(
+                    "{}.staging-{}",
+                    sanitize_image_identity(image_identity),
+                    unique_image_cache_suffix()
+                ))
+            },
+        )
     }
 
     #[tracing::instrument(
@@ -2643,7 +2988,7 @@ impl VmDriver {
         rootfs_tar_path: Option<&Path>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
             .await?;
@@ -2681,9 +3026,13 @@ impl VmDriver {
         }))
     }
 
-    fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+    fn bootstrap_image_ref(&self) -> Result<String, Status> {
         self.bootstrap_image_ref_default()
-            .unwrap_or_else(|| sandbox_image_ref.to_string())
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image",
+                )
+            })
     }
 
     fn bootstrap_image_ref_default(&self) -> Option<String> {
@@ -2714,6 +3063,7 @@ impl VmDriver {
         overlay_disk: &Path,
         owner_source_disk: &Path,
         preparation: OverlayPreparation,
+        requested_identity: Option<&WorkloadIdentityRequest>,
     ) -> Result<SandboxOwnerIdentity, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let overlay_disk = overlay_disk.to_path_buf();
@@ -2735,6 +3085,9 @@ impl VmDriver {
             preparation,
         )
         .await?;
+        // Validate before creating or recovering an overlay. A conflicting
+        // request must never change the persisted owner or its files.
+        validate_vm_workload_identity(requested_identity, owner_state)?;
         let owner_state_written_before_prepare =
             write_owner_state && preparation == OverlayPreparation::Fresh;
         if owner_state_written_before_prepare {
@@ -2745,28 +3098,53 @@ impl VmDriver {
         }
 
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
+        let overlay_metadata = tokio::fs::metadata(&overlay_disk).await;
         let recover_preserved_overlay = preparation == OverlayPreparation::PreserveExisting
-            && tokio::fs::metadata(&overlay_disk)
-                .await
-                .is_ok_and(|metadata| metadata.is_file());
+            && overlay_metadata.as_ref().is_ok_and(fs::Metadata::is_file);
+        let publish_new_overlay = preparation == OverlayPreparation::Fresh
+            || matches!(overlay_metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
         if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
             let _cache_guard = self.image_cache_lock.lock().await;
             let template_path = template_path.clone();
+            let staging_dir = self.image_staging_dir("overlay-template");
+            let cache_root = image_cache_root_dir(&self.config.state_dir);
             tokio::task::spawn_blocking(move || {
-                ensure_sandbox_overlay_template_image(&template_path, overlay_size_bytes)
+                ensure_sandbox_overlay_template_image(
+                    &cache_root,
+                    &template_path,
+                    overlay_size_bytes,
+                    &staging_dir,
+                )
             })
             .await
             .map_err(|err| format!("overlay template preparation panicked: {err}"))??;
         }
 
         let overlay_to_recover = overlay_disk.clone();
+        let staging_dir = self.image_staging_dir("writable-overlay");
         let result = tokio::task::spawn_blocking(move || {
-            prepare_sandbox_overlay_image(
-                &template_path,
-                &overlay_disk,
-                preparation,
-                overlay_size_bytes,
-            )
+            if publish_new_overlay {
+                // An interrupted first start can leave no persisted overlay.
+                // Stage that retry just like a fresh copy, so cancellation
+                // cannot publish a partial disk as existing VM state. Other
+                // metadata errors still go through the preservation checks.
+                fs::create_dir_all(&staging_dir).map_err(|error| error.to_string())?;
+                let staging_overlay = staging_dir.join(SANDBOX_OVERLAY_IMAGE);
+                prepare_sandbox_overlay_image(
+                    &template_path,
+                    &staging_overlay,
+                    preparation,
+                    overlay_size_bytes,
+                )?;
+                fs::rename(&staging_overlay, &overlay_disk).map_err(|error| error.to_string())
+            } else {
+                prepare_sandbox_overlay_image(
+                    &template_path,
+                    &overlay_disk,
+                    preparation,
+                    overlay_size_bytes,
+                )
+            }
         })
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
@@ -3177,7 +3555,7 @@ impl VmDriver {
             });
         }
 
-        let staging_dir = image_cache_staging_dir(&self.config.state_dir, &cache_identity);
+        let staging_dir = self.image_staging_dir(&cache_identity);
         let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         self.reset_image_staging_dir(&staging_dir).await?;
 
@@ -3290,7 +3668,7 @@ impl VmDriver {
             });
         }
 
-        let staging_dir = image_cache_staging_dir(&self.config.state_dir, &cache_identity);
+        let staging_dir = self.image_staging_dir(&cache_identity);
         let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         self.reset_image_staging_dir(&staging_dir).await?;
 
@@ -3431,7 +3809,7 @@ impl VmDriver {
             });
         }
 
-        let staging_dir = image_cache_staging_dir(&self.config.state_dir, &cache_identity);
+        let staging_dir = self.image_staging_dir(&cache_identity);
         self.reset_image_staging_dir(&staging_dir).await?;
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
@@ -3629,15 +4007,26 @@ impl VmDriver {
             return Err(Status::failed_precondition(message));
         }
 
-        if tokio::fs::metadata(&image_path).await.is_ok() {
-            let _ = tokio::fs::remove_dir_all(staging_dir).await;
-            return Ok(());
-        }
-        tokio::fs::rename(&prepared_image, &image_path)
-            .await
-            .map_err(|err| Status::internal(format!("store prepared image disk failed: {err}")))?;
+        self.publish_prepared_image(&prepared_image, &image_path)
+            .await?;
         let _ = tokio::fs::remove_dir_all(staging_dir).await;
         Ok(())
+    }
+
+    async fn publish_prepared_image(
+        &self,
+        staged: &Path,
+        destination: &Path,
+    ) -> Result<(), Status> {
+        let cache_root = image_cache_root_dir(&self.config.state_dir);
+        let staged = staged.to_path_buf();
+        let destination = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            preparation::publish_cache_file(&cache_root, &staged, &destination, None)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("cache publication panicked: {error}")))?
+        .map_err(|error| Status::internal(format!("store cached rootfs image failed: {error}")))
     }
 
     #[allow(clippy::similar_names)]
@@ -3651,7 +4040,8 @@ impl VmDriver {
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
-        command.stdout(Stdio::inherit());
+        // Worker stdout carries framed progress and completion messages.
+        command.stdout(Stdio::from(std::io::stderr()));
         command.stderr(Stdio::inherit());
         command.arg("--internal-run-vm");
         command.arg("--vm-root-disk").arg(bootstrap_root_disk);
@@ -3746,7 +4136,7 @@ impl VmDriver {
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
-        let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
+        let staging_dir = self.image_staging_dir(image_identity);
         let exported_rootfs = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         let prepared_rootfs = staging_dir.join("rootfs");
         let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
@@ -3853,14 +4243,8 @@ impl VmDriver {
             return Err(Status::failed_precondition(err));
         }
 
-        if tokio::fs::metadata(&image_path).await.is_ok() {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Ok(());
-        }
-
-        tokio::fs::rename(&prepared_image, &image_path)
-            .await
-            .map_err(|err| Status::internal(format!("store cached rootfs image failed: {err}")))?;
+        self.publish_prepared_image(&prepared_image, &image_path)
+            .await?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(())
     }
@@ -3877,7 +4261,7 @@ impl VmDriver {
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
-        let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
+        let staging_dir = self.image_staging_dir(image_identity);
         let prepared_rootfs = staging_dir.join("rootfs");
         let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
@@ -4004,23 +4388,8 @@ impl VmDriver {
             return Err(Status::failed_precondition(err));
         }
 
-        if tokio::fs::metadata(&image_path).await.is_ok() {
-            info!(
-                image_identity = %image_identity,
-                "vm driver: another task wrote image while we were building, discarding ours"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Ok(());
-        }
-
-        tokio::fs::rename(&prepared_image, &image_path)
-            .await
-            .map_err(|err| Status::internal(format!("store cached rootfs image failed: {err}")))?;
-        info!(
-            image_identity = %image_identity,
-            image_path = %image_path.display(),
-            "vm driver: root disk image committed to cache"
-        );
+        self.publish_prepared_image(&prepared_image, &image_path)
+            .await?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(())
     }
@@ -4120,16 +4489,6 @@ impl VmDriver {
                     || format!("{component} process exited"),
                     |code| format!("{component} process exited with status {code}"),
                 );
-                if component == "VM"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
-                        .expect("writing to String cannot fail");
-                }
                 if component == "host supervisor"
                     && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
@@ -4138,16 +4497,6 @@ impl VmDriver {
                     )
                 {
                     write!(message, "; supervisor stderr tail:\n{stderr}")
-                        .expect("writing to String cannot fail");
-                }
-                if component == "host supervisor"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
                         .expect("writing to String cannot fail");
                 }
                 if let Some(snapshot) = self
@@ -4248,6 +4597,89 @@ impl VmDriver {
         attach_vm_progress_metadata(&mut event);
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
+}
+
+/// Execute an internal image preparation request in its own process group.
+/// The driver supplies a private request file and an inherited staging lease;
+/// this entry point never restores sandboxes or launches a gateway listener.
+#[doc(hidden)]
+pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), String> {
+    let (request, directory) = preparation::read_request(request_path)?;
+    validate_sandbox_id(&request.sandbox_id).map_err(|error| error.message().to_string())?;
+    preparation::watch_parent(request.parent_pid)?;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(request.config.log_level.clone())
+        .try_init()
+        .map_err(|error| format!("initialize image preparation logging: {error}"))?;
+    let (events, mut receiver) = broadcast::channel(WATCH_BUFFER);
+    let socket_root_fd = fs::File::open(&directory)
+        .map_err(|error| error.to_string())?
+        .into();
+    let launcher_bin = request
+        .config
+        .launcher_bin
+        .clone()
+        .map_or_else(std::env::current_exe, Ok)
+        .map_err(|error| error.to_string())?;
+    let driver = VmDriver {
+        config: request.config,
+        socket_root: directory.clone(),
+        socket_root_fd: Arc::new(socket_root_fd),
+        launcher_bin,
+        registry: Arc::new(Mutex::new(HashMap::new())),
+        image_cache_lock: Arc::new(Mutex::new(())),
+        preparation_root: Some(directory),
+        events,
+        gpu_inventory: None,
+        lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+    };
+    let prepare = async {
+        if let Some(overlay) = request.overlay {
+            driver
+                .prepare_requested_overlay(&request.sandbox_id, overlay)
+                .await
+                .map(preparation::Output::Overlay)
+        } else if request.bootstrap_only {
+            let identity = driver
+                .ensure_cached_bootstrap_rootfs_image(&request.sandbox_id, &request.image_ref)
+                .await?;
+            Ok(preparation::Output::Images(RuntimeImagePlan {
+                root_disk: image_cache_rootfs_image(&driver.config.state_dir, &identity),
+                image_disk: None,
+                image_identity: identity.clone(),
+                bootstrap_image_identity: identity,
+            }))
+        } else {
+            driver
+                .prepare_runtime_images(
+                    &request.sandbox_id,
+                    &request.image_ref,
+                    request.rootfs_tar.as_deref(),
+                )
+                .await
+                .map(preparation::Output::Images)
+        }
+    };
+    tokio::pin!(prepare);
+    let result = loop {
+        tokio::select! {
+            result = &mut prepare => break result,
+            event = receiver.recv() => {
+                if let Ok(event) = event {
+                    preparation::send(&preparation::Message::Event(event.encode_to_vec())).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+    };
+    while let Ok(event) = receiver.try_recv() {
+        preparation::send(&preparation::Message::Event(event.encode_to_vec()))
+            .map_err(|error| error.to_string())?;
+    }
+    preparation::send(&preparation::Message::Complete(
+        result.map_err(|error| error.message().to_string()),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 fn read_vm_console_tail(path: &Path, limit: u64) -> Option<String> {
@@ -4480,6 +4912,29 @@ fn check_gpu_privileges() -> Result<(), String> {
 
 // `tonic::Status` is ~176 bytes; it's the standard error type across the
 // gRPC API surface, so boxing here would diverge from every other handler.
+#[allow(clippy::result_large_err)]
+fn decode_launch_authentication(
+    encoded: &[u8],
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    if encoded.is_empty() {
+        return Err(Status::failed_precondition(
+            "VM sandbox launch authentication is required; configure the gateway's \
+                 [openshell.gateway.gateway_jwt] signing bundle. Listener TLS is separate",
+        ));
+    }
+    // Serde errors may quote an unexpected field or value from the secret
+    // bundle. Return fixed diagnostics rather than forwarding those details.
+    let authentication =
+        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+            .map_err(|_| {
+                Status::failed_precondition("VM sandbox launch authentication is malformed")
+            })?;
+    authentication.validate().map_err(|_| {
+        Status::failed_precondition("VM sandbox launch authentication has invalid fields")
+    })?;
+    Ok(authentication)
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     validate_sandbox_id(&sandbox.id)?;
@@ -5432,142 +5887,6 @@ fn layer_compression_from_media_type(media_type: &str) -> Result<LayerCompressio
     Err(format!("unsupported layer media type '{media_type}'"))
 }
 
-fn apply_layer_dir_to_rootfs(layer_root: &Path, rootfs: &Path) -> Result<(), String> {
-    merge_layer_directory(layer_root, rootfs)
-}
-
-fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(target_dir)
-        .map_err(|err| format!("create {}: {err}", target_dir.display()))?;
-
-    let mut entries = fs::read_dir(source_dir)
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-
-    if entries
-        .iter()
-        .any(|entry| entry.file_name().to_string_lossy() == ".wh..wh..opq")
-    {
-        clear_directory_contents(target_dir)?;
-    }
-
-    for entry in entries {
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if name == ".wh..wh..opq" {
-            continue;
-        }
-        if let Some(hidden_name) = name.strip_prefix(".wh.") {
-            remove_path_if_exists(&target_dir.join(hidden_name))?;
-            continue;
-        }
-
-        let source_path = entry.path();
-        let dest_path = target_dir.join(&file_name);
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            if let Ok(dest_metadata) = fs::symlink_metadata(&dest_path)
-                && !dest_metadata.file_type().is_dir()
-                && !path_is_dir_or_symlink_to_dir(&dest_path)?
-            {
-                remove_path_if_exists(&dest_path)?;
-            }
-            fs::create_dir_all(&dest_path)
-                .map_err(|err| format!("create {}: {err}", dest_path.display()))?;
-            merge_layer_directory(&source_path, &dest_path)?;
-            if fs::symlink_metadata(&dest_path)
-                .map_err(|err| format!("stat {}: {err}", dest_path.display()))?
-                .file_type()
-                .is_dir()
-            {
-                fs::set_permissions(&dest_path, metadata.permissions())
-                    .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-            }
-        } else if file_type.is_file() {
-            remove_path_if_exists(&dest_path)?;
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("create {}: {err}", parent.display()))?;
-            }
-            fs::copy(&source_path, &dest_path).map_err(|err| {
-                format!(
-                    "copy {} to {}: {err}",
-                    source_path.display(),
-                    dest_path.display()
-                )
-            })?;
-            fs::set_permissions(&dest_path, metadata.permissions())
-                .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source_path, &dest_path)?;
-        } else {
-            return Err(format!(
-                "unsupported layer entry type at {}",
-                source_path.display()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn path_is_dir_or_symlink_to_dir(path: &Path) -> Result<bool, String> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("stat {}: {err}", path.display())),
-    }
-}
-
-fn clear_directory_contents(dir: &Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir).map_err(|err| format!("read {}: {err}", dir.display()))? {
-        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
-        remove_path_if_exists(&entry.path())?;
-    }
-    Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    } else {
-        fs::remove_file(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    }
-}
-
-#[cfg(unix)]
-fn copy_symlink(source_path: &Path, dest_path: &Path) -> Result<(), String> {
-    let target = fs::read_link(source_path)
-        .map_err(|err| format!("readlink {}: {err}", source_path.display()))?;
-    remove_path_if_exists(dest_path)?;
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
-    }
-    std::os::unix::fs::symlink(&target, dest_path).map_err(|err| {
-        format!(
-            "symlink {} to {}: {err}",
-            target.display(),
-            dest_path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn copy_symlink(_source_path: &Path, _dest_path: &Path) -> Result<(), String> {
-    Err("symlink layers are only supported on Unix hosts".to_string())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayerCompression {
     None,
@@ -5656,6 +5975,88 @@ async fn restrict_owner_only_dir(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(not(unix))]
 async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
+/// macOS `sun_path` is 104 bytes including the NUL terminator.
+const MAX_SUN_PATH_LEN: usize = 103;
+
+fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
+    socket_root.join(sandbox_id)
+}
+
+fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
+    let uid = rustix::process::geteuid().as_raw();
+    allocate_socket_root_with(Path::new("/tmp"), || {
+        let random: u128 = rand::random();
+        format!("os-{uid}-{random:032x}")
+    })
+}
+
+fn allocate_socket_root_with(
+    base: &Path,
+    mut gen_name: impl FnMut() -> String,
+) -> Result<(PathBuf, OwnedFd), std::io::Error> {
+    for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
+        let root = base.join(gen_name());
+        match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
+            Ok(()) => {
+                let fd = rustix::fs::open(
+                    &root,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                return Ok((root, fd));
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate socket root under {} after {SOCKET_ROOT_ALLOC_RETRIES} attempts",
+            base.display()
+        ),
+    ))
+}
+
+fn create_sandbox_socket_dir(
+    root_fd: &OwnedFd,
+    socket_root: &Path,
+    sandbox_id: &str,
+) -> Result<PathBuf, std::io::Error> {
+    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
+    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
+                longest.display()
+            ),
+        ));
+    }
+    match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(socket_root.join(sandbox_id))
+}
+
+fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
+    if let Ok(leaf_fd) = rustix::fs::openat(
+        root_fd,
+        sandbox_id,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        let _ = rustix::fs::unlinkat(&leaf_fd, VM_CONTROL_SOCKET, rustix::fs::AtFlags::empty());
+        let _ = rustix::fs::unlinkat(&leaf_fd, "ssh.sock", rustix::fs::AtFlags::empty());
+    }
+    let _ = rustix::fs::unlinkat(root_fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
 }
 
 #[allow(clippy::result_large_err)]
@@ -5790,6 +6191,35 @@ async fn persisted_sandbox_owner_identity(
     }
 
     Ok(None)
+}
+
+/// Reconstruct status from the owner chosen during preparation, never from a
+/// new driver default or a status embedded in the persisted create request.
+/// Missing or v1 markers do not contain an identity to report. Invalid owner
+/// data must not be published as a resolved identity.
+async fn read_persisted_workload_identity(
+    state_dir: &Path,
+) -> Result<Option<ResolvedWorkloadIdentity>, String> {
+    let contents = match tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE)).await {
+        Ok(contents) if contents.trim() == SANDBOX_OWNER_STATE_V1 => return Ok(None),
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read sandbox owner state: {error}")),
+    };
+    let owner = parse_sandbox_owner_state(&contents)
+        .map_err(|error| format!("invalid sandbox owner state: {error}"))?;
+    let resource_digest = match read_persisted_image_identity(state_dir).await {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read persisted VM image identity: {error}")),
+    };
+    Ok(Some(ResolvedWorkloadIdentity {
+        uid: owner.uid,
+        gid: owner.gid,
+        supplementary_gids: Vec::new(),
+        source: "vm-config".into(),
+        resource_digest,
+    }))
 }
 
 async fn sandbox_owner_identity_from_image(
@@ -6192,6 +6622,19 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
+async fn clear_explicit_start_markers(state_dir: &Path) -> Result<(), std::io::Error> {
+    // Remove the terminal marker first. If clearing the durable stop marker
+    // fails, the sandbox remains stopped and a later start can safely retry.
+    for marker in [MAIN_PROCESS_EXITED_FILE, SANDBOX_STOPPED_FILE] {
+        match tokio::fs::remove_file(state_dir.join(marker)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn restrict_owner_read_write(path: &Path) -> Result<(), std::io::Error> {
     tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await
@@ -6234,8 +6677,10 @@ async fn overlay_template_image_ready(path: &Path, size_bytes: u64) -> Result<bo
 }
 
 fn ensure_sandbox_overlay_template_image(
+    cache_root: &Path,
     template_path: &Path,
     size_bytes: u64,
+    staging_dir: &Path,
 ) -> Result<(), String> {
     if let Ok(metadata) = fs::metadata(template_path)
         && metadata.is_file()
@@ -6257,30 +6702,23 @@ fn ensure_sandbox_overlay_template_image(
         )
     })?;
 
-    let staging_image = parent.join(format!(
-        ".{}.staging-{}-{}",
-        template_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("overlay-template.ext4"),
-        std::process::id(),
-        openshell_core::time::now_ms()
-    ));
+    fs::create_dir_all(staging_dir).map_err(|error| error.to_string())?;
+    let staging_image = staging_dir.join("overlay-template.ext4");
 
     let result = (|| {
         create_empty_sandbox_overlay_image(&staging_image, size_bytes)?;
-        fs::rename(&staging_image, template_path).map_err(|err| {
-            format!(
-                "move overlay template {} to {}: {err}",
-                staging_image.display(),
-                template_path.display()
-            )
-        })
+        preparation::publish_cache_file(cache_root, &staging_image, template_path, Some(size_bytes))
+            .map_err(|err| {
+                format!(
+                    "move overlay template {} to {}: {err}",
+                    staging_image.display(),
+                    template_path.display()
+                )
+            })
     })();
 
-    if result.is_err() {
-        let _ = fs::remove_file(&staging_image);
-    }
+    // A competing publisher may have won; only our private staged file is disposable.
+    let _ = fs::remove_file(&staging_image);
     result
 }
 
@@ -6798,8 +7236,33 @@ fn status_with_condition(
         sandbox_fd: String::new(),
         conditions: vec![condition],
         deleting,
-        ..Default::default()
+        ..snapshot.status.clone().unwrap_or_default()
     }
+}
+
+/// VM init reconciles the named `sandbox` account to this overlay's owner.
+/// Numeric selectors assert that same immutable identity; they cannot select
+/// a new owner. Each empty selector independently accepts the driver default.
+fn validate_vm_workload_identity(
+    request: Option<&WorkloadIdentityRequest>,
+    owner: SandboxOwnerIdentity,
+) -> Result<(), String> {
+    let Some(request) = request else {
+        return Ok(());
+    };
+    for (field, selector, expected) in [
+        ("run_as_user", request.user.as_str(), owner.uid),
+        ("run_as_group", request.group.as_str(), owner.gid),
+    ] {
+        if selector.is_empty() || selector == "sandbox" || selector.parse::<u32>() == Ok(expected) {
+            continue;
+        }
+        return Err(format!(
+            "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+            owner.uid, owner.gid
+        ));
+    }
+    Ok(())
 }
 
 fn provisioning_condition() -> SandboxCondition {
@@ -6959,6 +7422,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
+
+    fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
+        let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).expect("create test socket root");
+        std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("set test socket root permissions");
+        let fd = rustix::fs::open(
+            &dir,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open test socket root");
+        (dir, Arc::new(fd))
+    }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -7339,10 +7818,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
         let sandbox = Sandbox {
             id: "sb-spawned-trace".to_string(),
             name: "spawned-trace".to_string(),
             spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("spawned-trace").0,
                 template: Some(SandboxTemplate {
                     image: "invalid image reference".to_string(),
                     ..Default::default()
@@ -7392,6 +7873,7 @@ mod tests {
                 id: format!("sb-restored-trace-{suffix}"),
                 name: format!("restored-trace-{suffix}"),
                 spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication(suffix).0,
                     template: Some(SandboxTemplate {
                         image: "invalid image reference".to_string(),
                         ..Default::default()
@@ -7451,6 +7933,172 @@ mod tests {
         }
     }
 
+    async fn assert_inactive_restore_retains_identity(marker: &str, reason: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        // Current driver defaults and serialized status are not evidence of
+        // the identity that owns an already prepared overlay.
+        driver.config.sandbox_uid = Some(9000);
+        driver.config.sandbox_gid = Some(9001);
+        let sandbox = Sandbox {
+            id: "sb-inactive-identity".into(),
+            name: "inactive-identity".into(),
+            status: Some(SandboxStatus {
+                resolved_identity: Some(ResolvedWorkloadIdentity {
+                    uid: 8000,
+                    gid: 8001,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_sandbox_owner_state(
+            &state_dir,
+            SandboxOwnerIdentity {
+                uid: 4242,
+                gid: 4343,
+            },
+        )
+        .await
+        .unwrap();
+        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(marker), b"inactive\n")
+            .await
+            .unwrap();
+        let mut events = driver.events.subscribe();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = restored.status.as_ref().unwrap();
+        assert_eq!(status.conditions[0].reason, reason);
+        let identity = status
+            .resolved_identity
+            .as_ref()
+            .expect("restored overlay owner");
+        assert_eq!((identity.uid, identity.gid), (4242, 4343));
+        assert!(identity.supplementary_gids.is_empty());
+        assert_eq!(identity.source, "vm-config");
+        assert_eq!(identity.resource_digest, "sha256:original-image");
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).unwrap();
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        drop(registry);
+        let event = events.try_recv().expect("restored snapshot event");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected sandbox snapshot event");
+        };
+        assert_eq!(event.sandbox.as_ref(), Some(&restored));
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                .await
+                .unwrap(),
+            "sandbox-owner-v2:4242:4343\n"
+        );
+        assert!(state_dir.join(marker).exists());
+    }
+
+    #[tokio::test]
+    async fn stopped_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(SANDBOX_STOPPED_FILE, "ComputeStopped").await;
+    }
+
+    #[tokio::test]
+    async fn terminal_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(MAIN_PROCESS_EXITED_FILE, "ProcessExited").await;
+    }
+
+    #[tokio::test]
+    async fn inactive_restore_keeps_invalid_metadata_manageable() {
+        for (marker, reason) in [
+            (SANDBOX_STOPPED_FILE, "ComputeStopped"),
+            (MAIN_PROCESS_EXITED_FILE, "ProcessExited"),
+        ] {
+            for invalid_owner in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+                driver.config.state_dir = temp.path().to_path_buf();
+                let sandbox = Sandbox {
+                    id: "sb-invalid-owner".into(),
+                    name: "invalid-owner".into(),
+                    ..Default::default()
+                };
+                let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+                tokio::fs::create_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                tokio::fs::write(state_dir.join(marker), b"inactive\n")
+                    .await
+                    .unwrap();
+                let owner = if invalid_owner {
+                    "sandbox-owner-v2:0:4343\n"
+                } else {
+                    "sandbox-owner-v2:4242:4343\n"
+                };
+                tokio::fs::write(state_dir.join(SANDBOX_OWNER_STATE_FILE), owner)
+                    .await
+                    .unwrap();
+                if !invalid_owner {
+                    // A directory deterministically fails read_to_string on every test host.
+                    tokio::fs::create_dir(state_dir.join(IMAGE_IDENTITY_FILE))
+                        .await
+                        .unwrap();
+                }
+                let mut events = driver.events.subscribe();
+
+                driver.restore_persisted_sandboxes().await;
+
+                let restored = driver
+                    .get_sandbox(&sandbox.id, &sandbox.name)
+                    .await
+                    .unwrap()
+                    .expect("inactive sandbox remains manageable");
+                let status = restored.status.as_ref().unwrap();
+                assert_eq!(status.conditions[0].reason, reason);
+                assert!(status.resolved_identity.is_none());
+                let registry = driver.registry.lock().await;
+                let record = registry.get(&sandbox.id).unwrap();
+                assert!(record.process.is_none());
+                assert!(record.provisioning_task.is_none());
+                drop(registry);
+                let event = events.try_recv().expect("inactive snapshot event");
+                let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+                    panic!("expected sandbox snapshot");
+                };
+                assert_eq!(event.sandbox.as_ref(), Some(&restored));
+                assert!(state_dir.join(marker).exists());
+                assert_eq!(
+                    tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                        .await
+                        .unwrap(),
+                    owner
+                );
+                assert!(
+                    driver
+                        .delete_sandbox(&sandbox.id, &sandbox.name)
+                        .await
+                        .unwrap()
+                        .deleted
+                );
+                assert!(
+                    !state_dir.exists(),
+                    "explicit delete removes retained state"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn startup_does_not_restore_terminal_canonical_process() {
         let temp = tempfile::tempdir().unwrap();
@@ -7485,9 +8133,70 @@ mod tests {
         assert!(record.process.is_none());
         assert!(record.provisioning_task.is_none());
         let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(
+            status.resolved_identity.is_none(),
+            "an absent owner marker must not invent an identity"
+        );
         assert!(status.conditions.iter().any(|condition| {
             condition.reason == "ProcessExited" && condition.status == "False"
         }));
+    }
+
+    #[tokio::test]
+    async fn process_exit_status_omits_guest_console_output() {
+        let running_child = || {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        for (component, child) in [
+            ("VM", spawn_exited_child()),
+            ("host supervisor", running_child()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("rootfs-console.log"), "agent output\n").unwrap();
+            std::fs::write(temp.path().join("supervisor.err.log"), "supervisor error\n").unwrap();
+            let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            let mut events = driver.events.subscribe();
+            insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
+
+            driver.monitor_sandbox("sb-exit".to_string()).await;
+
+            let condition = driver.registry.lock().await["sb-exit"]
+                .snapshot
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .find(|condition| condition.reason == "ProcessExited")
+                        .cloned()
+                })
+                .expect("ProcessExited condition");
+            let mut event_message = None;
+            while let Ok(event) = events.try_recv() {
+                if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload
+                    && let Some(event) = platform.event
+                    && event.reason == "ProcessExited"
+                {
+                    event_message = Some(event.message);
+                }
+            }
+            let event_message = event_message.expect("ProcessExited platform event");
+            for message in [&condition.message, &event_message] {
+                assert!(message.starts_with(&format!("{component} process exited")));
+                assert!(!message.contains("agent output"), "{component}: {message}");
+            }
+            if component == "host supervisor" {
+                assert!(condition.message.contains("supervisor error"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -7527,6 +8236,7 @@ mod tests {
                 Path::new("/unused"),
                 Path::new("/unused"),
                 OverlayPreparation::Fresh,
+                None,
             )
             .instrument(parent)
             .await;
@@ -8114,6 +8824,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflicting_vm_identity_preserves_overlay_and_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        write_sandbox_owner_state(directory.path(), owner)
+            .await
+            .unwrap();
+        let overlay = directory.path().join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"existing overlay must not be touched").unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.sandbox_uid = Some(10000);
+        driver.config.sandbox_gid = Some(10001);
+        let request = WorkloadIdentityRequest {
+            user: "10000".into(),
+            group: "10001".into(),
+        };
+        let error = driver
+            .prepare_runtime_overlay(
+                directory.path(),
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                Some(&request),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("run_as_user '10000'"), "{error}");
+        assert!(error.contains("1000:1001"), "{error}");
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"existing overlay must not be touched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(SANDBOX_OWNER_STATE_FILE)).unwrap(),
+            owner.marker_contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_worker_rejects_identity_conflicts_before_disk_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        // A changed host default must not replace the persisted owner's identity.
+        driver.config.sandbox_uid = Some(10000);
+        driver.config.sandbox_gid = Some(10001);
+        let sandbox_id = "identity-worker";
+        let state_dir = sandbox_state_dir(directory.path(), sandbox_id).unwrap();
+        create_private_dir_all(&state_dir).await.unwrap();
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        write_sandbox_owner_state(&state_dir, owner).await.unwrap();
+        let overlay_disk = sandbox_runtime_disk_paths(&state_dir).overlay_disk;
+        std::fs::write(&overlay_disk, b"existing overlay must not be touched").unwrap();
+
+        for (user, group, field) in [
+            ("10000", "", "run_as_user"),
+            ("sandbox", "10001", "run_as_group"),
+        ] {
+            let requested_identity = WorkloadIdentityRequest {
+                user: user.into(),
+                group: group.into(),
+            };
+            let request = preparation::OverlayRequest {
+                source_disk: image_cache_root_dir(directory.path()).join("must-not-read-image"),
+                preparation: OverlayPreparation::PreserveExisting,
+                requested_identity: Some(preparation::WorkloadIdentitySelectors::from(
+                    &requested_identity,
+                )),
+            };
+            // Exercise the serialized request and the same entry point the
+            // worker uses, so dropping either selector cannot weaken the check.
+            let wire = serde_json::to_vec(&request).unwrap();
+            let decoded = serde_json::from_slice(&wire).unwrap();
+            let error = driver
+                .prepare_requested_overlay(sandbox_id, decoded)
+                .await
+                .unwrap_err();
+            assert!(error.message().contains(field), "{error}");
+            assert!(error.message().contains("1000:1001"), "{error}");
+            assert_eq!(
+                std::fs::read(&overlay_disk).unwrap(),
+                b"existing overlay must not be touched"
+            );
+            assert_eq!(
+                std::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE)).unwrap(),
+                owner.marker_contents()
+            );
+        }
+    }
+
+    #[test]
+    fn vm_workload_identity_checks_independent_numeric_and_symbolic_selectors() {
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        validate_vm_workload_identity(None, owner).unwrap();
+        for (user, group) in [
+            ("", ""),
+            ("1000", ""),
+            ("", "1001"),
+            ("sandbox", "1001"),
+            ("1000", "sandbox"),
+            ("sandbox", "sandbox"),
+        ] {
+            validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap();
+        }
+        for (user, group, field) in [
+            ("10000", "", "run_as_user"),
+            ("", "10001", "run_as_group"),
+            ("sandbox", "10001", "run_as_group"),
+            ("nobody", "", "run_as_user"),
+        ] {
+            let error = validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap_err();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("1000:1001"), "{error}");
+        }
+    }
+
+    #[test]
+    fn vm_lifecycle_status_retains_resolved_workload_identity() {
+        let identity = ResolvedWorkloadIdentity {
+            uid: 1000,
+            gid: 1001,
+            source: "vm-config".into(),
+            resource_digest: "sha256:image".into(),
+            ..Default::default()
+        };
+        let snapshot = Sandbox {
+            status: Some(SandboxStatus {
+                resolved_identity: Some(identity.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for condition in [
+            provisioning_condition(),
+            stopped_condition(),
+            deleting_condition(),
+            error_condition("ProcessExited", "exited"),
+        ] {
+            let status = status_with_condition(&snapshot, condition, false);
+            assert_eq!(status.resolved_identity.as_ref(), Some(&identity));
+        }
+    }
+
+    #[tokio::test]
     async fn unmarked_overlay_uses_current_image_instead_of_blind_legacy_identity() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -8499,6 +9375,105 @@ mod tests {
     }
 
     #[test]
+    fn create_sandbox_socket_dir_rejects_over_long_ids() {
+        let (root, fd) = test_socket_root();
+        let err = create_sandbox_socket_dir(&fd, &root, &"x".repeat(128)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!root.join("x".repeat(128)).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandbox_socket_dir_fits_macos_sun_path() {
+        let sandbox_id = "3eb2ad45-bead-4c2e-bd10-1a4a7f3a2721";
+        let worst_root = "/tmp/os-4294967295-00000000000000000000000000000000";
+        let control = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join(VM_CONTROL_SOCKET);
+        let ssh = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join("ssh.sock");
+        assert!(
+            control.as_os_str().len() < 104,
+            "control socket path exceeds macOS sun_path: {}",
+            control.display()
+        );
+        assert!(
+            ssh.as_os_str().len() < 104,
+            "ssh socket path exceeds macOS sun_path: {}",
+            ssh.display()
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_returns_distinct_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut counter = 0u64;
+        let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
+            counter += 1;
+            format!("root-{counter}")
+        })
+        .unwrap();
+        let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
+            counter += 1;
+            format!("root-{counter}")
+        })
+        .unwrap();
+        assert_ne!(
+            root_a, root_b,
+            "two allocations must produce distinct roots"
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_retries_on_occupied_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let original_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+
+        // attempt-0: symlink to victim directory
+        std::os::unix::fs::symlink(&victim, tmp.path().join("attempt-0")).unwrap();
+        // attempt-1: existing directory (simulates foreign-owned pre-creation)
+        std::fs::create_dir(tmp.path().join("attempt-1")).unwrap();
+
+        let call_count = AtomicUsize::new(0);
+        let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
+            let n = call_count.fetch_add(1, Ordering::SeqCst);
+            format!("attempt-{n}")
+        })
+        .expect("should succeed after retries");
+
+        assert_eq!(root, tmp.path().join("attempt-2"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert!(
+            tmp.path()
+                .join("attempt-0")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "pre-created symlink must not be removed"
+        );
+        assert!(
+            tmp.path().join("attempt-1").exists(),
+            "pre-created directory must not be removed"
+        );
+        let after_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            original_mode, after_mode,
+            "victim directory permissions must not change"
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_exhaustion_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+
+        let err = allocate_socket_root_with(tmp.path(), || "blocked".to_string())
+            .expect_err("should fail when all names are occupied");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn sandbox_state_dir_rejects_path_unsafe_ids() {
         let err = sandbox_state_dir(Path::new("/tmp/openshell-vm"), "../escape")
             .expect_err("path traversal should be rejected");
@@ -8581,11 +9556,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        let (old_authentication, old_session) = test_launch_authentication("old");
         let sandbox = Sandbox {
             id: "sandbox-stopped".to_string(),
             name: "stopped".to_string(),
             spec: Some(SandboxSpec {
-                launch_authentication: test_launch_authentication("old").0,
+                launch_authentication: old_authentication,
                 ..Default::default()
             }),
             ..Default::default()
@@ -8596,6 +9572,9 @@ mod tests {
         tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
             .await
             .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
+            .await
+            .unwrap();
         let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
         driver.registry.lock().await.insert(
             sandbox.id.clone(),
@@ -8604,12 +9583,13 @@ mod tests {
                 state_dir: state_dir.clone(),
                 process: None,
                 provisioning_task: None,
+                preparation: None,
                 gpu_bdf: None,
                 deleting: false,
             },
         );
 
-        let (fresh_authentication, fresh_session) = test_launch_authentication("fresh");
+        let (fresh_authentication, _) = test_launch_authentication("fresh");
         let err = driver
             .start_sandbox(
                 &sandbox.id,
@@ -8620,12 +9600,18 @@ mod tests {
             .await
             .expect_err("start without an image should fail");
 
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
             tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok(),
             "failed start must retain its durable stop marker"
+        );
+        assert!(
+            tokio::fs::metadata(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its terminal marker"
         );
         let restored = driver
             .get_sandbox(&sandbox.id, &sandbox.name)
@@ -8650,10 +9636,395 @@ mod tests {
                     .launch_authentication,
             )
             .expect("persisted launch authentication");
-        assert_eq!(
-            persisted_authentication.supervisor.session_id,
-            fresh_session
+        assert_eq!(persisted_authentication.supervisor.session_id, old_session);
+    }
+
+    #[tokio::test]
+    async fn already_running_start_noop_does_not_require_admission_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-running".to_string(),
+            name: "running".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            b"g0000000000000001\n",
+        )
+        .await
+        .unwrap();
+        let provisioning_task = tokio::spawn(std::future::pending());
+        let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir,
+                process: None,
+                provisioning_task: Some(provisioning_task),
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
         );
+
+        driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
+            .await
+            .expect("matching already-running start must remain an idempotent no-op");
+
+        let task = driver
+            .registry
+            .lock()
+            .await
+            .remove(&sandbox.id)
+            .and_then(|record| record.provisioning_task)
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn blocked_worker_does_not_delay_independent_image_and_overlay_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = root.path().to_path_buf();
+        driver.config.bootstrap_image = "test-bootstrap".to_string();
+        driver.launcher_bin = root.path().join("worker");
+        let cached_root = root.path().join("images/warm/rootfs.ext4");
+        fs::create_dir_all(cached_root.parent().unwrap()).unwrap();
+        fs::write(&cached_root, b"cached bootstrap").unwrap();
+        let images =
+            preparation::Message::Complete(Ok(preparation::Output::Images(RuntimeImagePlan {
+                root_disk: cached_root.clone(),
+                image_disk: None,
+                image_identity: "warm".to_string(),
+                bootstrap_image_identity: "warm".to_string(),
+            })));
+        let overlay = preparation::Message::Complete(Ok(preparation::Output::Overlay(
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )));
+        fs::write(
+            root.path().join("images.json"),
+            serde_json::to_vec(&images).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("overlay.json"),
+            serde_json::to_vec(&overlay).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &driver.launcher_bin,
+            r#"#!/bin/sh
+    control=$(dirname "$0")
+    request=$(cat "$2")
+    case "$request" in
+        *'"sandbox_id":"slow-a"'*)
+            : > "$control/ready"
+            exec sleep 300
+            ;;
+        *'"overlay":null'*) cat "$control/images.json" ;;
+        *) cat "$control/overlay.json" ;;
+    esac
+    printf '\n'
+    "#,
+        )
+        .unwrap();
+        fs::set_permissions(&driver.launcher_bin, fs::Permissions::from_mode(0o700)).unwrap();
+        for id in ["slow-a", "warm-b"] {
+            let state_dir = sandboxes_root_dir(root.path()).join(id);
+            create_private_dir_all(&state_dir).await.unwrap();
+            driver.registry.lock().await.insert(
+                id.to_string(),
+                SandboxRecord {
+                    snapshot: Sandbox {
+                        id: id.to_string(),
+                        ..Default::default()
+                    },
+                    state_dir,
+                    process: None,
+                    provisioning_task: None,
+                    preparation: None,
+                    gpu_bdf: None,
+                    deleting: false,
+                },
+            );
+        }
+
+        let slow_driver = driver.clone();
+        let slow = tokio::spawn(async move {
+            slow_driver
+                .prepare_images_in_worker("slow-a", "test-bootstrap", None, true)
+                .await
+        });
+        let warm_driver = driver.clone();
+        let ready = root.path().join("ready");
+        let mut warm = tokio::spawn(async move {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let plan = warm_driver
+                .prepare_images_in_worker("warm-b", "test-bootstrap", None, true)
+                .await
+                .map_err(|error| error.to_string())?;
+            if plan.root_disk != cached_root {
+                return Err("warm image result was not preserved".to_string());
+            }
+            let owner = warm_driver
+                .prepare_overlay_in_worker(
+                    "warm-b",
+                    &plan.root_disk,
+                    OverlayPreparation::Fresh,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if owner
+                != (SandboxOwnerIdentity {
+                    uid: 1000,
+                    gid: 1000,
+                })
+            {
+                return Err("warm overlay result was not preserved".to_string());
+            }
+            Ok::<(), String>(())
+        });
+        let outcome = match tokio::time::timeout(Duration::from_secs(10), &mut warm).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("warm task failed: {error}")),
+            Err(_) => {
+                warm.abort();
+                let _ = warm.await;
+                Err("warm request waited for the unrelated slow worker".to_string())
+            }
+        };
+        let slow_still_running = !slow.is_finished();
+        slow.abort();
+        let _ = slow.await;
+        let warm_cleanup = driver.cleanup_image_preparation("warm-b").await;
+        let slow_cleanup = driver.cleanup_image_preparation("slow-a").await;
+        warm_cleanup.expect("warm worker cleanup");
+        slow_cleanup.expect("slow worker cleanup");
+        outcome.expect("independent image and overlay requests must complete");
+        assert!(
+            slow_still_running,
+            "the slow worker must remain blocked during the proof"
+        );
+    }
+
+    async fn lifecycle_cancels_image_preparation(delete: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let id = "sandbox-cancel-image";
+        let state_dir = sandboxes_root_dir(temp.path()).join(id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        let launcher = temp.path().join("worker");
+        fs::write(&launcher, "#!/bin/sh\nroot=$(dirname \"$2\")\nsleep 300 &\nprintf ready > \"$root/ready\"\nwait\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = image_cache_root_dir(temp.path());
+        let mut attempt = preparation::Attempt::create(&cache).unwrap();
+        let directory = attempt.directory.clone();
+        let _stdout = attempt
+            .spawn(
+                &launcher,
+                preparation::Request {
+                    config: driver.config.clone(),
+                    sandbox_id: id.to_string(),
+                    image_ref: "test-image".to_string(),
+                    rootfs_tar: None,
+                    bootstrap_only: false,
+                    overlay: None,
+                    lease_fd: -1,
+                    parent_pid: 0,
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !directory.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("preparation worker readiness");
+        let attempt = Arc::new(Mutex::new(attempt));
+        driver.registry.lock().await.insert(
+            id.to_string(),
+            SandboxRecord {
+                snapshot: Sandbox {
+                    id: id.to_string(),
+                    name: "cancel-image".to_string(),
+                    ..Default::default()
+                },
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: Some(tokio::spawn(std::future::pending())),
+                preparation: Some(attempt.clone()),
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        if delete {
+            let response = driver.delete_sandbox(id, "").await.unwrap();
+            assert!(response.deleted);
+            assert!(!state_dir.exists());
+        } else {
+            driver.stop_sandbox(id, "").await.unwrap();
+            assert!(state_dir.join(SANDBOX_STOPPED_FILE).exists());
+        }
+        assert!(
+            !directory.exists(),
+            "lifecycle completion must reclaim preparation staging"
+        );
+        attempt
+            .lock()
+            .await
+            .cleanup()
+            .await
+            .expect("worker was reaped and cleanup is idempotent");
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_image_preparation_cleanup() {
+        lifecycle_cancels_image_preparation(false).await;
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_image_preparation_cleanup() {
+        lifecycle_cancels_image_preparation(true).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_preparation_cleanup_failure_preserves_sandbox_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let id = "sandbox-incomplete-cleanup";
+        let state_dir = sandboxes_root_dir(temp.path()).join(id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        fs::write(&overlay, b"owned overlay").unwrap();
+        let attempt = Arc::new(Mutex::new(
+            preparation::Attempt::create(&image_cache_root_dir(temp.path())).unwrap(),
+        ));
+        driver.registry.lock().await.insert(
+            id.to_string(),
+            SandboxRecord {
+                snapshot: Sandbox {
+                    id: id.to_string(),
+                    ..Default::default()
+                },
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                preparation: Some(attempt),
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+
+        // Failed worker cleanup retains the registered attempt. Its failure
+        // epilogue must not remove state that a descendant could still write.
+        driver
+            .fail_provisioning(
+                id,
+                &state_dir,
+                "PreparationFailed",
+                "image preparation descendants still own staging; files retained",
+                true,
+            )
+            .await;
+        let retained = fs::read(&overlay);
+        driver.cleanup_image_preparation(id).await.unwrap();
+        assert_eq!(retained.unwrap(), b"owned overlay");
+
+        driver
+            .fail_provisioning(id, &state_dir, "PreparationFailed", "worker stopped", true)
+            .await;
+        assert!(
+            !state_dir.exists(),
+            "successful worker cleanup permits removing failed sandbox state"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_start_preserves_active_and_stopped_generation_material() {
+        for active in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            driver.config.state_dir = directory.path().to_path_buf();
+            driver.config.default_image = "test/image:latest".to_string();
+            let sandbox = Sandbox {
+                id: "sb-auth-start".to_string(),
+                name: "auth-start".to_string(),
+                spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication("existing").0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let state_dir = directory.path().join("sandbox");
+            create_private_dir_all(&state_dir).await.unwrap();
+            write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+            // An empty marker on the stopped fixture avoids invoking debugfs if
+            // the guard regresses, so the test reaches the destructive host cleanup.
+            let generation = if active { "g0000000000000001" } else { "" };
+            std::fs::write(state_dir.join(HOST_BOUNDARY_GENERATION_FILE), generation).unwrap();
+            std::fs::write(
+                state_dir.join(HOST_AUTH_BUNDLE_FILE),
+                b"retained authentication",
+            )
+            .unwrap();
+            let task = active.then(|| tokio::spawn(std::future::pending()));
+            driver.registry.lock().await.insert(
+                sandbox.id.clone(),
+                SandboxRecord {
+                    snapshot: sandbox.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: task,
+                    preparation: None,
+                    gpu_bdf: None,
+                    deleting: false,
+                },
+            );
+            let error = driver
+                .start_sandbox(
+                    &sandbox.id,
+                    &sandbox.name,
+                    "g0000000000000001",
+                    br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert_eq!(
+                error.message(),
+                "VM sandbox launch authentication is malformed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).unwrap(),
+                generation
+            );
+            assert_eq!(
+                std::fs::read(state_dir.join(HOST_AUTH_BUNDLE_FILE)).unwrap(),
+                b"retained authentication"
+            );
+            let record = driver.registry.lock().await.remove(&sandbox.id).unwrap();
+            assert_eq!(record.snapshot, sandbox);
+            assert_eq!(record.provisioning_task.is_some(), active);
+            if let Some(task) = record.provisioning_task {
+                assert!(!task.is_finished());
+                task.abort();
+            }
+        }
     }
 
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
@@ -8687,6 +10058,32 @@ mod tests {
             serde_json::to_vec(&authentication).expect("encode launch authentication"),
             session_id,
         )
+    }
+
+    #[tokio::test]
+    async fn explicit_start_clears_stop_and_terminal_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("sandbox");
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
+            .await
+            .unwrap();
+
+        clear_explicit_start_markers(&state_dir).await.unwrap();
+
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -8742,20 +10139,246 @@ mod tests {
 
     #[test]
     fn capabilities_report_configured_default_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:dev".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
+        let gateway = openshell_core::extension_protocol::gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        );
+        let negotiated = openshell_core::extension_protocol::negotiate(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "vm",
+            &gateway,
+            driver.capabilities().extension,
+        )
+        .unwrap();
+        assert!(negotiated.required_capabilities.iter().any(|capability| {
+            capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
+        }));
+    }
+
+    #[tokio::test]
+    async fn launch_authentication_is_checked_before_create_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        driver.config.default_image = "invalid image reference".to_string();
+        let mut events = driver.events.subscribe();
+        let mut invalid_fields: serde_json::Value =
+            serde_json::from_slice(&test_launch_authentication("invalid-fields").0).unwrap();
+        invalid_fields["verification_keys"] = serde_json::json!([]);
+        let malformed = br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec();
+
+        for (authentication, diagnostic) in [
+            (Vec::new(), "is required"),
+            (malformed, "is malformed"),
+            (
+                serde_json::to_vec(&invalid_fields).unwrap(),
+                "has invalid fields",
+            ),
+        ] {
+            let sandbox = Sandbox {
+                id: "sb-auth-preflight".to_string(),
+                name: "auth-preflight".to_string(),
+                spec: Some(SandboxSpec {
+                    launch_authentication: authentication,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let error = driver
+                .create_sandbox(&sandbox)
+                .await
+                .expect_err("invalid launch material must fail synchronously");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains(diagnostic), "{error}");
+            assert!(!error.message().contains("secret-marker"));
+            assert!(driver.registry.lock().await.is_empty());
+            assert!(directory.path().read_dir().unwrap().next().is_none());
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioning_rechecks_launch_authentication_before_resolving_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
+        let sandbox = Sandbox {
+            id: "sb-auth-recovery".to_string(),
+            name: "auth-recovery".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let state_dir = directory.path().join("sandbox");
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox.clone(),
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        let mut events = driver.events.subscribe();
+        let error = driver
+            .provision_sandbox_inner(
+                sandbox,
+                "invalid image reference".to_string(),
+                state_dir,
+                None,
+                OverlayPreparation::PreserveExisting,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("VM sandbox launch authentication is required")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_invalid_launch_authentication_before_side_effects() {
+        #[derive(Debug, Default)]
+        struct RestoreObserver {
+            calls: AtomicUsize,
+        }
+
+        #[tonic::async_trait]
+        impl LifecycleExtension for RestoreObserver {
+            fn name(&self) -> &'static str {
+                "restore-observer"
+            }
+
+            async fn before_restore(&self, _sandbox: &RestoreContext) -> LifecycleResult<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        for scan_at_startup in [true, false] {
+            for authentication in [
+                Vec::new(),
+                br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let observer = Arc::new(RestoreObserver::default());
+                let mut driver =
+                    test_driver_with_extensions(LifecycleExtensionRegistry::with(vec![
+                        observer.clone(),
+                    ]));
+                driver.config.state_dir = directory.path().to_path_buf();
+                driver.config.default_image = "invalid image reference".to_string();
+                let sandbox = Sandbox {
+                    id: "sb-auth-restore".to_string(),
+                    name: "auth-restore".to_string(),
+                    spec: Some(SandboxSpec {
+                        launch_authentication: authentication,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let state_dir = sandbox_state_dir(directory.path(), &sandbox.id).unwrap();
+                create_private_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                fs::write(state_dir.join("overlay.ext4"), b"retained overlay").unwrap();
+                fs::write(state_dir.join(HOST_AUTH_BUNDLE_FILE), b"retained auth").unwrap();
+                if !scan_at_startup {
+                    fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n").unwrap();
+                }
+                let mut original_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                original_files.sort();
+                let mut events = driver.events.subscribe();
+
+                let accepted = if scan_at_startup {
+                    driver.restore_persisted_sandboxes().await;
+                    false
+                } else {
+                    driver
+                        .restore_persisted_sandbox(
+                            sandbox.clone(),
+                            state_dir.clone(),
+                            true,
+                            &tracing::Span::current(),
+                        )
+                        .await
+                };
+                // If validation regresses, join the failed provisioning task so
+                // its later cleanup cannot race with the state assertions.
+                let task = driver
+                    .registry
+                    .lock()
+                    .await
+                    .get_mut(&sandbox.id)
+                    .and_then(|record| record.provisioning_task.take());
+                if let Some(task) = task {
+                    task.await.unwrap();
+                }
+
+                assert!(
+                    !accepted,
+                    "invalid launch credentials must deny restoration"
+                );
+                assert_eq!(
+                    observer.calls.load(Ordering::Relaxed),
+                    0,
+                    "launch authentication must precede lifecycle extension hooks"
+                );
+                assert!(driver.registry.lock().await.is_empty());
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+                assert!(
+                    !extension_state_dir(&state_dir, "restore-observer")
+                        .unwrap()
+                        .exists()
+                );
+                let mut retained_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                retained_files.sort();
+                assert_eq!(retained_files, original_files);
+            }
+        }
     }
 
     #[test]
@@ -8778,14 +10401,18 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_prefers_template_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -8809,14 +10436,18 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_falls_back_to_driver_default() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -8837,11 +10468,15 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_returns_none_without_template_or_default() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -8859,63 +10494,106 @@ mod tests {
 
     #[test]
     fn bootstrap_image_ref_prefers_explicit_bootstrap_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox-bootstrap:latest"
         );
     }
 
     #[test]
     fn bootstrap_image_ref_falls_back_to_default_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox:default"
         );
     }
 
     #[test]
-    fn bootstrap_image_ref_falls_back_to_requested_image() {
+    fn bootstrap_image_ref_rejects_missing_trusted_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
-        assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
-            "ghcr.io/example/app:latest"
-        );
+        let error = driver
+            .bootstrap_image_ref()
+            .expect_err("sandbox images must not become VM bootstrap images");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox image cannot be used"));
+    }
+
+    #[tokio::test]
+    async fn vm_driver_startup_rejects_missing_trusted_bootstrap_image() {
+        let Err(error) = VmDriver::new(VmDriverConfig::default()).await else {
+            panic!("driver startup must reject an empty bootstrap configuration");
+        };
+        assert!(error.contains("sandbox image cannot be used"));
+    }
+
+    #[test]
+    fn bootstrap_image_config_requires_a_trusted_image() {
+        let error = VmDriverConfig::default()
+            .validate_bootstrap_image_config()
+            .expect_err("an empty bootstrap configuration must fail closed");
+        assert!(error.contains("sandbox image cannot be used"));
+
+        VmDriverConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmDriverConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("an explicit bootstrap image is valid");
     }
 
     #[test]
@@ -9250,6 +10928,214 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+
+        let sentinel = fs::read_to_string(outside.join("sentinel")).unwrap();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(sentinel, "unchanged");
+        assert!(
+            !payload_escaped,
+            "upper-layer payload escaped the rootfs through a lower-layer symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_whiteout_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let outside_entry = base.join("outside-entry");
+        let outside_opaque = base.join("outside-opaque");
+        fs::create_dir_all(&outside_entry).unwrap();
+        fs::create_dir_all(&outside_opaque).unwrap();
+        fs::write(outside_entry.join("victim"), "entry").unwrap();
+        fs::write(outside_opaque.join("victim"), "opaque").unwrap();
+
+        let entry_rootfs = base.join("entry-rootfs");
+        let entry_layer = base.join("entry-layer");
+        fs::create_dir_all(&entry_rootfs).unwrap();
+        fs::create_dir_all(entry_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_entry, entry_rootfs.join("escape")).unwrap();
+        fs::write(entry_layer.join("escape/.wh.victim"), "").unwrap();
+        let entry_error = apply_layer_dir_to_rootfs(&entry_layer, &entry_rootfs).err();
+
+        let opaque_rootfs = base.join("opaque-rootfs");
+        let opaque_layer = base.join("opaque-layer");
+        fs::create_dir_all(&opaque_rootfs).unwrap();
+        fs::create_dir_all(opaque_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_opaque, opaque_rootfs.join("escape")).unwrap();
+        fs::write(opaque_layer.join("escape/.wh..wh..opq"), "").unwrap();
+        let opaque_error = apply_layer_dir_to_rootfs(&opaque_layer, &opaque_rootfs).err();
+
+        let entry_remained = outside_entry.join("victim").exists();
+        let opaque_remained = outside_opaque.join("victim").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let entry_error =
+            entry_error.expect("escaping symlink should reject an individual whiteout layer");
+        let opaque_error =
+            opaque_error.expect("escaping symlink should reject an opaque whiteout layer");
+        assert!(
+            entry_error.contains("absolute symlink"),
+            "unexpected error: {entry_error}"
+        );
+        assert!(
+            opaque_error.contains("absolute symlink"),
+            "unexpected error: {opaque_error}"
+        );
+        assert!(entry_remained, "individual whiteout escaped the rootfs");
+        assert!(opaque_remained, "opaque whiteout escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_relative_symlink_escape() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink("../outside", rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("escapes rootfs"),
+            "unexpected error: {error}"
+        );
+        assert!(!payload_escaped, "relative symlink escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_directory_symlink_cycles() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("a")).unwrap();
+        fs::write(layer.join("a/payload"), "payload").unwrap();
+        std::os::unix::fs::symlink("b", rootfs.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", rootfs.join("b")).unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs)
+            .expect_err("directory symlink cycle must reject the layer");
+
+        assert!(
+            error.contains("too many symlinks"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layers_do_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        // GNU tar's legacy symlink field is limited to 100 bytes, while the
+        // macOS temporary directory path is already close to that limit.
+        let outside = Path::new("/tmp").join(format!(
+            "openshell-vm-layer-test-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_symlink(&mut lower_tar, "escape", &outside);
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        let upper_tar = tar_bytes_with_file("escape/payload", b"escaped");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        let error = apply_layer_dir_to_rootfs(&upper, &rootfs)
+            .expect_err("upper layer must not traverse the lower absolute symlink");
+
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.join("payload").exists());
+
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layer_implicit_parent_preserves_lower_directory_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut lower_tar, "usr/bin/bash", b"bash");
+        append_test_tar_symlink(&mut lower_tar, "bin", Path::new("usr/bin"));
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        // The tar contains no explicit `bin/` entry. Extraction necessarily
+        // materializes it as an implicit parent for `bin/tool`.
+        let upper_tar = tar_bytes_with_file("bin/tool", b"tool");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        apply_layer_dir_to_rootfs(&upper, &rootfs).unwrap();
+
+        assert!(
+            fs::symlink_metadata(rootfs.join("bin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "implicit upper parent must not replace the lower /bin symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("usr/bin/tool")).unwrap(),
+            "tool"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn layer_compression_from_media_type_supports_common_formats() {
         assert_eq!(
@@ -9273,8 +11159,6 @@ mod tests {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -9305,14 +11189,18 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -9367,14 +11255,18 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -9395,6 +11287,7 @@ mod tests {
                     state_dir: state_dir.clone(),
                     process: None,
                     provisioning_task: None,
+                    preparation: None,
                     gpu_bdf: None,
                     deleting: false,
                 },
@@ -9417,15 +11310,19 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 default_image: "ghcr.io/example/sandbox:latest".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -9447,6 +11344,7 @@ mod tests {
                     state_dir: state_dir.clone(),
                     process: None,
                     provisioning_task: None,
+                    preparation: None,
                     gpu_bdf: None,
                     deleting: false,
                 },
@@ -9457,7 +11355,10 @@ mod tests {
             .create_sandbox(&Sandbox {
                 id: "sandbox-123".to_string(),
                 name: "sandbox-123".to_string(),
-                spec: Some(SandboxSpec::default()),
+                spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication("duplicate").0,
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
             .await
@@ -9637,7 +11538,7 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v4:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-",
             openshell_core::VERSION
         )));
         assert!(identity.ends_with(":sha256:bootstrap-image"));
@@ -9801,6 +11702,7 @@ mod tests {
                 state_dir,
                 process: Some(process),
                 provisioning_task: None,
+                preparation: None,
                 gpu_bdf: None,
                 deleting: false,
             },
@@ -9816,15 +11718,19 @@ mod tests {
     /// Driver whose rootfs tar staging root is an isolated temp directory.
     fn rootfs_tar_test_driver(staging_root: &Path, max_bytes: Option<u64>) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 rootfs_tar_staging_dir: Some(staging_root.to_path_buf()),
                 rootfs_tar_max_bytes: max_bytes,
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
@@ -10028,6 +11934,11 @@ mod tests {
     /// Build an uncompressed tar holding a single file.
     fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut builder, name, contents);
+        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_file(builder: &mut tar::Builder<Vec<u8>>, name: &str, contents: &[u8]) {
         let mut header = tar::Header::new_gnu();
         header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
         header.set_mode(0o644);
@@ -10035,7 +11946,18 @@ mod tests {
         builder
             .append_data(&mut header, name, contents)
             .expect("append tar entry");
-        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_symlink(builder: &mut tar::Builder<Vec<u8>>, name: &str, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(target).expect("set symlink target");
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .expect("append symlink entry");
     }
 
     fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -10137,6 +12059,7 @@ mod tests {
 
     fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 grpc_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -10146,9 +12069,12 @@ mod tests {
                 gpu_mem_mib: 16384,
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
+            preparation_root: None,
             events,
             gpu_inventory: None,
             lifecycle_extensions: Arc::new(extensions),
@@ -10757,6 +12683,7 @@ mod tests {
                 state_dir: state_dir.clone(),
                 process: None,
                 provisioning_task: None,
+                preparation: None,
                 gpu_bdf: None,
                 deleting: false,
             },
