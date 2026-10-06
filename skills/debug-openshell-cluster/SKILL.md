@@ -93,6 +93,11 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+The gateway container uses a Distroless Debian runtime. For OS-library
+vulnerability findings, check the deployed image digest and package version;
+deploy a rebuilt gateway image with the patched base. Updating the gateway
+binary alone does not update the libraries supplied by its container image.
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
@@ -213,6 +218,8 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
+runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve

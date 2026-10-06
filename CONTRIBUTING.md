@@ -279,6 +279,22 @@ each worktree. Cache reuse therefore depends on the compiler inputs: outputs
 that embed absolute paths, including Rust dependencies in some builds, can
 still miss across worktrees.
 
+## Container Image Base Overrides
+
+The gateway and supervisor Dockerfiles accept `GATEWAY_BASE_IMAGE` and
+`SUPERVISOR_BASE_IMAGE` build arguments. Omitting them keeps the pinned
+distroless defaults. To build with your own bases, pass the argument through
+the corresponding task:
+
+```shell
+mise run build:docker:gateway -- --build-arg GATEWAY_BASE_IMAGE=registry.example.com/gateway-base:tag
+mise run build:docker:supervisor -- --build-arg SUPERVISOR_BASE_IMAGE=registry.example.com/supervisor-base:tag
+```
+
+Choose bases that provide the GNU runtime libraries required by the binaries
+and CA certificates for the target architecture. Validate the resulting images
+with your deployment. The sandbox image uses `scratch` and has no base override.
+
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
