@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Accessing Logs"
-description: "How to view sandbox logs through the CLI, TUI, and directly on the sandbox filesystem."
+description: "How to view sandbox logs through the CLI, TUI, supervisor files, and container logs."
 keywords: "Generative AI, Cybersecurity, Logging, CLI, TUI, Observability"
 ---
 
-OpenShell provides three ways to access sandbox logs: the CLI, the TUI, and direct filesystem access inside the sandbox.
+Use the CLI or TUI for recent supervisor logs, and compute-driver tooling for supervisor files, sandbox-runtime events, and main process output. The supervisor runs separately from the sandbox workload, so these logs have different locations and collection paths.
 
 ## CLI
 
@@ -35,7 +35,7 @@ The TUI dashboard displays sandbox logs in real time. Logs appear in the log pan
 
 ## Main Process Output
 
-The sandbox's main process writes its stdout and stderr to the sandbox container's stdout and stderr, alongside warnings from the sandbox runtime. Read it with the container tooling for the compute driver:
+The sandbox's main process writes its stdout and stderr to the sandbox container's stdout and stderr, alongside sandbox-runtime diagnostics. Read this output with the container tooling for the compute driver:
 
 ```shell
 kubectl -n <namespace> logs <sandbox-pod> -c agent
@@ -43,15 +43,19 @@ docker logs <sandbox-container>
 podman logs <sandbox-container>
 ```
 
+The sandbox runtime also emits OCSF shorthand events, including process-launch and Landlock filesystem events, into these container logs when its diagnostic log filter permits them. These runtime-originated events are not pushed to the gateway log stream or included in the supervisor's JSONL file. Collect workload container logs separately from supervisor logs to retain both sources.
+
 A main process started with a TTY writes only to its attachment; use `openshell sandbox connect` to view that output. Output from `sandbox exec` and SSH sessions does not reach the container log, and `openshell logs` does not include main process output.
 
 When the container runtime falls behind reading the log, the main process blocks on writes, as with any container.
 
 ## Gateway Log Storage
 
-The sandbox pushes logs to the gateway over gRPC in real time. The gateway stores a bounded buffer of recent log lines per sandbox. This buffer is not persisted to disk and is lost when the gateway restarts.
+The supervisor pushes logs to the gateway over gRPC in real time. The gateway stores up to 2,000 recent log lines per sandbox in memory. This buffer is not persisted to disk and is lost when the gateway restarts or the sandbox's buffers are removed. The push channel is bounded and can drop events under load or during disconnection.
 
-For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
+For durable retention, collect supervisor output or files and workload container logs into an external log store. The local files rotate and use temporary storage on container drivers; they are not a durable archive. See [Direct Filesystem Access](#direct-filesystem-access) for locations and collection limits, and [OCSF JSON export](/observability/ocsf-json-export) for structured file output.
+
+The gateway's separate `ocsf_log` configuration writes gateway-produced OCSF events to JSONL. It does not persist supervisor log lines received over gRPC or main process output.
 
 ## Loss Awareness and Resume
 
@@ -62,7 +66,7 @@ Do not parse a cursor. The only supported operation is comparing two cursors obs
 The gateway distinguishes recoverable from unrecoverable loss:
 
 - **Recoverable lag.** When a consumer falls behind and the gateway skips ahead in its buffer, the stream emits a warning event and keeps running. The warning is the signal that events were skipped.
-- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status. The client should restart observation and, if it needs the missing lines, read them from the log files inside the sandbox.
+- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status. The client should restart observation and, if it needs the missing lines, check collected logs or any remaining supervisor files. Those sources may also have gaps.
 
 A cursor is bound to the cursor space that issued it. A gateway restart, teardown of the sandbox's buffers, or a reconnect that lands on a different gateway replica starts a new space, and cursors from the previous one no longer refer to anything. The gateway rejects them with `OUT_OF_RANGE` instead of treating them as caught up — which would silently suppress the new space's events. A malformed cursor is rejected with `INVALID_ARGUMENT`.
 
@@ -74,49 +78,63 @@ The gateway merges the log and platform event sources before emitting, so events
 
 ## Direct Filesystem Access
 
-Start an independent shell with `sandbox exec` to read log files directly:
+The supervisor writes shorthand logs to `/var/log/openshell.YYYY-MM-DD.log` and, when enabled, OCSF JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.log` in its own filesystem. `openshell sandbox exec` runs in the workload and does not give access to the supervisor's files.
 
-```text
-openshell sandbox exec --name my-sandbox --tty -- /bin/bash -l
-sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
-```
+| Compute driver | Supervisor log location | Local storage lifetime |
+|---|---|---|
+| Kubernetes | `/var/log` in the separate supervisor pod's `supervisor` container | An `emptyDir` volume, removed with the pod. |
+| Docker / Podman | `/var/log` in the separate supervisor container | A tmpfs mount, lost when the container stops. |
+| VM | `/var/log` on the host running the supervisor, if writable | Host-managed storage. The driver also captures stderr in `supervisor.err.log` in the sandbox's driver state directory. |
+| Windows MXC | Gateway-local JSONL output | See [Windows MXC gateways](/observability/ocsf-json-export#windows-mxc-gateways). |
 
-Or run a one-off command without an interactive shell:
+Use platform tooling with access to the supervisor resources. For Podman, copy the current supervisor files to a local directory while the container is running:
 
 ```shell
-openshell sandbox exec --name my-sandbox -- cat /var/log/openshell.2026-04-01.log
+mkdir -p ./supervisor-logs
+podman cp <supervisor-container>:/var/log/. ./supervisor-logs/
 ```
 
-`sandbox connect` attaches to the sandbox's existing canonical main process; it
-does not start a new shell.
+Docker's `docker cp` cannot copy the live contents of the supervisor's tmpfs log mount. Retrieving those files requires operator-managed access to the live mount on the Docker daemon host. The default supervisor image has no shell or `tar`, so shell-based `docker exec` collection is not an alternative.
 
-The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
+For live shorthand output, read the supervisor's stderr through the platform log interface:
+
+```shell
+kubectl -n <sandbox-namespace> logs <supervisor-pod> -c supervisor --follow
+docker logs --follow <supervisor-container>
+podman logs --follow <supervisor-container>
+```
+
+This console output follows the supervisor's diagnostic log filter and does not include full OCSF JSON records. A cluster or container log collector can ship it for retention. Collect workload container logs separately for main process output and sandbox-runtime events.
+
+The default supervisor image has no shell or `tar`, so shell-based `kubectl exec` and `kubectl cp` examples do not work with that image. Reading Kubernetes supervisor files requires operator-managed access to its log volume, such as cluster debugging tooling. OpenShell does not configure a file collector for you.
+
+Ship files before rotation or resource teardown and configure your collector to handle daily rotation. Local file writers are non-blocking and can also drop events under pressure. If the supervisor cannot open `/var/log`, it falls back to stderr-only logging and does not produce these files, even when `ocsf_json_enabled` is true. Neither the local files nor the gateway stream guarantees complete audit history.
 
 ## Filtering by Event Type
 
-The shorthand format is designed for `grep`. Some useful patterns:
+The shorthand format is designed for `grep`. After copying supervisor files into `./supervisor-logs`, use these patterns:
 
 ```shell
 # All denied connections
-grep "DENIED\|BLOCKED" /var/log/openshell.*.log
+grep "DENIED\|BLOCKED" ./supervisor-logs/openshell.*.log
 
 # All network events
-grep "OCSF NET:" /var/log/openshell.*.log
+grep "OCSF NET:" ./supervisor-logs/openshell.*.log
 
 # All L7 enforcement decisions
-grep "OCSF HTTP:" /var/log/openshell.*.log
+grep "OCSF HTTP:" ./supervisor-logs/openshell.*.log
 
 # Security findings only
-grep "OCSF FINDING:" /var/log/openshell.*.log
+grep "OCSF FINDING:" ./supervisor-logs/openshell.*.log
 
 # Policy changes
-grep "OCSF CONFIG:" /var/log/openshell.*.log
+grep "OCSF CONFIG:" ./supervisor-logs/openshell.*.log
 
 # All OCSF events, excluding standard tracing
-grep "^.* OCSF " /var/log/openshell.*.log
+grep "^.* OCSF " ./supervisor-logs/openshell.*.log
 
 # Events at medium severity or above
-grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell.*.log
+grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" ./supervisor-logs/openshell.*.log
 ```
 
 ## Next Steps
