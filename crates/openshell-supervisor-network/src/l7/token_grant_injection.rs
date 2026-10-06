@@ -112,6 +112,20 @@ pub(super) async fn inject_for_admitted_owners(
     admitted_owners: &HashSet<String>,
 ) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    if snapshot
+        .dynamic_credentials
+        .iter()
+        .any(|(key, credential)| {
+            credential.token_grant.is_some()
+                && credential.token_grant_owners.is_empty()
+                && dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)
+                    .is_some()
+        })
+    {
+        return Err(miette!(
+            "dynamic token grant is missing endpoint ownership metadata; upgrade the gateway before the supervisor"
+        ));
+    }
     let candidates = token_grant_candidates(
         &snapshot.dynamic_credentials,
         ctx,

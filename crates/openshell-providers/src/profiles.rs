@@ -2649,6 +2649,10 @@ pub fn validate_profile_set(
             }
         }
 
+        let has_token_grant = profile
+            .credentials
+            .iter()
+            .any(|credential| credential.token_grant.is_some());
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
             if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3006,6 +3010,25 @@ pub fn validate_profile_set(
                             ));
                         }
                     }
+                }
+            }
+
+            if has_token_grant {
+                if endpoint.protocol.trim().eq_ignore_ascii_case("sql") {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        format!("endpoints[{index}].protocol"),
+                        "token_grant credentials require HTTP header injection, which protocol sql does not support",
+                    ));
+                }
+                if endpoint.tls.trim().eq_ignore_ascii_case("skip") {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        format!("endpoints[{index}].tls"),
+                        "token_grant credentials require HTTP header injection, which tls: skip bypasses; remove tls: skip",
+                    ));
                 }
             }
 
@@ -5400,6 +5423,69 @@ credentials:
                 diagnostics.is_empty(),
                 "unexpected diagnostics for {token_endpoint}: {diagnostics:?}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_grants_without_http_injection() {
+        for (protocol, tls, token_grant, rejected_field) in [
+            ("sql", "", true, Some("protocol")),
+            ("rest", "skip", true, Some("tls")),
+            ("graphql", "skip", true, Some("tls")),
+            ("json-rpc", "skip", true, Some("tls")),
+            ("mcp", "skip", true, Some("tls")),
+            ("tcp", "skip", true, Some("tls")),
+            ("", "skip", true, Some("tls")),
+            ("rest", "", true, None),
+            ("graphql", "", true, None),
+            ("json-rpc", "", true, None),
+            ("mcp", "", true, None),
+            ("tcp", "", true, None),
+            ("", "", true, None),
+            ("tcp", "skip", false, None),
+        ] {
+            let admission = match protocol {
+                "" | "tcp" => "",
+                "json-rpc" => "    rules: [{allow: {method: echo}}]",
+                "mcp" => "    rules: [{allow: {method: tools/call}}]",
+                _ => "    access: full",
+            };
+            let mut profile = parse_profile_yaml(&format!(
+                r#"
+id: grant-transport
+display_name: Grant Transport
+credentials:
+  - name: access_token
+    env_vars: [ACCESS_TOKEN]
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      audience: api://default
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: "{protocol}"
+{admission}
+    tls: "{tls}"
+    allow_uninspected_credentials: true
+binaries:
+  - /usr/bin/app
+"#,
+            ))
+            .expect("profile should parse");
+            if !token_grant {
+                profile.credentials[0].token_grant = None;
+            }
+            let diagnostics = validate_profile_set(&[("transport.yaml".to_string(), profile)]);
+            if let Some(field) = rejected_field {
+                assert_eq!(diagnostics.len(), 1, "{protocol}/{tls}: {diagnostics:?}");
+                assert_eq!(diagnostics[0].field, format!("endpoints[0].{field}"));
+                assert!(diagnostics[0].message.contains("token_grant"));
+                assert_eq!(diagnostics[0].severity, "error");
+            } else {
+                assert!(diagnostics.is_empty(), "{protocol}/{tls}: {diagnostics:?}");
+            }
         }
     }
 

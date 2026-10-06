@@ -145,7 +145,7 @@ fn credential_generation_guard(
 /// Resolve a grant from the provider installation and policy owners admitted
 /// for this request. Provider refresh is independent of tunnel lifetime: the
 /// connection's original dynamic map cannot authorize a later request.
-async fn inject_inspected_request_grant(
+pub(crate) async fn prepare_inspected_request(
     req: crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
     engine: &TunnelPolicyEngine,
@@ -213,6 +213,7 @@ async fn inject_inspected_request_grant(
     if let Some(guard) = credential_generation_guard(&scoped) {
         guard.ensure_current()?;
     }
+    let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
     Ok((req, scoped))
 }
 
@@ -623,6 +624,98 @@ pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
         .await
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()
+}
+
+struct InspectedForwarding<'a> {
+    config: &'a L7EndpointConfig,
+    engine: &'a TunnelPolicyEngine,
+    request_info: &'a L7RequestInfo,
+    request_id: &'a str,
+    response_chain: &'a [openshell_supervisor_middleware::ChainEntry],
+    websocket_middleware: bool,
+    observation_context: Option<&'a openshell_core::endpoint_status::EndpointObservationContext>,
+}
+
+// Every inspected HTTP relay enters here after policy and request middleware.
+// Keep credential preparation and the guarded upstream write together so new
+// protocol relays cannot accidentally forward without required authentication.
+async fn forward_inspected_request<C, U>(
+    request: crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &mut L7EvalContext,
+    forwarding: InspectedForwarding<'_>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let InspectedForwarding {
+        config,
+        engine,
+        request_info,
+        request_id,
+        response_chain,
+        websocket_middleware,
+        observation_context,
+    } = forwarding;
+    let (request, grant_ctx) =
+        match prepare_inspected_request(request, ctx, engine, config, request_info).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(error = %error, "Token grant failed before forwarding");
+                write_bad_gateway_response(client).await?;
+                return Ok(None);
+            }
+        };
+    *ctx = grant_ctx;
+    let observer = EndpointObserver::begin_captured(
+        ctx.endpoint_observation_tx.as_ref(),
+        config,
+        observation_context,
+        ctx.provider_credential_revision,
+        Some(engine.generation_guard()),
+    );
+    relay_http_request_with_credential_rejection_observed(
+        &request,
+        client,
+        upstream,
+        crate::l7::rest::RelayRequestOptions {
+            resolver: ctx.secret_resolver.as_deref(),
+            body_classifier: ctx.body_classifier.as_deref(),
+            mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
+                crate::l7::rest::McpRequestValidation {
+                    config,
+                    ctx,
+                    redacted_target: &request_info.target,
+                },
+            ),
+            credential_generation: credential_generation_guard(ctx),
+            generation_guard: Some(engine.generation_guard()),
+            websocket_extensions: websocket_extension_mode(config, websocket_middleware),
+            request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                && config.request_body_credential_rewrite,
+            deny_uninspected_credentials: config
+                .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+            credential_signing: config.credential_signing,
+            signing_service: &config.signing_service,
+            signing_region: &config.signing_region,
+            host: &ctx.host,
+            port: ctx.port,
+        },
+        ctx,
+        Some(http_response_middleware_relay(
+            &request,
+            ctx,
+            "https",
+            request_id,
+            response_chain,
+            engine.middleware_runner(),
+            Some(engine.generation_guard()),
+        )),
+        observer.as_ref(),
+    )
+    .await
 }
 
 async fn relay_http_request_with_credential_rejection<C, U>(
@@ -1379,82 +1472,25 @@ where
             } else {
                 None
             };
-            let (req, grant_ctx) = match inject_inspected_request_grant(
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
                 req,
-                ctx,
-                &engine,
-                config,
-                &request_info,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    warn!(error = %error, "Token grant failed in route-selected relay");
-                    if let Some(session) = middleware_session.take() {
-                        session
-                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
-                            .await;
-                    }
-                    write_bad_gateway_response(client).await?;
-                    return Ok(());
-                }
-            };
-            // Static revocation can retain the provider revision. Scope static
-            // material after the grant await and retain the pinned installation
-            // through the first upstream write.
-            let scoped_ctx = scoped_context_for_request(&grant_ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(&grant_ctx);
-            let observer = EndpointObserver::begin_captured(
-                ctx.endpoint_observation_tx.as_ref(),
-                config,
-                observation_context.as_ref(),
-                ctx.provider_credential_revision,
-                Some(engine.generation_guard()),
-            );
-            let outcome_result = relay_http_request_with_credential_rejection_observed(
-                &req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
-                        crate::l7::rest::McpRequestValidation {
-                            config,
-                            ctx,
-                            redacted_target: &redacted_target,
-                        },
-                    ),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine: &engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
-                observer.as_ref(),
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
@@ -1523,7 +1559,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req.query_params,
+                        &query_params,
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -2178,68 +2214,25 @@ where
             } else {
                 None
             };
-            let (req_with_auth, grant_ctx) =
-                match inject_inspected_request_grant(req, ctx, engine, config, &request_info).await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        if let Some(session) = middleware_session.take() {
-                            session
-                                .end(
-                                    openshell_core::proto::MiddlewareSessionEndReason::Cancellation,
-                                )
-                                .await;
-                        }
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
-            let scoped_ctx = scoped_context_for_request(&grant_ctx, &req_with_auth);
-            let ctx = scoped_ctx.as_ref().unwrap_or(&grant_ctx);
-
-            // Forward request to upstream and relay response
-            let outcome_result = relay_http_request_with_credential_rejection(
-                &req_with_auth,
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: None,
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: None,
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req_with_auth,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
@@ -2292,7 +2285,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req_with_auth.query_params,
+                        &query_params,
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -2620,49 +2613,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            // The outgoing resolver and revision are one snapshot. Rebind using
-            // the original authority so a newly scoped provider revision cannot
-            // publish its result under the earlier inventory.
-            let observer = EndpointObserver::begin_captured(
-                ctx.endpoint_observation_tx.as_ref(),
-                config,
-                observation_context.as_ref(),
-                ctx.provider_credential_revision,
-                Some(engine.generation_guard()),
-            );
-            // Policy inspects client request bodies. Response bodies and SSE
-            // messages remain opaque and are relayed without MCP inspection.
-            let Some(outcome) = relay_http_request_with_credential_rejection_observed(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
-                        crate::l7::rest::McpRequestValidation {
-                            config,
-                            ctx,
-                            redacted_target: &redacted_target,
-                        },
-                    ),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
-                observer.as_ref(),
             )
             .await?
             else {
@@ -2922,29 +2887,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            let Some(outcome) = relay_http_request_with_credential_rejection(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: None,
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
             )
             .await?
             else {

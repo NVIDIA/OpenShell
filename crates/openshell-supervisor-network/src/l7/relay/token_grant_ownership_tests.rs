@@ -99,6 +99,7 @@ struct Route<'a> {
     enforcement: &'a str,
     deny_path: Option<&'a str>,
     body_rewrite: bool,
+    protocol: &'a str,
 }
 
 fn route<'a>(name: &'a str, path: &'a str) -> Route<'a> {
@@ -110,6 +111,7 @@ fn route<'a>(name: &'a str, path: &'a str) -> Route<'a> {
         enforcement: "enforce",
         deny_path: None,
         body_rewrite: false,
+        protocol: "rest",
     }
 }
 
@@ -146,7 +148,7 @@ fn credentials(entries: &[(&str, &str, &str)]) -> HashMap<String, ProviderProfil
 }
 
 struct Fixture {
-    engine: OpaEngine,
+    engine: Arc<OpaEngine>,
     generation: u64,
     policy_data: String,
     configs: Vec<L7EndpointConfig>,
@@ -159,12 +161,23 @@ impl Fixture {
         let policies = routes
             .iter()
             .map(|route| {
+                let allow = match route.protocol {
+                    "graphql" => {
+                        serde_json::json!({"operation_type": "query", "fields": [route.method]})
+                    }
+                    "json-rpc" => serde_json::json!({"method": route.method}),
+                    "mcp" => serde_json::json!({"method": "tools/call", "tool": route.method}),
+                    _ => serde_json::json!({"method": route.method, "path": route.path}),
+                };
                 let mut endpoint = serde_json::json!({
                     "host": HOST, "port": PORT, "path": route.path,
-                    "protocol": "rest", "enforcement": route.enforcement,
+                    "protocol": route.protocol, "enforcement": route.enforcement,
                     "token_grant_owner": route.name,
-                    "rules": [{"allow": {"method": route.method, "path": route.path}}]
+                    "rules": [{"allow": allow}]
                 });
+                if route.protocol == "mcp" {
+                    endpoint["mcp"] = serde_json::json!({"versions": ["2025-11-25"]});
+                }
                 // An explicit empty deny_rules list is invalid authored policy.
                 if let Some(path) = route.deny_path {
                     endpoint["deny_rules"] = serde_json::json!([{"method": "GET", "path": path}]);
@@ -197,10 +210,10 @@ impl Fixture {
         assert_eq!(raw_configs.len(), expected_routes, "OPA route count");
         let configs = raw_configs
             .iter()
-            .map(|raw| crate::l7::parse_l7_config(raw).expect("OPA REST endpoint config"))
+            .map(|raw| crate::l7::parse_l7_config(raw).expect("OPA endpoint config"))
             .collect();
         Self {
-            engine,
+            engine: Arc::new(engine),
             generation,
             policy_data: data,
             configs,
@@ -257,6 +270,7 @@ impl Fixture {
         body_pending: Option<Arc<Notify>>,
     ) -> Connection {
         let configs = self.configs.clone();
+        let middleware_engine = self.engine.clone();
         let engine = self
             .engine
             .clone_engine_for_tunnel(self.generation)
@@ -301,12 +315,15 @@ impl Fixture {
         };
         let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
         let relay = tokio::spawn(async move {
-            if let [config] = configs.as_slice() {
-                relay_with_inspection(config, engine, &mut client, &mut relay_upstream, &ctx).await
-            } else {
-                relay_with_route_selection(&configs, engine, &mut client, &mut relay_upstream, &ctx)
-                    .await
-            }
+            crate::proxy::relay_inspected_http_stream_for_test(
+                &mut client,
+                &mut relay_upstream,
+                configs,
+                engine,
+                &middleware_engine,
+                &ctx,
+            )
+            .await
         });
         Connection {
             app,
@@ -319,6 +336,7 @@ impl Fixture {
 #[derive(Default)]
 struct Capture {
     requests: Vec<String>,
+    bodies: Vec<Vec<u8>>,
     bytes_seen: usize,
 }
 
@@ -412,9 +430,22 @@ async fn capture_upstream(mut stream: DuplexStream) -> Capture {
         if header.is_empty() || !header.ends_with(b"\r\n\r\n") {
             return capture;
         }
-        capture
-            .requests
-            .push(String::from_utf8(header).expect("HTTP fixture header"));
+        let header = String::from_utf8(header).expect("HTTP fixture header");
+        let length = header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| {
+                value.trim().parse::<usize>().expect("request length")
+            });
+        let mut body = vec![0; length];
+        timeout(WAIT, stream.read_exact(&mut body))
+            .await
+            .expect("upstream body read completes")
+            .expect("upstream body read");
+        capture.bytes_seen += body.len();
+        capture.requests.push(header);
+        capture.bodies.push(body);
         timeout(
             WAIT,
             stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
@@ -426,6 +457,25 @@ async fn capture_upstream(mut stream: DuplexStream) -> Capture {
 }
 
 impl Connection {
+    async fn exchange_body(&mut self, path: &str, body: &[u8]) -> String {
+        let mut request = body_request(path, body);
+        let version = b"MCP-Protocol-Version: 2025-11-25\r\n";
+        let header_end = request
+            .raw_header
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("fixture header terminator")
+            + 2;
+        request
+            .raw_header
+            .splice(header_end..header_end, version.iter().copied());
+        timeout(WAIT, self.app.write_all(&request.raw_header))
+            .await
+            .expect("client body request write completes")
+            .expect("client body request write");
+        self.response().await
+    }
+
     async fn send(&mut self, method: &str, path: &str, stale_authorization: bool) {
         let authorization = if stale_authorization {
             "Authorization: Bearer stale-inert-value\r\n"
@@ -536,6 +586,116 @@ async fn single_endpoint_grant_is_a_positive_control() {
         .assert_calls(&[(&fixture.grant_key("/a/**", "a"), "aud-a")]);
 }
 
+fn native_protocol_fixture(protocol: &str, multiple_routes: bool) -> Fixture {
+    let mut native = route("native", "/native");
+    native.protocol = protocol;
+    native.method = "echo";
+    let mut routes = vec![native];
+    if multiple_routes {
+        // An unrelated route changes production dispatch without changing the
+        // native endpoint's admission rules or credential ownership.
+        routes.push(route("unrelated", "/other/**"));
+    }
+    Fixture::new(
+        &routes,
+        &[("/native", "native", "aud-native")],
+        routes.len(),
+    )
+}
+
+fn native_protocol_body(protocol: &str, operation: &str) -> Vec<u8> {
+    let body = match protocol {
+        "graphql" => serde_json::json!({"query": format!("query {{ {operation} }}")}),
+        "json-rpc" => serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": operation}),
+        "mcp" => serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": operation, "arguments": {}}
+        }),
+        _ => panic!("unsupported fixture protocol"),
+    };
+    serde_json::to_vec(&body).expect("native protocol body")
+}
+
+#[tokio::test]
+async fn native_protocol_grants_preserve_auth_when_an_unrelated_route_is_added() {
+    for protocol in ["graphql", "json-rpc", "mcp"] {
+        let body = native_protocol_body(protocol, "echo");
+        let mut forwarded_headers = Vec::new();
+        for multiple_routes in [false, true] {
+            let fixture = native_protocol_fixture(protocol, multiple_routes);
+            let mut connection = fixture.connect();
+            let response = connection.exchange_body("/native", &body).await;
+            let capture = connection.finish().await;
+            assert!(
+                response.starts_with("HTTP/1.1 204"),
+                "{protocol}: {response}"
+            );
+            assert_eq!(capture.requests.len(), 1, "{protocol}");
+            assert_authorization(&capture.requests[0], "aud-native");
+            assert_eq!(
+                capture.bodies,
+                std::slice::from_ref(&body),
+                "{protocol} body preserved"
+            );
+            fixture
+                .resolver
+                .assert_calls(&[(&fixture.grant_key("/native", "native"), "aud-native")]);
+            forwarded_headers.push(capture.requests[0].clone());
+        }
+        assert_eq!(
+            forwarded_headers[0], forwarded_headers[1],
+            "{protocol} dispatch parity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_protocol_denials_do_not_resolve_grants_or_forward_bytes() {
+    for protocol in ["graphql", "json-rpc", "mcp"] {
+        for multiple_routes in [false, true] {
+            let fixture = native_protocol_fixture(protocol, multiple_routes);
+            let mut connection = fixture.connect();
+            let response = connection
+                .exchange_body("/native", &native_protocol_body(protocol, "blocked"))
+                .await;
+            let capture = connection.finish().await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{protocol}: {response}"
+            );
+            fixture.resolver.assert_calls(&[]);
+            assert_eq!(capture.bytes_seen, 0, "{protocol} denied before forwarding");
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_protocol_grant_failures_close_before_upstream_bytes() {
+    for protocol in ["graphql", "json-rpc", "mcp"] {
+        for multiple_routes in [false, true] {
+            let fixture = native_protocol_fixture(protocol, multiple_routes);
+            fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+            let mut connection = fixture.connect();
+            let response = connection
+                .exchange_body("/native", &native_protocol_body(protocol, "echo"))
+                .await;
+            assert!(
+                response.starts_with("HTTP/1.1 502"),
+                "{protocol}: {response}"
+            );
+            assert!(
+                connection.observes_eof().await,
+                "{protocol} failure closes tunnel"
+            );
+            let capture = connection.finish().await;
+            fixture
+                .resolver
+                .assert_calls(&[(&fixture.grant_key("/native", "native"), "aud-native")]);
+            assert_eq!(capture.bytes_seen, 0, "{protocol} failed before forwarding");
+        }
+    }
+}
+
 #[tokio::test]
 async fn grant_selection_uses_canonical_path_and_ignores_query_selector_text() {
     let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
@@ -550,6 +710,38 @@ async fn grant_selection_uses_canonical_path_and_ignores_query_selector_text() {
     fixture
         .resolver
         .assert_calls(&[(&fixture.grant_key("/a/**", "a"), "aud-a")]);
+}
+
+#[tokio::test]
+async fn missing_grant_owner_metadata_rejects_only_matching_requests() {
+    for multiple_routes in [false, true] {
+        for ownerless_path in ["/native", "/unrelated"] {
+            let fixture = native_protocol_fixture("mcp", multiple_routes);
+            let mut grants = credentials(&[("/native", "native", "aud-native")]);
+            let mut ownerless = grants[&key("/native", "native")].clone();
+            ownerless.token_grant_owners.clear();
+            grants.insert(key(ownerless_path, "legacy"), ownerless);
+            fixture
+                .state
+                .install_environment(2, HashMap::new(), HashMap::new(), grants);
+            let mut connection = fixture.connect();
+            let response = connection
+                .exchange_body("/native", &native_protocol_body("mcp", "echo"))
+                .await;
+            let capture = connection.finish().await;
+            if ownerless_path == "/native" {
+                assert!(response.starts_with("HTTP/1.1 502"));
+                fixture.resolver.assert_calls(&[]);
+                assert_eq!(capture.bytes_seen, 0);
+            } else {
+                assert!(response.starts_with("HTTP/1.1 204"));
+                assert_authorization(&capture.requests[0], "aud-native");
+                fixture
+                    .resolver
+                    .assert_calls(&[(&fixture.grant_key("/native", "native"), "aud-native")]);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1159,7 +1351,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
     let transformed = body_request("/api/rpc", final_body);
     let (injected, _) = timeout(
         WAIT,
-        inject_inspected_request_grant(transformed, &ctx, &engine, &config, &info),
+        prepare_inspected_request(transformed, &ctx, &engine, &config, &info),
     )
     .await
     .expect("final-body grant finishes")
