@@ -201,6 +201,34 @@ openshell provider update my-graph \
 
 Use `0` as the timestamp to clear expiry for a credential key.
 
+## Label a Provider Through the API
+
+API clients can attach labels when creating a provider by setting
+`CreateProviderRequest.provider.metadata.labels`. For example, this request
+creates a labeled provider using the imported `pypi` profile, which requires no
+static credentials.
+
+```json
+{
+  "workspaceScope": { "workspace": "default" },
+  "provider": {
+    "metadata": {
+      "name": "public-pypi",
+      "labels": { "env": "dev", "team": "ml" }
+    },
+    "type": "pypi"
+  }
+}
+```
+
+The gateway returns the labels in `provider.metadata.labels`. You can also
+inspect them with `openshell provider list --output json`.
+
+The provider CLI has no `--label` flag, and `ListProvidersRequest` has no label
+selector. For label-based automation, filter the returned provider collection
+in your client. Provider updates preserve existing labels and do not change
+them, so set labels during creation.
+
 ## Credential Refresh
 
 Provider refresh stores non-injectable refresh material separately from the
