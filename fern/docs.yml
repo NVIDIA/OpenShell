@@ -59,13 +59,49 @@ versions:
   - display-name: Dev
     path: ../docs/index.yml
     slug: dev
-    availability: beta
     announcement:
-      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.</span>'
+      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New in OpenShell 0.1.x:</strong> a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0" target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 
 redirects:
+  - source: "/openshell/latest/kubernetes/sandbox-runtime"
+    destination: "/openshell/latest/kubernetes/setup"
+  - source: "/openshell/dev/kubernetes/sandbox-runtime"
+    destination: "/openshell/dev/kubernetes/setup"
+  - source: "/openshell/latest/about/how-it-works"
+    destination: "/openshell/latest/about/architecture"
+  - source: "/openshell/dev/about/how-it-works"
+    destination: "/openshell/dev/about/architecture"
+  - source: "/openshell/latest/extensibility/extension-negotiation"
+    destination: "/openshell/latest/extensibility/overview#protocol-negotiation"
+  - source: "/openshell/dev/extensibility/extension-negotiation"
+    destination: "/openshell/dev/extensibility/overview#protocol-negotiation"
+  - source: "/openshell/latest/providers/google-vertex-ai"
+    destination: "/openshell/latest/how-it-works/providers/google#vertex-ai"
+  - source: "/openshell/dev/providers/google-vertex-ai"
+    destination: "/openshell/dev/how-it-works/providers/google#vertex-ai"
+  - source: "/openshell/latest/about/supported-agents"
+    destination: "/openshell/latest/about/run-your-first-agent"
+  - source: "/openshell/dev/about/supported-agents"
+    destination: "/openshell/dev/about/run-your-first-agent"
+  - source: "/openshell/latest/get-started/quickstart"
+    destination: "/openshell/latest/about/run-your-first-agent"
+  - source: "/openshell/dev/get-started/quickstart"
+    destination: "/openshell/dev/about/run-your-first-agent"
   - source: "/openshell/latest/sandboxes/providers-v2"
-    destination: "/openshell/latest/providers/profiles"
+    destination: "/openshell/latest/how-it-works/providers/profiles"
+  # Preserve published URLs when page names and slugs change.
+  - source: "/openshell/about/why-open-shell"
+    destination: "/openshell/latest/about/overview"
+  - source: "/openshell/sdk/type-script"
+    destination: "/openshell/latest/sdk/typescript"
+  - source: "/openshell/latest/about/why-open-shell"
+    destination: "/openshell/latest/about/overview"
+  - source: "/openshell/dev/about/why-open-shell"
+    destination: "/openshell/dev/about/overview"
+  - source: "/openshell/latest/sdk/type-script"
+    destination: "/openshell/latest/sdk/typescript"
+  - source: "/openshell/dev/sdk/type-script"
+    destination: "/openshell/dev/sdk/typescript"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
   # Legacy HTML URLs used .../path/to/page/index.html; Fern canonical URLs omit index.html.
   # List explicit /index.html routes before :path*/index.html so empty path segments do not
@@ -85,12 +121,7 @@ redirects:
     destination: "/openshell/:path*"
   - source: "/openshell/:path*.html"
     destination: "/openshell/:path*"
-  # tutorials moved under get-started
   - source: "/openshell/tutorials"
-    destination: "/openshell/latest/get-started/tutorials"
+    destination: "/openshell/latest/tutorials"
   - source: "/openshell/tutorials/:path*"
-    destination: "/openshell/latest/get-started/tutorials/:path*"
-  - source: "/openshell/latest/tutorials"
-    destination: "/openshell/latest/get-started/tutorials"
-  - source: "/openshell/latest/tutorials/:path*"
-    destination: "/openshell/latest/get-started/tutorials/:path*"
+    destination: "/openshell/latest/tutorials/:path*"

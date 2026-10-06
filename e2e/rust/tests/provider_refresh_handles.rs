@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::HostSupportContainer;
+use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
@@ -40,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation += 1
         current_token = f"access-token-{generation}"
+        print(f"issued-token generation={generation}", flush=True)
         body = json.dumps({
             "access_token": current_token,
             "expires_in": 300,
@@ -52,9 +54,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        authorized = self.headers.get("Authorization") == f"Bearer {current_token}"
+        print(f"resource-request path={self.path} authorized={authorized}", flush=True)
         if self.path == "/":
             self.send_response(204)
-        elif self.path == "/probe" and self.headers.get("Authorization") == f"Bearer {current_token}":
+        elif self.path == "/probe" and authorized:
             self.send_response(204)
         else:
             self.send_response(401)
@@ -63,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+ThreadingHTTPServer(("0.0.0.0", __PORT__), Handler).serve_forever()
 "#;
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
@@ -139,7 +143,7 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/local/bin/python3
+  - /**
 "
     );
     file.write_all(profile.as_bytes())
@@ -181,7 +185,7 @@ network_policies:
           - 172.0.0.0/8
           - 192.168.0.0/16
     binaries:
-      - path: /usr/local/bin/python3
+      - path: /**
 "
     );
     file.write_all(policy.as_bytes())
@@ -295,7 +299,10 @@ async fn wait_for_probe_failure(sandbox: &SandboxGuard) -> Result<(), String> {
 #[tokio::test]
 async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Result<(), String> {
     delete_provider_resources().await;
-    let fixture = HostSupportContainer::start_python(FIXTURE_SCRIPT, 8000).await?;
+    let fixture_port = find_free_port();
+    let fixture_script = FIXTURE_SCRIPT.replace("__PORT__", &fixture_port.to_string());
+    let fixture =
+        HostSupportContainer::start_python_on_host_network(&fixture_script, fixture_port).await?;
     let profile = write_profile(fixture.port, fixture.port)?;
     let policy = write_policy(fixture.port)?;
     configure_refresh(&profile).await?;
@@ -311,7 +318,7 @@ echo {READY_MARKER}
 while true; do
   if [ -f /sandbox/probe-trigger ]; then
     rm -f /sandbox/probe-trigger
-    if python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'; then
+    if /usr/bin/python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'; then
       echo ok > /sandbox/probe-result
     else
       echo failed > /sandbox/probe-result
@@ -329,7 +336,10 @@ done"#
 
     let result = async {
         if trigger_probe(&sandbox).await? != "ok" {
-            return Err("initial long-running credential probe failed".to_string());
+            return Err(format!(
+                "initial long-running credential probe failed; fixture logs:\n{}",
+                fixture.logs().unwrap_or_else(|error| error)
+            ));
         }
 
         for _ in 0..12 {
@@ -341,7 +351,7 @@ done"#
         wait_for_probe_failure(&sandbox).await?;
 
         let fresh_probe = format!(
-            r#"python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'"#
+            r#"/usr/bin/python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'"#
         );
         sandbox.exec(&["sh", "-c", &fresh_probe]).await?;
         Ok(())

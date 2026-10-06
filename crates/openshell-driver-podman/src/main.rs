@@ -18,6 +18,13 @@ use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanC
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -66,9 +73,10 @@ struct Args {
     )]
     gateway_port: u16,
 
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination used for sandbox host aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver.
+    /// Empty uses loopback on native Linux and the gvproxy host address on
+    /// macOS Podman Machine.
     #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
@@ -102,22 +110,22 @@ struct Args {
     health_check_interval_secs: Option<NonZeroU64>,
 
     /// OCI image containing the `openshell-sandbox` runtime binary.
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     /// OCI image containing the `openshell-supervisor` control binary.
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for supervisor-to-gateway TLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
     podman_tls_ca: Option<PathBuf>,
 
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated; client certificates are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CERT")]
     podman_tls_cert: Option<PathBuf>,
 
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated; client private keys are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
 
@@ -200,10 +208,13 @@ async fn main() -> Result<()> {
     );
 
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
         socket_path: args.podman_socket,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip

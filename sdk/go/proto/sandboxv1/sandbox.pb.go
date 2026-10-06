@@ -35,11 +35,11 @@ const (
 	NetworkTlsMode_NETWORK_TLS_MODE_UNSPECIFIED NetworkTlsMode = 0
 	// Disable TLS detection and relay the connection without inspection.
 	NetworkTlsMode_NETWORK_TLS_MODE_SKIP NetworkTlsMode = 1
-	// Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+	// Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
 	//
 	// Deprecated: Marked as deprecated in sandbox.proto.
 	NetworkTlsMode_NETWORK_TLS_MODE_TERMINATE NetworkTlsMode = 2
-	// Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+	// Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
 	//
 	// Deprecated: Marked as deprecated in sandbox.proto.
 	NetworkTlsMode_NETWORK_TLS_MODE_PASSTHROUGH NetworkTlsMode = 3
@@ -1970,7 +1970,11 @@ func (x *EffectiveSetting) GetScope() SettingScope {
 	return SettingScope_SETTING_SCOPE_UNSPECIFIED
 }
 
-// Complete effective sandbox configuration delivered to a supervisor.
+// Complete effective sandbox configuration delivered to a supervisor. Fields
+// have the same meaning as the identically numbered GetSandboxConfigResponse
+// fields, including fail-closed handling of an unknown
+// policy_validation_failure_mode and treating absent configuration_admitted as
+// not admitted. Move those field comments here when the polling RPC is removed.
 type SandboxConfigSnapshot struct {
 	state                          protoimpl.MessageState         `protogen:"open.v1"`
 	Policy                         *SandboxPolicy                 `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
@@ -2143,7 +2147,8 @@ func (x *SandboxConfigSnapshot) GetSettingsRevision() uint64 {
 	return 0
 }
 
-// Response containing effective sandbox settings and policy.
+// Response containing effective sandbox settings and policy. Polling
+// projection of SandboxConfigSnapshot; removed with the polling RPCs.
 type GetSandboxConfigResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The sandbox policy configuration.

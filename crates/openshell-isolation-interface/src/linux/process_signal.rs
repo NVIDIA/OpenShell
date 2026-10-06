@@ -12,6 +12,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::task_memory;
@@ -27,6 +28,7 @@ pub fn mediate_process_signal(
     listener: &NotificationListener,
     notification: Notification,
     sandbox_tgid: u32,
+    workload_frozen: &AtomicBool,
 ) -> io::Result<()> {
     listener.validate_id(notification.id)?;
     let target = scalar_int(notification.args[0]);
@@ -38,6 +40,7 @@ pub fn mediate_process_signal(
             libc::EINVAL
         }));
     }
+    refuse_resume_while_frozen(signal, workload_frozen)?;
     let target = u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     let retained = retain_signal_target(target, sandbox_tgid)?;
     // SAFETY: all-zero siginfo consists of valid integer/pointer fields. A
@@ -64,6 +67,7 @@ pub fn mediate_process_signal(
         _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
     };
     listener.validate_id(notification.id)?;
+    refuse_resume_while_frozen(signal, workload_frozen)?;
     // SAFETY: retained owns a live pidfd; info is null or a complete trusted
     // copy. The kernel targets that process object, never a reused numeric PID.
     let result = unsafe {
@@ -81,35 +85,60 @@ pub fn mediate_process_signal(
     listener.respond_value(notification.id, 0)
 }
 
-/// Continue a positive-target `tkill` only when the target thread belongs to
-/// an untrusted workload process rather than the sandbox runtime itself.
+/// Continue a thread-directed signal (`tkill`, `tgkill`,
+/// `rt_tgsigqueueinfo`) aimed at an untrusted workload thread.
 ///
 /// Continuing preserves Linux's thread-directed signal semantics, including
-/// the cancellation signal used by musl. A target that exits between the
-/// ownership check and continuation can only be reused inside the same PID
-/// namespace; the static child filter still rejects the sandbox leader.
+/// the cancellation signal used by musl. The static child filter rejects the
+/// sandbox leader as a `tgkill`/`rt_tgsigqueueinfo` group, and the kernel
+/// rejects a thread outside the named group, so those two are notified only
+/// for `SIGCONT`. A `tkill` names a bare thread, so its group is resolved here;
+/// a target reused between this check and continuation stays inside the same
+/// PID namespace.
 pub fn mediate_thread_signal(
     listener: &NotificationListener,
     notification: Notification,
     sandbox_tgid: u32,
+    workload_frozen: &AtomicBool,
 ) -> io::Result<()> {
     listener.validate_id(notification.id)?;
-    let target = scalar_int(notification.args[0]);
-    let signal = scalar_int(notification.args[1]);
-    if target <= 0 || !(0..=64).contains(&signal) {
-        return Err(io::Error::from_raw_os_error(if target <= 0 {
-            libc::EPERM
-        } else {
-            libc::EINVAL
-        }));
-    }
-    let target = u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
-    let target_group = thread_group_id(target)?;
-    if target_group == sandbox_tgid || target_group == 0 {
-        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    let signal = match i64::from(notification.syscall) {
+        libc::SYS_tkill => {
+            let target = scalar_int(notification.args[0]);
+            let signal = scalar_int(notification.args[1]);
+            if target <= 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            let target =
+                u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
+            let target_group = thread_group_id(target)?;
+            if target_group == sandbox_tgid || target_group == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            signal
+        }
+        libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo => scalar_int(notification.args[2]),
+        _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+    };
+    if !(0..=64).contains(&signal) {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
     listener.validate_id(notification.id)?;
+    refuse_resume_while_frozen(signal, workload_frozen)?;
     listener.respond_continue(notification.id)
+}
+
+/// While the boundary has stopped the workload for supervisor recovery, a
+/// workload process that was not yet stopped must not resume the others.
+///
+/// The flag is read immediately before delivery. The freezer does not wait
+/// for in-flight notifications, so a signal already past this check when the
+/// freeze begins can still be delivered.
+fn refuse_resume_while_frozen(signal: i32, workload_frozen: &AtomicBool) -> io::Result<()> {
+    if signal == libc::SIGCONT && workload_frozen.load(Ordering::Acquire) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
 }
 
 fn scalar_int(value: u64) -> i32 {
@@ -176,8 +205,13 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let notification = listener.receive().unwrap();
-        let error =
-            mediate_process_signal(&listener, notification, std::process::id()).unwrap_err();
+        let error = mediate_process_signal(
+            &listener,
+            notification,
+            std::process::id(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         listener
             .respond_errno(notification.id, libc::EPERM)

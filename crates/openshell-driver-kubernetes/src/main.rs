@@ -21,6 +21,13 @@ use openshell_driver_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -109,24 +116,17 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
     sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
     supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
-
-    #[arg(
-        long,
-        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_NETWORK_POLICY_ENFORCED",
-        default_value_t = false
-    )]
-    sandbox_runtime_network_policy_enforced: bool,
 
     #[arg(
         long,
@@ -158,6 +158,13 @@ struct Args {
     /// Send destination hostnames rather than validated IPs in CONNECT.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
     proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy. Required for
+    /// an `https://` proxy with a private CA, and for a TLS-intercepting proxy
+    /// that re-signs upstream certificates. Read by this process and staged
+    /// into each sandbox's supervisor bootstrap Secret.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
@@ -231,6 +238,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            allow_driver_config: args.admission_config_json.allow_driver_config,
+            resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
             gateway_id: args.gateway_id,
             namespace: args.sandbox_namespace,
@@ -254,7 +263,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
-                network_policy_enforced: args.sandbox_runtime_network_policy_enforced,
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,
@@ -263,7 +271,9 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),

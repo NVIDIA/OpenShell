@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use metrics::counter;
 use prost::Message;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -22,31 +22,35 @@ use openshell_core::proto::ConfigBootstrapResult;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigComponent, ConfigComponentApplyResult,
     ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult, GatewayMessage,
-    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, PeerRelayFrame,
-    PeerRelayInit, PolicySource, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
-    ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRejected,
-    SshRelayTarget, StartupConfigCandidate, SupervisorMessage, config_snapshot_revision,
+    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, PeerConfigUpdateHintRequest,
+    PeerConfigUpdateHintResponse, PeerRelayFrame, PeerRelayInit, PolicySource,
+    ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox,
+    SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRejected, SshRelayTarget,
+    StartupConfigCandidate, SupervisorHello, SupervisorMessage, config_snapshot_revision,
     config_update, gateway_message, open_shell_client, peer_relay_frame, relay_open,
     startup_config_prepared, supervisor_message,
 };
-use openshell_core::proto::{
-    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-    SUPERVISOR_PROTOCOL_REVISION,
-};
 use openshell_core::transport_errors::is_expected_transport_close_status;
-use openshell_core::{ObjectId, ObjectWorkspace};
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::config_delivery::{
-    DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfigMessage,
+    ConfigComponentKind, ConfigSlots, DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES,
+    SessionOutbound, SupervisorConfigMessage,
 };
 #[cfg(test)]
 use crate::config_delivery::{LocalSupervisorConfigRouter, SupervisorConfigRouter};
+use crate::gateway_metrics::{
+    self, GaugeSlot, PeerRpc, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
+    RoutedRequestTimer,
+};
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
-use crate::persistence::{CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, ObjectType, current_time_ms};
+use crate::persistence::{
+    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, ObjectId, ObjectType, ObjectWorkspace,
+    current_time_ms,
+};
 use crate::storage_proto::StoredConfigComponentObservation;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
@@ -54,6 +58,9 @@ const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_POLICY_REPAIR_TIMEOUT: Duration = Duration::from_mins(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a streamed-apply session holds newer updates for a component
+/// while waiting for the supervisor to acknowledge the one it already has.
+const CONFIG_ACK_TIMEOUT: Duration = Duration::from_mins(1);
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
@@ -68,6 +75,11 @@ const MAX_PENDING_RELAYS: usize = 256;
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
+/// The replica relay cap above, published as a capacity gauge when the metrics recorder is
+/// installed.
+pub(crate) const RELAY_CAPACITY: RelayCapacity = RelayCapacity {
+    per_replica: MAX_PENDING_RELAYS,
+};
 const PEER_TLS_CA_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CA_FILE";
 const PEER_TLS_CERT_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CERT_FILE";
 const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
@@ -303,6 +315,8 @@ struct LiveSession {
     /// Uniquely identifies this session instance. Used by cleanup to avoid
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
+    /// Present only for push-capable sessions on a gateway in push mode.
+    config_slots: Option<Arc<ConfigSlots>>,
     tx: mpsc::Sender<GatewayMessage>,
     config_sequences: ConfigSequences,
     /// Fires when this session is superseded by a reconnect so the old session
@@ -330,10 +344,16 @@ struct LiveSession {
     runtime_ready: bool,
     #[allow(dead_code)]
     connected_at: Instant,
+    /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
+    /// leaves the registry by any path (supersede, remove, disconnect, cleanup).
+    _gauge_slot: GaugeSlot,
 }
 
 #[derive(Debug, Default)]
 struct ConfigSequences {
+    /// The supervisor applies and acknowledges streamed configuration, so
+    /// each component is held until its previous update is acknowledged.
+    acknowledged: bool,
     sandbox_config: ComponentDeliveryState,
     provider_environment: ComponentDeliveryState,
 }
@@ -474,6 +494,11 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// Read guards cover owner publication through final cleanup, even after
+    /// a session has left `sessions`. Shutdown waits for the write guard.
+    session_lifetimes: Arc<RwLock<()>>,
+    admission_closed: AtomicBool,
+    shutdown: watch::Sender<bool>,
 }
 
 struct PendingRelay {
@@ -481,6 +506,10 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
+    /// Last session whose outbound queue received this `RelayOpen`.
+    delivered_session_id: Option<String>,
+    /// This relay's share of `openshell_server_relay_pending`.
+    _gauge_slot: GaugeSlot,
 }
 
 #[derive(Debug)]
@@ -654,6 +683,36 @@ impl SupervisorSessionRegistry {
         Self::default()
     }
 
+    fn track_session(&self) -> Result<OwnedRwLockReadGuard<()>, Status> {
+        // Acquire tracking BEFORE checking admission. A concurrent shutdown
+        // either sees this reader and waits for it, or prevents its admission.
+        let lifetime = Arc::clone(&self.session_lifetimes)
+            .try_read_owned()
+            .map_err(|_| Status::unavailable("gateway is shutting down"))?;
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Err(Status::unavailable("gateway is shutting down"));
+        }
+        Ok(lifetime)
+    }
+
+    /// Prevent existing HTTP connections from creating new owner records.
+    pub(crate) fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    /// Close control sessions and wait for tracked ownership cleanup. Call
+    /// after compute shutdown so supervisors can finish normal stop reporting.
+    pub(crate) async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
+        self.close_admission();
+        self.shutdown.send_replace(true);
+        tokio::time::timeout(timeout, self.session_lifetimes.write())
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                format!("supervisor session ownership cleanup did not complete within {timeout:?}")
+            })
+    }
+
     /// Register a live supervisor session for the given sandbox.
     ///
     /// If a previous session exists for the same sandbox, its shutdown signal
@@ -666,26 +725,22 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        self.register_with_runtime_state(sandbox_id, session_id, tx, shutdown, true)
+        self.register_with_config_slots(sandbox_id, session_id, tx, shutdown, None, false)
     }
 
-    fn register_initializing(
+    /// Register a session that may receive pushed configuration.
+    ///
+    /// A `config_apply` session acknowledges each update before the next one
+    /// for that component is released, and is not runtime-ready until the
+    /// supervisor sends `SupervisorRuntimeReady`.
+    pub(crate) fn register_with_config_slots(
         &self,
         sandbox_id: String,
         session_id: String,
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
-    ) -> bool {
-        self.register_with_runtime_state(sandbox_id, session_id, tx, shutdown, false)
-    }
-
-    fn register_with_runtime_state(
-        &self,
-        sandbox_id: String,
-        session_id: String,
-        tx: mpsc::Sender<GatewayMessage>,
-        shutdown: oneshot::Sender<()>,
-        runtime_ready: bool,
+        config_slots: Option<Arc<ConfigSlots>>,
+        config_apply: bool,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -694,15 +749,20 @@ impl SupervisorSessionRegistry {
             LiveSession {
                 sandbox_id,
                 session_id,
+                config_slots,
                 tx,
-                config_sequences: ConfigSequences::default(),
+                config_sequences: ConfigSequences {
+                    acknowledged: config_apply,
+                    ..ConfigSequences::default()
+                },
                 shutdown,
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
-                runtime_ready,
+                runtime_ready: !config_apply,
                 connected_at: Instant::now(),
+                _gauge_slot: GaugeSlot::supervisor_session(),
             },
         );
         match previous {
@@ -753,23 +813,28 @@ impl SupervisorSessionRegistry {
         None
     }
 
-    /// Look up the sender for a supervisor session, waiting up to `timeout`
-    /// for it to appear if absent.
+    /// Look up a supervisor session without extending the setup deadline.
     ///
     /// Uses exponential backoff (100ms → 2s) while polling the sessions map.
     async fn wait_for_session(
         &self,
         sandbox_id: &str,
-        timeout: Duration,
-    ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
-        let deadline = Instant::now() + timeout;
+        deadline: tokio::time::Instant,
+        wait_for_missing_session: bool,
+    ) -> Result<(String, mpsc::Sender<GatewayMessage>), Status> {
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
         loop {
-            if let Some(tx) = self.lookup_session(sandbox_id) {
-                return Ok(tx);
+            let session = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(sandbox_id)
+                .map(|session| (session.session_id.clone(), session.tx.clone()));
+            if let Some(session) = session {
+                return Ok(session);
             }
-            if Instant::now() + backoff > deadline {
+            if !wait_for_missing_session || tokio::time::Instant::now() + backoff > deadline {
                 return Err(Status::unavailable("supervisor session not connected"));
             }
             tokio::time::sleep(backoff).await;
@@ -777,6 +842,7 @@ impl SupervisorSessionRegistry {
         }
     }
 
+    #[cfg(test)]
     fn lookup_session(&self, sandbox_id: &str) -> Option<mpsc::Sender<GatewayMessage>> {
         self.sessions
             .lock()
@@ -826,65 +892,67 @@ impl SupervisorSessionRegistry {
         true
     }
 
-    pub(crate) fn connected_sandbox_ids(&self) -> Vec<String> {
-        self.sessions.lock().unwrap().keys().cloned().collect()
-    }
-
+    /// Hand a snapshot to the session it was built for. A replacement session
+    /// received its own bootstrap and must not receive an older build.
     pub(crate) fn deliver_config(
         &self,
         sandbox_id: &str,
+        session_id: &str,
         message: SupervisorConfigMessage,
     ) -> DeliveryDisposition {
-        let component_name = message.component_name();
+        let component = message.component();
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get_mut(sandbox_id) else {
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
             return DeliveryDisposition::NoActiveSession;
         };
-        let delivery_state = match &message {
-            SupervisorConfigMessage::SandboxConfig(_) => {
-                &mut session.config_sequences.sandbox_config
-            }
-            SupervisorConfigMessage::ProviderEnvironment(_) => {
+        let Some(slots) = session.config_slots.clone() else {
+            return DeliveryDisposition::UnsupportedSession;
+        };
+        let config_apply = session.config_sequences.acknowledged;
+        let delivery_state = match component {
+            ConfigComponentKind::SandboxConfig => &mut session.config_sequences.sandbox_config,
+            ConfigComponentKind::ProviderEnvironment => {
                 &mut session.config_sequences.provider_environment
             }
         };
-        if delivery_state.in_flight.is_none()
-            && delivery_state.last_acknowledged_fingerprint.as_ref()
-                == Some(&config_message_fingerprint(&message))
-        {
-            return DeliveryDisposition::SuppressedUnchanged;
-        }
-        if delivery_state
-            .in_flight
-            .as_ref()
-            .is_some_and(|update| update.sent_at.elapsed() < Duration::from_mins(1))
-        {
-            delivery_state.pending = Some(message);
-            return DeliveryDisposition::Coalesced;
+        if config_apply {
+            if delivery_state.in_flight.is_none()
+                && delivery_state.last_acknowledged_fingerprint.as_ref()
+                    == Some(&config_message_fingerprint(&message))
+            {
+                return DeliveryDisposition::SuppressedUnchanged;
+            }
+            // Hold the component until the supervisor acknowledges the update
+            // it already has, bounded so a lost result cannot stall it.
+            if delivery_state
+                .in_flight
+                .as_ref()
+                .is_some_and(|update| update.sent_at.elapsed() < CONFIG_ACK_TIMEOUT)
+            {
+                delivery_state.pending = Some(message);
+                return DeliveryDisposition::Coalesced;
+            }
+            delivery_state.pending = None;
         }
         delivery_state.in_flight = None;
-        delivery_state.pending = None;
 
+        // Replacing an unsent snapshot leaves a gap in the sequence.
         let (gateway_message, in_flight) = build_config_update(delivery_state, message);
-
         if gateway_message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
             return DeliveryDisposition::PayloadTooLarge;
         }
+        if config_apply {
+            delivery_state.in_flight = Some(in_flight);
+        }
+        drop(sessions);
 
-        match session.tx.try_send(gateway_message) {
-            Ok(()) => {
-                delivery_state.in_flight = Some(in_flight);
-                DeliveryDisposition::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    component = component_name,
-                    "supervisor configuration queue is full"
-                );
-                DeliveryDisposition::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => DeliveryDisposition::SessionClosed,
+        if slots.replace(component, gateway_message) {
+            DeliveryDisposition::Replaced
+        } else {
+            DeliveryDisposition::Queued
         }
     }
 
@@ -981,20 +1049,25 @@ impl SupervisorSessionRegistry {
             delivery_state.last_acknowledged_fingerprint = Some(completed.fingerprint.clone());
         }
         delivery_state.in_flight = None;
-        if let Some(pending) = delivery_state.pending.take() {
-            if delivery_state.last_acknowledged_fingerprint.as_ref()
-                == Some(&config_message_fingerprint(&pending))
-            {
-                return true;
-            }
-            let (message, next) = build_config_update(delivery_state, pending);
-            match session.tx.try_send(message) {
-                Ok(()) => delivery_state.in_flight = Some(next),
-                Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
-                    // Owner reconciliation rebuilds the newest snapshot.
-                }
-            }
+        let Some(pending) = delivery_state.pending.take() else {
+            return true;
+        };
+        if delivery_state.last_acknowledged_fingerprint.as_ref()
+            == Some(&config_message_fingerprint(&pending))
+        {
+            return true;
         }
+        let component = pending.component();
+        let (message, next) = build_config_update(delivery_state, pending);
+        if message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+            return true;
+        }
+        delivery_state.in_flight = Some(next);
+        let Some(slots) = session.config_slots.clone() else {
+            return true;
+        };
+        drop(sessions);
+        slots.replace(component, message);
         true
     }
 
@@ -1251,7 +1324,8 @@ impl SupervisorSessionRegistry {
     ///   blip, gateway restart, supervisor restart) and the supervisor is
     ///   in its reconnect backoff loop
     ///
-    /// Callers pick the timeout based on how much patience the caller needs.
+    /// The timeout bounds session lookup, reconnect retries, and outbound queue
+    /// capacity waits together. Callers pick it based on their patience.
     /// A first `sandbox connect` right after `sandbox create` may need to
     /// wait for the supervisor's initial TLS + gRPC handshake (tens of
     /// seconds on a slow cluster), while mid-lifetime calls typically just
@@ -1311,68 +1385,125 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
+        self.open_relay_with_message_until(
+            sandbox_id,
+            relay_open,
+            tokio::time::Instant::now() + session_wait_timeout,
+            true,
+        )
+        .await
+    }
+
+    /// Local routing skips waiting for a missing session, but queue capacity
+    /// and reconnect retries still share the routing caller's setup deadline.
+    async fn open_relay_with_message_until(
+        &self,
+        sandbox_id: &str,
+        relay_open: RelayOpen,
+        deadline: tokio::time::Instant,
+        wait_for_missing_session: bool,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
         if relay_open.channel_id.is_empty() {
             return Err(Status::invalid_argument("relay channel_id is required"));
         }
-        let tx = self
-            .wait_for_session(sandbox_id, session_wait_timeout)
-            .await?;
+        tokio::time::timeout_at(deadline, async {
+            let channel_id = relay_open.channel_id.clone();
 
-        let channel_id = relay_open.channel_id.clone();
-
-        // Register the pending relay before sending RelayOpen to avoid a race.
-        // Both caps are checked and the insert happens under a single lock hold
-        // so two concurrent calls can't both observe "under the cap" and then
-        // both insert past it.
-        let (relay_tx, relay_rx) = oneshot::channel();
-        {
-            let mut pending = self.pending_relays.lock().unwrap();
-            if pending.len() >= MAX_PENDING_RELAYS {
-                return Err(Status::resource_exhausted(format!(
-                    "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
-                )));
+            // Register the pending relay before sending RelayOpen to avoid a race.
+            // Both caps are checked and the insert happens under a single lock hold
+            // so two concurrent calls can't both observe "under the cap" and then
+            // both insert past it.
+            let (relay_tx, relay_rx) = oneshot::channel();
+            let mut relay_tx = Some(relay_tx);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
+                }
+                let (session_id, tx) = self
+                    .wait_for_session(sandbox_id, deadline, wait_for_missing_session)
+                    .await?;
+                // Reserve capacity before taking synchronous locks. The session
+                // may change while waiting; validate it again before insertion.
+                let permit = tx
+                    .reserve()
+                    .await
+                    .map_err(|_| Status::unavailable("supervisor session disconnected"))?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
+                }
+                let sent = {
+                    let sessions = self.sessions.lock().unwrap();
+                    if sessions
+                        .get(sandbox_id)
+                        .is_some_and(|session| session.session_id == session_id)
+                    {
+                        let mut pending = self.pending_relays.lock().unwrap();
+                        if pending.len() >= MAX_PENDING_RELAYS {
+                            gateway_metrics::record_relay_rejected(RelayRejection::ReplicaCapacity);
+                            return Err(Status::resource_exhausted(format!(
+                                "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                            )));
+                        }
+                        let per_sandbox = pending
+                            .values()
+                            .filter(|p| p.sandbox_id == sandbox_id)
+                            .count();
+                        if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                            gateway_metrics::record_relay_rejected(RelayRejection::SandboxCapacity);
+                            return Err(Status::resource_exhausted(format!(
+                                "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                            )));
+                        }
+                        pending.insert(
+                            channel_id.clone(),
+                            PendingRelay {
+                                sender: relay_tx.take().unwrap(),
+                                sandbox_id: sandbox_id.to_string(),
+                                relay_open: relay_open.clone(),
+                                created_at: Instant::now(),
+                                delivered_session_id: Some(session_id),
+                                _gauge_slot: GaugeSlot::relay_pending(),
+                            },
+                        );
+                        // Insertion, delivery selection, and enqueueing are atomic with
+                        // respect to registration and replay. No await holds these locks.
+                        permit.send(GatewayMessage {
+                            payload: Some(gateway_message::Payload::RelayOpen(relay_open.clone())),
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if sent {
+                    return Ok((channel_id, relay_rx));
+                }
             }
-            let per_sandbox = pending
-                .values()
-                .filter(|p| p.sandbox_id == sandbox_id)
-                .count();
-            if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
-                return Err(Status::resource_exhausted(format!(
-                    "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
-                )));
-            }
-            pending.insert(
-                channel_id.clone(),
-                PendingRelay {
-                    sender: relay_tx,
-                    sandbox_id: sandbox_id.to_string(),
-                    relay_open: relay_open.clone(),
-                    created_at: Instant::now(),
-                },
-            );
-        }
-
-        let msg = GatewayMessage {
-            payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-        };
-
-        if tx.send(msg).await.is_err() {
-            // Session dropped between our lookup and send.
-            self.pending_relays.lock().unwrap().remove(&channel_id);
-            return Err(Status::unavailable("supervisor session disconnected"));
-        }
-
-        Ok((channel_id, relay_rx))
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
-        let pending = self.pending_relays.lock().unwrap().remove(channel_id);
-        if let Some(pending) = pending {
-            let _ = pending.sender.send(Err(Status::unavailable(error)));
-            true
-        } else {
-            false
-        }
+        // The rest of the entry, including its gauge slot, drops inside this statement while the
+        // lock is still held, so `relay_pending` never exceeds capacity.
+        let Some(sender) = self
+            .pending_relays
+            .lock()
+            .unwrap()
+            .remove(channel_id)
+            .map(|pending| pending.sender)
+        else {
+            return false;
+        };
+        let _ = sender.send(Err(Status::unavailable(error)));
+        true
     }
 
     /// Claim a pending relay channel. Called by the `/relay/{channel_id}` HTTP handler
@@ -1386,7 +1517,7 @@ impl SupervisorSessionRegistry {
         channel_id: &str,
         principal: Option<&Principal>,
     ) -> Result<ClaimedRelay, Status> {
-        let pending = {
+        let (sender, sandbox_id) = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
                 .get(channel_id)
@@ -1406,13 +1537,22 @@ impl SupervisorSessionRegistry {
                 return Err(status);
             }
 
-            if pending.created_at.elapsed() > RELAY_PENDING_TIMEOUT {
+            let waited = pending.created_at.elapsed();
+            if waited > RELAY_PENDING_TIMEOUT {
                 map.remove(channel_id);
+                gateway_metrics::record_relay_expired(1);
                 return Err(Status::deadline_exceeded("relay channel timed out"));
             }
+            gateway_metrics::record_relay_claimed(waited);
 
-            map.remove(channel_id)
-                .expect("pending relay existed before removal")
+            // The rest of the entry, including its gauge slot, drops at the end of this
+            // statement while the lock is still held, so `relay_pending` never exceeds capacity.
+            let PendingRelay {
+                sender, sandbox_id, ..
+            } = map
+                .remove(channel_id)
+                .expect("pending relay existed before removal");
+            (sender, sandbox_id)
         };
 
         // Create a duplex stream pair: one end for the gateway bridge, one for
@@ -1420,20 +1560,25 @@ impl SupervisorSessionRegistry {
         let (gateway_stream, supervisor_stream) = tokio::io::duplex(64 * 1024);
 
         // Send the gateway-side stream to the waiter (exec handler or forward handler).
-        if pending.sender.send(Ok(gateway_stream)).is_err() {
+        if sender.send(Ok(gateway_stream)).is_err() {
             return Err(Status::internal("relay requester dropped"));
         }
 
         Ok(ClaimedRelay {
             stream: supervisor_stream,
-            sandbox_id: pending.sandbox_id,
+            sandbox_id,
         })
     }
 
     /// Remove all pending relays that have exceeded the timeout.
     pub fn reap_expired_relays(&self) {
-        let mut map = self.pending_relays.lock().unwrap();
-        map.retain(|_, pending| pending.created_at.elapsed() <= RELAY_PENDING_TIMEOUT);
+        let reaped = {
+            let mut map = self.pending_relays.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, pending| pending.created_at.elapsed() <= RELAY_PENDING_TIMEOUT);
+            before - map.len()
+        };
+        gateway_metrics::record_relay_expired(reaped);
     }
 
     /// Clean up all state for a sandbox (session + pending relays).
@@ -1441,23 +1586,43 @@ impl SupervisorSessionRegistry {
         self.remove(sandbox_id);
     }
 
-    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
+    pub async fn replay_pending_relays(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
-            let relay_open = {
+            let needs_replay = {
                 let pending = self.pending_relays.lock().unwrap();
-                pending
-                    .get(&channel_id)
-                    .map(|pending| pending.relay_open.clone())
+                pending.get(&channel_id).is_some_and(|pending| {
+                    pending.delivered_session_id.as_deref() != Some(session_id)
+                })
             };
-            let Some(relay_open) = relay_open else {
+            if !needs_replay {
                 continue;
-            };
-            let msg = GatewayMessage {
-                payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-            };
-            if tx.send(msg).await.is_err() {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
+            }
+            let Ok(permit) = tx.reserve().await else {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to connected session");
                 break;
+            };
+            let sessions = self.sessions.lock().unwrap();
+            if sessions
+                .get(sandbox_id)
+                .is_none_or(|session| session.session_id != session_id)
+            {
+                break;
+            }
+            let mut pending = self.pending_relays.lock().unwrap();
+            if let Some(pending) = pending.get_mut(&channel_id)
+                && pending.delivered_session_id.as_deref() != Some(session_id)
+            {
+                pending.delivered_session_id = Some(session_id.to_string());
+                permit.send(GatewayMessage {
+                    payload: Some(gateway_message::Payload::RelayOpen(
+                        pending.relay_open.clone(),
+                    )),
+                });
             }
         }
     }
@@ -1790,6 +1955,19 @@ async fn peer_rpc_client(
     ))
 }
 
+pub(crate) async fn forward_config_hint_to_peer(
+    state: &Arc<ServerState>,
+    endpoint: &str,
+    request: PeerConfigUpdateHintRequest,
+) -> Result<PeerConfigUpdateHintResponse, Status> {
+    let mut client = peer_rpc_client(state, endpoint).await?;
+    client
+        .peer_notify_config_update(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| state.peer_routes.evict_channel(endpoint))
+}
+
 pub(crate) async fn remote_supervisor_owner(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1830,15 +2008,16 @@ pub(crate) async fn forward_provider_readiness_to_owner(
     request: ReportProviderReadinessRequest,
 ) -> Result<ReportProviderReadinessResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_report_provider_readiness(request)
+    let mut timer = RoutedRequestTimer::start(PeerRpc::ReportProviderReadiness);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(&sandbox_id);
-        })
+        .inspect_err(|status| timer.local_error(status))?;
+    let result = client.peer_report_provider_readiness(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(&sandbox_id);
+    })
 }
 
 pub(crate) async fn forward_endpoint_status_to_owner(
@@ -1847,15 +2026,16 @@ pub(crate) async fn forward_endpoint_status_to_owner(
     request: ReportEndpointStatusRequest,
 ) -> Result<ReportEndpointStatusResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_report_endpoint_status(request)
+    let mut timer = RoutedRequestTimer::start(PeerRpc::ReportEndpointStatus);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(&sandbox_id);
-        })
+        .inspect_err(|status| timer.local_error(status))?;
+    let result = client.peer_report_endpoint_status(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(&sandbox_id);
+    })
 }
 
 pub(crate) async fn forward_provider_status_query_to_owner(
@@ -1864,15 +2044,16 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     sandbox_id: &str,
     request: GetSandboxProviderStatusRequest,
 ) -> Result<GetSandboxProviderStatusResponse, Status> {
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_get_sandbox_provider_status(request)
+    let mut timer = RoutedRequestTimer::start(PeerRpc::GetSandboxProviderStatus);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(sandbox_id);
-        })
+        .inspect_err(|status| timer.local_error(status))?;
+    let result = client.peer_get_sandbox_provider_status(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(sandbox_id);
+    })
 }
 
 pub async fn open_routed_relay_with_target(
@@ -1897,6 +2078,68 @@ pub async fn open_routed_relay_with_target(
     open_routed_relay_with_message(state, sandbox_id, relay_open, session_wait_timeout).await
 }
 
+fn relay_kind(relay_open: &RelayOpen) -> RelayKind {
+    // An absent target means SSH for compatibility with older callers.
+    match relay_open.target.as_ref() {
+        Some(relay_open::Target::Ssh(_)) | None => RelayKind::Ssh,
+        Some(relay_open::Target::Tcp(_)) => RelayKind::Tcp,
+    }
+}
+
+/// Hand the caller a receiver that forwards the local relay's claim result unchanged, and count
+/// the attempt when the supervisor claims the relay, the claim window closes, or the caller
+/// gives up. The owner of a `PeerRelay` answers on the same events, so a relay outcome means
+/// the same thing on the local and peer routes.
+///
+/// The window is anchored before the caller can start its own wait, so a caller that times out
+/// with the same 10 s budget is counted as an unclaimed relay, not as a cancellation. A claim
+/// that lands just after the caller gave up still succeeds in the registry; the forwarder then
+/// drops the stream and the supervisor sees it close, as when a caller drops right after a claim.
+fn track_local_relay_claim(
+    mut timer: RoutedRequestTimer,
+    mut claimed: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+) -> oneshot::Receiver<Result<tokio::io::DuplexStream, Status>> {
+    let claim_deadline = tokio::time::Instant::now() + RELAY_PENDING_TIMEOUT;
+    let unclaimed = || Status::deadline_exceeded("relay was not claimed in time");
+    let (mut forward_tx, forward_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let claim_window = tokio::time::sleep_until(claim_deadline);
+        tokio::pin!(claim_window);
+        let mut window_open = true;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut claimed => break result,
+                () = &mut claim_window, if window_open => {
+                    window_open = false;
+                    timer.local_error(&unclaimed());
+                }
+                () = forward_tx.closed() => {
+                    if tokio::time::Instant::now() >= claim_deadline {
+                        timer.local_error(&unclaimed());
+                    }
+                    // Otherwise dropping the timer records the cancellation.
+                    return;
+                }
+            }
+        };
+        match result {
+            Ok(claim) => {
+                timer.finish(&claim);
+                let _ = forward_tx.send(claim);
+            }
+            // The registry dropped the relay without an answer: it expired (reaper or a late
+            // claim), or the registry was torn down. Dropping `forward_tx` passes the same closed
+            // channel on to the caller.
+            Err(_) if tokio::time::Instant::now() >= claim_deadline => {
+                timer.local_error(&unclaimed());
+            }
+            Err(_) => timer.local_error(&Status::unavailable("relay channel dropped")),
+        }
+    });
+    forward_rx
+}
+
 pub async fn open_routed_relay_with_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1909,85 +2152,96 @@ pub async fn open_routed_relay_with_message(
     ),
     Status,
 > {
-    let deadline = Instant::now() + session_wait_timeout;
-    let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
-    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-    loop {
-        if state.supervisor_sessions.has_session(sandbox_id) {
-            match state
-                .supervisor_sessions
-                .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
-                .await
-            {
-                Ok(relay) => return Ok(relay),
-                Err(status) if status.code() == tonic::Code::Unavailable => {
-                    // The session can migrate after `has_session` but before
-                    // RelayOpen reaches its sender. Fall through and reread the
-                    // persisted owner instead of surfacing a handoff race.
-                    warn!(
-                        sandbox_id,
-                        error = %status,
-                        "local supervisor relay disappeared during open; resolving owner again"
-                    );
+    let deadline = tokio::time::Instant::now() + session_wait_timeout;
+    tokio::time::timeout_at(deadline, async {
+        let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        loop {
+            if state.supervisor_sessions.has_session(sandbox_id) {
+                let mut timer =
+                    RoutedRequestTimer::relay(relay_kind(&relay_open), RelayRoute::Local);
+                let result = state
+                    .supervisor_sessions
+                    .open_relay_with_message_until(sandbox_id, relay_open.clone(), deadline, false)
+                    .await;
+                if let Err(status) = &result {
+                    timer.local_error(status);
                 }
-                Err(status) => return Err(status),
+                match result {
+                    Ok((channel_id, relay_rx)) => {
+                        return Ok((channel_id, track_local_relay_claim(timer, relay_rx)));
+                    }
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        // The session can migrate after `has_session` but before
+                        // RelayOpen reaches its sender. Fall through and reread the
+                        // persisted owner instead of surfacing a handoff race.
+                        warn!(
+                            sandbox_id,
+                            error = %status,
+                            "local supervisor relay disappeared during open; resolving owner again"
+                        );
+                    }
+                    Err(status) => return Err(status),
+                }
             }
-        }
 
-        if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
-            && owner_is_fresh(&owner)
-        {
-            if owner.owner_replica_id == state.replica_id {
-                warn!(
-                    sandbox_id,
-                    owner_replica_id = %owner.owner_replica_id,
-                    "supervisor owner record points at this replica but no local session is registered; retrying"
-                );
-                state.peer_routes.evict_owner(sandbox_id);
-                if Instant::now() + backoff > deadline {
-                    return Err(Status::unavailable("supervisor session not connected"));
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
-                continue;
-            }
-            if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
-                     set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
-                    owner.owner_replica_id
-                )));
-            }
-            match open_peer_relay(
-                state,
-                owner.owner_peer_endpoint.clone(),
-                sandbox_id,
-                relay_open.clone(),
-            )
-            .await
+            if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
+                && owner_is_fresh(&owner)
             {
-                Ok(relay) => return Ok(relay),
-                Err(status) => {
+                if owner.owner_replica_id == state.replica_id {
                     warn!(
                         sandbox_id,
                         owner_replica_id = %owner.owner_replica_id,
-                        owner_peer_endpoint = %owner.owner_peer_endpoint,
-                        error = %status,
-                        "gateway peer owner relay open failed; retrying until session wait timeout"
+                        "supervisor owner record points at this replica but no local session is registered; retrying"
                     );
-                    // The record may name a replaced pod, so retry against a
-                    // fresh read rather than the cached endpoint.
                     state.peer_routes.evict_owner(sandbox_id);
+                    if tokio::time::Instant::now() + backoff > deadline {
+                        return Err(Status::unavailable("supervisor session not connected"));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+                    continue;
+                }
+                if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
+                         set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
+                        owner.owner_replica_id
+                    )));
+                }
+                match open_peer_relay(
+                    state,
+                    owner.owner_peer_endpoint.clone(),
+                    sandbox_id,
+                    relay_open.clone(),
+                )
+                .await
+                {
+                    Ok(relay) => return Ok(relay),
+                    Err(status) => {
+                        warn!(
+                            sandbox_id,
+                            owner_replica_id = %owner.owner_replica_id,
+                            owner_peer_endpoint = %owner.owner_peer_endpoint,
+                            error = %status,
+                            "gateway peer owner relay open failed; retrying until session wait timeout"
+                        );
+                        // The record may name a replaced pod, so retry against a
+                        // fresh read rather than the cached endpoint.
+                        state.peer_routes.evict_owner(sandbox_id);
+                    }
                 }
             }
-        }
 
-        if Instant::now() + backoff > deadline {
-            return Err(Status::unavailable("supervisor session not connected"));
+            if tokio::time::Instant::now() + backoff > deadline {
+                return Err(Status::unavailable("supervisor session not connected"));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
-    }
+    })
+    .await
+    .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
 }
 
 /// Reads the owning replica, reusing a recent result when one is cached.
@@ -2043,15 +2297,30 @@ async fn open_peer_relay(
     Ok((channel_id, relay_rx))
 }
 
+/// Open a `PeerRelay` stream to the owner replica and bridge it to a local duplex stream.
+///
+/// The peer request metrics count attempts, so the routed-relay retry loop spikes `unavailable`
+/// during rollouts. `ok` means the owner's supervisor claimed the relay (response headers
+/// arrived); later bridge failures are not counted.
 async fn connect_peer_relay(
     state: &Arc<ServerState>,
     owner_peer_endpoint: &str,
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
-    let token = state.peer_routes.peer_token().await?;
-    let channel = state.peer_routes.channel(owner_peer_endpoint).await?;
-    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
+    let mut timer = RoutedRequestTimer::relay(relay_kind(&relay_open), RelayRoute::Peer);
+    let token = state
+        .peer_routes
+        .peer_token()
+        .await
+        .inspect_err(|s| timer.local_error(s))?;
+    let channel = state
+        .peer_routes
+        .channel(owner_peer_endpoint)
+        .await
+        .inspect_err(|s| timer.local_error(s))?;
+    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)
+        .inspect_err(|s| timer.local_error(s))?;
     let mut client = open_shell_client::OpenShellClient::with_interceptor(channel, interceptor);
 
     let (out_tx, out_rx) = mpsc::channel::<PeerRelayFrame>(16);
@@ -2064,15 +2333,16 @@ async fn connect_peer_relay(
             })),
         })
         .await
-        .map_err(|_| Status::internal("failed to initialize peer relay stream"))?;
+        .map_err(|_| Status::internal("failed to initialize peer relay stream"))
+        .inspect_err(|s| timer.local_error(s))?;
 
-    let response = client
-        .peer_relay(ReceiverStream::new(out_rx))
-        .await
-        .map_err(|err| {
-            state.peer_routes.evict_channel(owner_peer_endpoint);
-            Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
-        })?;
+    let result = client.peer_relay(ReceiverStream::new(out_rx)).await;
+    // Record the owner's code before the remap below hides it as `unavailable`.
+    timer.finish(&result);
+    let response = result.map_err(|err| {
+        state.peer_routes.evict_channel(owner_peer_endpoint);
+        Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
+    })?;
     let inbound = response.into_inner();
     let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
@@ -2282,19 +2552,47 @@ fn spawn_peer_owner_bridge(
 // ConnectSupervisor gRPC handler
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn accept_supervisor_session(
+/// Push-mode state captured before the bootstrap inputs are read.
+struct ConfigPushSetup {
+    captured_seq: u64,
+    workspace: String,
+    providers: HashSet<String>,
+}
+
+/// Everything needed to accept a supervisor session once its bootstrap is
+/// final. Setup runs in its own task so a caller disconnect after owner
+/// publication cannot strand the record; the lifetime guard moves into the
+/// session task or drops with early cleanup.
+struct SessionSetup {
     state: Arc<ServerState>,
     sandbox_id: String,
     instance_id: String,
     connection_epoch: u64,
-    protocol_revision: u32,
     stream_applies_config: bool,
     bootstrap: Option<ConfigBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
+    config_push: Option<ConfigPushSetup>,
+    config_slots: Option<Arc<ConfigSlots>>,
     outbound_tx: mpsc::Sender<GatewayMessage>,
-    mut inbound: tonic::Streaming<SupervisorMessage>,
-) -> Result<(), Status> {
+    inbound: tonic::Streaming<SupervisorMessage>,
+    session_lifetime: OwnedRwLockReadGuard<()>,
+}
+
+async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
+    let SessionSetup {
+        state,
+        sandbox_id,
+        instance_id,
+        connection_epoch,
+        stream_applies_config,
+        bootstrap,
+        provider_readiness,
+        config_push,
+        config_slots,
+        outbound_tx,
+        mut inbound,
+        session_lifetime,
+    } = setup;
     let expected_bootstrap_admission = bootstrap
         .as_ref()
         .and_then(|bootstrap| bootstrap.sandbox_config.as_ref())
@@ -2314,7 +2612,7 @@ async fn accept_supervisor_session(
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
             bootstrap,
-            protocol_revision,
+            config_apply_enabled: stream_applies_config,
             heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
                 u64::from(HEARTBEAT_INTERVAL_SECS),
             ))
@@ -2339,6 +2637,13 @@ async fn accept_supervisor_session(
         };
         accepted_payload.bootstrap = None;
     }
+    let bootstrap_built = matches!(
+        &accepted.payload,
+        Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+            bootstrap: Some(_),
+            ..
+        }))
+    );
     let owner_peer_endpoint = state.peer_endpoint.as_deref().map_or_else(
         || local_owner_endpoint(&state.replica_id),
         ToString::to_string,
@@ -2355,21 +2660,14 @@ async fn accept_supervisor_session(
         )
         .await
         .map_err(owner_error_to_status)?;
-    let superseded = if stream_applies_config {
-        state.supervisor_sessions.register_initializing(
-            sandbox_id.clone(),
-            session_id.clone(),
-            session_tx.clone(),
-            shutdown_tx,
-        )
-    } else {
-        state.supervisor_sessions.register(
-            sandbox_id.clone(),
-            session_id.clone(),
-            session_tx.clone(),
-            shutdown_tx,
-        )
-    };
+    let superseded = state.supervisor_sessions.register_with_config_slots(
+        sandbox_id.clone(),
+        session_id.clone(),
+        session_tx.clone(),
+        shutdown_tx,
+        config_slots,
+        stream_applies_config,
+    );
     if superseded {
         info!(
             sandbox_id = %sandbox_id,
@@ -2378,6 +2676,9 @@ async fn accept_supervisor_session(
         );
     }
 
+    // A replacement stream is a new observation authority. Reset its endpoint
+    // results before acknowledging the session so it cannot inherit evidence
+    // reported by the superseded stream.
     if let Err(error) = crate::grpc::policy::reset_endpoint_status_for_supervisor_session(
         &state,
         &sandbox_id,
@@ -2421,6 +2722,10 @@ async fn accept_supervisor_session(
         return Err(error);
     }
 
+    // Do not expose SessionAccepted to the supervisor when the gateway could
+    // not durably record the connection. Dropping the buffered response forces
+    // a reconnect, which gives the state transition a fresh chance. A
+    // streamed-apply session becomes ready only after SupervisorRuntimeReady.
     if !stream_applies_config
         && !mark_supervisor_initialized(&state, &sandbox_id, &session_id, &instance_id, false).await
     {
@@ -2448,6 +2753,9 @@ async fn accept_supervisor_session(
         sandbox_id = %sandbox_id,
         session_id = %session_id,
         instance_id = %instance_id,
+        connection_epoch,
+        replica_id = %state.replica_id,
+        config_apply = stream_applies_config,
         "supervisor session: accepted"
     );
 
@@ -2460,14 +2768,30 @@ async fn accept_supervisor_session(
         }
     });
 
-    if superseded {
-        state
-            .supervisor_sessions
-            .replay_pending_relays(&sandbox_id, &session_tx)
-            .await;
+    // A disconnected session may already have removed its registration while
+    // an unclaimed RelayOpen remains pending. Replay on every accepted session,
+    // including reconnects that did not supersede a live registration.
+    state
+        .supervisor_sessions
+        .replay_pending_relays(&sandbox_id, &session_id, &session_tx)
+        .await;
+
+    if let Some(setup) = config_push {
+        crate::config_delivery::register_session(
+            &state,
+            crate::config_delivery::Registration {
+                sandbox_id: sandbox_id.clone(),
+                session_id: session_id.clone(),
+                workspace: setup.workspace,
+                providers: setup.providers,
+                captured_seq: setup.captured_seq,
+                bootstrap_built,
+            },
+        );
     }
 
     tokio::spawn(async move {
+        let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
         run_session_loop(
             &state,
@@ -2486,6 +2810,8 @@ async fn accept_supervisor_session(
         let terminal_finalized = state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        // Every removal path ends this task, including supersede and disconnect.
+        crate::config_delivery::unregister_session(&state, &sandbox_id, &session_id);
         // Release only this exact ownership record. A newer supervisor session
         // may already have published replacement ownership on another replica.
         let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
@@ -2537,28 +2863,141 @@ enum ImagePolicyAdmission {
     Policy(Box<openshell_core::proto::SandboxPolicy>),
 }
 
-fn image_policy_admission(
-    hello: &openshell_core::proto::SupervisorHello,
-) -> Result<ImagePolicyAdmission, Status> {
+fn image_policy_admission(hello: &SupervisorHello) -> Result<ImagePolicyAdmission, Status> {
     use openshell_core::proto::image_policy_discovery::Result as DiscoveryResult;
 
-    match hello
-        .image_policy_discovery
-        .as_ref()
-        .and_then(|discovery| discovery.result.as_ref())
-    {
+    let Some(discovery) = hello.image_policy_discovery.as_ref() else {
+        return Ok(ImagePolicyAdmission::Missing);
+    };
+    match discovery.result.as_ref() {
         Some(DiscoveryResult::Missing(())) => Ok(ImagePolicyAdmission::Missing),
         Some(DiscoveryResult::Invalid(())) => Ok(ImagePolicyAdmission::Invalid),
         Some(DiscoveryResult::Policy(policy)) => {
             Ok(ImagePolicyAdmission::Policy(Box::new(policy.clone())))
         }
-        None if hello.image_policy.is_some() => Ok(ImagePolicyAdmission::Policy(Box::new(
-            hello.image_policy.clone().expect("checked above"),
-        ))),
-        None if hello.image_policy_discovery.is_none() => Ok(ImagePolicyAdmission::Missing),
         None => Err(Status::invalid_argument(
             "image policy discovery result is required",
         )),
+    }
+}
+
+/// Build the authoritative bootstrap for a streamed-apply session.
+///
+/// An invalid image policy cannot become the startup baseline, so the build
+/// waits for an operator to store a gateway policy, bounded by
+/// `STARTUP_POLICY_REPAIR_TIMEOUT`.
+async fn build_required_bootstrap(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    image_policy_admission: &ImagePolicyAdmission,
+) -> Result<ConfigBootstrap, Status> {
+    let waits_for_repair = matches!(image_policy_admission, ImagePolicyAdmission::Invalid);
+    let mut repair_updates =
+        waits_for_repair.then(|| state.sandbox_watch_bus.subscribe(sandbox_id));
+    let repair_deadline = tokio::time::Instant::now() + STARTUP_POLICY_REPAIR_TIMEOUT;
+    loop {
+        let current_sandbox = require_persisted_sandbox(&state.store, sandbox_id).await?;
+        match crate::config_delivery::build_config_bootstrap(
+            state,
+            &current_sandbox,
+            crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+        )
+        .await
+        {
+            Ok(bootstrap) => {
+                let has_gateway_policy = bootstrap
+                    .sandbox_config
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.policy.as_ref())
+                    .is_some();
+                if !waits_for_repair || has_gateway_policy {
+                    counter!(
+                        "openshell_supervisor_config_bootstrap_total",
+                        "outcome" => "built"
+                    )
+                    .increment(1);
+                    return Ok(bootstrap);
+                }
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    "invalid image policy rejected; waiting for a gateway policy repair"
+                );
+            }
+            Err(error) if waits_for_repair => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error_code = ?error.code(),
+                    "invalid image policy rejected; waiting for configuration repair"
+                );
+            }
+            Err(error) => {
+                counter!(
+                    "openshell_supervisor_config_bootstrap_total",
+                    "outcome" => "build_failed"
+                )
+                .increment(1);
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error_code = ?error.code(),
+                    "failed to build supervisor configuration bootstrap"
+                );
+                return Err(error);
+            }
+        }
+
+        let updates = repair_updates
+            .as_mut()
+            .expect("only an invalid image policy waits for repair");
+        match tokio::time::timeout_at(repair_deadline, updates.recv()).await {
+            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(Status::aborted(
+                    "sandbox configuration watch closed during startup repair",
+                ));
+            }
+            Err(_) => {
+                return Err(Status::deadline_exceeded(
+                    "image policy repair window expired",
+                ));
+            }
+        }
+    }
+}
+
+/// Build the shadow bootstrap for a session that keeps polling. A slow
+/// credential backend must not delay acceptance, so failures omit it.
+async fn build_optional_bootstrap(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Option<ConfigBootstrap> {
+    match crate::config_delivery::build_config_bootstrap(
+        state,
+        sandbox,
+        crate::config_delivery::OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+    )
+    .await
+    {
+        Ok(bootstrap) => {
+            counter!(
+                "openshell_supervisor_config_bootstrap_total",
+                "outcome" => "built"
+            )
+            .increment(1);
+            Some(bootstrap)
+        }
+        Err(error) => {
+            counter!(
+                "openshell_supervisor_config_bootstrap_total",
+                "outcome" => "build_failed"
+            )
+            .increment(1);
+            warn!(
+                sandbox_id = %sandbox.object_id(),
+                error_code = ?error.code(),
+                "failed to build supervisor configuration bootstrap"
+            );
+            None
+        }
     }
 }
 
@@ -2584,299 +3023,228 @@ pub async fn handle_connect_supervisor(
     };
 
     let sandbox_id = hello.sandbox_id.clone();
-    let stream_applies_config = hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION;
-    // The stock supervisor includes discovery only on its first connection.
-    // Reconnects from the same process intentionally omit both startup policy
-    // fields and must proceed directly to the current authoritative bootstrap.
-    let prepares_startup_policy = stream_applies_config
-        && (hello.image_policy_discovery.is_some() || hello.image_policy.is_some());
-    let image_policy_admission = image_policy_admission(&hello)?;
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    validate_protocol_revision(&sandbox_id, hello.protocol_revision)?;
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
+    // Configuration is pushed only in push mode and only to supervisors that
+    // advertise snapshot support. Of those, supervisors that also apply
+    // snapshots receive authoritative delivery; the rest keep polling.
+    let config_push_enabled = state.config.config_delivery_mode
+        == openshell_core::config::ConfigDeliveryMode::Push
+        && hello.supports_config_snapshots;
+    let stream_applies_config = config_push_enabled && hello.supports_config_apply;
+    // The stock supervisor includes discovery only on its first connection.
+    // Reconnects from the same process omit it and proceed directly to the
+    // current authoritative bootstrap.
+    let prepares_startup_policy = stream_applies_config && hello.image_policy_discovery.is_some();
+    let image_policy_admission = if stream_applies_config {
+        image_policy_admission(&hello)?
+    } else {
+        ImagePolicyAdmission::Missing
+    };
+    // Captured before reading any bootstrap input, including the sandbox
+    // record, so registration detects publications the bootstrap may miss.
+    let captured_seq = config_push_enabled.then(|| state.config_delivery.current_seq());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
     // Validate readiness identities before replacing a healthy session. Older
     // supervisors remain usable but cannot assert provider installation.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
-    let bootstrap_timeout = if stream_applies_config {
-        crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
+    let config_push = captured_seq.map(|captured_seq| ConfigPushSetup {
+        captured_seq,
+        workspace: sandbox.object_workspace().to_string(),
+        providers: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.iter().cloned().collect())
+            .unwrap_or_default(),
+    });
+    let bootstrap = if stream_applies_config {
+        Some(build_required_bootstrap(state, &sandbox_id, &image_policy_admission).await?)
+    } else if config_push.is_some() {
+        build_optional_bootstrap(state, &sandbox).await
     } else {
-        crate::config_delivery::OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
+        None
     };
-    let mut repair_updates = matches!(image_policy_admission, ImagePolicyAdmission::Invalid)
-        .then(|| state.sandbox_watch_bus.subscribe(&sandbox_id));
-    let repair_deadline = tokio::time::Instant::now() + STARTUP_POLICY_REPAIR_TIMEOUT;
-    let bootstrap = loop {
-        let current_sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
-        match crate::config_delivery::build_config_bootstrap(
-            state,
-            &current_sandbox,
-            bootstrap_timeout,
-        )
-        .await
-        {
-            Ok(bootstrap) => {
-                let has_gateway_policy = bootstrap
-                    .sandbox_config
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.policy.as_ref())
-                    .is_some();
-                if matches!(image_policy_admission, ImagePolicyAdmission::Invalid)
-                    && !has_gateway_policy
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        "invalid image policy rejected; waiting for a gateway policy repair"
-                    );
-                } else {
-                    counter!(
-                        "openshell_supervisor_config_bootstrap_total",
-                        "outcome" => "built"
-                    )
-                    .increment(1);
-                    break Some(bootstrap);
-                }
-            }
-            Err(error) if matches!(image_policy_admission, ImagePolicyAdmission::Invalid) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error_code = ?error.code(),
-                    "invalid image policy rejected; waiting for configuration repair"
-                );
-            }
-            Err(error) => {
-                counter!(
-                    "openshell_supervisor_config_bootstrap_total",
-                    "outcome" => "build_failed"
-                )
-                .increment(1);
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error_code = ?error.code(),
-                    "failed to build supervisor configuration bootstrap"
-                );
-                if stream_applies_config {
-                    return Err(error);
-                }
-                break None;
-            }
-        }
 
-        let Some(updates) = repair_updates.as_mut() else {
-            return Err(Status::failed_precondition(
-                "image policy is invalid and no gateway policy is available",
-            ));
-        };
-        match tokio::time::timeout_at(repair_deadline, updates.recv()).await {
-            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err(Status::aborted(
-                    "sandbox configuration watch closed during startup repair",
-                ));
-            }
-            Err(_) => {
-                return Err(Status::deadline_exceeded(
-                    "image policy repair window expired",
-                ));
-            }
-        }
-    };
+    let session_lifetime = state.supervisor_sessions.track_session()?;
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
+    let config_slots = config_push
+        .as_ref()
+        .map(|_| Arc::new(ConfigSlots::default()));
+    let stream: Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
+    > = match config_slots.clone() {
+        Some(slots) => Box::pin(SessionOutbound::new(rx, slots)),
+        None => Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok)),
+    };
+
+    if !prepares_startup_policy {
+        let setup = SessionSetup {
+            state: Arc::clone(state),
+            sandbox_id,
+            instance_id: hello.instance_id,
+            connection_epoch: hello.connection_epoch,
+            stream_applies_config,
+            bootstrap,
+            provider_readiness,
+            config_push,
+            config_slots,
+            outbound_tx: tx,
+            inbound,
+            session_lifetime,
+        };
+        // Keep setup alive if the RPC caller disconnects after publication.
+        tokio::spawn(accept_supervisor_session(setup))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("supervisor session setup failed: {error}"))
+            })??;
+        return Ok(Response::new(stream));
+    }
+
+    // The first connection of a streamed-apply supervisor prepares the
+    // gateway-selected policy against its image before the bootstrap is final.
     let gateway_snapshot = bootstrap
         .as_ref()
         .and_then(|bootstrap| bootstrap.sandbox_config.as_ref());
     let gateway_policy = gateway_snapshot.and_then(|snapshot| snapshot.policy.clone());
     let gateway_has_policy = gateway_policy.is_some();
-
-    if prepares_startup_policy {
-        let policy = gateway_policy
-            .or_else(|| match image_policy_admission {
-                ImagePolicyAdmission::Policy(policy) => Some(*policy),
-                ImagePolicyAdmission::Missing => {
-                    Some(openshell_policy::restrictive_default_policy())
-                }
-                ImagePolicyAdmission::Invalid => None,
-            })
-            .ok_or_else(|| Status::failed_precondition("startup policy candidate is missing"))?;
-        let (policy_hash, policy_source, policy_version) = if gateway_has_policy {
-            let snapshot = gateway_snapshot.expect("gateway policy came from sandbox snapshot");
-            (
-                snapshot.policy_hash.clone(),
-                snapshot.policy_source,
-                snapshot.version,
-            )
-        } else {
-            (
-                openshell_core::policy_identity::deterministic_policy_hash(&policy),
-                PolicySource::Sandbox.into(),
-                0,
-            )
-        };
-        let candidate_id = Uuid::new_v4().to_string();
-        let candidate = GatewayMessage {
-            payload: Some(gateway_message::Payload::StartupConfigCandidate(
-                StartupConfigCandidate {
-                    candidate_id: candidate_id.clone(),
-                    policy_hash,
-                    policy_source,
-                    policy_version,
-                    policy: Some(policy.clone()),
-                },
-            )),
-        };
-        if candidate.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
-            return Err(Status::resource_exhausted(
-                "startup configuration candidate exceeds the stream message limit",
-            ));
-        }
-        tx.send(candidate)
-            .await
-            .map_err(|_| Status::internal("failed to send startup configuration candidate"))?;
-
-        let state = Arc::clone(state);
-        let provider_readiness = provider_readiness.clone();
-        let tx_for_rejection = tx.clone();
-        let protocol_revision = hello.protocol_revision;
-        let connection_epoch = hello.connection_epoch;
-        let instance_id = hello.instance_id;
-        tokio::spawn(async move {
-            let result = Box::pin(async {
-                let prepared = tokio::time::timeout(
-                    crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
-                    inbound.message(),
+    let policy = gateway_policy
+        .or_else(|| match image_policy_admission {
+            ImagePolicyAdmission::Policy(policy) => Some(*policy),
+            ImagePolicyAdmission::Missing => Some(openshell_policy::restrictive_default_policy()),
+            ImagePolicyAdmission::Invalid => None,
+        })
+        .ok_or_else(|| Status::failed_precondition("startup policy candidate is missing"))?;
+    let (policy_hash, policy_source, policy_version) =
+        gateway_snapshot.filter(|_| gateway_has_policy).map_or_else(
+            || {
+                (
+                    openshell_core::policy_identity::deterministic_policy_hash(&policy),
+                    PolicySource::Sandbox.into(),
+                    0,
                 )
-                .await
-                .map_err(|_| {
-                    Status::deadline_exceeded("startup configuration preparation timed out")
-                })??
-                .ok_or_else(|| {
-                    Status::aborted("supervisor disconnected during startup preparation")
-                })?;
-                let Some(supervisor_message::Payload::StartupConfigPrepared(prepared)) =
-                    prepared.payload
-                else {
-                    return Err(Status::invalid_argument("expected StartupConfigPrepared"));
-                };
-                if prepared.candidate_id != candidate_id {
-                    return Err(Status::failed_precondition(
-                        "startup configuration candidate ID does not match",
+            },
+            |snapshot| {
+                (
+                    snapshot.policy_hash.clone(),
+                    snapshot.policy_source,
+                    snapshot.version,
+                )
+            },
+        );
+    let candidate_id = Uuid::new_v4().to_string();
+    let candidate = GatewayMessage {
+        payload: Some(gateway_message::Payload::StartupConfigCandidate(
+            StartupConfigCandidate {
+                candidate_id: candidate_id.clone(),
+                policy_hash,
+                policy_source,
+                policy_version,
+                policy: Some(policy.clone()),
+            },
+        )),
+    };
+    if candidate.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+        return Err(Status::resource_exhausted(
+            "startup configuration candidate exceeds the stream message limit",
+        ));
+    }
+    tx.send(candidate)
+        .await
+        .map_err(|_| Status::internal("failed to send startup configuration candidate"))?;
+
+    let state = Arc::clone(state);
+    let tx_for_rejection = tx.clone();
+    tokio::spawn(async move {
+        let result = Box::pin(async {
+            let prepared = tokio::time::timeout(
+                crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+                inbound.message(),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("startup configuration preparation timed out"))??
+            .ok_or_else(|| Status::aborted("supervisor disconnected during startup preparation"))?;
+            let Some(supervisor_message::Payload::StartupConfigPrepared(prepared)) =
+                prepared.payload
+            else {
+                return Err(Status::invalid_argument("expected StartupConfigPrepared"));
+            };
+            if prepared.candidate_id != candidate_id {
+                return Err(Status::failed_precondition(
+                    "startup configuration candidate ID does not match",
+                ));
+            }
+
+            let policy_to_persist = match prepared.result {
+                Some(startup_config_prepared::Result::Unchanged(())) => {
+                    (!gateway_has_policy).then_some(policy)
+                }
+                Some(startup_config_prepared::Result::PreparedPolicy(policy)) => Some(policy),
+                Some(startup_config_prepared::Result::Failure(failure)) => {
+                    return Err(Status::failed_precondition(format!(
+                        "supervisor could not prepare startup policy: {}: {}",
+                        failure.code, failure.message
+                    )));
+                }
+                None => {
+                    return Err(Status::invalid_argument(
+                        "startup configuration result is required",
                     ));
                 }
+            };
 
-                let policy_to_persist = match prepared.result {
-                    Some(startup_config_prepared::Result::Unchanged(())) => {
-                        (!gateway_has_policy).then_some(policy)
-                    }
-                    Some(startup_config_prepared::Result::PreparedPolicy(policy)) => Some(policy),
-                    Some(startup_config_prepared::Result::Failure(failure)) => {
-                        return Err(Status::failed_precondition(format!(
-                            "supervisor could not prepare startup policy: {}: {}",
-                            failure.code, failure.message
-                        )));
-                    }
-                    None => {
-                        return Err(Status::invalid_argument(
-                            "startup configuration result is required",
-                        ));
-                    }
-                };
-
-                if let Some(policy) = policy_to_persist {
-                    let principal = principal.clone().ok_or_else(|| {
-                        Status::unauthenticated(
-                            "startup policy preparation requires an authenticated supervisor",
-                        )
-                    })?;
-                    crate::grpc::policy::persist_supervisor_startup_policy(
-                        &state, principal, &sandbox, policy,
+            if let Some(policy) = policy_to_persist {
+                let principal = principal.clone().ok_or_else(|| {
+                    Status::unauthenticated(
+                        "startup policy preparation requires an authenticated supervisor",
                     )
-                    .await?;
-                }
-
-                let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
-                let bootstrap = crate::config_delivery::build_config_bootstrap(
-                    &state,
-                    &sandbox,
-                    crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+                })?;
+                crate::grpc::policy::persist_supervisor_startup_policy(
+                    &state, principal, &sandbox, policy,
                 )
                 .await?;
-                accept_supervisor_session(
-                    state,
-                    sandbox_id.clone(),
-                    instance_id,
-                    connection_epoch,
-                    protocol_revision,
-                    true,
-                    Some(bootstrap),
-                    provider_readiness,
-                    tx,
-                    inbound,
-                )
-                .await
-            })
-            .await;
-            if let Err(error) = result {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error_code = ?error.code(),
-                    "supervisor startup policy preparation failed"
-                );
-                reject_startup_session(&tx_for_rejection, &error).await;
             }
-        });
-    } else {
-        accept_supervisor_session(
-            Arc::clone(state),
-            sandbox_id,
-            hello.instance_id,
-            hello.connection_epoch,
-            hello.protocol_revision,
-            stream_applies_config,
-            bootstrap,
-            provider_readiness,
-            tx,
-            inbound,
-        )
-        .await?;
-    }
 
-    // Return the outbound stream.
-    let stream = ReceiverStream::new(rx);
-    let stream: Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
-    > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
+            let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
+            let bootstrap = crate::config_delivery::build_config_bootstrap(
+                &state,
+                &sandbox,
+                crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+            )
+            .await?;
+            accept_supervisor_session(SessionSetup {
+                state: Arc::clone(&state),
+                sandbox_id: sandbox_id.clone(),
+                instance_id: hello.instance_id,
+                connection_epoch: hello.connection_epoch,
+                stream_applies_config,
+                bootstrap: Some(bootstrap),
+                provider_readiness,
+                config_push,
+                config_slots,
+                outbound_tx: tx,
+                inbound,
+                session_lifetime,
+            })
+            .await
+        })
+        .await;
+        if let Err(error) = result {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error_code = ?error.code(),
+                "supervisor startup policy preparation failed"
+            );
+            reject_startup_session(&tx_for_rejection, &error).await;
+        }
+    });
 
     Ok(Response::new(stream))
-}
-
-fn validate_protocol_revision(sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
-    match supervisor_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_previous_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: Stage 1 supervisor is using polling compatibility"
-            );
-            Ok(())
-        }
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_legacy_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: supervisor predates the protocol handshake; recreate the sandbox before the next gateway upgrade"
-            );
-            Ok(())
-        }
-        other => Err(Status::failed_precondition(format!(
-            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {other}"
-        ))),
-    }
 }
 
 pub async fn handle_report_main_process_exit(
@@ -2922,10 +3290,18 @@ pub async fn handle_finalize_main_process_exit(
         .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
         .await
         .map_err(Status::failed_precondition)?;
-    if !state
+    let session_finalized = state
         .supervisor_sessions
-        .finalize_main_process_exit(&report.sandbox_id)
-    {
+        .finalize_main_process_exit(&report.sandbox_id);
+    // The session can close between durable result validation and this mark.
+    // Schedule cleanup in either case so a disconnect with an unfinalized
+    // in-memory session cannot strand the ephemeral sandbox.
+    state
+        .compute
+        .cleanup_finalized_ephemeral_sandbox(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::internal)?;
+    if !session_finalized {
         return Err(Status::failed_precondition(
             "supervisor session is not connected",
         ));
@@ -2953,6 +3329,7 @@ async fn run_session_loop(
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
 ) {
+    let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     // Skip the first immediate tick.
@@ -2963,6 +3340,10 @@ async fn run_session_loop(
 
     loop {
         tokio::select! {
+            () = async { let _ = gateway_shutdown.wait_for(|shutdown| *shutdown).await; } => {
+                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: gateway shutting down");
+                break;
+            }
             _ = &mut shutdown_rx => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
                 break;
@@ -3633,12 +4014,19 @@ mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use crate::gateway_metrics::MetricsCapture;
+    use crate::grpc::test_support::StreamFeatures;
     use crate::persistence::Store;
+    use bytes::Bytes;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, Empty, StreamBody};
     use openshell_core::proto::{
         ProviderEnvironmentSnapshot, ProviderEnvironmentValue, SandboxConfigRevision,
-        SandboxConfigSnapshot, SandboxSpec, StartupConfigPrepared, startup_config_prepared,
+        SandboxConfigSnapshot,
     };
+    use openshell_core::proto::{SandboxSpec, StartupConfigPrepared};
     use prost::Message;
+    use std::convert::Infallible;
 
     #[test]
     fn configuration_stream_messages_round_trip() {
@@ -3653,7 +4041,7 @@ mod tests {
                     sandbox_config: Some(SandboxConfigSnapshot::default()),
                     provider_environment: Some(ProviderEnvironmentSnapshot::default()),
                 }),
-                protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+                config_apply_enabled: true,
             })),
         };
         let updates = [
@@ -3670,24 +4058,7 @@ mod tests {
             })),
         });
 
-        let admission = SandboxConfigurationAdmission {
-            instance_id: "configuration-1".into(),
-            state: openshell_core::proto::ConfigurationAdmissionState::Accepted.into(),
-            policy_version: 3,
-            policy_hash: "policy-hash".into(),
-            config_revision: 7,
-            provider_env_revision: 5,
-            error: String::new(),
-        };
-        let admission_ack = GatewayMessage {
-            payload: Some(gateway_message::Payload::ConfigurationAdmission(
-                admission.clone(),
-            )),
-        };
-        for original in std::iter::once(bootstrap)
-            .chain(updates)
-            .chain(std::iter::once(admission_ack))
-        {
+        for original in std::iter::once(bootstrap).chain(updates) {
             let decoded = GatewayMessage::decode(original.encode_to_vec().as_slice()).unwrap();
             assert_eq!(decoded, original);
         }
@@ -3697,6 +4068,7 @@ mod tests {
                 ConfigUpdateResult {
                     update_id: "update-1".into(),
                     component_sequence: 4,
+                    admission: None,
                     result: Some(ConfigComponentApplyResult {
                         component: ConfigComponent::SandboxConfig.into(),
                         requested_revision: Some(ConfigSnapshotRevision {
@@ -3720,124 +4092,11 @@ mod tests {
                         outcome: ConfigApplyOutcome::Applied.into(),
                         failure: None,
                     }),
-                    admission: Some(admission),
                 },
             )),
         };
-        let runtime_ready = SupervisorMessage {
-            payload: Some(supervisor_message::Payload::RuntimeReady(
-                openshell_core::proto::SupervisorRuntimeReady {},
-            )),
-        };
-        for original in [result, runtime_ready] {
-            let decoded = SupervisorMessage::decode(original.encode_to_vec().as_slice()).unwrap();
-            assert_eq!(decoded, original);
-        }
-    }
-
-    #[test]
-    fn supervisor_protocol_revision_accepts_current_and_legacy_peers() {
-        assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-    }
-
-    #[test]
-    fn configuration_admission_preserves_gateway_rejection_and_accepts_repair() {
-        use openshell_core::proto::ConfigurationAdmissionState;
-
-        let mut expected = SandboxConfigurationAdmission {
-            instance_id: "configuration-1".into(),
-            state: ConfigurationAdmissionState::Rejected.into(),
-            policy_version: 3,
-            policy_hash: "policy-hash".into(),
-            config_revision: 7,
-            provider_env_revision: 5,
-            error: "invalid image policy".into(),
-        };
-        let rejected = validate_configuration_admission(
-            Some(&expected),
-            &expected,
-            ConfigApplyOutcome::Applied,
-        )
-        .unwrap();
-        assert_eq!(rejected, expected);
-
-        expected.state = ConfigurationAdmissionState::Accepted.into();
-        expected.error.clear();
-        let accepted = validate_configuration_admission(
-            Some(&expected),
-            &expected,
-            ConfigApplyOutcome::Applied,
-        )
-        .unwrap();
-        assert_eq!(accepted, expected);
-    }
-
-    #[test]
-    fn bootstrap_requires_every_delivered_component_to_succeed() {
-        let sandbox_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::SandboxConfig(
-                SandboxConfigRevision {
-                    config_revision: 7,
-                    ..Default::default()
-                },
-            )),
-        };
-        let provider_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
-        };
-        let expected = vec![
-            (
-                ConfigComponent::SandboxConfig,
-                sandbox_revision.clone(),
-                ConfigSnapshotFingerprint::Sandbox {
-                    revision: sandbox_revision.clone(),
-                    provider_env_revision: 0,
-                    provider_attachment_epoch: String::new(),
-                    policy_hash: String::new(),
-                },
-            ),
-            (
-                ConfigComponent::ProviderEnvironment,
-                provider_revision.clone(),
-                ConfigSnapshotFingerprint::ProviderEnvironment {
-                    provider_env_revision: 9,
-                    provider_attachment_epoch: String::new(),
-                    policy_hash: String::new(),
-                },
-            ),
-        ];
-        let result =
-            |component: ConfigComponent,
-             revision: ConfigSnapshotRevision,
-             outcome: ConfigApplyOutcome| ConfigComponentApplyResult {
-                component: component.into(),
-                requested_revision: Some(revision.clone()),
-                applied_revision: Some(revision),
-                outcome: outcome.into(),
-                ..Default::default()
-            };
-        let mut results = vec![
-            result(
-                ConfigComponent::SandboxConfig,
-                sandbox_revision,
-                ConfigApplyOutcome::Applied,
-            ),
-            result(
-                ConfigComponent::ProviderEnvironment,
-                provider_revision,
-                ConfigApplyOutcome::Degraded,
-            ),
-        ];
-        assert!(validate_bootstrap_result(&results, &expected).unwrap());
-
-        results[1].outcome = ConfigApplyOutcome::FailedClosed.into();
-        results[1].applied_revision = None;
-        assert!(!validate_bootstrap_result(&results, &expected).unwrap());
-        assert!(validate_bootstrap_result(&results[..1], &expected).is_err());
-        results[1].requested_revision = Some(ConfigSnapshotRevision::default());
-        assert!(validate_bootstrap_result(&results, &expected).is_err());
+        let decoded = SupervisorMessage::decode(result.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, result);
     }
 
     async fn state_with_sandbox(sandbox_id: &str) -> Arc<ServerState> {
@@ -3850,342 +4109,6 @@ mod tests {
         state
     }
 
-    async fn state_with_startup_policy(
-        sandbox_id: &str,
-        policy: Option<openshell_core::proto::SandboxPolicy>,
-    ) -> Arc<ServerState> {
-        let state = crate::grpc::test_support::test_server_state().await;
-        let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
-        sandbox.spec = Some(SandboxSpec {
-            policy,
-            ..SandboxSpec::default()
-        });
-        state.store.put_message(&sandbox).await.unwrap();
-        state
-    }
-
-    #[tokio::test]
-    async fn persisted_bootstrap_result_suppresses_unchanged_reconciliation() {
-        let state = state_with_sandbox("sb-bootstrap-ack").await;
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        state.supervisor_sessions.register(
-            "sb-bootstrap-ack".into(),
-            "session-1".into(),
-            tx.clone(),
-            shutdown_tx,
-        );
-        let snapshot = ProviderEnvironmentSnapshot {
-            provider_env_revision: 11,
-            ..Default::default()
-        };
-        let revision = config_message_revision(&SupervisorConfigMessage::ProviderEnvironment(
-            snapshot.clone(),
-        ));
-        let result = ConfigComponentApplyResult {
-            component: ConfigComponent::ProviderEnvironment.into(),
-            requested_revision: Some(revision.clone()),
-            applied_revision: Some(revision.clone()),
-            outcome: ConfigApplyOutcome::Applied.into(),
-            ..Default::default()
-        };
-
-        handle_supervisor_message(
-            &state,
-            "sb-bootstrap-ack",
-            "session-1",
-            "instance-1",
-            true,
-            &[(
-                ConfigComponent::ProviderEnvironment,
-                revision.clone(),
-                config_message_fingerprint(&SupervisorConfigMessage::ProviderEnvironment(
-                    snapshot.clone(),
-                )),
-            )],
-            &tx,
-            SupervisorMessage {
-                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
-                    ConfigBootstrapResult {
-                        results: vec![result],
-                        admission: None,
-                    },
-                )),
-            },
-        )
-        .await;
-
-        let observation = state
-            .store
-            .get_message::<StoredConfigComponentObservation>(
-                "sb-bootstrap-ack:provider_environment",
-            )
-            .await
-            .unwrap()
-            .expect("bootstrap observation");
-        assert_eq!(observation.requested_revision, Some(revision.clone()));
-        assert_eq!(
-            state.supervisor_sessions.deliver_config(
-                "sb-bootstrap-ack",
-                SupervisorConfigMessage::ProviderEnvironment(snapshot),
-            ),
-            DeliveryDisposition::SuppressedUnchanged
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn failed_admission_persistence_does_not_suppress_unchanged_repair() {
-        let sandbox_id = "sb-admission-persistence-retry";
-        let state = state_with_sandbox(sandbox_id).await;
-        let (tx, mut rx) = mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        state.supervisor_sessions.register(
-            sandbox_id.into(),
-            "session-1".into(),
-            tx.clone(),
-            shutdown_tx,
-        );
-        let snapshot = SandboxConfigSnapshot {
-            configuration_instance_id: "configuration-1".into(),
-            configuration_admitted: true,
-            config_revision: 7,
-            version: 3,
-            policy_hash: "policy-hash".into(),
-            provider_env_revision: 5,
-            ..Default::default()
-        };
-        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
-        assert_eq!(
-            state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, message.clone()),
-            DeliveryDisposition::Enqueued
-        );
-        let Some(gateway_message::Payload::ConfigUpdate(update)) =
-            rx.recv().await.expect("initial update").payload
-        else {
-            panic!("expected initial config update");
-        };
-        let revision = config_message_revision(&message);
-        *FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX.lock().unwrap() = Some(sandbox_id.into());
-
-        handle_supervisor_message(
-            &state,
-            sandbox_id,
-            "session-1",
-            "instance-1",
-            true,
-            &[],
-            &tx,
-            SupervisorMessage {
-                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
-                    ConfigUpdateResult {
-                        update_id: update.update_id,
-                        component_sequence: update.component_sequence,
-                        result: Some(ConfigComponentApplyResult {
-                            component: ConfigComponent::SandboxConfig.into(),
-                            requested_revision: Some(revision.clone()),
-                            applied_revision: Some(revision),
-                            outcome: ConfigApplyOutcome::Applied.into(),
-                            ..Default::default()
-                        }),
-                        admission: Some(expected_configuration_admission(&snapshot)),
-                    },
-                )),
-            },
-        )
-        .await;
-
-        assert_eq!(
-            state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, message),
-            DeliveryDisposition::Enqueued,
-            "a non-durable admission must leave the revision eligible for repair"
-        );
-        assert!(matches!(
-            rx.recv().await.expect("repair update").payload,
-            Some(gateway_message::Payload::ConfigUpdate(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn generation_pending_result_schedules_reconciliation_without_persistence() {
-        use openshell_core::proto::{ConfigApplyFailure, ConfigurationAdmissionState};
-
-        let sandbox_id = "sb-generation-pending-retry";
-        let state = state_with_sandbox(sandbox_id).await;
-        let mut stored_sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .expect("sandbox is persisted");
-        stored_sandbox.spec = Some(SandboxSpec::default());
-        state.store.put_message(&stored_sandbox).await.unwrap();
-        let (tx, mut rx) = mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        state.supervisor_sessions.register(
-            sandbox_id.into(),
-            "session-1".into(),
-            tx.clone(),
-            shutdown_tx,
-        );
-        let snapshot = SandboxConfigSnapshot {
-            configuration_instance_id: "configuration-1".into(),
-            configuration_admitted: true,
-            config_revision: 7,
-            version: 3,
-            policy_hash: "policy-hash".into(),
-            provider_env_revision: 5,
-            ..Default::default()
-        };
-        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
-        assert_eq!(
-            state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, message.clone()),
-            DeliveryDisposition::Enqueued
-        );
-        let Some(gateway_message::Payload::ConfigUpdate(update)) =
-            rx.recv().await.expect("initial update").payload
-        else {
-            panic!("expected initial config update");
-        };
-        let revision = config_message_revision(&message);
-        let mut rejected_admission = expected_configuration_admission(&snapshot);
-        rejected_admission.state = ConfigurationAdmissionState::Rejected.into();
-        rejected_admission.error = "effective configuration could not be activated".into();
-
-        handle_supervisor_message(
-            &state,
-            sandbox_id,
-            "session-1",
-            "instance-1",
-            true,
-            &[],
-            &tx,
-            SupervisorMessage {
-                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
-                    ConfigUpdateResult {
-                        update_id: update.update_id,
-                        component_sequence: update.component_sequence,
-                        result: Some(ConfigComponentApplyResult {
-                            component: ConfigComponent::SandboxConfig.into(),
-                            requested_revision: Some(revision),
-                            applied_revision: None,
-                            outcome: ConfigApplyOutcome::FailedClosed.into(),
-                            failure: Some(ConfigApplyFailure {
-                                code: "generation_mismatch".into(),
-                                message: "waiting for matching provider generation".into(),
-                                retryable: true,
-                            }),
-                        }),
-                        admission: Some(rejected_admission),
-                    },
-                )),
-            },
-        )
-        .await;
-
-        assert!(
-            state
-                .store
-                .get_message::<StoredConfigComponentObservation>(
-                    "sb-generation-pending-retry:sandbox_config",
-                )
-                .await
-                .unwrap()
-                .is_none(),
-            "a transient cross-component ordering result must not become durable state"
-        );
-        let sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .expect("sandbox remains persisted");
-        assert!(
-            sandbox
-                .status
-                .as_ref()
-                .and_then(|status| status.configuration_admission.as_ref())
-                .is_none(),
-            "a transient generation mismatch must not persist rejected admission"
-        );
-        let redriven_components = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut components = Vec::new();
-            while components.len() < 2 {
-                let Some(gateway_message::Payload::ConfigUpdate(update)) = rx
-                    .recv()
-                    .await
-                    .expect("redriven configuration update")
-                    .payload
-                else {
-                    continue;
-                };
-                components.push(match update.component.expect("redriven component") {
-                    config_update::Component::SandboxConfig(_) => ConfigComponent::SandboxConfig,
-                    config_update::Component::ProviderEnvironment(_) => {
-                        ConfigComponent::ProviderEnvironment
-                    }
-                });
-            }
-            components
-        })
-        .await
-        .expect("generation mismatch schedules prompt reconciliation");
-        assert!(redriven_components.contains(&ConfigComponent::SandboxConfig));
-        assert!(redriven_components.contains(&ConfigComponent::ProviderEnvironment));
-    }
-
-    #[tokio::test]
-    async fn component_apply_result_persists_compact_observed_state() {
-        let state = state_with_sandbox("sb-observed").await;
-        let requested_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(11)),
-        };
-        let applied_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
-        };
-        record_component_apply_result(
-            &state,
-            "sb-observed",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(requested_revision),
-                applied_revision: Some(applied_revision),
-                outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood.into(),
-                failure: Some(openshell_core::proto::ConfigApplyFailure {
-                    message: "x".repeat(2_000),
-                    ..Default::default()
-                }),
-            },
-        )
-        .await
-        .unwrap();
-
-        let observation = state
-            .store
-            .get_message::<StoredConfigComponentObservation>("sb-observed:provider_environment")
-            .await
-            .unwrap()
-            .expect("component observation");
-        assert_eq!(observation.sandbox_id, "sb-observed");
-        assert_eq!(
-            observation.component,
-            ConfigComponent::ProviderEnvironment as i32
-        );
-        assert_eq!(
-            observation.outcome,
-            ConfigApplyOutcome::FailedRetainedLastKnownGood as i32
-        );
-        assert_eq!(observation.effective_source, "last_known_good");
-        assert_eq!(observation.sanitized_error.len(), 1_024);
-        assert!(observation.observed_at_time.is_some());
-    }
-
     async fn first_gateway_message(
         harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
     ) -> GatewayMessage {
@@ -4196,99 +4119,20 @@ mod tests {
             .expect("gateway message")
     }
 
-    fn applied_bootstrap_result(bootstrap: &ConfigBootstrap) -> ConfigBootstrapResult {
-        let sandbox = bootstrap
-            .sandbox_config
-            .as_ref()
-            .expect("sandbox bootstrap component");
-        let provider = bootstrap
-            .provider_environment
-            .as_ref()
-            .expect("provider bootstrap component");
-        let sandbox_revision = config_message_revision(&SupervisorConfigMessage::SandboxConfig(
-            Box::new(sandbox.clone()),
-        ));
-        let provider_revision = config_message_revision(
-            &SupervisorConfigMessage::ProviderEnvironment(provider.clone()),
-        );
-        ConfigBootstrapResult {
-            results: vec![
-                ConfigComponentApplyResult {
-                    component: ConfigComponent::SandboxConfig.into(),
-                    requested_revision: Some(sandbox_revision.clone()),
-                    applied_revision: Some(sandbox_revision),
-                    outcome: ConfigApplyOutcome::Applied.into(),
-                    ..Default::default()
-                },
-                ConfigComponentApplyResult {
-                    component: ConfigComponent::ProviderEnvironment.into(),
-                    requested_revision: Some(provider_revision.clone()),
-                    applied_revision: Some(provider_revision),
-                    outcome: ConfigApplyOutcome::Applied.into(),
-                    ..Default::default()
-                },
-            ],
-            admission: Some(expected_configuration_admission(sandbox)),
-        }
-    }
-
-    async fn report_bootstrap_and_runtime_ready(
-        state: &Arc<ServerState>,
-        sandbox_id: &str,
-        harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
-        bootstrap: &ConfigBootstrap,
-    ) {
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
-                    applied_bootstrap_result(bootstrap),
-                )),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            first_gateway_message(harness).await.payload,
-            Some(gateway_message::Payload::ConfigurationAdmission(_))
-        ));
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::RuntimeReady(
-                    openshell_core::proto::SupervisorRuntimeReady {},
-                )),
-            })
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.supervisor_sessions.is_runtime_ready(sandbox_id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("runtime readiness before timeout");
-    }
-
     #[tokio::test]
-    async fn legacy_supervisor_without_protocol_revision_is_accepted() {
+    async fn supervisor_without_config_snapshots_is_accepted() {
         let state = state_with_sandbox("sb-legacy").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-legacy",
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("legacy supervisor must connect");
+        let mut harness =
+            crate::grpc::test_support::connect_supervisor_stream(&state, "sb-legacy", false)
+                .await
+                .expect("supervisor without configuration snapshots must connect");
 
         let Some(gateway_message::Payload::SessionAccepted(accepted)) =
             first_gateway_message(&mut harness).await.payload
         else {
             panic!("expected SessionAccepted");
         };
-        assert_eq!(
-            accepted.protocol_revision,
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION
-        );
+        assert!(accepted.bootstrap.is_none());
         assert!(
             state
                 .supervisor_sessions
@@ -4296,377 +4140,35 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stage_one_supervisor_uses_polling_compatibility() {
-        let state = state_with_sandbox("sb-stage-one").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-stage-one",
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("Stage 1 supervisor must connect");
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted.protocol_revision,
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION
+    fn register_push_session(
+        registry: &SupervisorSessionRegistry,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> (mpsc::Sender<GatewayMessage>, SessionOutbound) {
+        let (tx, rx) = mpsc::channel(4);
+        let slots = Arc::new(ConfigSlots::default());
+        registry.register_with_config_slots(
+            sandbox_id.into(),
+            session_id.into(),
+            tx.clone(),
+            make_shutdown(),
+            Some(Arc::clone(&slots)),
+            false,
         );
-        assert!(
-            state
-                .supervisor_sessions
-                .is_current_session("sb-stage-one", &accepted.session_id)
-        );
+        (tx, SessionOutbound::new(rx, slots))
     }
 
-    #[tokio::test]
-    async fn revision_two_reconnect_skips_startup_preparation_and_restores_readiness() {
-        let sandbox_id = "sb-reconnect-no-preparation";
-        let policy = openshell_policy::restrictive_default_policy();
-        let state = state_with_startup_policy(sandbox_id, Some(policy)).await;
-        let mut initial = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            sandbox_id,
-            SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("initial supervisor connection");
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut initial).await.payload
-        else {
-            panic!("initial session must prepare the startup policy");
-        };
-        initial
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::Unchanged(())),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut initial).await.payload
-        else {
-            panic!("expected initial SessionAccepted");
-        };
-        let bootstrap = accepted.bootstrap.expect("initial authoritative bootstrap");
-        report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut initial, &bootstrap).await;
-        drop(initial);
-
-        let mut reconnect = crate::grpc::test_support::reconnect_supervisor_stream(
-            &state,
-            sandbox_id,
-            SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("stock supervisor reconnect");
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut reconnect).await.payload
-        else {
-            panic!("reconnect must proceed directly to SessionAccepted");
-        };
-        let bootstrap = accepted
-            .bootstrap
-            .expect("reconnect authoritative bootstrap");
-        report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut reconnect, &bootstrap).await;
-    }
-
-    #[tokio::test]
-    async fn invalid_image_policy_waits_for_gateway_repair_on_same_stream() {
-        use openshell_core::proto::image_policy_discovery::Result as DiscoveryResult;
-
-        let sandbox_id = "sb-invalid-image-repair";
-        let state = state_with_startup_policy(sandbox_id, None).await;
-        let connecting_state = Arc::clone(&state);
-        let connection = tokio::spawn(async move {
-            crate::grpc::test_support::connect_supervisor_stream_with_image_policy_discovery(
-                &connecting_state,
-                sandbox_id,
-                SUPERVISOR_PROTOCOL_REVISION,
-                openshell_core::proto::ImagePolicyDiscovery {
-                    result: Some(DiscoveryResult::Invalid(())),
-                },
-            )
-            .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !connection.is_finished(),
-            "invalid image policy must keep the startup stream pending"
-        );
-
-        let repaired_policy = openshell_policy::restrictive_default_policy();
-        let mut sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .expect("sandbox exists");
-        sandbox.spec.get_or_insert_default().policy = Some(repaired_policy.clone());
-        state.store.put_message(&sandbox).await.unwrap();
-        state.sandbox_watch_bus.notify(sandbox_id);
-
-        let mut harness = tokio::time::timeout(Duration::from_secs(5), connection)
-            .await
-            .expect("repair resumes the pending stream")
-            .expect("connection task")
-            .expect("supervisor connects after repair");
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected StartupConfigCandidate after repair");
-        };
-        assert_eq!(candidate.policy.as_ref(), Some(&repaired_policy));
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::Unchanged(())),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            first_gateway_message(&mut harness).await.payload,
-            Some(gateway_message::Payload::SessionAccepted(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn startup_candidate_prefers_gateway_policy_and_accepts_unchanged_result() {
-        let gateway_policy = openshell_policy::restrictive_default_policy();
-        let mut image_policy = gateway_policy.clone();
-        image_policy
-            .filesystem
-            .get_or_insert_default()
-            .read_only
-            .push("/image-only".into());
-        let state =
-            state_with_startup_policy("sb-startup-gateway", Some(gateway_policy.clone())).await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
-            &state,
-            "sb-startup-gateway",
-            SUPERVISOR_PROTOCOL_REVISION,
-            Some(image_policy),
-        )
-        .await
-        .expect("supervisor must connect");
-
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected StartupConfigCandidate");
-        };
-        assert_eq!(candidate.policy.as_ref(), Some(&gateway_policy));
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::Unchanged(())),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted
-                .bootstrap
-                .and_then(|bootstrap| bootstrap.sandbox_config)
-                .and_then(|snapshot| snapshot.policy),
-            Some(gateway_policy)
-        );
-    }
-
-    #[tokio::test]
-    async fn unchanged_image_policy_is_persisted_before_session_acceptance() {
-        let image_policy = openshell_policy::restrictive_default_policy();
-        let state = state_with_startup_policy("sb-startup-image", None).await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
-            &state,
-            "sb-startup-image",
-            SUPERVISOR_PROTOCOL_REVISION,
-            Some(image_policy.clone()),
-        )
-        .await
-        .expect("supervisor must connect");
-
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected StartupConfigCandidate");
-        };
-        assert_eq!(candidate.policy.as_ref(), Some(&image_policy));
-        assert_eq!(candidate.policy_version, 0);
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::Unchanged(())),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        let snapshot = accepted
-            .bootstrap
-            .and_then(|bootstrap| bootstrap.sandbox_config)
-            .expect("authoritative sandbox snapshot");
-        assert_eq!(snapshot.policy, Some(image_policy));
-        assert_eq!(snapshot.version, 1);
-    }
-
-    #[tokio::test]
-    async fn prepared_policy_is_validated_and_returned_in_fresh_bootstrap() {
-        let image_policy = openshell_policy::restrictive_default_policy();
-        let mut prepared_policy = image_policy.clone();
-        prepared_policy
-            .filesystem
-            .get_or_insert_default()
-            .read_only
-            .push("/prepared-path".into());
-        let state = state_with_startup_policy("sb-startup-prepared", None).await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
-            &state,
-            "sb-startup-prepared",
-            SUPERVISOR_PROTOCOL_REVISION,
-            Some(image_policy),
-        )
-        .await
-        .expect("supervisor must connect");
-
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected StartupConfigCandidate");
-        };
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::PreparedPolicy(
-                            prepared_policy.clone(),
-                        )),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted
-                .bootstrap
-                .and_then(|bootstrap| bootstrap.sandbox_config)
-                .and_then(|snapshot| snapshot.policy),
-            Some(prepared_policy)
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_prepared_policy_rejects_session_without_acceptance() {
-        let image_policy = openshell_policy::restrictive_default_policy();
-        let mut invalid_policy = image_policy.clone();
-        invalid_policy
-            .filesystem
-            .get_or_insert_default()
-            .read_only
-            .push("relative/path".into());
-        let state = state_with_startup_policy("sb-startup-invalid", None).await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
-            &state,
-            "sb-startup-invalid",
-            SUPERVISOR_PROTOCOL_REVISION,
-            Some(image_policy),
-        )
-        .await
-        .expect("supervisor must connect");
-
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected StartupConfigCandidate");
-        };
-        harness
-            .outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(startup_config_prepared::Result::PreparedPolicy(
-                            invalid_policy,
-                        )),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-
-        let Some(gateway_message::Payload::SessionRejected(rejected)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("invalid preparation must reject without accepting the session");
-        };
-        assert!(rejected.reason.contains("policy"));
-    }
-
-    #[tokio::test]
-    async fn unknown_supervisor_protocol_revision_is_rejected() {
-        let state = state_with_sandbox("sb-future").await;
-        let Err(status) = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-future",
-            SUPERVISOR_PROTOCOL_REVISION + 1,
-        )
-        .await
-        else {
-            panic!("mismatched revision must be rejected");
-        };
-
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(status.message().contains("revision mismatch"));
-        assert!(state.supervisor_sessions.connected_sandbox_ids().is_empty());
-    }
-
-    #[test]
-    fn supervisor_protocol_revision_rejects_unknown_peers() {
-        let error =
-            validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION + 1).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("revision mismatch"));
+    fn component_sequence(message: GatewayMessage) -> (bool, u64) {
+        match message.payload {
+            Some(gateway_message::Payload::ConfigUpdate(update)) => (
+                matches!(
+                    update.component,
+                    Some(config_update::Component::SandboxConfig(_))
+                ),
+                update.component_sequence,
+            ),
+            other => panic!("expected config update, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4676,6 +4178,7 @@ mod tests {
             router
                 .deliver(
                     "missing",
+                    "session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
@@ -4683,436 +4186,103 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bootstrap_acknowledgement_suppresses_unchanged_reconciliation() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
-        let snapshot = SandboxConfigSnapshot {
-            config_revision: 7,
-            version: 11,
-            ..Default::default()
-        };
-        let revision = config_message_revision(&SupervisorConfigMessage::SandboxConfig(Box::new(
-            snapshot.clone(),
-        )));
-        let fingerprint = config_message_fingerprint(&SupervisorConfigMessage::SandboxConfig(
-            Box::new(snapshot.clone()),
-        ));
-
-        assert!(!registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::SandboxConfig.into(),
-                requested_revision: Some(revision.clone()),
-                applied_revision: None,
-                outcome: ConfigApplyOutcome::FailedClosed.into(),
-                ..Default::default()
-            },
-            &fingerprint,
-        ));
-        assert!(registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::SandboxConfig.into(),
-                requested_revision: Some(revision.clone()),
-                applied_revision: Some(revision),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &fingerprint,
-        ));
-        assert_eq!(
-            registry.deliver_config(
-                "sb-1",
-                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
-            ),
-            DeliveryDisposition::SuppressedUnchanged
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn bootstrap_acknowledgement_does_not_replace_newer_delivery_state() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
-        let bootstrap_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(7)),
-        };
-        let bootstrap_fingerprint = ConfigSnapshotFingerprint::ProviderEnvironment {
-            provider_env_revision: 7,
-            provider_attachment_epoch: String::new(),
-            policy_hash: String::new(),
-        };
-
-        assert_eq!(
-            registry.deliver_config(
-                "sb-1",
-                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
-                    provider_env_revision: 8,
-                    ..Default::default()
-                }),
-            ),
-            DeliveryDisposition::Enqueued
-        );
-        assert!(!registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(bootstrap_revision.clone()),
-                applied_revision: Some(bootstrap_revision.clone()),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &bootstrap_fingerprint,
-        ));
-
-        let message = rx.try_recv().expect("newer update");
-        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
-            panic!("expected config update");
-        };
-        assert_eq!(update.component_sequence, 1);
-        let in_flight_revision = registry
-            .sessions
-            .lock()
-            .unwrap()
-            .get("sb-1")
-            .unwrap()
-            .config_sequences
-            .provider_environment
-            .in_flight
-            .as_ref()
-            .unwrap()
-            .revision
-            .clone();
-        assert_eq!(
-            in_flight_revision.component,
-            Some(config_snapshot_revision::Component::ProviderEnvironment(8))
-        );
-
-        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
-        let (replacement_shutdown_tx, _replacement_shutdown_rx) = oneshot::channel();
-        registry.register(
-            "sb-1".into(),
-            "session-2".into(),
-            replacement_tx,
-            replacement_shutdown_tx,
-        );
-        assert!(!registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(bootstrap_revision.clone()),
-                applied_revision: Some(bootstrap_revision),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &bootstrap_fingerprint,
-        ));
-    }
-
-    #[test]
-    fn sandbox_delivery_fingerprint_includes_provider_generation() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
-        let snapshot = SandboxConfigSnapshot {
-            configuration_admitted: true,
-            config_revision: 7,
-            provider_env_revision: 11,
-            provider_attachment_epoch: "epoch-1".into(),
-            policy_hash: "policy-1".into(),
-            ..Default::default()
-        };
-        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
-        let revision = config_message_revision(&message);
-        assert!(registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::SandboxConfig.into(),
-                requested_revision: Some(revision.clone()),
-                applied_revision: Some(revision),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &config_message_fingerprint(&message),
-        ));
-        assert_eq!(
-            registry.deliver_config("sb-1", message),
-            DeliveryDisposition::SuppressedUnchanged
-        );
-        assert_eq!(
-            registry.deliver_config(
-                "sb-1",
-                SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
-                    provider_env_revision: 12,
-                    ..snapshot
-                })),
-            ),
-            DeliveryDisposition::Enqueued
-        );
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    fn provider_delivery_fingerprint_includes_policy_hash_and_attachment_epoch() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(2);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
-        let snapshot = ProviderEnvironmentSnapshot {
-            provider_env_revision: 7,
-            provider_attachment_epoch: "epoch-1".into(),
-            policy_hash: "policy-1".into(),
-            ..Default::default()
-        };
-        let message = SupervisorConfigMessage::ProviderEnvironment(snapshot.clone());
-        let revision = config_message_revision(&message);
-        let fingerprint = config_message_fingerprint(&message);
-        assert!(registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-1",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(revision.clone()),
-                applied_revision: Some(revision),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &fingerprint,
-        ));
-        assert_eq!(
-            registry.deliver_config("sb-1", message),
-            DeliveryDisposition::SuppressedUnchanged
-        );
-
-        let policy_changed =
-            SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
-                policy_hash: "policy-2".into(),
-                ..snapshot.clone()
-            });
-        assert_eq!(
-            registry.deliver_config("sb-1", policy_changed),
-            DeliveryDisposition::Enqueued
-        );
-        assert!(rx.try_recv().is_ok());
-
-        let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
-        let (replacement_shutdown_tx, _replacement_shutdown_rx) = oneshot::channel();
-        registry.register(
-            "sb-1".into(),
-            "session-2".into(),
-            replacement_tx,
-            replacement_shutdown_tx,
-        );
-        let fingerprint = config_message_fingerprint(
-            &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
-        );
-        assert!(registry.acknowledge_bootstrap_component(
-            "sb-1",
-            "session-2",
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(config_message_revision(
-                    &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
-                )),
-                applied_revision: Some(config_message_revision(
-                    &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
-                )),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-            &fingerprint,
-        ));
-        assert_eq!(
-            registry.deliver_config(
-                "sb-1",
-                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
-                    provider_attachment_epoch: "epoch-2".into(),
-                    ..snapshot
-                }),
-            ),
-            DeliveryDisposition::Enqueued
-        );
-        assert!(replacement_rx.try_recv().is_ok());
-    }
-
     #[tokio::test]
-    async fn config_router_assigns_sequences_per_component() {
+    async fn config_router_keeps_the_latest_unsent_snapshot_per_component() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, mut rx) = mpsc::channel(4);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (_tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
+        for expected in [DeliveryDisposition::Queued, DeliveryDisposition::Replaced] {
+            assert_eq!(
+                router
+                    .deliver(
+                        "sb-1",
+                        "session-1",
+                        SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    )
+                    .await,
+                expected
+            );
+        }
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
-                        config_revision: 2,
-                        ..Default::default()
-                    })),
-                )
-                .await,
-            DeliveryDisposition::Enqueued
-        );
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::default()),
-                )
-                .await,
-            DeliveryDisposition::Coalesced
-        );
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::ProviderEnvironment(
                         ProviderEnvironmentSnapshot::default(),
                     ),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::Queued
         );
 
-        let first = rx.recv().await.expect("first config update");
-        let third = rx.recv().await.expect("provider config update");
-        let update = |message: GatewayMessage| match message.payload {
-            Some(gateway_message::Payload::ConfigUpdate(update)) => update,
-            other => panic!("expected config update, got {other:?}"),
-        };
-        let first = update(first);
-        assert_eq!(first.component_sequence, 1);
-        let revision = registry
-            .sessions
-            .lock()
-            .unwrap()
-            .get("sb-1")
-            .unwrap()
-            .config_sequences
-            .sandbox_config
-            .in_flight
-            .as_ref()
-            .unwrap()
-            .revision
-            .clone();
-        let completed = registry
-            .complete_config_update(
-                "sb-1",
-                "session-1",
-                &ConfigUpdateResult {
-                    update_id: first.update_id,
-                    component_sequence: first.component_sequence,
-                    result: Some(ConfigComponentApplyResult {
-                        component: ConfigComponent::SandboxConfig.into(),
-                        requested_revision: Some(revision.clone()),
-                        applied_revision: Some(revision.clone()),
-                        outcome: ConfigApplyOutcome::Applied.into(),
-                        failure: None,
-                    }),
-                    admission: None,
-                },
-            )
-            .unwrap();
-        assert!(registry.finalize_config_update("sb-1", "session-1", &completed, true,));
-        let second = update(rx.recv().await.expect("coalesced config update"));
-        assert_eq!(second.component_sequence, 2);
-        assert_eq!(update(third).component_sequence, 1);
+        let first = outbound.next().await.unwrap().unwrap();
+        let second = outbound.next().await.unwrap().unwrap();
+        assert_eq!(component_sequence(first), (true, 2));
+        assert_eq!(component_sequence(second), (false, 1));
     }
 
     #[tokio::test]
-    async fn config_router_uses_replacement_session() {
+    async fn config_router_never_crosses_into_a_replacement_session() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (old_tx, mut old_rx) = mpsc::channel(2);
-        let (old_shutdown_tx, _old_shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "old-session".into(), old_tx, old_shutdown_tx);
+        let (_old_tx, _old_outbound) = register_push_session(&registry, "sb-1", "old-session");
+        let (_new_tx, mut new_outbound) = register_push_session(&registry, "sb-1", "new-session");
 
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "old-session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::NoActiveSession
         );
-        let old_update = old_rx.recv().await.expect("old-session config update");
-        let Some(gateway_message::Payload::ConfigUpdate(old_update)) = old_update.payload else {
-            panic!("expected config update");
-        };
-        assert_eq!(old_update.component_sequence, 1);
-
-        let (new_tx, mut new_rx) = mpsc::channel(1);
-        let (new_shutdown_tx, _new_shutdown_rx) = oneshot::channel();
-        assert!(registry.register("sb-1".into(), "new-session".into(), new_tx, new_shutdown_tx,));
-
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "new-session",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::Enqueued
+            DeliveryDisposition::Queued
         );
-        assert!(old_rx.try_recv().is_err());
-        let new_update = new_rx.try_recv().expect("new-session config update");
-        let Some(gateway_message::Payload::ConfigUpdate(new_update)) = new_update.payload else {
-            panic!("expected config update");
-        };
-        assert_eq!(new_update.component_sequence, 1);
+        let update = new_outbound.next().await.unwrap().unwrap();
+        assert_eq!(component_sequence(update), (true, 1));
     }
 
     #[tokio::test]
-    async fn config_router_reports_full_and_closed_queues() {
+    async fn config_router_skips_sessions_without_push() {
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, rx) = mpsc::channel(1);
-        tx.try_send(GatewayMessage::default()).unwrap();
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sb-1".into(), "session-1".into(), tx, make_shutdown());
         assert_eq!(
             router
                 .deliver(
                     "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
                 )
                 .await,
-            DeliveryDisposition::QueueFull
-        );
-
-        drop(rx);
-        assert_eq!(
-            router
-                .deliver(
-                    "sb-1",
-                    SupervisorConfigMessage::SandboxConfig(Box::default()),
-                )
-                .await,
-            DeliveryDisposition::SessionClosed
+            DeliveryDisposition::UnsupportedSession
         );
     }
 
     #[tokio::test]
     async fn config_router_rejects_oversized_messages() {
+        use tokio_stream::StreamExt as _;
+
         let registry = Arc::new(SupervisorSessionRegistry::new());
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let (tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
         let snapshot = ProviderEnvironmentSnapshot {
             values: vec![ProviderEnvironmentValue {
@@ -5126,12 +4296,15 @@ mod tests {
             router
                 .deliver(
                     "sb-1",
+                    "session-1",
                     SupervisorConfigMessage::ProviderEnvironment(snapshot),
                 )
                 .await,
             DeliveryDisposition::PayloadTooLarge
         );
-        assert!(rx.try_recv().is_err());
+        drop(tx);
+        registry.remove_if_current("sb-1", "session-1");
+        assert!(outbound.next().await.is_none());
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -5144,6 +4317,172 @@ mod tests {
     /// `register` signature without the receiver noise.
     fn make_shutdown() -> oneshot::Sender<()> {
         oneshot::channel::<()>().0
+    }
+
+    /// Register a streamed-apply session and return its configuration slots.
+    fn register_apply_session(
+        registry: &SupervisorSessionRegistry,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Arc<ConfigSlots> {
+        let (tx, _rx) = mpsc::channel(1);
+        let slots = Arc::new(ConfigSlots::default());
+        registry.register_with_config_slots(
+            sandbox_id.into(),
+            session_id.into(),
+            tx,
+            make_shutdown(),
+            Some(Arc::clone(&slots)),
+            true,
+        );
+        slots
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_owner_release_after_session_leaves_registry() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let owner_index = Arc::new(SupervisorOwnerIndex::new(test_store().await, OWNER_TTL));
+        let lifetime = registry.track_session().unwrap();
+        let owner = owner_index
+            .publish(
+                "sb-1",
+                "old-session",
+                "old-instance",
+                1,
+                "old-replica",
+                "local://old",
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sb-1".into(), "old-session".into(), tx, make_shutdown());
+
+        let (removed_tx, removed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_index = owner_index.clone();
+        let cleanup = tokio::spawn(async move {
+            let _lifetime = lifetime;
+            cleanup_registry.remove_if_current("sb-1", "old-session");
+            removed_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            cleanup_index.release_if_current(&owner).await.unwrap();
+        });
+        removed_rx.await.unwrap();
+        assert!(registry.sessions.lock().unwrap().is_empty());
+
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        assert!(matches!(
+            owner_index
+                .publish(
+                    "sb-1",
+                    "new-session",
+                    "new-instance",
+                    1,
+                    "new-replica",
+                    "local://new"
+                )
+                .await,
+            Err(OwnerError::AlreadyOwned)
+        ));
+
+        release_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        cleanup.await.unwrap();
+        assert!(owner_index.read("sb-1").await.unwrap().is_none());
+        owner_index
+            .publish(
+                "sb-1",
+                "new-session",
+                "new-instance",
+                1,
+                "new-replica",
+                "local://new",
+            )
+            .await
+            .expect("restart can immediately claim ownership after shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_admitted_setup_and_rejects_new_connections() {
+        let registry = SupervisorSessionRegistry::new();
+        // An RPC has been admitted but has not yet registered a live session.
+        let lifetime = registry.track_session().unwrap();
+        registry.close_admission();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        // Closing admission alone must leave stop reporting available.
+        assert!(!*registry.shutdown.borrow());
+
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        // An admitted setup that starts its session loop after cancellation
+        // must still observe the shutdown signal immediately.
+        let mut late_subscriber = registry.shutdown.subscribe();
+        assert!(*late_subscriber.wait_for(|closing| *closing).await.unwrap());
+        drop(lifetime);
+        shutdown.await.unwrap();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_does_not_delete_replacement_owner() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let owner_index = SupervisorOwnerIndex::new(test_store().await, OWNER_TTL);
+        let lifetime = registry.track_session().unwrap();
+        let old = owner_index
+            .publish("sb-1", "old", "instance", 1, "replica-a", "local://a")
+            .await
+            .unwrap();
+        let replacement = owner_index
+            .publish("sb-1", "new", "instance", 2, "replica-b", "local://b")
+            .await
+            .unwrap();
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        owner_index.release_if_current(&old).await.unwrap();
+        drop(lifetime);
+        shutdown.await.unwrap();
+        let persisted = owner_index.read("sb-1").await.unwrap().unwrap();
+        assert_eq!(persisted.session_id, replacement.session_id);
+        assert_eq!(persisted.owner_replica_id, replacement.owner_replica_id);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_bounded_failure_when_cleanup_stalls() {
+        let registry = SupervisorSessionRegistry::new();
+        let lifetime = registry.track_session().unwrap();
+        let error = registry
+            .shutdown(Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.contains("ownership cleanup did not complete"));
+        assert!(*registry.shutdown.borrow());
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        drop(lifetime);
+        registry.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_sessions_completes_and_closes_admission() {
+        let registry = SupervisorSessionRegistry::new();
+        registry.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 
     #[test]
@@ -5212,6 +4551,8 @@ mod tests {
                 service_id: String::new(),
             },
             created_at,
+            delivered_session_id: None,
+            _gauge_slot: GaugeSlot::relay_pending(),
         }
     }
 
@@ -5413,10 +4754,46 @@ mod tests {
         assert_eq!(registry.remove_if_current("sbx", "s1"), Some(true));
     }
 
+    #[test]
+    fn session_gauge_tracks_register_supersede_and_removal() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+
+        registry.register(
+            "sbx-a".to_string(),
+            "s1".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(1));
+        registry.register(
+            "sbx-a".to_string(),
+            "s2".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSIONS),
+            Some(1),
+            "a supersede on the same replica nets zero"
+        );
+        registry.register("sbx-b".to_string(), "s3".to_string(), tx, make_shutdown());
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(2));
+
+        assert_eq!(registry.remove_if_current("sbx-a", "s1"), None);
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(2));
+        assert_eq!(registry.remove_if_current("sbx-a", "s2"), Some(false));
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(1));
+        assert!(registry.disconnect("sbx-b"));
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(0));
+    }
+
     // ---- open_relay: happy path and wait semantics ----
 
     #[tokio::test]
     async fn open_relay_sends_relay_open_to_registered_session() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, mut rx) = mpsc::channel(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
@@ -5434,6 +4811,12 @@ mod tests {
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL),
+            "owner-side registry opens must not count another routing attempt"
+        );
     }
 
     #[tokio::test]
@@ -5474,6 +4857,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_relay_fails_when_session_receiver_dropped() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, rx) = mpsc::channel::<GatewayMessage>(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
@@ -5489,10 +4873,14 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
         // The pending-relay entry must have been cleaned up on failure.
         assert!(registry.pending_relays.lock().unwrap().is_empty());
+        // Queue capacity is reserved before insertion, so no gauge slot was ever taken.
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), None);
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
     }
 
     #[tokio::test]
     async fn open_relay_rejects_when_global_cap_reached() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
         registry.register(
@@ -5523,10 +4911,20 @@ mod tests {
             .expect_err("open_relay should reject once global cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(err.message().contains("gateway relay capacity"));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(256));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn open_relay_rejects_when_per_sandbox_cap_reached() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
         registry.register("sbx".to_string(), "s".to_string(), tx, make_shutdown());
@@ -5548,6 +4946,11 @@ mod tests {
             .expect_err("open_relay should reject when per-sandbox cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(err.message().contains("per-sandbox relay limit"));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(32));
 
         // A different sandbox still has headroom.
         let (tx2, _rx2) = mpsc::channel::<GatewayMessage>(8);
@@ -5561,6 +4964,7 @@ mod tests {
             .open_relay("sbx-other", Duration::from_millis(50))
             .await
             .expect("different sandbox should still accept new relays");
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(33));
     }
 
     #[tokio::test]
@@ -5637,6 +5041,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_relay_attempt_skips_missing_session_without_spending_setup_budget() {
+        let registry = SupervisorSessionRegistry::new();
+        let started = tokio::time::Instant::now();
+        let attempt = registry.open_relay_with_message_until(
+            "missing",
+            RelayOpen {
+                channel_id: "test-channel".into(),
+                ..Default::default()
+            },
+            started + Duration::from_secs(15),
+            false,
+        );
+        tokio::pin!(attempt);
+        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(&mut attempt) else {
+            panic!("local routing must immediately fall back when its session disappears");
+        };
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_setup_deadline_bounds_queue_wait_for_nonwaiting_local_attempt() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register("sbx".into(), "session".into(), tx.clone(), make_shutdown());
+        tx.send(GatewayMessage::default()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let attempt = registry.open_relay_with_message_until(
+            "sbx",
+            RelayOpen {
+                channel_id: "test-channel".into(),
+                ..Default::default()
+            },
+            deadline,
+            false,
+        );
+        tokio::pin!(attempt);
+        // Skipping a missing-session wait must not imply a zero queue budget.
+        assert!(futures_util::poll!(&mut attempt).is_pending());
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(
+            attempt.await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+        rx.recv().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_setup_deadline_is_not_reset_by_reconnects() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register(
+            "sbx".into(),
+            "session-0".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        tx.send(GatewayMessage::default()).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let attempt = registry.open_relay("sbx", Duration::from_secs(9));
+        tokio::pin!(attempt);
+        assert!(futures_util::poll!(&mut attempt).is_pending());
+        for generation in 1..=2 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            let (new_tx, new_rx) = mpsc::channel(1);
+            new_tx.send(GatewayMessage::default()).await.unwrap();
+            registry.register(
+                "sbx".into(),
+                format!("session-{generation}"),
+                new_tx,
+                make_shutdown(),
+            );
+            rx.recv().await.unwrap();
+            assert!(futures_util::poll!(&mut attempt).is_pending());
+            rx = new_rx;
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(
+            attempt.await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(9));
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_does_not_duplicate_forward_opened_after_registration() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (old_channel, _old_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        // Session establishment is paused between registration and replay.
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        let (new_channel, new_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+
+        for expected in [new_channel.clone(), old_channel] {
+            let Some(gateway_message::Payload::RelayOpen(open)) =
+                rx_new.recv().await.unwrap().payload
+            else {
+                panic!("expected RelayOpen");
+            };
+            assert_eq!(open.channel_id, expected);
+        }
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let principal = sandbox_principal("sbx");
+        let _claimed = registry
+            .claim_relay(&new_channel, Some(&principal))
+            .unwrap();
+        assert!(new_relay_rx.await.unwrap().is_ok());
+        assert_eq!(
+            registry
+                .claim_relay(&new_channel, Some(&principal))
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn open_relay_rechecks_session_after_waiting_for_queue_capacity() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(1);
+        registry.register("sbx".into(), "old".into(), tx_old.clone(), make_shutdown());
+        tx_old.send(GatewayMessage::default()).await.unwrap();
+        let open = registry.open_relay("sbx", Duration::from_secs(1));
+        tokio::pin!(open);
+        assert!(futures_util::poll!(&mut open).is_pending());
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        rx_old.recv().await.unwrap();
+        let (channel_id, _relay_rx) = open.await.unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        let Some(gateway_message::Payload::RelayOpen(message)) =
+            rx_new.recv().await.unwrap().payload
+        else {
+            panic!("expected RelayOpen on replacement session");
+        };
+        assert_eq!(message.channel_id, channel_id);
+        assert!(rx_old.try_recv().is_err());
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_after_disconnected_session_was_removed() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (channel_id, relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        assert!(!registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown()));
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        let replayed = rx_new.recv().await.unwrap();
+        let Some(gateway_message::Payload::RelayOpen(open)) = replayed.payload else {
+            panic!("expected replayed RelayOpen");
+        };
+        assert_eq!(open.channel_id, channel_id);
+        let _claimed = registry
+            .claim_relay(&channel_id, Some(&sandbox_principal("sbx")))
+            .unwrap();
+        assert!(relay_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn replay_pending_relays_reissues_open_to_superseding_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
@@ -5672,7 +5270,7 @@ mod tests {
         assert!(superseded);
 
         registry
-            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", "s-new", &registry.lookup_session("sbx").unwrap())
             .await;
 
         let replayed = rx_new
@@ -5775,6 +5373,7 @@ mod tests {
 
     #[test]
     fn claim_relay_success() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5786,10 +5385,86 @@ mod tests {
         let result = registry.claim_relay("ch-1", Some(&principal));
         assert!(result.is_ok());
         assert!(!registry.pending_relays.lock().unwrap().contains_key("ch-1"));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
+    }
+
+    /// Waker that reads `relay_pending` each time it is woken. `oneshot::Sender::send` wakes a
+    /// registered receiver synchronously, so the probe sees the gauge exactly as a waiter on
+    /// another worker thread could at that instant.
+    struct PendingGaugeProbe {
+        read: Box<dyn Fn() -> Option<i64> + Send + Sync>,
+        seen: Mutex<Vec<Option<i64>>>,
+    }
+
+    impl PendingGaugeProbe {
+        fn register<T>(metrics: &MetricsCapture, rx: &mut oneshot::Receiver<T>) -> Arc<Self> {
+            let probe = Arc::new(Self {
+                read: metrics.value_reader(gateway_metrics::RELAY_PENDING),
+                seen: Mutex::new(Vec::new()),
+            });
+            let waker = std::task::Waker::from(Arc::clone(&probe));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(Pin::new(rx).poll(&mut cx).is_pending());
+            probe
+        }
+
+        fn seen(&self) -> Vec<Option<i64>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl std::task::Wake for PendingGaugeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.seen.lock().unwrap().push((self.read)());
+        }
+    }
+
+    #[test]
+    fn claim_relay_releases_pending_slot_before_waking_waiter() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, mut relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-1".to_string(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+        let probe = PendingGaugeProbe::register(&metrics, &mut relay_rx);
+
+        registry
+            .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
+            .expect("claim should succeed");
+        // The slot is released under the pending lock, before the waiter is woken, so a
+        // concurrent open can never push `relay_pending` above capacity.
+        assert_eq!(probe.seen(), vec![Some(0)]);
+    }
+
+    #[test]
+    fn fail_pending_relay_releases_pending_slot_before_waking_waiter() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, mut relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-fail".to_string(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+        let probe = PendingGaugeProbe::register(&metrics, &mut relay_rx);
+
+        assert!(registry.fail_pending_relay("ch-fail", "target refused".to_string()));
+        assert_eq!(probe.seen(), vec![Some(0)]);
     }
 
     #[test]
     fn claim_relay_rejects_cross_sandbox_principal_without_consuming_channel() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5810,6 +5485,11 @@ mod tests {
                 .contains_key("ch-cross"),
             "failed cross-sandbox claim must not consume the channel"
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(1));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            None
+        );
     }
 
     #[test]
@@ -5829,6 +5509,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_open_failure_completes_pending_waiter() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5849,10 +5530,13 @@ mod tests {
         let status = result.expect_err("waiter should receive status failure");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), "target refused");
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
     }
 
     #[test]
     fn claim_relay_expired_returns_deadline_exceeded() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5878,10 +5562,17 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-old")
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), Some(1));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            None
+        );
     }
 
     #[test]
     fn claim_relay_receiver_dropped_returns_internal() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
         drop(relay_rx); // Gateway-side waiter has given up already.
@@ -5894,6 +5585,11 @@ mod tests {
             .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
             .expect_err("should err when receiver is gone");
         assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
     }
 
     #[tokio::test]
@@ -5931,6 +5627,7 @@ mod tests {
 
     #[test]
     fn reap_expired_relays_removes_old_entries() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5952,10 +5649,13 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-old")
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), Some(1));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
     }
 
     #[test]
     fn reap_expired_relays_keeps_fresh_entries() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -5971,6 +5671,9 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-fresh")
         );
+        // Reaping nothing records nothing.
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(1));
     }
 
     fn owner_record(replica: &str) -> crate::supervisor_owner::OwnerRecord {
@@ -6049,6 +5752,630 @@ mod tests {
         assert!(OWNER_CACHE_TTL < OWNER_TTL);
     }
 
+    // ---- peer request metrics (requester side) ----
+
+    #[derive(Clone, Copy)]
+    enum FakePeerReply {
+        Status(tonic::Code),
+        EmptyOk,
+    }
+
+    /// Minimal h2c server that answers every gRPC call the same way. It stands in for an owner
+    /// replica without implementing the full `OpenShell` service.
+    async fn spawn_fake_peer(reply: FakePeerReply) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |_req: http::Request<hyper::body::Incoming>| async move {
+                            Ok::<_, Infallible>(fake_peer_response(reply))
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn fake_peer_response(
+        reply: FakePeerReply,
+    ) -> http::Response<http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>> {
+        let builder = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc");
+        match reply {
+            // Trailers-only error: tonic returns Err(status) for unary and streaming calls.
+            FakePeerReply::Status(code) => builder
+                .header("grpc-status", i32::from(code).to_string())
+                .header("grpc-message", "fake peer")
+                .body(Empty::new().boxed_unsync())
+                .unwrap(),
+            // One empty message (5-byte frame header, zero length), then grpc-status 0. This
+            // decodes as a default response for any unary RPC, and gives streaming calls an OK
+            // header.
+            FakePeerReply::EmptyOk => {
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                let frames = futures::stream::iter([
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(&[0, 0, 0, 0, 0]))),
+                    Ok(Frame::trailers(trailers)),
+                ]);
+                builder
+                    .body(StreamBody::new(frames).boxed_unsync())
+                    .unwrap()
+            }
+        }
+    }
+
+    fn seed_peer_token(state: &ServerState) {
+        *state.peer_routes.token.lock().unwrap() = Some(CachedPeerToken {
+            token: "test-peer-token".to_string(),
+            refresh_at: Instant::now() + Duration::from_mins(5),
+        });
+    }
+
+    fn owner_at(endpoint: &str) -> crate::supervisor_owner::OwnerRecord {
+        let mut owner = owner_record("replica-owner");
+        owner.owner_peer_endpoint = endpoint.to_string();
+        owner
+    }
+
+    fn closed_local_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn peer_relay_open(channel_id: &str) -> RelayOpen {
+        RelayOpen {
+            channel_id: channel_id.to_string(),
+            target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
+            service_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_local_targets_including_legacy_ssh() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, mut rx) = mpsc::channel(4);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        for (target, label, expected) in [
+            (Some(relay_open::Target::Ssh(SshRelayTarget {})), "ssh", 1),
+            (
+                Some(relay_open::Target::Tcp(
+                    openshell_core::proto::TcpRelayTarget {
+                        host: "127.0.0.1".into(),
+                        port: 12345,
+                    },
+                )),
+                "tcp",
+                1,
+            ),
+            (None, "ssh", 2),
+        ] {
+            let relay_open = RelayOpen {
+                target,
+                ..peer_relay_open(&Uuid::new_v4().to_string())
+            };
+            let (channel_id, relay_rx) = open_routed_relay_with_message(
+                &state,
+                "sbx-routing",
+                relay_open.clone(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(channel_id, relay_open.channel_id);
+            assert_eq!(
+                rx.recv().await.unwrap().payload,
+                Some(gateway_message::Payload::RelayOpen(relay_open))
+            );
+            let series = format!(
+                "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"local\",relay_kind=\"{label}\",outcome=\"success\",grpc_code=\"ok\"}}"
+            );
+            // Enqueued but not claimed yet: success waits for the supervisor.
+            assert_eq!(metrics.value(&series).unwrap_or(0), expected - 1);
+            let _claimed = state
+                .supervisor_sessions
+                .claim_relay(&channel_id, None)
+                .unwrap();
+            relay_rx.await.unwrap().unwrap();
+            assert_eq!(metrics.value(&series), Some(expected));
+        }
+        let rendered = metrics.render();
+        assert!(!rendered.contains("route=\"peer\""));
+        for identifier in ["sbx-routing", "session-routing", "127.0.0.1", "12345"] {
+            assert!(
+                !rendered.contains(identifier),
+                "must not label with {identifier}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_failed_local_setup() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the local supervisor disconnected");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",relay_kind=\"ssh\",outcome=\"local_error\",grpc_code=\"unavailable\"}"
+            ),
+            Some(1)
+        );
+        assert!(!metrics.render().contains("route=\"peer\""));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_local_to_peer_fallback() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+        state
+            .peer_routes
+            .store_owner("sbx-routing", &owner_at(&endpoint));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "old-session".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the peer accepts after the local supervisor disconnects");
+        for route in ["local", "peer"] {
+            let (outcome, code) = if route == "local" {
+                ("local_error", "unavailable")
+            } else {
+                ("success", "ok")
+            };
+            assert_eq!(
+                metrics.value(&format!(
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",relay_kind=\"ssh\",outcome=\"{outcome}\",grpc_code=\"{code}\"}}"
+                )),
+                Some(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_peer_targets() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+        state
+            .peer_routes
+            .store_owner("sbx-routing", &owner_at(&endpoint));
+
+        for (target, label) in [
+            (relay_open::Target::Ssh(SshRelayTarget {}), "ssh"),
+            (
+                relay_open::Target::Tcp(openshell_core::proto::TcpRelayTarget {
+                    host: "127.0.0.1".into(),
+                    port: 12345,
+                }),
+                "tcp",
+            ),
+        ] {
+            let (_channel_id, _relay_rx) = open_routed_relay_with_target(
+                &state,
+                "sbx-routing",
+                target,
+                String::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                metrics.value(&format!(
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"peer\",relay_kind=\"{label}\",outcome=\"success\",grpc_code=\"ok\"}}"
+                )),
+                Some(1)
+            );
+        }
+        let rendered = metrics.render();
+        assert!(!rendered.contains("route=\"local\""));
+        assert!(!rendered.contains(endpoint.trim_start_matches("http://")));
+        assert!(!rendered.contains("sbx-routing"));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_each_failed_peer_retry() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::Unavailable)).await;
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sbx-routing",
+                "session",
+                "instance",
+                1,
+                "replica-owner",
+                &endpoint,
+            )
+            .await
+            .unwrap();
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the peer rejects every attempt");
+        let attempts = metrics
+            .value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"ssh\",outcome=\"remote_error\",grpc_code=\"unavailable\"}")
+            .unwrap();
+        assert!(attempts > 1, "the routing loop must have retried");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_request_duration_seconds_count{operation=\"relay\",outcome=\"remote_error\"}"
+            ),
+            Some(attempts)
+        );
+        assert!(!metrics.render().contains("route=\"local\""));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_do_not_count_waiting_for_an_owner() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        open_routed_relay_with_message(
+            &state,
+            "sbx-missing",
+            peer_relay_open("ch-routing"),
+            Duration::from_millis(250),
+        )
+        .await
+        .expect_err("no supervisor or owner is available");
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_cancelled_local_setup_once() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(GatewayMessage::default()).unwrap();
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+        let mut setup = Box::pin(open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(5),
+        ));
+        tokio::select! {
+            result = &mut setup => panic!("setup should wait for queue space: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL)
+        );
+        drop(setup);
+        assert_eq!(
+            metrics.value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",relay_kind=\"ssh\",outcome=\"local_error\",grpc_code=\"cancelled\"}"),
+            Some(1)
+        );
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::PEER_REQUEST_DURATION_SECONDS)
+        );
+    }
+
+    const LOCAL_RELAY_SERIES: &str = "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",relay_kind=\"ssh\"";
+
+    fn local_relay_outcome(metrics: &MetricsCapture, outcome: &str, code: &str) -> Option<i64> {
+        metrics.value(&format!(
+            "{LOCAL_RELAY_SERIES},outcome=\"{outcome}\",grpc_code=\"{code}\"}}"
+        ))
+    }
+
+    type RelayClaim = Result<tokio::io::DuplexStream, Status>;
+
+    fn tracked_local_relay() -> (oneshot::Sender<RelayClaim>, oneshot::Receiver<RelayClaim>) {
+        let (claim_tx, claim_rx) = oneshot::channel();
+        let timer = RoutedRequestTimer::relay(RelayKind::Ssh, RelayRoute::Local);
+        (claim_tx, track_local_relay_claim(timer, claim_rx))
+    }
+
+    #[tokio::test]
+    async fn local_relay_claim_records_success_once() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        let (stream, _peer) = tokio::io::duplex(64);
+        claim_tx.send(Ok(stream)).unwrap();
+        forwarded.await.unwrap().unwrap();
+        assert_eq!(local_relay_outcome(&metrics, "success", "ok"), Some(1));
+        assert!(!metrics.render().contains("local_error"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_relay_unclaimed_in_window_records_deadline_exceeded_once() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        tokio::time::sleep(RELAY_PENDING_TIMEOUT + Duration::from_millis(1)).await;
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "deadline_exceeded"),
+            Some(1)
+        );
+        // A late answer still reaches the caller without a second count.
+        claim_tx
+            .send(Err(Status::unavailable("supervisor gone")))
+            .unwrap();
+        let answer = forwarded.await.unwrap();
+        assert_eq!(answer.unwrap_err().code(), tonic::Code::Unavailable);
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "unavailable"),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_relay_caller_timeout_counts_as_unclaimed_not_cancelled() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        // Callers wait with the same 10 s budget and drop the receiver when it runs out.
+        assert!(
+            tokio::time::timeout(RELAY_PENDING_TIMEOUT, forwarded)
+                .await
+                .is_err()
+        );
+        while !claim_tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "deadline_exceeded"),
+            Some(1)
+        );
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "cancelled"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn local_relay_failed_by_registry_records_its_status() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        claim_tx
+            .send(Err(Status::unavailable("supervisor session disconnected")))
+            .unwrap();
+        assert_eq!(
+            forwarded.await.unwrap().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "unavailable"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_relay_dropped_by_registry_closes_the_caller_channel() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        drop(claim_tx);
+        assert!(
+            forwarded.await.is_err(),
+            "the caller sees the same closed channel"
+        );
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "unavailable"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_relay_abandoned_by_caller_records_cancelled() {
+        let metrics = MetricsCapture::install();
+        let (claim_tx, forwarded) = tracked_local_relay();
+        drop(forwarded);
+        while !claim_tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            local_relay_outcome(&metrics, "local_error", "cancelled"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_relay_metrics_keep_owner_code_before_unavailable_remap() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::ResourceExhausted)).await;
+
+        let err = connect_peer_relay(&state, &endpoint, "sbx-peer", peer_relay_open("ch-peer"))
+            .await
+            .expect_err("the owner rejected the relay");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"ssh\",outcome=\"remote_error\",grpc_code=\"resource_exhausted\"}"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_request_duration_seconds_count{operation=\"relay\",outcome=\"remote_error\"}"
+            ),
+            Some(1)
+        );
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "openshell_server_peer_request_duration_seconds_bucket{operation=\"relay\",outcome=\"remote_error\",le=\"0.001\"}"
+        ));
+        assert!(
+            !state
+                .peer_routes
+                .channels
+                .lock()
+                .unwrap()
+                .contains_key(&endpoint),
+            "a failed peer relay must evict the channel"
+        );
+        let host_port = endpoint.trim_start_matches("http://");
+        assert!(
+            !rendered.contains(host_port),
+            "metrics must not carry peer endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_relay_metrics_record_ok_when_owner_accepts() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+
+        connect_peer_relay(&state, &endpoint, "sbx-peer", peer_relay_open("ch-peer"))
+            .await
+            .expect("the owner accepted the relay");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"ssh\",outcome=\"success\",grpc_code=\"ok\"}"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_local_error_when_owner_unreachable() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = closed_local_endpoint();
+
+        let err = forward_provider_status_query_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            "sbx-peer",
+            GetSandboxProviderStatusRequest::default(),
+        )
+        .await
+        .expect_err("the owner is unreachable");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"get_sandbox_provider_status\",route=\"peer\",relay_kind=\"none\",outcome=\"local_error\",grpc_code=\"unavailable\"}"
+            ),
+            Some(1)
+        );
+        assert!(
+            !metrics
+                .render()
+                .contains("operation=\"get_sandbox_provider_status\",outcome=\"remote_error\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_owner_remote_error_code() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::PermissionDenied)).await;
+
+        let err = forward_endpoint_status_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            ReportEndpointStatusRequest {
+                sandbox_id: "sbx-peer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the owner rejected the report");
+        // Unary forwarders return the owner's status unchanged.
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"report_endpoint_status\",route=\"peer\",relay_kind=\"none\",outcome=\"remote_error\",grpc_code=\"permission_denied\"}"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_ok() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+
+        forward_provider_readiness_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            ReportProviderReadinessRequest {
+                sandbox_id: "sbx-peer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the owner accepted the report");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"report_provider_readiness\",route=\"peer\",relay_kind=\"none\",outcome=\"success\",grpc_code=\"ok\"}"
+            ),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn evict_channel_removes_only_the_named_peer() {
         let cache = PeerRouteCache::default();
@@ -6064,5 +6391,1218 @@ mod tests {
         let channels = cache.channels.lock().unwrap();
         assert!(!channels.contains_key("http://10.0.0.1:8080"));
         assert!(channels.contains_key("http://10.0.0.2:8080"));
+    }
+
+    async fn push_state() -> Arc<ServerState> {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+        state
+    }
+
+    async fn push_state_with_sandbox(sandbox_id: &str) -> Arc<ServerState> {
+        let state = push_state().await;
+        state
+            .store
+            .put_message(&sandbox_record(sandbox_id, sandbox_id))
+            .await
+            .unwrap();
+        state
+    }
+
+    fn applied_bootstrap_result(bootstrap: &ConfigBootstrap) -> ConfigBootstrapResult {
+        let sandbox = bootstrap
+            .sandbox_config
+            .as_ref()
+            .expect("sandbox bootstrap component");
+        let provider = bootstrap
+            .provider_environment
+            .as_ref()
+            .expect("provider bootstrap component");
+        let sandbox_revision = config_message_revision(&SupervisorConfigMessage::SandboxConfig(
+            Box::new(sandbox.clone()),
+        ));
+        let provider_revision = config_message_revision(
+            &SupervisorConfigMessage::ProviderEnvironment(provider.clone()),
+        );
+        ConfigBootstrapResult {
+            results: vec![
+                ConfigComponentApplyResult {
+                    component: ConfigComponent::SandboxConfig.into(),
+                    requested_revision: Some(sandbox_revision.clone()),
+                    applied_revision: Some(sandbox_revision),
+                    outcome: ConfigApplyOutcome::Applied.into(),
+                    ..Default::default()
+                },
+                ConfigComponentApplyResult {
+                    component: ConfigComponent::ProviderEnvironment.into(),
+                    requested_revision: Some(provider_revision.clone()),
+                    applied_revision: Some(provider_revision),
+                    outcome: ConfigApplyOutcome::Applied.into(),
+                    ..Default::default()
+                },
+            ],
+            admission: Some(expected_configuration_admission(sandbox)),
+        }
+    }
+
+    #[test]
+    fn bootstrap_acknowledgement_does_not_replace_newer_delivery_state() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let bootstrap_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(7)),
+        };
+        let bootstrap_fingerprint = ConfigSnapshotFingerprint::ProviderEnvironment {
+            provider_env_revision: 7,
+            provider_attachment_epoch: String::new(),
+            policy_hash: String::new(),
+        };
+
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                "session-1",
+                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                    provider_env_revision: 8,
+                    ..Default::default()
+                }),
+            ),
+            DeliveryDisposition::Queued
+        );
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(bootstrap_revision.clone()),
+                applied_revision: Some(bootstrap_revision.clone()),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &bootstrap_fingerprint,
+        ));
+
+        let message = slots.take_for_test().ok_or(()).expect("newer update");
+        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+            panic!("expected config update");
+        };
+        assert_eq!(update.component_sequence, 1);
+        let in_flight_revision = registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get("sb-1")
+            .unwrap()
+            .config_sequences
+            .provider_environment
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        assert_eq!(
+            in_flight_revision.component,
+            Some(config_snapshot_revision::Component::ProviderEnvironment(8))
+        );
+
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let (replacement_shutdown_tx, _replacement_shutdown_rx) = oneshot::channel();
+        registry.register(
+            "sb-1".into(),
+            "session-2".into(),
+            replacement_tx,
+            replacement_shutdown_tx,
+        );
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(bootstrap_revision.clone()),
+                applied_revision: Some(bootstrap_revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &bootstrap_fingerprint,
+        ));
+    }
+
+    #[test]
+    fn bootstrap_acknowledgement_suppresses_unchanged_reconciliation() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let snapshot = SandboxConfigSnapshot {
+            config_revision: 7,
+            version: 11,
+            ..Default::default()
+        };
+        let revision = config_message_revision(&SupervisorConfigMessage::SandboxConfig(Box::new(
+            snapshot.clone(),
+        )));
+        let fingerprint = config_message_fingerprint(&SupervisorConfigMessage::SandboxConfig(
+            Box::new(snapshot.clone()),
+        ));
+
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: None,
+                outcome: ConfigApplyOutcome::FailedClosed.into(),
+                ..Default::default()
+            },
+            &fingerprint,
+        ));
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &fingerprint,
+        ));
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                "session-1",
+                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
+            ),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+        assert!(slots.take_for_test().ok_or(()).is_err());
+    }
+
+    #[test]
+    fn bootstrap_requires_every_delivered_component_to_succeed() {
+        let sandbox_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::SandboxConfig(
+                SandboxConfigRevision {
+                    config_revision: 7,
+                    ..Default::default()
+                },
+            )),
+        };
+        let provider_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
+        };
+        let expected = vec![
+            (
+                ConfigComponent::SandboxConfig,
+                sandbox_revision.clone(),
+                ConfigSnapshotFingerprint::Sandbox {
+                    revision: sandbox_revision.clone(),
+                    provider_env_revision: 0,
+                    provider_attachment_epoch: String::new(),
+                    policy_hash: String::new(),
+                },
+            ),
+            (
+                ConfigComponent::ProviderEnvironment,
+                provider_revision.clone(),
+                ConfigSnapshotFingerprint::ProviderEnvironment {
+                    provider_env_revision: 9,
+                    provider_attachment_epoch: String::new(),
+                    policy_hash: String::new(),
+                },
+            ),
+        ];
+        let result =
+            |component: ConfigComponent,
+             revision: ConfigSnapshotRevision,
+             outcome: ConfigApplyOutcome| ConfigComponentApplyResult {
+                component: component.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: outcome.into(),
+                ..Default::default()
+            };
+        let mut results = vec![
+            result(
+                ConfigComponent::SandboxConfig,
+                sandbox_revision,
+                ConfigApplyOutcome::Applied,
+            ),
+            result(
+                ConfigComponent::ProviderEnvironment,
+                provider_revision,
+                ConfigApplyOutcome::Degraded,
+            ),
+        ];
+        assert!(validate_bootstrap_result(&results, &expected).unwrap());
+
+        results[1].outcome = ConfigApplyOutcome::FailedClosed.into();
+        results[1].applied_revision = None;
+        assert!(!validate_bootstrap_result(&results, &expected).unwrap());
+        assert!(validate_bootstrap_result(&results[..1], &expected).is_err());
+        results[1].requested_revision = Some(ConfigSnapshotRevision::default());
+        assert!(validate_bootstrap_result(&results, &expected).is_err());
+    }
+
+    #[tokio::test]
+    async fn component_apply_result_persists_compact_observed_state() {
+        let state = push_state_with_sandbox("sb-observed").await;
+        let requested_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(11)),
+        };
+        let applied_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
+        };
+        record_component_apply_result(
+            &state,
+            "sb-observed",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(requested_revision),
+                applied_revision: Some(applied_revision),
+                outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood.into(),
+                failure: Some(openshell_core::proto::ConfigApplyFailure {
+                    message: "x".repeat(2_000),
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let observation = state
+            .store
+            .get_message::<StoredConfigComponentObservation>("sb-observed:provider_environment")
+            .await
+            .unwrap()
+            .expect("component observation");
+        assert_eq!(observation.sandbox_id, "sb-observed");
+        assert_eq!(
+            observation.component,
+            ConfigComponent::ProviderEnvironment as i32
+        );
+        assert_eq!(
+            observation.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood as i32
+        );
+        assert_eq!(observation.effective_source, "last_known_good");
+        assert_eq!(observation.sanitized_error.len(), 1_024);
+        assert!(observation.observed_at_time.is_some());
+    }
+
+    #[test]
+    fn configuration_admission_preserves_gateway_rejection_and_accepts_repair() {
+        use openshell_core::proto::ConfigurationAdmissionState;
+
+        let mut expected = SandboxConfigurationAdmission {
+            instance_id: "configuration-1".into(),
+            state: ConfigurationAdmissionState::Rejected.into(),
+            policy_version: 3,
+            policy_hash: "policy-hash".into(),
+            config_revision: 7,
+            provider_env_revision: 5,
+            error: "invalid image policy".into(),
+        };
+        let rejected = validate_configuration_admission(
+            Some(&expected),
+            &expected,
+            ConfigApplyOutcome::Applied,
+        )
+        .unwrap();
+        assert_eq!(rejected, expected);
+
+        expected.state = ConfigurationAdmissionState::Accepted.into();
+        expected.error.clear();
+        let accepted = validate_configuration_admission(
+            Some(&expected),
+            &expected,
+            ConfigApplyOutcome::Applied,
+        )
+        .unwrap();
+        assert_eq!(accepted, expected);
+    }
+
+    #[tokio::test]
+    async fn failed_admission_persistence_does_not_suppress_unchanged_repair() {
+        let sandbox_id = "sb-admission-persistence-retry";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        let (tx, _rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let slots = Arc::new(ConfigSlots::default());
+        state.supervisor_sessions.register_with_config_slots(
+            sandbox_id.into(),
+            "session-1".into(),
+            tx.clone(),
+            shutdown_tx,
+            Some(Arc::clone(&slots)),
+            true,
+        );
+        let snapshot = SandboxConfigSnapshot {
+            configuration_instance_id: "configuration-1".into(),
+            configuration_admitted: true,
+            config_revision: 7,
+            version: 3,
+            policy_hash: "policy-hash".into(),
+            provider_env_revision: 5,
+            ..Default::default()
+        };
+        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
+        assert_eq!(
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
+            DeliveryDisposition::Queued
+        );
+        let Some(gateway_message::Payload::ConfigUpdate(update)) =
+            slots.take_for_test().expect("initial update").payload
+        else {
+            panic!("expected initial config update");
+        };
+        let revision = config_message_revision(&message);
+        *FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX.lock().unwrap() = Some(sandbox_id.into());
+
+        handle_supervisor_message(
+            &state,
+            sandbox_id,
+            "session-1",
+            "instance-1",
+            true,
+            &[],
+            &tx,
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    ConfigUpdateResult {
+                        update_id: update.update_id,
+                        component_sequence: update.component_sequence,
+                        result: Some(ConfigComponentApplyResult {
+                            component: ConfigComponent::SandboxConfig.into(),
+                            requested_revision: Some(revision.clone()),
+                            applied_revision: Some(revision),
+                            outcome: ConfigApplyOutcome::Applied.into(),
+                            ..Default::default()
+                        }),
+                        admission: Some(expected_configuration_admission(&snapshot)),
+                    },
+                )),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message),
+            DeliveryDisposition::Queued,
+            "a non-durable admission must leave the revision eligible for repair"
+        );
+        assert!(matches!(
+            slots.take_for_test().expect("repair update").payload,
+            Some(gateway_message::Payload::ConfigUpdate(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn generation_pending_result_schedules_reconciliation_without_persistence() {
+        use openshell_core::proto::{ConfigApplyFailure, ConfigurationAdmissionState};
+
+        let sandbox_id = "sb-generation-pending-retry";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        let mut stored_sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox is persisted");
+        stored_sandbox.spec = Some(SandboxSpec::default());
+        state.store.put_message(&stored_sandbox).await.unwrap();
+        let mut session = crate::config_delivery::register_test_apply_session(
+            &state,
+            &stored_sandbox,
+            "session-1",
+        );
+        let tx = session.control.clone();
+        SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL)
+            .publish(
+                sandbox_id,
+                "session-1",
+                "instance-1",
+                1,
+                &state.replica_id,
+                &local_owner_endpoint(&state.replica_id),
+            )
+            .await
+            .unwrap();
+        let snapshot = SandboxConfigSnapshot {
+            configuration_instance_id: "configuration-1".into(),
+            configuration_admitted: true,
+            config_revision: 7,
+            version: 3,
+            policy_hash: "policy-hash".into(),
+            provider_env_revision: 5,
+            ..Default::default()
+        };
+        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
+        assert_eq!(
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
+            DeliveryDisposition::Queued
+        );
+        let Some(gateway_message::Payload::ConfigUpdate(update)) =
+            tokio_stream::StreamExt::next(&mut session.outbound)
+                .await
+                .expect("initial update")
+                .expect("outbound frame")
+                .payload
+        else {
+            panic!("expected initial config update");
+        };
+        let revision = config_message_revision(&message);
+        let mut rejected_admission = expected_configuration_admission(&snapshot);
+        rejected_admission.state = ConfigurationAdmissionState::Rejected.into();
+        rejected_admission.error = "effective configuration could not be activated".into();
+
+        handle_supervisor_message(
+            &state,
+            sandbox_id,
+            "session-1",
+            "instance-1",
+            true,
+            &[],
+            &tx,
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    ConfigUpdateResult {
+                        update_id: update.update_id,
+                        component_sequence: update.component_sequence,
+                        result: Some(ConfigComponentApplyResult {
+                            component: ConfigComponent::SandboxConfig.into(),
+                            requested_revision: Some(revision),
+                            applied_revision: None,
+                            outcome: ConfigApplyOutcome::FailedClosed.into(),
+                            failure: Some(ConfigApplyFailure {
+                                code: "generation_mismatch".into(),
+                                message: "waiting for matching provider generation".into(),
+                                retryable: true,
+                            }),
+                        }),
+                        admission: Some(rejected_admission),
+                    },
+                )),
+            },
+        )
+        .await;
+
+        assert!(
+            state
+                .store
+                .get_message::<StoredConfigComponentObservation>(
+                    "sb-generation-pending-retry:sandbox_config",
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a transient cross-component ordering result must not become durable state"
+        );
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox remains persisted");
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.configuration_admission.as_ref())
+                .is_none(),
+            "a transient generation mismatch must not persist rejected admission"
+        );
+        let redriven_components = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut components = Vec::new();
+            while components.len() < 2 {
+                let Some(gateway_message::Payload::ConfigUpdate(update)) =
+                    tokio_stream::StreamExt::next(&mut session.outbound)
+                        .await
+                        .expect("redriven configuration update")
+                        .expect("outbound frame")
+                        .payload
+                else {
+                    continue;
+                };
+                components.push(match update.component.expect("redriven component") {
+                    config_update::Component::SandboxConfig(_) => ConfigComponent::SandboxConfig,
+                    config_update::Component::ProviderEnvironment(_) => {
+                        ConfigComponent::ProviderEnvironment
+                    }
+                });
+            }
+            components
+        })
+        .await
+        .expect("generation mismatch schedules prompt reconciliation");
+        assert!(redriven_components.contains(&ConfigComponent::SandboxConfig));
+        assert!(redriven_components.contains(&ConfigComponent::ProviderEnvironment));
+    }
+
+    #[tokio::test]
+    async fn invalid_image_policy_waits_for_gateway_repair_on_same_stream() {
+        use openshell_core::proto::image_policy_discovery::Result as DiscoveryResult;
+
+        let sandbox_id = "sb-invalid-image-repair";
+        let state = state_with_startup_policy(sandbox_id, None).await;
+        let connecting_state = Arc::clone(&state);
+        let connection = tokio::spawn(async move {
+            crate::grpc::test_support::connect_supervisor_stream_with_image_policy_discovery(
+                &connecting_state,
+                sandbox_id,
+                StreamFeatures::Apply,
+                openshell_core::proto::ImagePolicyDiscovery {
+                    result: Some(DiscoveryResult::Invalid(())),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !connection.is_finished(),
+            "invalid image policy must keep the startup stream pending"
+        );
+
+        let repaired_policy = openshell_policy::restrictive_default_policy();
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        sandbox.spec.get_or_insert_default().policy = Some(repaired_policy.clone());
+        state.store.put_message(&sandbox).await.unwrap();
+        state.sandbox_watch_bus.notify(sandbox_id);
+
+        let mut harness = tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("repair resumes the pending stream")
+            .expect("connection task")
+            .expect("supervisor connects after repair");
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected StartupConfigCandidate after repair");
+        };
+        assert_eq!(candidate.policy.as_ref(), Some(&repaired_policy));
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::Unchanged(())),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_gateway_message(&mut harness).await.payload,
+            Some(gateway_message::Payload::SessionAccepted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_prepared_policy_rejects_session_without_acceptance() {
+        let image_policy = openshell_policy::restrictive_default_policy();
+        let mut invalid_policy = image_policy.clone();
+        invalid_policy
+            .filesystem
+            .get_or_insert_default()
+            .read_only
+            .push("relative/path".into());
+        let state = state_with_startup_policy("sb-startup-invalid", None).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
+            &state,
+            "sb-startup-invalid",
+            StreamFeatures::Apply,
+            Some(image_policy),
+        )
+        .await
+        .expect("supervisor must connect");
+
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected StartupConfigCandidate");
+        };
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::PreparedPolicy(
+                            invalid_policy,
+                        )),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        let Some(gateway_message::Payload::SessionRejected(rejected)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("invalid preparation must reject without accepting the session");
+        };
+        assert!(rejected.reason.contains("policy"));
+    }
+
+    #[tokio::test]
+    async fn persisted_bootstrap_result_suppresses_unchanged_reconciliation() {
+        let state = push_state_with_sandbox("sb-bootstrap-ack").await;
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let slots = Arc::new(ConfigSlots::default());
+        state.supervisor_sessions.register_with_config_slots(
+            "sb-bootstrap-ack".into(),
+            "session-1".into(),
+            tx.clone(),
+            shutdown_tx,
+            Some(Arc::clone(&slots)),
+            true,
+        );
+        let snapshot = ProviderEnvironmentSnapshot {
+            provider_env_revision: 11,
+            ..Default::default()
+        };
+        let revision = config_message_revision(&SupervisorConfigMessage::ProviderEnvironment(
+            snapshot.clone(),
+        ));
+        let result = ConfigComponentApplyResult {
+            component: ConfigComponent::ProviderEnvironment.into(),
+            requested_revision: Some(revision.clone()),
+            applied_revision: Some(revision.clone()),
+            outcome: ConfigApplyOutcome::Applied.into(),
+            ..Default::default()
+        };
+
+        handle_supervisor_message(
+            &state,
+            "sb-bootstrap-ack",
+            "session-1",
+            "instance-1",
+            true,
+            &[(
+                ConfigComponent::ProviderEnvironment,
+                revision.clone(),
+                config_message_fingerprint(&SupervisorConfigMessage::ProviderEnvironment(
+                    snapshot.clone(),
+                )),
+            )],
+            &tx,
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
+                    ConfigBootstrapResult {
+                        results: vec![result],
+                        admission: None,
+                    },
+                )),
+            },
+        )
+        .await;
+
+        let observation = state
+            .store
+            .get_message::<StoredConfigComponentObservation>(
+                "sb-bootstrap-ack:provider_environment",
+            )
+            .await
+            .unwrap()
+            .expect("bootstrap observation");
+        assert_eq!(observation.requested_revision, Some(revision.clone()));
+        assert_eq!(
+            state.supervisor_sessions.deliver_config(
+                "sb-bootstrap-ack",
+                "session-1",
+                SupervisorConfigMessage::ProviderEnvironment(snapshot),
+            ),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+        assert!(slots.take_for_test().ok_or(()).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_policy_is_validated_and_returned_in_fresh_bootstrap() {
+        let image_policy = openshell_policy::restrictive_default_policy();
+        let mut prepared_policy = image_policy.clone();
+        prepared_policy
+            .filesystem
+            .get_or_insert_default()
+            .read_only
+            .push("/prepared-path".into());
+        let state = state_with_startup_policy("sb-startup-prepared", None).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
+            &state,
+            "sb-startup-prepared",
+            StreamFeatures::Apply,
+            Some(image_policy),
+        )
+        .await
+        .expect("supervisor must connect");
+
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected StartupConfigCandidate");
+        };
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::PreparedPolicy(
+                            prepared_policy.clone(),
+                        )),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert_eq!(
+            accepted
+                .bootstrap
+                .and_then(|bootstrap| bootstrap.sandbox_config)
+                .and_then(|snapshot| snapshot.policy),
+            Some(prepared_policy)
+        );
+    }
+
+    #[test]
+    fn provider_delivery_fingerprint_includes_policy_hash_and_attachment_epoch() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let snapshot = ProviderEnvironmentSnapshot {
+            provider_env_revision: 7,
+            provider_attachment_epoch: "epoch-1".into(),
+            policy_hash: "policy-1".into(),
+            ..Default::default()
+        };
+        let message = SupervisorConfigMessage::ProviderEnvironment(snapshot.clone());
+        let revision = config_message_revision(&message);
+        let fingerprint = config_message_fingerprint(&message);
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &fingerprint,
+        ));
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", message),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+
+        let policy_changed =
+            SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                policy_hash: "policy-2".into(),
+                ..snapshot.clone()
+            });
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", policy_changed),
+            DeliveryDisposition::Queued
+        );
+        assert!(slots.take_for_test().ok_or(()).is_ok());
+
+        let replacement_slots = register_apply_session(&registry, "sb-1", "session-2");
+        let fingerprint = config_message_fingerprint(
+            &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
+        );
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-2",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(config_message_revision(
+                    &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
+                )),
+                applied_revision: Some(config_message_revision(
+                    &SupervisorConfigMessage::ProviderEnvironment(snapshot.clone()),
+                )),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &fingerprint,
+        ));
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                "session-2",
+                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                    provider_attachment_epoch: "epoch-2".into(),
+                    ..snapshot
+                }),
+            ),
+            DeliveryDisposition::Queued
+        );
+        assert!(replacement_slots.take_for_test().ok_or(()).is_ok());
+    }
+
+    async fn report_bootstrap_and_runtime_ready(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
+        bootstrap: &ConfigBootstrap,
+    ) {
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
+                    applied_bootstrap_result(bootstrap),
+                )),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_gateway_message(harness).await.payload,
+            Some(gateway_message::Payload::ConfigurationAdmission(_))
+        ));
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::RuntimeReady(
+                    openshell_core::proto::SupervisorRuntimeReady {},
+                )),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.supervisor_sessions.is_runtime_ready(sandbox_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime readiness before timeout");
+    }
+
+    #[tokio::test]
+    async fn apply_reconnect_skips_startup_preparation_and_restores_readiness() {
+        let sandbox_id = "sb-reconnect-no-preparation";
+        let policy = openshell_policy::restrictive_default_policy();
+        let state = state_with_startup_policy(sandbox_id, Some(policy)).await;
+        let mut initial = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("initial supervisor connection");
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut initial).await.payload
+        else {
+            panic!("initial session must prepare the startup policy");
+        };
+        initial
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::Unchanged(())),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut initial).await.payload
+        else {
+            panic!("expected initial SessionAccepted");
+        };
+        let bootstrap = accepted.bootstrap.expect("initial authoritative bootstrap");
+        report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut initial, &bootstrap).await;
+        drop(initial);
+
+        let mut reconnect = crate::grpc::test_support::reconnect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("stock supervisor reconnect");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut reconnect).await.payload
+        else {
+            panic!("reconnect must proceed directly to SessionAccepted");
+        };
+        let bootstrap = accepted
+            .bootstrap
+            .expect("reconnect authoritative bootstrap");
+        report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut reconnect, &bootstrap).await;
+    }
+
+    #[test]
+    fn sandbox_delivery_fingerprint_includes_provider_generation() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let snapshot = SandboxConfigSnapshot {
+            configuration_admitted: true,
+            config_revision: 7,
+            provider_env_revision: 11,
+            provider_attachment_epoch: "epoch-1".into(),
+            policy_hash: "policy-1".into(),
+            ..Default::default()
+        };
+        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
+        let revision = config_message_revision(&message);
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+            &config_message_fingerprint(&message),
+        ));
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", message),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                "session-1",
+                SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
+                    provider_env_revision: 12,
+                    ..snapshot
+                })),
+            ),
+            DeliveryDisposition::Queued
+        );
+        assert!(slots.take_for_test().ok_or(()).is_ok());
+    }
+
+    #[test]
+    fn shadow_session_updates_are_not_held_for_acknowledgement() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let slots = Arc::new(ConfigSlots::default());
+        registry.register_with_config_slots(
+            "sb-1".into(),
+            "session-1".into(),
+            tx,
+            make_shutdown(),
+            Some(Arc::clone(&slots)),
+            false,
+        );
+        let update = |revision| {
+            SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                provider_env_revision: revision,
+                ..Default::default()
+            })
+        };
+
+        // Shadow supervisors never acknowledge, so a newer snapshot replaces
+        // the unsent one instead of waiting behind it.
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", update(1)),
+            DeliveryDisposition::Queued
+        );
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", update(2)),
+            DeliveryDisposition::Replaced
+        );
+        let Some(gateway_message::Payload::ConfigUpdate(sent)) =
+            slots.take_for_test().expect("latest update").payload
+        else {
+            panic!("expected config update");
+        };
+        assert_eq!(
+            sent.component,
+            Some(config_update::Component::ProviderEnvironment(
+                ProviderEnvironmentSnapshot {
+                    provider_env_revision: 2,
+                    ..Default::default()
+                }
+            ))
+        );
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", update(3)),
+            DeliveryDisposition::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_mode_gateway_does_not_enable_apply() {
+        let state = state_with_sandbox("sb-poll-apply").await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-poll-apply",
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("apply-capable supervisor connects in poll mode");
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted without a startup candidate");
+        };
+        assert!(!accepted.config_apply_enabled);
+        assert!(accepted.bootstrap.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_only_supervisor_keeps_polling() {
+        let state = push_state_with_sandbox("sb-stage-one").await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-stage-one",
+            StreamFeatures::Snapshots,
+        )
+        .await
+        .expect("Stage 1 supervisor must connect");
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert!(!accepted.config_apply_enabled);
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-stage-one", &accepted.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_candidate_prefers_gateway_policy_and_accepts_unchanged_result() {
+        let gateway_policy = openshell_policy::restrictive_default_policy();
+        let mut image_policy = gateway_policy.clone();
+        image_policy
+            .filesystem
+            .get_or_insert_default()
+            .read_only
+            .push("/image-only".into());
+        let state =
+            state_with_startup_policy("sb-startup-gateway", Some(gateway_policy.clone())).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
+            &state,
+            "sb-startup-gateway",
+            StreamFeatures::Apply,
+            Some(image_policy),
+        )
+        .await
+        .expect("supervisor must connect");
+
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected StartupConfigCandidate");
+        };
+        assert_eq!(candidate.policy.as_ref(), Some(&gateway_policy));
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::Unchanged(())),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert_eq!(
+            accepted
+                .bootstrap
+                .and_then(|bootstrap| bootstrap.sandbox_config)
+                .and_then(|snapshot| snapshot.policy),
+            Some(gateway_policy)
+        );
+    }
+
+    async fn state_with_startup_policy(
+        sandbox_id: &str,
+        policy: Option<openshell_core::proto::SandboxPolicy>,
+    ) -> Arc<ServerState> {
+        let state = push_state().await;
+        let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
+        sandbox.spec = Some(SandboxSpec {
+            policy,
+            ..SandboxSpec::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn unchanged_image_policy_is_persisted_before_session_acceptance() {
+        let image_policy = openshell_policy::restrictive_default_policy();
+        let state = state_with_startup_policy("sb-startup-image", None).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_image_policy(
+            &state,
+            "sb-startup-image",
+            StreamFeatures::Apply,
+            Some(image_policy.clone()),
+        )
+        .await
+        .expect("supervisor must connect");
+
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected StartupConfigCandidate");
+        };
+        assert_eq!(candidate.policy.as_ref(), Some(&image_policy));
+        assert_eq!(candidate.policy_version, 0);
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(startup_config_prepared::Result::Unchanged(())),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        let snapshot = accepted
+            .bootstrap
+            .and_then(|bootstrap| bootstrap.sandbox_config)
+            .expect("authoritative sandbox snapshot");
+        assert_eq!(snapshot.policy, Some(image_policy));
+        assert_eq!(snapshot.version, 1);
     }
 }

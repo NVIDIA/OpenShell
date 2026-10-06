@@ -3,7 +3,7 @@ name: Windows MSVC
 on:
   push:
     branches:
-      - main
+      - windows
       - "pull-request/[0-9]+"
   workflow_dispatch:
 
@@ -27,12 +27,12 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ github.ref == 'refs/heads/main' || steps.gate.outputs.should_run == 'true' }}
+      should_run: ${{ github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
-        if: github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/windows'
         uses: ./.github/actions/pr-gate
         with:
           required_label: test:windows
@@ -42,7 +42,7 @@ jobs:
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
-      github.ref != 'refs/heads/main' &&
+      github.ref != 'refs/heads/windows' &&
       github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -104,12 +104,12 @@ jobs:
 
   cache-seed:
     name: Seed cache (${{ matrix.arch }})
-    # Keep main/manual Windows validation advisory while the lane matures.
+    # Keep release-branch Windows validation advisory while the lane matures.
     continue-on-error: true
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
-      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+      github.ref == 'refs/heads/windows'
     strategy:
       fail-fast: false
       matrix:
@@ -155,8 +155,8 @@ jobs:
           cache-on-failure: "true"
           cache-bin: "false"
       - name: Lint Windows-supported crates
-        # Keep the seed workload identical to the pull-request workload so its
-        # target and compiler caches are reusable by subsequent pull requests.
+        # Keep the seed workload identical to the pull-request workload so the
+        # windows-branch cache reflects the same lint and test commands.
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}

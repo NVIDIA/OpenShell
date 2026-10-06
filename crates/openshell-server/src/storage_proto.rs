@@ -161,15 +161,34 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // Restart policy is stored in SandboxSpec, and the count and well-known
+    // timestamps are stored in SandboxStatus. Legacy payloads decode with
+    // Unspecified (treated as Never), zero count, and absent timestamps.
+    // ProviderProfileFile is reachable from stored provider profiles. Its
+    // additive declaration changes the durable and public/durable overlap
+    // inventories; the provider-environment file map and peer configuration
+    // hint are public-only. The
+    // request has no provider-file capability field: older supervisors ignore
+    // the additive file map while retaining the rest of the response.
+    // Preparation timing adds two optional timestamps to SandboxProvisioning.
+    // Existing rows decode with both absent and retain their active deadline;
+    // no stored attempt gains another phase or time budget on upgrade.
+    // Service authorization also extends both schemas additively. Legacy
+    // payloads retain the safe Strip default.
+    // Driver-operation ownership adds pending and a retained operation ID to
+    // SandboxProvisioning in both closures. Old rows decode false and empty;
+    // decoding or deadline updates cannot claim an existing attempt.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "708ad5971c5ed52a1e9294da62322b9864f38fa6d95add8e2df49523b99bee4f";
+        "f769d9effbb594fed3110470a580c623b3211b4b027ff64fdb3a64260d6d80f6";
     const DURABLE_SCHEMA_SHA256: &str =
-        "965a8a09fa80168906a4f9cc6169d3623b98f5281c367695f2f2898230915dd0";
+        "8fa5153f96896035f9ffc0b9ef753a74028c81738383fa8b7ab084bd7e978f97";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "a6e97fdde30c439ffaa03c2952a43033f8ea338fed6b1456ebe2d7d8af14e834";
+        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
+    // ServiceEndpoint encoded before authorization_mode field 7 existed.
+    const SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE: &str = "0a260a0b656e64706f696e742d6964120c73616e64626f782d2d77656228073a0764656661756c74120a73616e64626f782d69641a0773616e64626f78220377656228903f3001";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -205,6 +224,9 @@ mod tests {
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerConfigUpdateHintRequest|.openshell.v1.PeerConfigUpdateHintResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -571,14 +593,24 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_CONFIG_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer config RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -586,7 +618,9 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -630,14 +664,38 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (320, 26),
-                (93, 19),
-                (80, 19),
+                (327, 28),
+                (94, 21),
+                (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
+        );
+    }
+
+    #[test]
+    fn service_endpoint_without_authorization_mode_decodes_as_strip() {
+        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+
+        let endpoint = ServiceEndpoint::decode(
+            legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
+        )
+        .expect("stored service endpoint without authorization mode must decode");
+
+        assert_eq!(endpoint.sandbox_id, "sandbox-id");
+        assert_eq!(endpoint.sandbox, "sandbox");
+        assert_eq!(endpoint.name, "web");
+        assert_eq!(endpoint.target_port, 8080);
+        assert!(endpoint.domain);
+        assert_eq!(
+            endpoint.authorization_mode(),
+            ServiceAuthorizationMode::Unspecified
+        );
+        assert_eq!(
+            crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
+            ServiceAuthorizationMode::Strip
         );
     }
 
@@ -691,6 +749,9 @@ mod tests {
         assert_eq!(status.current_policy_version, 7);
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
+        assert_eq!(status.restart_count, 0);
+        assert!(status.next_restart_time.is_none());
+        assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);
         assert_eq!(status.conditions[0].r#type, "Ready");
         assert_eq!(status.conditions[0].status, "True");

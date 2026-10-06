@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::{Code, Status};
-use tracing::{info, warn};
+use tracing::{Instrument as _, info, warn};
 
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
@@ -1925,11 +1925,12 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
             ))
             .await
             {
-                Ok(workspaces) => {
-                    for workspace in workspaces {
-                        crate::config_delivery::publish_workspace_components(
+                Ok(providers) => {
+                    for (workspace, provider_name) in providers {
+                        crate::config_delivery::publish_provider_components(
                             &state,
                             &workspace,
+                            &provider_name,
                             crate::config_delivery::ConfigComponents::ALL,
                         );
                     }
@@ -1942,25 +1943,15 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
     });
 }
 
-#[tracing::instrument(
-    name = "refresh",
-    skip_all,
-    fields(
-        otel.name = "refresh.provider_credentials",
-        watched_count = tracing::field::Empty,
-        due_count = tracing::field::Empty,
-    )
-)]
+/// Returns the `(workspace, provider)` pairs whose provider records changed.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<std::collections::HashSet<String>, Status> {
-    let mut changed_workspaces = std::collections::HashSet::new();
+) -> Result<std::collections::HashSet<(String, String)>, Status> {
+    let changed_providers = std::collections::HashSet::new();
     let now_ms = current_time_ms();
-    let states = list_all_refresh_states(store).await.inspect_err(|_| {
-        crate::otel_tracing::mark_error(&tracing::Span::current());
-    })?;
+    let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
     let due_count = states
         .iter()
@@ -1970,13 +1961,47 @@ async fn run_refresh_worker_tick(
         .iter()
         .filter(|state| state.status == "rotation_requested")
         .count();
-    let span = tracing::Span::current();
-    span.record("watched_count", watched_count);
-    span.record("due_count", due_count);
     info!(
         watched_count,
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
     );
+    if !states
+        .iter()
+        .any(|state| refresh_state_has_work(state, now_ms))
+    {
+        return Ok(changed_providers);
+    }
+    let span = tracing::info_span!(
+        "refresh",
+        otel.name = "refresh.provider_credentials",
+        watched_count,
+        due_count,
+    );
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
+}
+
+fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
+    state
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
+        || !state.pending_secret_deletions.is_empty()
+        || state.next_refresh_at_ms <= 0
+        || state.next_refresh_at_ms <= now_ms
+        || state.status == "rotation_requested"
+}
+
+async fn refresh_states(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    states: Vec<StoredProviderCredentialRefreshState>,
+    now_ms: i64,
+) -> std::collections::HashSet<(String, String)> {
+    let mut changed_providers = std::collections::HashSet::new();
     for state in states {
         if state
             .metadata
@@ -2007,7 +2032,7 @@ async fn run_refresh_worker_tick(
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
             } else {
-                changed_workspaces.insert(state.object_workspace().to_string());
+                changed_providers.insert(changed_provider(&state));
             }
             continue;
         }
@@ -2092,10 +2117,17 @@ async fn run_refresh_worker_tick(
                 "provider credential refresh failed"
             );
         } else {
-            changed_workspaces.insert(state.object_workspace().to_string());
+            changed_providers.insert(changed_provider(&state));
         }
     }
-    Ok(changed_workspaces)
+    changed_providers
+}
+
+fn changed_provider(state: &StoredProviderCredentialRefreshState) -> (String, String) {
+    (
+        state.object_workspace().to_string(),
+        state.provider_name.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -3558,10 +3590,18 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
+        let changed = Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
+        assert_eq!(
+            changed,
+            std::collections::HashSet::from([(
+                "default".to_string(),
+                "tombstoned-refresh".to_string()
+            )]),
+            "only the refreshed provider's attached sandboxes need an update"
+        );
         assert!(
             get_refresh_state(
                 &store,
@@ -3576,11 +3616,8 @@ mod tests {
         assert_eq!(credentials.stored_credential_count(), Some(0));
     }
 
-    /// The worker ticks on a timer with no inbound request, so without a span
-    /// of its own its store reads export as anonymous single-span traces.
     #[tokio::test]
-    #[ignore = "flaky under concurrent test execution"]
-    async fn refresh_worker_ticks_are_roots_and_store_operations_have_parents() {
+    async fn refresh_worker_records_a_root_span_only_when_a_state_has_work() {
         use crate::otel_tracing::test_exporter;
 
         let store = test_store().await;
@@ -3589,27 +3626,38 @@ mod tests {
         Box::pin(run_refresh_worker_tick(&store, None, None))
             .await
             .unwrap();
+        assert!(
+            traced
+                .spans_named("refresh.provider_credentials")
+                .is_empty(),
+            "an idle tick records no refresh span"
+        );
 
-        let spans = traced.finished_spans();
-        let root = spans
-            .iter()
-            .find(|s| s.name == "refresh.provider_credentials")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the tick records a span of its own, got {:?}",
-                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
-                )
-            });
+        let provider = provider("my-external", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::External,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before: None,
+                max_lifetime: None,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
 
-        test_exporter::assert_is_root(root);
-        let store_span = spans
-            .iter()
-            .find(|span| {
-                span.name.starts_with("store.")
-                    && span.span_context.trace_id() == root.span_context.trace_id()
-            })
-            .expect("the tick records its store operation");
-        test_exporter::assert_has_parent(store_span);
+        Box::pin(run_refresh_worker_tick(&store, None, None))
+            .await
+            .unwrap();
+        test_exporter::assert_is_root(&traced.wait_for_span("refresh.provider_credentials").await);
     }
 
     #[test]

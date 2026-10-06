@@ -86,8 +86,7 @@ impl ProcfsIdentityResolver {
             return Err(ResolveError::NotFound);
         };
         if identities.iter().skip(1).any(|candidate| {
-            candidate.binary_path != identity.binary_path
-                || candidate.binary_digest != identity.binary_digest
+            candidate.executable != identity.executable
                 || candidate.ancestors != identity.ancestors
                 || candidate.cmdline_paths != identity.cmdline_paths
         }) {
@@ -106,7 +105,7 @@ mod tests {
     /// Stands in for the mediation service: a binary-scoped rule can only be
     /// authorized by a resolved identity carrying the fields it requires.
     fn admits_binary_rule(result: Result<BinaryIdentity, ResolveError>) -> bool {
-        matches!(result, Ok(identity) if identity.binary_digest.is_some())
+        matches!(result, Ok(identity) if identity.executable.digest.is_some())
     }
 
     #[test]

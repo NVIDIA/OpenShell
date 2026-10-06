@@ -21,6 +21,11 @@ pub const BACKEND_NAME: &str = "openshell-sandbox";
 /// Resource claim set by compute drivers when the workload requests GPU access.
 pub const GPU_RESOURCE_CLAIM: &str = "openshell.gpu";
 
+/// Resource claim set when the runtime may retain supplementary groups in
+/// addition to the image-derived workload identity.
+pub const ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM: &str =
+    "openshell.identity.allow_extra_supplementary_groups";
+
 /// Memory-backed parent used for supervisor CA material.
 pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
 

@@ -17,7 +17,9 @@ use bollard::query_parameters::{
     RemoveVolumeOptionsBuilder, StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::TryStreamExt;
-use openshell_e2e::harness::container::{ImageGuard, e2e_driver};
+#[cfg(feature = "e2e-docker")]
+use openshell_e2e::harness::container::ImageGuard;
+use openshell_e2e::harness::container::e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 

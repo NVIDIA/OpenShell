@@ -10,6 +10,7 @@
 use openshell_ocsf::OcsfJsonlLayer;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::prelude::*;
 
 use crate::config_file::OtlpConfig;
@@ -36,9 +37,41 @@ impl TracingHandle {
     }
 }
 
+fn filter_from(directives: &str) -> EnvFilter {
+    EnvFilter::try_new(directives).unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+struct GatewayEventFormat;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for GatewayEventFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if event.metadata().target() == openshell_ocsf::OCSF_TARGET
+            && let Some(ocsf) = openshell_ocsf::clone_current_event()
+        {
+            return writeln!(
+                writer,
+                "{} OCSF {}",
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                ocsf.format_shorthand()
+            );
+        }
+        tracing_subscriber::fmt::format().format_event(context, writer, event)
+    }
+}
+
 pub fn install(
-    env_filter: EnvFilter,
+    filter_directives: &str,
     tracing_log_bus: &TracingLogBus,
+    ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
     otlp_config: Option<&OtlpConfig>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
@@ -66,14 +99,31 @@ pub fn install(
     // level. An explicit JSONL opt-in must keep every OCSF event even when the
     // console and routed diagnostic logs are restricted to `warn` or `error`.
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter.clone()))
-        .with(tracing_log_bus.layer().with_filter(env_filter.clone()))
+        .with(
+            ocsf_log
+                .map(crate::ocsf_log::OcsfLog::layer)
+                .with_filter(filter_fn(|metadata| {
+                    metadata.target() == openshell_ocsf::OCSF_TARGET
+                })),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .event_format(GatewayEventFormat)
+                .with_filter(filter_from(filter_directives)),
+        )
+        .with(
+            tracing_log_bus
+                .layer()
+                .with_filter(filter_from(filter_directives).or(filter_fn(|metadata| {
+                    metadata.target() == openshell_ocsf::OCSF_TARGET
+                }))),
+        )
         .with(jsonl_layer)
         .with(
             tracer_provider
                 .as_ref()
                 .map(|provider| crate::otel_tracing::layer(provider, driver))
-                .with_filter(env_filter.clone()),
+                .with_filter(filter_from(filter_directives)),
         )
         .with(
             driver_tracer_provider
@@ -83,7 +133,7 @@ pub fn install(
                         .expect("a driver provider requires a selected driver")
                         .in_process_layer(provider)
                 })
-                .with_filter(env_filter),
+                .with_filter(filter_from(filter_directives)),
         )
         .init();
 
@@ -248,6 +298,7 @@ mod tests {
             product_version: openshell_core::VERSION.into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
             proxy_port: 0,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         tracing::subscriber::with_default(subscriber, || {
@@ -291,5 +342,43 @@ mod tests {
         ] {
             assert!(!mxc_ocsf_jsonl_requested(driver, Some("1")));
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_format_tests {
+    use std::io::{Read, Seek};
+
+    use super::*;
+
+    #[test]
+    fn gateway_ocsf_console_preserves_details_without_jsonl() {
+        let file = tempfile::tempfile().unwrap();
+        let reader = file.try_clone().unwrap();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(GatewayEventFormat)
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .with_filter(filter_from("info")),
+        );
+        let event =
+            openshell_ocsf::ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("", ""))
+                .message("TLS certificate config reloaded successfully")
+                .build();
+        let expected = event.format_shorthand();
+        tracing::subscriber::with_default(subscriber, || {
+            openshell_ocsf::ocsf_emit!(event);
+            tracing::info!(answer = 42, "ordinary diagnostic");
+        });
+        let mut reader = reader;
+        reader.rewind().unwrap();
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+        assert!(output.contains(&expected), "missing OCSF details: {output}");
+        assert!(!output.contains("ocsf_event"));
+        assert!(output.contains("ordinary diagnostic"));
+        assert!(output.contains("answer=42"));
+        assert_eq!(output.lines().count(), 2);
     }
 }

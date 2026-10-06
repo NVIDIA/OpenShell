@@ -6,28 +6,135 @@ landing-page:
   path: index.mdx
 
 navigation:
-- folder: about
-  title: "About NVIDIA OpenShell"
-- section: "Get Started"
-  slug: get-started
+- section: "About NVIDIA OpenShell"
+  slug: about
   contents:
-  - page: "Quickstart"
-    path: get-started/quickstart.mdx
-  - folder: get-started/tutorials
-    skip-slug: true
-- folder: sandboxes
-  title: "Manage OpenShell"
-- folder: providers
-  title: "Providers"
-- folder: extensibility
-  title: "Extensibility"
+  - page: "Overview"
+    path: about/overview.mdx
+  - page: "Architecture"
+    path: about/architecture.mdx
+  - page: "Installation"
+    path: about/installation.mdx
+  - page: "Run Your First Agent"
+    path: about/run-your-first-agent.mdx
+  - page: "Support Matrix"
+    path: about/support-matrix.mdx
+- section: "How It Works"
+  slug: how-it-works
+  contents:
+  - section: "Gateways"
+    slug: gateways
+    contents:
+    - page: "Overview"
+      path: how-it-works/gateways/overview.mdx
+    - page: "Authentication"
+      path: how-it-works/gateways/authentication.mdx
+    - page: "Configuration"
+      path: how-it-works/gateways/configuration.mdx
+    - page: "Container Deployment"
+      path: how-it-works/gateways/container-deployment.mdx
+  - page: "Workspaces"
+    path: how-it-works/workspaces.mdx
+  - section: "Sandboxes"
+    slug: sandboxes
+    contents:
+    - page: "Overview"
+      path: how-it-works/sandboxes/overview.mdx
+    - page: "Templates"
+      path: how-it-works/sandboxes/templates.mdx
+    - page: "Runtimes"
+      path: how-it-works/sandboxes/runtimes.mdx
+  - section: "Providers"
+    slug: providers
+    contents:
+    - page: "Overview"
+      path: how-it-works/providers/overview.mdx
+    - page: "Profiles"
+      path: how-it-works/providers/profiles.mdx
+    - page: "AWS"
+      path: how-it-works/providers/aws.mdx
+    - page: "Google"
+      path: how-it-works/providers/google.mdx
+  - section: "Policies"
+    slug: policies
+    contents:
+    - page: "Overview"
+      path: how-it-works/policies/overview.mdx
+    - page: "Network Rules"
+      path: how-it-works/policies/network-rules.mdx
+    - page: "Manage Policies"
+      path: how-it-works/policies/manage-policies.mdx
+    - page: "Policy Prover"
+      path: how-it-works/policies/prover.mdx
+      slug: prover
+    - page: "Policy Advisor"
+      path: how-it-works/policies/advisor.mdx
+      slug: advisor
+    - page: "Default Policy"
+      path: how-it-works/policies/default-policy.mdx
+    - page: "Schema Reference"
+      path: how-it-works/policies/schema.mdx
+      slug: schema
+  - page: "Inference"
+    path: how-it-works/inference.mdx
+- section: "Extensibility"
+  slug: extensibility
+  contents:
+  - page: "Overview"
+    path: extensibility/overview.mdx
+  - section: "Supervisor Middleware"
+    slug: supervisor-middleware
+    path: extensibility/supervisor-middleware/index.mdx
+    contents:
+    - page: "Configuration"
+      path: extensibility/supervisor-middleware/configure.mdx
+    - page: "Supported Operations"
+      path: extensibility/supervisor-middleware/operations.mdx
+  - page: "Gateway Interceptors"
+    path: extensibility/gateway-interceptors.mdx
+  - page: "Drivers"
+    path: extensibility/drivers.mdx
+  - page: "Isolation Backends"
+    path: extensibility/isolation-backends.mdx
 - folder: observability
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
-- folder: reference
-  title: "Reference"
+- section: "Tutorials"
+  slug: tutorials
+  path: tutorials/index.mdx
+  contents:
+  - page: "Run Pi with OpenRouter"
+    path: tutorials/run-pi-with-openrouter.mdx
+    slug: run-pi-with-openrouter
+  - page: "First Network Policy"
+    path: tutorials/first-network-policy.mdx
+  - page: "GitHub Push Access"
+    path: tutorials/github-push-access.mdx
+  - page: "Microsoft Graph Provider Refresh"
+    path: tutorials/microsoft-graph-provider-refresh.mdx
+- section: "SDK Reference"
+  slug: sdk
+  contents:
+  - page: "Go"
+    path: sdk/go.mdx
+  - page: "Rust"
+    path: sdk/rust.mdx
+  - page: "Python"
+    path: sdk/python.mdx
+  - page: "TypeScript"
+    path: sdk/typescript.mdx
+    slug: typescript
+  - page: "API Errors"
+    path: sdk/api-errors.mdx
+  - page: "Protobuf Time Types"
+    path: sdk/protobuf-time-types.mdx
 - folder: security
   title: "Security"
+- section: "Upgrade Guides"
+  slug: upgrade
+  contents:
+  - page: "0.1.0"
+    path: upgrade/0-1-0.mdx
 - folder: resources
   title: "Resources"

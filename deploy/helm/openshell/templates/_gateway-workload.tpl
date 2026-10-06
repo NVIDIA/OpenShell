@@ -43,7 +43,7 @@ spec:
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
       image: {{ include "openshell.image" . | quote }}
-      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
       args:
         - --config
         - /etc/openshell/gateway.toml
@@ -174,10 +174,18 @@ spec:
           mountPath: /etc/openshell-tls/vault-ca
           readOnly: true
         {{- end }}
+        {{- if .Values.upstreamProxy.caBundle.configMapName }}
+        - name: upstream-proxy-ca
+          mountPath: /etc/openshell-tls/proxy-ca
+          readOnly: true
+        {{- end }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
         - name: spiffe-workload-api
           mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
           readOnly: true
+        {{- end }}
+        {{- with .Values.server.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       ports:
         - name: grpc
@@ -270,11 +278,24 @@ spec:
           - key: ca.crt
             path: ca.crt
     {{- end }}
+    {{- if .Values.upstreamProxy.caBundle.configMapName }}
+    - name: upstream-proxy-ca
+      configMap:
+        name: {{ .Values.upstreamProxy.caBundle.configMapName | quote }}
+        items:
+          # The mounted filename stays fixed so the rendered proxy_ca_bundle
+          # path does not depend on the operator's ConfigMap key.
+          - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
+            path: ca.crt
+    {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     - name: spiffe-workload-api
       csi:
         driver: csi.spiffe.io
         readOnly: true
+    {{- end }}
+    {{- with .Values.server.extraVolumes }}
+    {{- toYaml . | nindent 4 }}
     {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:

@@ -7,6 +7,4 @@ socket_path = "{{ openshell_runtime_socket }}"
 image_pull_policy = "if_not_present"
 sandbox_label = "tmachine"
 grpc_endpoint = "http://127.0.0.1:17670"
-sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
-supervisor_image = "docker.io/openshell/supervisor:tmachine"
 {% endblock %}

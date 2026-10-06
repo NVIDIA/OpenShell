@@ -3,15 +3,20 @@
 
 # Allow curl to read from the GitHub REST API.
 # POST, PUT, PATCH, and DELETE are blocked by the "read-only" preset.
+#
+# This is a complete policy for starting a new sandbox:
+#   openshell sandbox create --name demo --policy policy.yaml
+# To add the same rule to a running sandbox, use `openshell policy update` as
+# shown in README.md. `openshell policy set` replaces the entire policy and is
+# rejected if the file drops a filesystem path the running sandbox already has.
 
 version: 1
 
-# Default sandbox filesystem and Landlock settings. Process identity is omitted
-# so the active compute driver can select it. These fields are required when
-# using `openshell policy set` because it replaces the entire policy.
+# Filesystem and Landlock settings that cover the restrictive default policy.
+# Process identity is omitted so the active compute driver can select it.
 filesystem_policy:
   include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
   read_write: [/sandbox, /tmp, /dev/null]
 landlock:
   compatibility: best_effort

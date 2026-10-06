@@ -5,7 +5,11 @@
 //!
 //! The filter uses a default-allow policy with targeted blocks:
 //!
-//! 1. **Socket domain blocks** -- prevent raw/kernel sockets that bypass the proxy
+//! 1. **Socket domain allowlist** -- only `AF_UNIX`, `AF_NETLINK`, and (when
+//!    networking is enabled) the brokered `AF_INET`/`AF_INET6` families can be
+//!    created. Every other family is refused, because protocol families such as
+//!    `AF_RXRPC`, `AF_SMC`, and `AF_KCM` carry traffic over kernel-owned
+//!    sockets that the broker never creates or confines to loopback.
 //! 2. **Unconditional syscall blocks** -- block syscalls that enable sandbox escape
 //!    (fileless exec, ptrace, BPF, cross-process memory access, `io_uring`, mount)
 //! 3. **Conditional syscall blocks** -- block dangerous flag combinations on otherwise
@@ -184,23 +188,18 @@ fn apply_runtime_filters(
 fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    // --- Socket domain blocks ---
-    let mut blocked_domains = vec![
-        libc::AF_PACKET,
-        libc::AF_BLUETOOTH,
-        libc::AF_VSOCK,
-        // AF_NETLINK is handled separately below: NETLINK_ROUTE (protocol 0)
-        // is allowed for getifaddrs(3); all other netlink protocols are blocked.
-    ];
-    if !allow_inet {
-        blocked_domains.push(libc::AF_INET);
-        blocked_domains.push(libc::AF_INET6);
+    // --- Socket domain allowlist ---
+    // AF_NETLINK is narrowed further below: only NETLINK_ROUTE (protocol 0)
+    // is allowed, for getifaddrs(3).
+    let mut allowed_domains = vec![libc::AF_UNIX, libc::AF_NETLINK];
+    if allow_inet {
+        allowed_domains.extend([libc::AF_INET, libc::AF_INET6]);
     }
-
-    for domain in blocked_domains {
-        debug!(domain, "Blocking socket domain via seccomp");
-        add_socket_domain_rule(&mut rules, domain)?;
-    }
+    debug!(?allowed_domains, "Restricting socket domains via seccomp");
+    add_socket_domain_allowlist(&mut rules, libc::SYS_socket, &allowed_domains)?;
+    // socketpair(2) is only meaningful for AF_UNIX here; other families either
+    // reject it or create kernel transport sockets.
+    add_socket_domain_allowlist(&mut rules, libc::SYS_socketpair, &[libc::AF_UNIX])?;
 
     // Allow AF_NETLINK only for NETLINK_ROUTE (protocol 0).
     //
@@ -296,14 +295,27 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     Ok(rules)
 }
 
+/// Refuse `syscall` unless its domain argument is one of `allowed`.
+///
+/// A seccomp rule matches only when all of its conditions hold, so one rule
+/// with a `!=` condition per allowed domain matches exactly the domains
+/// outside the allowlist. The domain is a scalar argument that another thread
+/// cannot replace before the kernel reads it.
 #[allow(clippy::cast_sign_loss)]
-fn add_socket_domain_rule(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, domain: i32) -> Result<()> {
-    let condition =
-        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain as u64)
-            .into_diagnostic()?;
-
-    let rule = SeccompRule::new(vec![condition]).into_diagnostic()?;
-    rules.entry(libc::SYS_socket).or_default().push(rule);
+fn add_socket_domain_allowlist(
+    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
+    syscall: i64,
+    allowed: &[i32],
+) -> Result<()> {
+    let conditions = allowed
+        .iter()
+        .map(|domain| {
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, *domain as u64)
+                .into_diagnostic()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rule = SeccompRule::new(conditions).into_diagnostic()?;
+    rules.entry(syscall).or_default().push(rule);
     Ok(())
 }
 
@@ -849,6 +861,78 @@ mod tests {
             unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
             "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) should be blocked with EPERM"
         );
+    }
+
+    #[test]
+    fn behavioral_socket_families_are_allowlisted() {
+        // Applying a filter is irreversible, so run the probe in a fresh copy
+        // of this test binary rather than in the harness process.
+        const CHILD_MARKER: &str = "OPENSHELL_SOCKET_FAMILY_ALLOWLIST_CHILD";
+        // libc does not export these family numbers.
+        const AF_KCM: i32 = 41;
+        const AF_SMC: i32 = 43;
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            set_no_new_privs().expect("set no_new_privs");
+            apply_filter(&build_filter(true).unwrap()).expect("apply proxy-mode filter");
+            let create = |domain: i32, kind: socket2::Type| {
+                socket2::Socket::new(socket2::Domain::from(domain), kind, None)
+                    .map(drop)
+                    .map_err(|error| error.raw_os_error())
+            };
+            for (domain, kind) in [
+                (libc::AF_UNIX, socket2::Type::STREAM),
+                (libc::AF_NETLINK, socket2::Type::RAW),
+                (libc::AF_INET, socket2::Type::STREAM),
+                (libc::AF_INET6, socket2::Type::DGRAM),
+            ] {
+                assert_eq!(
+                    create(domain, kind),
+                    Ok(()),
+                    "domain {domain} must be allowed"
+                );
+            }
+            // Families whose kernel transport sockets the broker cannot
+            // confine, plus previously denylisted ones.
+            for (domain, kind) in [
+                (libc::AF_RXRPC, socket2::Type::DGRAM),
+                (AF_SMC, socket2::Type::STREAM),
+                (AF_KCM, socket2::Type::DGRAM),
+                (libc::AF_ALG, socket2::Type::SEQPACKET),
+                (libc::AF_TIPC, socket2::Type::from(libc::SOCK_RDM)),
+                (libc::AF_PACKET, socket2::Type::RAW),
+                (libc::AF_VSOCK, socket2::Type::STREAM),
+            ] {
+                assert_eq!(
+                    create(domain, kind),
+                    Err(Some(libc::EPERM)),
+                    "domain {domain} must be refused by the filter"
+                );
+            }
+            assert!(
+                socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::STREAM, None).is_ok()
+            );
+            assert_eq!(
+                socket2::Socket::pair(
+                    socket2::Domain::from(libc::AF_TIPC),
+                    socket2::Type::STREAM,
+                    None
+                )
+                .map(drop)
+                .map_err(|error| error.raw_os_error()),
+                Err(Some(libc::EPERM))
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::linux::seccomp::tests::behavioral_socket_families_are_allowlisted",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated socket family test");
+        assert!(status.success(), "isolated socket family test failed");
     }
 
     #[test]

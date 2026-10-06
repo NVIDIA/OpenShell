@@ -25,7 +25,9 @@ pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
 use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, canonicalize_mcp_versions,
+};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
@@ -358,22 +360,6 @@ fn default_mcp_versions() -> Vec<String> {
     // size and order, so adding support for a revision cannot widen an
     // existing versionless policy.
     vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()]
-}
-
-fn canonicalize_mcp_versions(versions: &mut [String]) {
-    // Unknown and duplicate values remain present so canonicalization cannot
-    // erase evidence that the raw policy was invalid.
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
 }
 
 /// Sort one protobuf MCP contract without hiding invalid input.
@@ -1362,6 +1348,61 @@ pub fn validate_sandbox_policy(
     validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
 }
 
+/// Validate filesystem paths shared by typed policies and raw OPA data.
+///
+/// Paths must be absolute, contain no parent traversal, and fit the path count
+/// and byte limits. Read-write access to the filesystem root is forbidden.
+/// Callers that expose errors outside trusted authoring tools must redact the
+/// path values carried by the returned violations.
+pub fn validate_filesystem_paths(
+    read_only: &[String],
+    read_write: &[String],
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    let total_paths = read_only.len() + read_write.len();
+    if total_paths > MAX_FILESYSTEM_PATHS {
+        violations.push(PolicyViolation::TooManyPaths { count: total_paths });
+    }
+
+    for path_str in read_only.iter().chain(read_write.iter()) {
+        if path_str.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::FieldTooLong {
+                path: truncate_for_display(path_str),
+                length: path_str.len(),
+            });
+            continue;
+        }
+        let path = Path::new(path_str);
+        if !path.has_root() {
+            violations.push(PolicyViolation::RelativePath {
+                path: path_str.clone(),
+            });
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::PathTraversal {
+                path: path_str.clone(),
+            });
+        }
+    }
+
+    for path_str in read_write {
+        // Repeated separators still designate the filesystem root.
+        if path_str.trim_end_matches('/').is_empty() {
+            violations.push(PolicyViolation::OverlyBroadPath {
+                path: path_str.clone(),
+            });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpVersionPresence {
     RequireMaterialized,
@@ -1403,50 +1444,10 @@ fn validate_sandbox_policy_with_mcp_presence(
         });
     }
 
-    // Check filesystem paths
-    if let Some(ref fs) = policy.filesystem {
-        let total_paths = fs.read_only.len() + fs.read_write.len();
-        if total_paths > MAX_FILESYSTEM_PATHS {
-            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
-        }
-
-        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
-            if path_str.len() > MAX_PATH_LENGTH {
-                violations.push(PolicyViolation::FieldTooLong {
-                    path: truncate_for_display(path_str),
-                    length: path_str.len(),
-                });
-                continue;
-            }
-
-            let path = Path::new(path_str);
-
-            if !path.has_root() {
-                violations.push(PolicyViolation::RelativePath {
-                    path: path_str.clone(),
-                });
-            }
-
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                violations.push(PolicyViolation::PathTraversal {
-                    path: path_str.clone(),
-                });
-            }
-        }
-
-        // Only reject "/" as read-write (overly broad)
-        for path_str in &fs.read_write {
-            let normalized = path_str.trim_end_matches('/');
-            if normalized.is_empty() {
-                // Path is "/" or "///" etc.
-                violations.push(PolicyViolation::OverlyBroadPath {
-                    path: path_str.clone(),
-                });
-            }
-        }
+    if let Some(ref fs) = policy.filesystem
+        && let Err(errors) = validate_filesystem_paths(&fs.read_only, &fs.read_write)
+    {
+        violations.extend(errors);
     }
 
     // Protobuf maps do not preserve iteration order. Sort rule keys so callers
@@ -2508,7 +2509,7 @@ network_policies:
         }
     }
 
-    const MCP_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+    const MCP_VERSIONS: [&str; 4] = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
 
     fn mcp_version_options(versions: &[&str]) -> McpOptions {
         McpOptions {
@@ -2607,6 +2608,30 @@ network_policies:
             [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
         );
         assert!(McpProtocolVersion::ALL.len() > default_mcp_versions().len());
+    }
+
+    #[test]
+    fn sessionless_mcp_version_requires_an_explicit_policy_opt_in() {
+        let mut authored =
+            mcp_version_endpoint_yaml("mcp", Some("          versions: [\"2026-07-28\"]\n"));
+        authored.push_str("        rules:\n          - allow:\n              method: tools/list\n");
+        let explicit = parse_sandbox_policy(&authored)
+            .expect("the sessionless revision must be accepted when explicitly allowed");
+        let options = explicit.network_policies["versioned"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options must be materialized");
+        assert_eq!(options.versions, ["2026-07-28"]);
+        validate_sandbox_policy(&explicit)
+            .expect("a sessionless endpoint with an explicit method rule must validate");
+
+        let yaml = serialize_sandbox_policy(&explicit)
+            .expect("an explicitly allowed sessionless revision must serialize");
+        assert_eq!(
+            parse_sandbox_policy(&yaml).expect("the sessionless policy must round-trip"),
+            explicit
+        );
+        assert!(!default_mcp_versions().contains(&"2026-07-28".to_string()));
     }
 
     #[test]
@@ -2778,7 +2803,7 @@ network_policies:
             "rendered diagnostic omitted remediation choices: {authored_diagnostic}"
         );
 
-        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-28"])));
+        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-29"])));
         let violations = validate_sandbox_policy(&policy)
             .expect_err("unsupported protobuf revisions must fail closed");
         assert!(violations.iter().map(ToString::to_string).any(|message| {
@@ -2875,6 +2900,7 @@ network_policies:
         let policy = mcp_version_policy(
             "mcp",
             Some(mcp_version_options(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",

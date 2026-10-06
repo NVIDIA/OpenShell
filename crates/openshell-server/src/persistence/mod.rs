@@ -370,6 +370,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
     )]
@@ -394,6 +395,39 @@ impl Store {
         ))
     }
 
+    /// Create an object that is safe to lose in a crash.
+    ///
+    /// Behaves like [`Self::put_if`] with [`WriteCondition::MustCreate`], but
+    /// the file-backed `SQLite` store commits it with `synchronous=NORMAL`, so
+    /// a power loss or kernel crash shortly after the call returns may roll
+    /// the insert back. Use it only for objects whose absence denies access,
+    /// such as newly minted SSH session tokens. Writes that revoke or tighten
+    /// anything must use [`Self::put_if`], which is always durable.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_relaxed", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_relaxed(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels
+        ))
+    }
+
     /// Delete an object by id with compare-and-swap support.
     ///
     /// # Arguments
@@ -407,6 +441,7 @@ impl Store {
     /// * `Err(Conflict)` - Resource version mismatch
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -423,6 +458,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put_scoped", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
     )]
@@ -455,6 +491,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.create_scoped", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
     )]
@@ -488,6 +525,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
     )]
@@ -515,6 +553,7 @@ impl Store {
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.get", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -529,6 +568,7 @@ impl Store {
     /// Fetch an object by name within an object type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty,
@@ -549,6 +589,7 @@ impl Store {
     /// Delete an object by id.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -559,6 +600,7 @@ impl Store {
     /// Delete objects of one type by id in bounded, set-based statements.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.delete_many",
@@ -575,6 +617,7 @@ impl Store {
     /// Count objects of a given type within a workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.count_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -589,6 +632,7 @@ impl Store {
     /// Delete all objects of a given type within a workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_all_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -603,6 +647,7 @@ impl Store {
     /// Delete all objects of a given type with a matching scope.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
     )]
@@ -613,6 +658,7 @@ impl Store {
     /// Delete an object by name within an object type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_by_name", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace, object.name = %name)
     )]
@@ -628,6 +674,7 @@ impl Store {
     /// List objects by type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -644,6 +691,7 @@ impl Store {
     /// List objects by type across all workspaces.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_by_type", otel.status_code = tracing::field::Empty,  object_type = %object_type)
     )]
@@ -659,6 +707,7 @@ impl Store {
     /// List workspace objects after a stable cursor, without offset drift.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_after",
@@ -680,6 +729,7 @@ impl Store {
     /// List objects across workspaces after a stable cursor, without offset drift.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_by_type_after",
@@ -805,6 +855,7 @@ impl Store {
     /// UUIDs which are globally unique. Revisit if non-UUID scopes are introduced.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
     )]
@@ -822,6 +873,7 @@ impl Store {
     /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty,
@@ -890,6 +942,7 @@ impl Store {
     /// List objects by type across all workspaces with label selector filtering.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_all_with_selector", otel.status_code = tracing::field::Empty,  object_type = %object_type, label_selector = %label_selector)
     )]
@@ -1082,7 +1135,7 @@ impl Store {
     /// Update a protobuf message using CAS (compare-and-swap).
     ///
     /// Fetches the current object, validates the expected version, applies the
-    /// mutation function, and attempts a single CAS write. Returns Conflict on
+    /// mutation function, and attempts a CAS write. Returns Conflict on
     /// version mismatch for caller-driven retry.
     ///
     /// # Arguments
@@ -1115,79 +1168,92 @@ impl Store {
             + Clone,
         F: FnMut(&mut T),
     {
-        // Fetch current object with authoritative resource_version
-        let current = self
-            .get_message::<T>(id)
-            .await?
-            .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
+        const INTERNAL_CAS_ATTEMPTS: u32 = 5;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            // Fetch current object with authoritative resource_version
+            let current = self
+                .get_message::<T>(id)
+                .await?
+                .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
 
-        let current_version = current.get_resource_version();
+            let current_version = current.get_resource_version();
 
-        // Determine the version to use for CAS:
-        // - If expected_version is 0, use current version (internal operations)
-        // - Otherwise, validate that expected matches current (client-facing operations)
-        let cas_version = if expected_version == 0 {
-            current_version
-        } else {
-            if expected_version != current_version {
-                return Err(PersistenceError::Conflict {
-                    current_resource_version: Some(current_version),
-                });
+            // Determine the version to use for CAS:
+            // - If expected_version is 0, use current version (internal operations)
+            // - Otherwise, validate that expected matches current (client-facing operations)
+            let cas_version = if expected_version == 0 {
+                current_version
+            } else {
+                if expected_version != current_version {
+                    return Err(PersistenceError::Conflict {
+                        current_resource_version: Some(current_version),
+                    });
+                }
+                expected_version
+            };
+
+            // Apply mutation
+            let mut updated = current.clone();
+            mutate(&mut updated);
+
+            // Serialize labels
+            let labels_map = updated.object_labels();
+            let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+                None
+            } else {
+                Some(serde_json::to_string(&labels_map).map_err(|e| {
+                    PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+                })?)
+            };
+
+            if T::requires_workspace() && updated.object_workspace().is_empty() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} requires a non-empty workspace",
+                    T::object_type(),
+                )));
             }
-            expected_version
-        };
 
-        // Apply mutation
-        let mut updated = current.clone();
-        mutate(&mut updated);
+            if updated.object_name() != current.object_name() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} name cannot be changed after creation",
+                    T::object_type(),
+                )));
+            }
 
-        // Serialize labels
-        let labels_map = updated.object_labels();
-        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-            None
-        } else {
-            Some(serde_json::to_string(&labels_map).map_err(|e| {
-                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
-            })?)
-        };
+            if updated.object_workspace() != current.object_workspace() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} workspace cannot be changed after creation",
+                    T::object_type(),
+                )));
+            }
 
-        if T::requires_workspace() && updated.object_workspace().is_empty() {
-            return Err(PersistenceError::Encode(format!(
-                "{} requires a non-empty workspace",
-                T::object_type(),
-            )));
+            let result = match self
+                .put_if(
+                    T::object_type(),
+                    updated.object_id(),
+                    updated.object_name(),
+                    updated.object_workspace(),
+                    &updated.encode_to_vec(),
+                    labels_json.as_deref(),
+                    WriteCondition::MatchResourceVersion(cas_version),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(PersistenceError::Conflict { .. })
+                    if expected_version == 0 && attempt < INTERNAL_CAS_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            // Success - hydrate the new resource_version and return
+            updated.set_resource_version(result.resource_version);
+            return Ok(updated);
         }
-
-        if updated.object_name() != current.object_name() {
-            return Err(PersistenceError::Encode(format!(
-                "{} name cannot be changed after creation",
-                T::object_type(),
-            )));
-        }
-
-        if updated.object_workspace() != current.object_workspace() {
-            return Err(PersistenceError::Encode(format!(
-                "{} workspace cannot be changed after creation",
-                T::object_type(),
-            )));
-        }
-
-        // Single-attempt CAS write - fails with Conflict on version mismatch
-        let result = self
-            .put_if(
-                T::object_type(),
-                updated.object_id(),
-                updated.object_name(),
-                updated.object_workspace(),
-                &updated.encode_to_vec(),
-                labels_json.as_deref(),
-                WriteCondition::MatchResourceVersion(cas_version),
-            )
-            .await?;
-
-        // Success - hydrate the new resource_version and return
-        updated.set_resource_version(result.resource_version);
-        Ok(updated)
     }
 }
 
@@ -1275,6 +1341,7 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
 impl Store {
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
     )]

@@ -60,14 +60,23 @@ ENVIRONMENT VARIABLES:
                         Prereleases require an authenticated GitHub CLI session.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
-                        pre-v0.0.37 installation.
+                        pre-v0.0.37 or non-snap installation.
+    OPENSHELL_INSTALL_METHOD
+                        Linux package to install: snap, deb, or rpm. Unset
+                        selects deb or rpm from the host package manager.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
+    x86_64/aarch64, depending on the host package manager. Set
+    OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
+    that already have the OpenShell snap keep refreshing it. Snap installs use
+    latest/stable by default and latest/edge for dev, and do not support
+    explicit release tags or prereleases. The OpenShell snap requires a running
+    Docker Engine installed from a system package or Docker's package
+    repository. The Docker snap is not currently compatible with OpenShell.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -244,12 +253,17 @@ installed_version_needs_breaking_upgrade_notice() {
   ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
 }
 
-find_existing_openshell_bin() {
+find_existing_native_openshell_bin() {
   _path="$(command -v openshell 2>/dev/null || true)"
-  if [ -n "$_path" ] && [ -x "$_path" ]; then
-    printf '%s\n' "$_path"
-    return 0
-  fi
+  case "$_path" in
+    /snap/*) ;;
+    *)
+      if [ -n "$_path" ] && [ -x "$_path" ]; then
+        printf '%s\n' "$_path"
+        return 0
+      fi
+      ;;
+  esac
 
   for _candidate in \
     "${TARGET_HOME:-}/.local/bin/openshell" \
@@ -293,7 +307,7 @@ print_breaking_upgrade_notice() {
   cat >&2 <<EOF
 
 OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
-state created by earlier releases. Before installing ${RELEASE_TAG}, back up
+state created by earlier releases. Before installing OpenShell ${RELEASE_TAG}, back up
 any files, artifacts, and configuration you need from existing sandboxes.
 
 Then clean up the old runtime with the currently installed CLI:
@@ -318,7 +332,7 @@ EOF
 guard_breaking_upgrade() {
   target_uses_breaking_gateway_model || return 0
 
-  _bin="$(find_existing_openshell_bin || true)"
+  _bin="$(find_existing_native_openshell_bin || true)"
   [ -n "$_bin" ] || return 0
 
   _version="$(existing_openshell_version "$_bin")"
@@ -332,6 +346,55 @@ guard_breaking_upgrade() {
   fi
 
   error "manual cleanup is required before upgrading from this OpenShell installation"
+}
+
+print_native_to_snap_notice() {
+  _bin="$1"
+  _version="$2"
+
+  if [ -n "$_version" ]; then
+    warn "detected existing non-snap OpenShell ${_version} at ${_bin}"
+  else
+    warn "detected an existing non-snap OpenShell installation at ${_bin}"
+  fi
+
+  cat >&2 <<EOF
+
+The OpenShell snap keeps gateway and CLI state in snap-specific directories and
+does not import state from a non-snap installation. Before installing the snap,
+back up anything you need and clean up sandboxes and runtime resources managed
+by the existing installation.
+
+For older installations that provide these commands, run:
+
+    ${_bin} sandbox delete --all
+    ${_bin} gateway destroy
+
+Stop the non-snap gateway service and remove the native package or manual
+installation before continuing. For package and service instructions, see:
+
+    https://docs.nvidia.com/openshell/latest/about/installation
+
+If you have already backed up and cleaned up the non-snap installation, rerun with:
+
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+
+EOF
+}
+
+guard_native_to_snap_transition() {
+  _bin="$(find_existing_native_openshell_bin || true)"
+  [ -n "$_bin" ] || return 0
+
+  _version="$(existing_openshell_version "$_bin")"
+  print_native_to_snap_notice "$_bin" "$_version"
+
+  if [ "$UPGRADE_NOTICE_ACK" = "1" ]; then
+    warn "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set"
+    return 0
+  fi
+
+  error "manual cleanup is required before replacing this non-snap OpenShell installation"
 }
 
 resolve_release_tag() {
@@ -372,61 +435,39 @@ resolve_latest_prerelease_tag() {
 
   info "resolving latest prerelease..."
   _artifact_platform="$(prerelease_artifact_platform)"
-  _successful_run_ids="$(gh api --paginate \
-    "repos/${REPO}/actions/workflows/release-tag.yml/runs?status=success&per_page=100" \
-    --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')" || {
-    error "failed to list successful Release Tag workflow runs"
+  _release_tags="$(gh api "repos/${REPO}/git/matching-refs/tags/v" --jq '
+    [.[].ref | sub("^refs/tags/"; "") |
+      select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+-pre\\.[1-9][0-9]*$"))] |
+    sort_by(split("-pre.") as $parts |
+      ($parts[0] | ltrimstr("v") | split(".") | map(tonumber)) +
+      [($parts[1] | tonumber)]) | reverse | .[]')" || {
+    error "failed to list prerelease tags"
   }
-  _artifact_records="$(gh api --paginate \
-    "repos/${REPO}/actions/artifacts?per_page=100" \
-    --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')" || {
-    error "failed to list prerelease artifacts"
-  }
-  _artifact_names="$(printf '%s\n--ARTIFACTS--\n%s\n' "$_successful_run_ids" "$_artifact_records" | awk -F '\t' '
-    $0 == "--ARTIFACTS--" {
-      reading_artifacts = 1
-      next
-    }
-    !reading_artifacts {
-      if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
-      next
-    }
-    $1 in successful_runs {
-      print $2
-    }
-  ')"
-  _release_tags="$(printf '%s\n' "$_artifact_names" | sed -n "s/^openshell-\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-pre\.[1-9][0-9]*\)-${_artifact_platform}$/\1/p" | sort -u)"
 
-  _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk '
-    /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
-      tag = $0
-      sub(/^v/, "", tag)
-      split(tag, version_parts, "-pre[.]")
-      split(version_parts[1], core, "[.]")
-      sequence = version_parts[2] + 0
+  for _tag in $_release_tags; do
+    _artifact_name="openshell-${_tag}-${_artifact_platform}"
+    info "checking ${_tag} for ${_artifact_platform}..."
+    _run_ids="$(gh api \
+      "repos/${REPO}/actions/artifacts?name=${_artifact_name}&per_page=100" \
+      --jq '[.artifacts[] | select(.expired == false)] |
+        sort_by(.created_at) | reverse | .[] | .workflow_run.id')" || {
+      error "failed to find prerelease artifact ${_artifact_name}"
+    }
 
-      if (!found || core[1] + 0 > major ||
-          (core[1] + 0 == major && core[2] + 0 > minor) ||
-          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
-          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
-        selected = $0
-        major = core[1] + 0
-        minor = core[2] + 0
-        patch = core[3] + 0
-        prerelease = sequence
-        found = 1
+    for _run_id in $_run_ids; do
+      _successful="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
+        .status == "completed" and .conclusion == "success" and
+        (.path | startswith(".github/workflows/release-tag.yml"))')" || {
+        error "failed to check prerelease workflow run ${_run_id}"
       }
-    }
-    END {
-      if (found) print selected
-    }
-  ')"
+      if [ "$_successful" = "true" ]; then
+        printf '%s\n' "$_tag"
+        return 0
+      fi
+    done
+  done
 
-  if [ -z "$_latest_prerelease" ]; then
-    error "no unexpired prerelease artifacts found"
-  fi
-
-  printf '%s\n' "$_latest_prerelease"
+  error "no unexpired prerelease artifacts found"
 }
 
 is_prerelease_tag() {
@@ -618,6 +659,26 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
+  case "${OPENSHELL_INSTALL_METHOD:-}" in
+    snap | deb | rpm)
+      echo "$OPENSHELL_INSTALL_METHOD"
+      return 0
+      ;;
+    '') ;;
+    *) error "unsupported OPENSHELL_INSTALL_METHOD=${OPENSHELL_INSTALL_METHOD}; use snap, deb, or rpm" ;;
+  esac
+
+  # Keep refreshing an existing snap install instead of adding a second
+  # gateway on the same port.
+  case "${OPENSHELL_VERSION:-}" in
+    '' | dev)
+      if has_cmd snap && snap list openshell >/dev/null 2>&1; then
+        echo "snap"
+        return 0
+      fi
+      ;;
+  esac
+
   if has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
@@ -874,8 +935,19 @@ start_user_gateway() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_local_gateway_listener
+  wait_for_local_gateway_listener user_gateway_service_failed
   wait_for_local_gateway_status
+}
+
+# Succeeds when the gateway user service has failed or is waiting to restart
+# after a failure. A unit that is starting or running does not match, even if
+# it failed before it was restarted.
+user_gateway_service_failed() {
+  _unit_state="$(as_target_user systemctl --user show openshell-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
+  case "$_unit_state" in
+    *ActiveState=failed* | *SubState=auto-restart*) return 0 ;;
+  esac
+  return 1
 }
 
 dump_local_gateway_diagnostics() {
@@ -892,12 +964,30 @@ dump_local_gateway_diagnostics() {
       dump_homebrew_gateway_diagnostics "$_lines"
       ;;
     linux)
-      dump_user_service_gateway_diagnostics "$_lines"
+      if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
+        dump_snap_gateway_diagnostics "$_lines"
+      else
+        dump_user_service_gateway_diagnostics "$_lines"
+      fi
       ;;
     *)
       info "no gateway log collector is available for platform: ${PLATFORM:-unknown}"
       ;;
   esac
+}
+
+dump_snap_gateway_diagnostics() {
+  _lines="$1"
+
+  info "OpenShell snap service status:"
+  as_root snap services openshell >&2 || true
+  info "OpenShell snap connections:"
+  as_root snap connections openshell >&2 || true
+  if has_cmd journalctl; then
+    info "last ${_lines} lines from the OpenShell snap gateway journal:"
+    as_root journalctl -b -u snap.openshell.gateway.service --no-pager -n "$_lines" >&2 || true
+  fi
+  as_root snap logs openshell.gateway -n="$_lines" >&2 || true
 }
 
 dump_homebrew_gateway_diagnostics() {
@@ -936,10 +1026,14 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+# An optional command name stops the wait early when it succeeds, so a service
+# that already failed does not run out the full timeout.
 wait_for_local_gateway_listener() {
+  _failed_check="${1:-}"
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
   _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
@@ -951,12 +1045,19 @@ wait_for_local_gateway_listener() {
       info "local gateway listener is reachable"
       return 0
     fi
+    if [ -n "$_failed_check" ] && "$_failed_check"; then
+      _service_failed=1
+      break
+    fi
     sleep 1
     _elapsed=$((_elapsed + 1))
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
+  if [ "$_service_failed" -eq 1 ]; then
+    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+  fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
@@ -985,12 +1086,12 @@ wait_for_local_gateway_status() {
   error "openshell status did not report connected within ${_timeout}s"
 }
 
-remove_local_gateway_registration() {
+remove_local_gateway_registration_from() {
+  _config_dir="$1"
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
-  _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The install-dev gateway is a user service. Replace the CLI registration
-  # directly instead of asking `gateway destroy` to tear down Docker resources.
+  # Replace the CLI registration directly instead of asking `gateway destroy`
+  # to tear down package-managed resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
     config_dir=$1
@@ -1007,6 +1108,15 @@ remove_local_gateway_registration() {
       rm -f "$active"
     fi
   ' sh "$_config_dir"
+}
+
+remove_local_gateway_registration() {
+  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+}
+
+remove_snap_gateway_registration() {
+  remove_local_gateway_registration_from \
+    "${TARGET_HOME}/snap/openshell/common/.config/openshell"
 }
 
 register_local_gateway() {
@@ -1136,6 +1246,160 @@ install_linux_rpm() {
   start_user_gateway
 }
 
+openshell_snap_channel() {
+  case "${OPENSHELL_VERSION:-}" in
+    dev) printf '%s\n' "latest/edge" ;;
+    '') printf '%s\n' "latest/stable" ;;
+    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+  esac
+}
+
+wait_for_docker_daemon() {
+  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+
+  info "waiting for Docker daemon to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_root docker info 2>&1)"; then
+      info "Docker daemon is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  if snap list docker >/dev/null 2>&1; then
+    as_root snap services docker >&2 || true
+    as_root snap changes >&2 || true
+  fi
+  error "Docker daemon did not become reachable within ${_timeout}s"
+}
+
+# Copy the snap gateway's client bundle into the target user's snap state
+# directory, where `openshell gateway add --local` imports it. Root only reads
+# the source files; the target user writes the copies into their own home.
+copy_snap_client_bundle() {
+  _src="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+  _dst="${TARGET_HOME}/snap/openshell/common/.local/state/openshell/tls"
+
+  as_target_user mkdir -p "${_dst}/client"
+  as_target_user chmod 700 "$_dst" "${_dst}/client"
+  for _file in ca.crt client/tls.crt client/tls.key; do
+    as_root cat "${_src}/${_file}" |
+      as_target_user sh -c 'umask 077; cat >"$1"' sh "${_dst}/${_file}"
+    as_target_user chmod 600 "${_dst}/${_file}"
+  done
+}
+
+# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# older plaintext configs.
+snap_gateway_uses_mtls() {
+  [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
+}
+
+register_snap_gateway() {
+  _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
+
+  if snap_gateway_uses_mtls; then
+    _endpoint="https://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+    info "copying the gateway client certificate for ${TARGET_USER}..."
+    copy_snap_client_bundle
+  else
+    _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+    warn "this OpenShell snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
+  fi
+
+  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
+    return 0
+  else
+    _add_status=$?
+  fi
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_snap_gateway_registration
+      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
+}
+
+# The mTLS gateway rejects TLS handshakes without a client certificate, so
+# probe it with the root-owned client bundle.
+wait_for_snap_gateway_listener() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+  _tls_dir="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+
+  if snap_gateway_uses_mtls; then
+    _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=as_root
+    set -- --cacert "${_tls_dir}/ca.crt" \
+      --cert "${_tls_dir}/client/tls.crt" --key "${_tls_dir}/client/tls.key"
+  else
+    _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=""
+    set --
+  fi
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$($_probe_as curl -sS --max-time 2 "$@" -o /dev/null "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  dump_local_gateway_diagnostics
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
+install_linux_snap() {
+  require_cmd snap
+  set_linux_target_runtime_dir
+
+  if snap list docker >/dev/null 2>&1; then
+    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
+Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
+  fi
+  if ! has_cmd docker; then
+    error "Docker is required before installing the OpenShell snap.
+Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
+  fi
+  info "using existing Docker installation"
+  wait_for_docker_daemon
+
+  _channel="$(openshell_snap_channel)"
+  if snap list openshell >/dev/null 2>&1; then
+    info "refreshing OpenShell snap from ${_channel}..."
+    as_root snap refresh openshell --channel="$_channel"
+    warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+  else
+    info "installing OpenShell snap from ${_channel}..."
+    as_root snap install openshell --channel="$_channel"
+  fi
+
+  as_root snap restart openshell.gateway
+
+  info "installed OpenShell snap from ${_channel}"
+  wait_for_snap_gateway_listener
+  info "registering local gateway as ${TARGET_USER}..."
+  register_snap_gateway
+  OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
+  wait_for_local_gateway_status
+}
+
 install_macos_homebrew() {
   check_macos_platform
 
@@ -1206,23 +1470,34 @@ main() {
 
   require_cmd curl
   PLATFORM="$(detect_platform)"
-  RELEASE_TAG="$(resolve_release_tag)"
+  if [ "$PLATFORM" = "linux" ]; then
+    LINUX_INSTALL_METHOD="$(linux_package_method)"
+  fi
 
   TARGET_USER="$(target_user)"
   TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"
   [ -n "$TARGET_UID" ] || error "cannot resolve uid for ${TARGET_USER}"
   TARGET_HOME="$(user_home "$TARGET_USER")"
 
-  guard_breaking_upgrade
+  if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
+    guard_native_to_snap_transition
+  else
+    RELEASE_TAG="$(resolve_release_tag)"
+    guard_breaking_upgrade
+  fi
 
   case "$PLATFORM" in
     linux)
-      require_linux_package_glibc
-      case "$(linux_package_method)" in
+      case "$LINUX_INSTALL_METHOD" in
+        snap)
+          install_linux_snap
+          ;;
         deb)
+          require_linux_package_glibc
           install_linux_deb
           ;;
         rpm)
+          require_linux_package_glibc
           install_linux_rpm
           ;;
         *)

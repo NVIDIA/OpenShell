@@ -137,7 +137,7 @@ fn container_id_for_role(
     role: &str,
 ) -> Result<String, String> {
     let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
-    let role_filter = format!("label=openshell.io/isolation-role={role}");
+    let role_filter = format!("label=openshell.ai/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[
@@ -244,6 +244,23 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         "Podman sandbox must launch the immutable image ID inspected before creation"
     );
 
+    let workspace_output = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            "set -eu; stat -c 'workspace-owner=%u:%g' /sandbox; touch /sandbox/probe; rm /sandbox/probe; echo podman-workspace-write-ok",
+        ])
+        .await
+        .expect("OCI workload should be able to write to the managed workspace");
+    assert!(
+        workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
+        "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"
+    );
+    assert!(
+        workspace_output.contains("podman-workspace-write-ok"),
+        "expected workspace write marker:\n{workspace_output}"
+    );
+
     assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
 }
@@ -252,23 +269,31 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
         .expect("find separate supervisor companion");
     assert_ne!(supervisor_id, container_id);
-    for id in [container_id, &supervisor_id] {
-        let user = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.Config.User}}", id],
-        )
-        .unwrap();
-        assert_eq!(user, format!("{OCI_UID}:{OCI_GID}"));
-        let caps = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.EffectiveCaps}}", id],
-        )
-        .unwrap();
-        assert_eq!(
-            caps, "[]",
-            "neither container may have effective capabilities"
-        );
-    }
+    let workload_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", container_id],
+    )
+    .unwrap();
+    assert_eq!(
+        workload_user,
+        format!("{OCI_UID}:{OCI_GID}"),
+        "the workload must start directly as the final OCI identity"
+    );
+    let supervisor_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(supervisor_user, format!("{OCI_UID}:{OCI_GID}"));
+    let supervisor_caps = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.EffectiveCaps}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(
+        supervisor_caps, "[]",
+        "the supervisor companion may not have effective capabilities"
+    );
     let network = run_engine(
         &image.engine,
         &[

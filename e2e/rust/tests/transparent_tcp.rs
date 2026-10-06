@@ -285,11 +285,19 @@ serve(fixture_listener)
         Host(HostPythonFixture),
         Network(SupportContainer),
     }
-    let (fixture, policy_host, real_ip, fixture_port, tcp_dns_port, transparent_port) =
+    let (fixture, policy_host, real_ip, fixture_port, tcp_dns_port, transparent_port, wrong_port) =
         if is_e2e_driver("docker") {
             let fixture_host_port = find_free_port();
             let tcp_dns_host_port = find_free_port();
             let transparent_host_port = find_free_port();
+            let wrong_host_port = loop {
+                let candidate = find_free_port();
+                if ![fixture_host_port, tcp_dns_host_port, transparent_host_port]
+                    .contains(&candidate)
+                {
+                    break candidate;
+                }
+            };
             let fixture = HostPythonFixture::start(
                 &fixture_script(fixture_host_port, tcp_dns_host_port, transparent_host_port),
                 fixture_host_port,
@@ -303,6 +311,7 @@ serve(fixture_listener)
                 fixture_host_port,
                 tcp_dns_host_port,
                 transparent_host_port,
+                wrong_host_port,
             )
         } else {
             let fixture = SupportContainer::start_python_with_capabilities(
@@ -321,6 +330,7 @@ serve(fixture_listener)
                 FIXTURE_PORT,
                 TCP_DNS_PORT,
                 TRANSPARENT_LISTENER_PORT,
+                FIXTURE_PORT + 1,
             )
         };
     // Keep the fixture alive through the sandbox assertions.
@@ -373,7 +383,7 @@ print('transparent-tcp-e2e-ok')
         host = policy_host,
         port = fixture_port,
         tcp_dns_port = tcp_dns_port,
-        wrong_port = fixture_port + 1,
+        wrong_port = wrong_port,
         real_ip = real_ip,
         transparent_port = transparent_port,
     );

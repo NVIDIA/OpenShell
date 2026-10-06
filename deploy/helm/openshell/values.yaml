@@ -7,6 +7,15 @@
 # server.externalDbSecret because the default SQLite backend is per pod.
 replicaCount: 1
 
+global:
+  image:
+    # -- Shared OpenShell image registry. Individual image registries take precedence.
+    registry: ghcr.io/nvidia
+    # -- Shared OpenShell image tag. Defaults to the chart appVersion when empty.
+    tag: ""
+    # -- Shared OpenShell image pull policy. Individual image pull policies take precedence.
+    pullPolicy: IfNotPresent
+
 workload:
   # -- Gateway workload controller kind. Use `statefulset` for the default
   # SQLite database, or `deployment` when server.externalDbSecret points at an
@@ -18,45 +27,68 @@ workload:
   # StatefulSet identity or storage semantics.
   allowMultiReplicaStatefulSet: false
 
-image:
-  # -- Gateway image repository.
-  repository: ghcr.io/nvidia/openshell/gateway
-  # -- Gateway image pull policy.
-  pullPolicy: IfNotPresent
-  # -- Gateway image tag. Defaults to the chart appVersion when empty.
-  tag: ""
+gateway:
+  image:
+    # -- Gateway image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Gateway image repository.
+    repository: openshell/gateway
+    # -- Gateway image pull policy. Empty uses global.image.pullPolicy.
+    pullPolicy: null
+    # -- Gateway image tag. Defaults to the chart appVersion when empty.
+    tag: ""
+    # -- Gateway image digest. When set, this takes precedence over tag.
+    digest: ""
 
 # Trusted workload-side runtime image.
 sandboxRuntime:
   image:
-    # -- Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/sandbox
-    # -- Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty.
-    pullPolicy: ""
-    # -- Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed.
+    # -- Sandbox runtime image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Sandbox runtime image repository.
+    repository: openshell/sandbox
+    # -- Sandbox runtime image pull policy. Empty uses global.image.pullPolicy.
+    pullPolicy: null
+    # -- Sandbox runtime image tag. Defaults to the chart appVersion when empty.
     tag: ""
+    # -- Sandbox runtime image digest. When set, this takes precedence over tag.
+    digest: ""
 
 # Trusted control-side runtime image.
 supervisor:
   image:
-    # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/supervisor
-    # -- Sandbox supervisor pull policy. Leave unset to use the Kubernetes
-    # image default. Prefer always, if_not_present, or never; the chart also
-    # accepts legacy Kubernetes spellings Always, IfNotPresent, and Never.
+    # -- Supervisor image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Supervisor image repository.
+    repository: openshell/supervisor
+    # -- Supervisor image pull policy. Empty uses global.image.pullPolicy.
+    # Prefer always, if_not_present, or never; the chart also accepts legacy
+    # Kubernetes spellings Always, IfNotPresent, and Never.
     pullPolicy: null
-    # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
+    # -- Supervisor image tag. Defaults to the chart appVersion when empty.
     tag: ""
+    # -- Supervisor image digest. When set, this takes precedence over tag.
+    digest: ""
   sandboxRuntime:
-    # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
-    networkPolicyEnforced: false
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
+
+sandbox:
+  image:
+    # -- Default standalone sandbox image repository.
+    repository: nvcr.io/nvidia/base/ubuntu
+    # -- Sandbox image tag. Defaults to latest when empty.
+    tag: "24.04"
+    # -- Sandbox image digest. When set, this takes precedence over tag.
+    digest: ""
+    # -- Sandbox image pull policy. Leave unset to use the Kubernetes image default.
+    pullPolicy: null
 
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
 # from Kubernetes sandboxes. The workload cannot select or override it.
 upstreamProxy:
-  # -- HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported.
+  # -- Proxy URL in http://host:port or https://host:port form. An https:// proxy
+  # whose certificate is not publicly trusted also needs caBundle below.
   url: ""
   # -- Comma-separated destinations that bypass only the corporate proxy.
   noProxy: ""
@@ -69,6 +101,22 @@ upstreamProxy:
   authAllowInsecure: false
   # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
   connectByHostname: false
+  caBundle:
+    # -- ConfigMap in the release namespace holding the corporate proxy CA bundle.
+    # Required for an https:// proxy with a private CA, and for a TLS-intercepting
+    # proxy that re-signs upstream certificates. The gateway reads it and stages it
+    # into each sandbox's immutable supervisor bootstrap Secret, so the anchor stays
+    # in the gateway's trust domain rather than the workload namespace.
+    # Supply only the CA that signs your proxy's certificate, or that the proxy
+    # re-signs intercepted upstream certificates with. Public roots already come
+    # from the supervisor image and its TLS stack, so a full merged trust bundle
+    # (for example an OpenShift config.openshift.io/inject-trusted-cabundle
+    # ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed
+    # the sandbox boundary's control-frame budget.
+    configMapName: ""
+    # -- Key inside that ConfigMap. Change this only to reuse an existing
+    # ConfigMap whose key is not ca.crt.
+    key: ca.crt
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
@@ -92,6 +140,26 @@ sandboxServiceAccount:
   annotations: {}
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
+
+# RBAC objects created for the gateway ServiceAccount. Cluster-scoped objects
+# can be omitted so a cluster-admin applies them once and a namespace-admin
+# installs and upgrades the gateway release without cluster-scoped permissions.
+rbac:
+  # -- Create the RBAC objects that grant the gateway ServiceAccount access.
+  # Disable to supply the namespaced sandbox and peer Role/RoleBinding and the
+  # cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook
+  # and credential driver RBAC keep their own flags.
+  create: true
+  clusterScoped:
+    # -- Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable
+    # for a namespace-admin install where a cluster-admin applies them
+    # separately; the gateway ServiceAccount name and namespace are unchanged,
+    # so a pre-created ClusterRoleBinding still matches.
+    create: true
+    # -- Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleName: ""
+    # -- Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleBindingName: ""
 
 # Namespace-scoped resources needed to run sandboxes. Disable this when the
 # gateway and workspace prerequisites are managed as separate Helm releases
@@ -144,8 +212,54 @@ agentSandbox:
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
-  # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
-  terminationGracePeriodSeconds: 5
+  # -- Maximum time, in seconds, Kubernetes waits for the gateway to exit before
+  # killing it. The gateway exits as soon as shutdown completes; the limit
+  # covers supervisor session cleanup and draining queued OCSF records.
+  terminationGracePeriodSeconds: 30
+
+# Optional HorizontalPodAutoscaler (autoscaling/v2) for the gateway workload.
+# When enabled, the Deployment or StatefulSet omits spec.replicas and the HPA
+# owns the replica count; replicaCount is ignored. Multi-replica limits
+# (server.externalDbSecret, and workload.allowMultiReplicaStatefulSet for a
+# StatefulSet) apply to maxReplicas. Scaling out does not move established
+# supervisor sessions; read the High Availability guide before choosing metrics.
+# The workload can drop to one replica when you enable this on an existing
+# release, until the HPA scales it back up; read the chart README before you
+# upgrade.
+autoscaling:
+  # -- Render a HorizontalPodAutoscaler and stop rendering spec.replicas.
+  enabled: false
+  # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
+  minReplicas: 2
+  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
+  # connection pool; size the database for rollouts at this count, as the High
+  # Availability guide describes.
+  maxReplicas: 4
+  # -- Target average CPU utilization, as a percentage of
+  # resources.requests.cpu. Set to null to disable. Requires
+  # resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies
+  # into the request.
+  targetCPUUtilizationPercentage: 80
+  # -- (int) Target average memory utilization, as a percentage of
+  # resources.requests.memory. Null disables it. Requires
+  # resources.requests.memory, or resources.limits.memory, which Kubernetes
+  # copies into the request.
+  targetMemoryUtilizationPercentage: null
+  # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
+  # Pods metrics served by prometheus-adapter.
+  metrics: []
+  # -- HPA scaling behavior. Scale-down disconnects the removed pod's
+  # supervisor sessions; they reconnect to the remaining replicas, so the
+  # default removes at most one replica every two minutes after a
+  # five-minute stabilization window. Helm merges maps: set
+  # autoscaling.behavior.scaleDown to null to drop the default.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
 
 probes:
   startup:
@@ -200,26 +314,46 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
+  # Gateway-native OCSF JSONL output.
+  ocsfLog:
+    # -- Write gateway OCSF events as JSONL.
+    enabled: false
+    # -- OCSF JSONL path. The default is writable in the gateway container but
+    # does not persist across restarts. To keep records, mount a volume with
+    # server.extraVolumes and server.extraVolumeMounts and set a path on it.
+    # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
+    # on the mount so each replica writes its own file.
+    path: /tmp/gateway-ocsf.jsonl
+    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
+    # Supported values: "1.1", "1.3".
+    schemaVersion: ""
+    # -- Rotate the active file daily in UTC, or never.
+    rotation: daily
+    # -- Rotated files retained when rotation is daily.
+    maxFiles: 7
+    # -- Maximum records waiting for the file writer.
+    queueCapacity: 10000
+    # -- Maximum encoded bytes waiting for the file writer.
+    queueMaxBytes: 16777216
+  # -- Additional volumes for the gateway pod.
+  extraVolumes: []
+  # -- Additional volume mounts for the gateway container.
+  extraVolumeMounts: []
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
-  # -- Gateway database URL (used for the default SQLite backend).
+  # -- Gateway database URL (used for the default SQLite backend). SQLite runs
+  # in WAL mode and needs a local block-backed volume, not NFS or other network
+  # filesystems.
   dbUrl: "sqlite:/var/openshell/openshell.db"
   # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
   # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
   # from this Secret instead of using dbUrl. The Secret must contain a
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
-  # -- Default sandbox image used when requests do not specify one.
-  sandboxImage: "nvcr.io/nvidia/base/ubuntu:24.04"
-  # -- Pull policy for sandbox pods. Leave unset to use the Kubernetes image
-  # default (Always for :latest, IfNotPresent otherwise). Prefer always,
-  # if_not_present, or never; the chart also accepts legacy Kubernetes spellings
-  # Always, IfNotPresent, and Never.
-  sandboxImagePullPolicy: null
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []
@@ -238,6 +372,13 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
+  # SCC namespace annotation if present, otherwise the driver default. Must be
+  # an integer between 1 and 4294967294.
+  sandboxUid: ""
+  # -- GID for sandbox pods (`sandbox_gid`). Empty (default) = same as
+  # sandboxUid. Must be an integer between 1 and 4294967294.
+  sandboxGid: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
@@ -261,6 +402,13 @@ server:
   # Kubernetes compute driver settings.
   drivers:
     kubernetes:
+      # -- Allow caller driver JSON; external resources still require approval.
+      allowDriverConfig: false
+      resourceAdmission:
+        # -- Require operator approval labels on external sandbox attachments (GPU attachments exempt).
+        enabled: true
+        # -- Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled.
+        requiredLabels: null
       # -- How workspaces map to Kubernetes namespaces.
       # "shared" (default): all sandboxes in a single namespace.
       # "managed": auto-creates per-workspace namespaces.
@@ -278,6 +426,9 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
+  # authenticated edge proxy. Leave disabled for direct gateway installs.
+  enableWebsocketTunnel: false
   # -- Posture when a candidate sandbox policy fails validation. `fail_closed`
   # deactivates the previous policy; `retain_last_valid` keeps it active.
   policyValidationFailureMode: fail_closed
@@ -318,8 +469,11 @@ server:
       # Empty = Helm release namespace. A dedicated namespace is RECOMMENDED
       # to isolate OpenShell-managed Secrets from other workloads.
       namespace: ""
-      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
-      allowReferenceNamespace: false
+      # -- Create the credential namespace. Requires a namespace other than the
+      # release namespace. The Namespace is retained on uninstall so stored
+      # credentials survive; an existing Namespace not owned by this release is
+      # left untouched.
+      createNamespace: false
       rbac:
         # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
         create: true

@@ -12,38 +12,45 @@ description: |
   profile-backed model-provider access.
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
-  (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).
+  (`openshell.term`), a standalone policy prover (`openshell.prover`), and a
+  managed gateway daemon (`openshell.gateway`).
 
   **Setup instructions**
 
-    1. Install the Docker snap:
+    1. Install and start Docker using your preferred package source before
+       installing the OpenShell snap. Use a system package or Docker's package
+       repository. The Docker snap is not currently compatible with OpenShell.
 
-         sudo snap install docker
+       Snap Store installations automatically connect the required interfaces.
 
-       Support for system-installed Docker is coming in snapd 2.76.
+       If the OpenShell snap was installed before Docker was running, it may
+       have hit the systemd start limit when trying to repeatedly start and
+       connect to docker. If this is the case, it can be resolved by doing:
 
-    2. Connect the required interfaces:
-
-         sudo snap connect openshell:docker docker:docker-daemon
-         sudo snap connect openshell:log-observe
-         sudo snap connect openshell:system-observe
-
-    3. Verify the gateway and register it locally:
-
-         snap services openshell.gateway
-         openshell status
-         openshell gateway add http://127.0.0.1:17670 --local --name openshell-gateway
-
-    After a snap refresh, restart the gateway to pick up the new revision:
-
+         sudo systemctl reset-failed snap.openshell.gateway.service
          sudo snap restart openshell.gateway
 
-    Restarting the gateway will interrupt active sandbox sessions. The gateway
-    is not restarted automatically to avoid disconnecting running sandboxes.
+    2. Give your user the gateway client certificate and register the gateway.
+       The gateway requires mTLS; only users holding this certificate can use
+       it, so copy it only for trusted users:
+
+         snap services openshell.gateway
+         d=~/snap/openshell/common/.local/state/openshell/tls
+         mkdir -p -m 700 "$d" "$d/client"
+         sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
+         sudo install -o "$USER" -m 600 -t "$d/client" \
+           /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
+         openshell gateway add https://127.0.0.1:17670 --local --name openshell
+         openshell status
 
 base: core24
 grade: stable
 confinement: strict
+# The system :docker slot was added in snapd 2.76, so this is the minimum
+# required version. Snapd 2.77 allowed manual connection to that slot without
+# snap-declaration overrides from the store, such as when installing a locally-
+# built snap, but that is not required for installations from the snap store.
+assumes: [snapd2.76]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
 source-code: https://github.com/NVIDIA/OpenShell
@@ -79,6 +86,12 @@ apps:
       - home
       - network
       - system-observe
+  prover:
+    command: bin/openshell-prover
+    aliases:
+      - openshell-prover
+    plugs:
+      - home
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
@@ -86,18 +99,18 @@ apps:
     # during snap refreshes, which would kill active sandbox sessions.
     # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
-    # The wrapper sets OPENSHELL_DISABLE_TLS=true and OPENSHELL_DB_URL to
-    # use $SNAP_COMMON/gateway.db. Before startup it bootstraps package-managed
-    # credentials and validates the selected operator-provided config without
-    # creating or rewriting it. A nonempty OPENSHELL_GATEWAY_CONFIG takes
-    # precedence over gateway.toml.
+    # Snapd runs this daemon as root. The wrapper serves TLS from the bundle
+    # generated in $SNAP_COMMON/tls, and the default config requires client
+    # certificates; the installer copies the client bundle to the target
+    # user. The wrapper uses $SNAP_COMMON/gateway.db. Before startup it
+    # bootstraps package-managed credentials and validates the selected
+    # operator-provided config without creating or rewriting it. A nonempty
+    # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
       - docker
-      # Docker snap is required because the snap uses the docker:docker-daemon
-      # interface slot. It does not work with system-installed Docker.
       - log-observe
       - network
       - network-bind
@@ -114,7 +127,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -132,6 +145,8 @@ parts:
 
       install -D -m 0755 "$CRAFT_PART_SRC/openshell" \
         "$CRAFT_PART_INSTALL/bin/openshell"
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-prover" \
+        "$CRAFT_PART_INSTALL/bin/openshell-prover"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \

@@ -8,6 +8,13 @@ The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest
 
 ## How it fits together
 
+Caller driver config is disabled by default, including upload workflows
+encoded in driver JSON. GPU devices and their trusted VFIO plumbing are
+temporarily exempt from approval labels; existing GPU selection validation
+still applies. Private rootfs staging does not authorize arbitrary host paths.
+The gateway passes its common policy to its managed VM subprocess.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 ```mermaid
 flowchart LR
     subgraph host["Host"]
@@ -154,14 +161,12 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
-| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
+| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
 | `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |
-| `guest_tls_cert` | unset | Historical key name for the host supervisor's client certificate; never copied into the guest. |
-| `guest_tls_key` | unset | Historical key name for the host supervisor's client private key; never copied into the guest. |
 | `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) that host control chains policy-approved TLS CONNECT egress through. Host-loopback proxy URLs work because control runs on the gateway host. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |
@@ -205,7 +210,18 @@ and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENC
 tune registry layer download parallelism (default `4`, maximum `16`).
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
-embedded supervisor.
+embedded supervisor. Host-side bootstrap layer assembly preserves relative
+symlinks that remain inside the rootfs, but rejects absolute or escaping
+cross-layer symlink traversal before applying later files or whiteouts. The
+layer applier performs rootfs mutations relative to opened directory handles
+and creates destination files without following symlinks.
+The requested sandbox image is never selected as the bootstrap image. Operators
+must configure either `bootstrap_image` or `default_image`; when both are empty,
+the driver fails during startup.
+
+Image and writable-overlay preparation run in owned worker processes. Stopping or deleting a sandbox cancels its worker and formatter processes, waits for them to exit, then removes the attempt's temporary files under `<state-dir>/images/preparations/`. New overlays, including retries after an interrupted first start, are built there and renamed into sandbox state only after completion. A file lock inherited by the worker's children keeps cleanup from deleting files that a process still owns. If cleanup cannot establish that the processes have stopped, the operation returns an error and retains both temporary files and sandbox state.
+
+At startup, the driver reclaims inactive attempts in this directory. It preserves active attempts, committed image caches, and unmarked staging from older releases. Concurrent preparations serialize image-cache publication; an interrupted attempt cannot publish a partial disk over an existing cache entry. Gateway upload slots for `rootfs_tar_path` keep their existing, separate lifecycle.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

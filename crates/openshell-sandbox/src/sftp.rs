@@ -320,6 +320,11 @@ impl russh_sftp::server::Handler for SftpHandler {
             .await
             .map_err(io_status)?;
         file.write_all(&data).await.map_err(io_status)?;
+        // `tokio::fs::File::write_all` may return after copying the bytes into
+        // its internal buffer while the blocking filesystem write is still in
+        // flight. Do not acknowledge the SFTP write until that operation has
+        // completed, otherwise session shutdown can race the final write.
+        file.flush().await.map_err(io_status)?;
         Ok(ok(id))
     }
 

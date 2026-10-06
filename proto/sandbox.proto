@@ -108,9 +108,9 @@ enum NetworkTlsMode {
   NETWORK_TLS_MODE_UNSPECIFIED = 0;
   // Disable TLS detection and relay the connection without inspection.
   NETWORK_TLS_MODE_SKIP = 1;
-  // Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+  // Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
   NETWORK_TLS_MODE_TERMINATE = 2 [deprecated = true];
-  // Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+  // Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
   NETWORK_TLS_MODE_PASSTHROUGH = 3 [deprecated = true];
 }
 
@@ -400,7 +400,11 @@ enum PolicySource {
   POLICY_SOURCE_GLOBAL = 2;
 }
 
-// Complete effective sandbox configuration delivered to a supervisor.
+// Complete effective sandbox configuration delivered to a supervisor. Fields
+// have the same meaning as the identically numbered GetSandboxConfigResponse
+// fields, including fail-closed handling of an unknown
+// policy_validation_failure_mode and treating absent configuration_admitted as
+// not admitted. Move those field comments here when the polling RPC is removed.
 message SandboxConfigSnapshot {
   SandboxPolicy policy = 1;
   uint32 version = 2;
@@ -421,7 +425,8 @@ message SandboxConfigSnapshot {
   uint64 settings_revision = 17;
 }
 
-// Response containing effective sandbox settings and policy.
+// Response containing effective sandbox settings and policy. Polling
+// projection of SandboxConfigSnapshot; removed with the polling RPCs.
 message GetSandboxConfigResponse {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;

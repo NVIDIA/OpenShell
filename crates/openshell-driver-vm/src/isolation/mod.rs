@@ -11,6 +11,7 @@
 use openshell_isolation_interface::contract::{
     BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -70,6 +71,7 @@ pub struct VmBoundarySpec {
     pub agent_uid: u32,
     pub agent_gid: u32,
     pub child_env: HashMap<String, String>,
+    pub gpu_requested: bool,
 }
 
 /// The protected guest config and matching host descriptor for one VM.
@@ -89,10 +91,13 @@ impl VmBoundarySpec {
             "vm-config".to_string(),
             self.image_identity.clone(),
         )?;
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             ("vm.generation".to_string(), self.generation.clone()),
             ("vm.image_identity".to_string(), self.image_identity),
         ]);
+        if self.gpu_requested {
+            resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
+        }
         let outer_fence = VmOuterFenceEvidence {
             generation: &self.generation,
             network_device_count: 0,
@@ -165,6 +170,12 @@ mod tests {
 
     #[test]
     fn provisioning_binds_identical_resource_claims() {
+        for gpu_requested in [false, true] {
+            assert_provisioning_claims(gpu_requested);
+        }
+    }
+
+    fn assert_provisioning_claims(gpu_requested: bool) {
         let session_id = openshell_core::SandboxSessionId::new();
         let material = generate_sandbox_tls_material(session_id).unwrap();
         let provisioned = VmBoundarySpec {
@@ -195,6 +206,7 @@ mod tests {
             agent_uid: 1000,
             agent_gid: 1000,
             child_env: HashMap::new(),
+            gpu_requested,
         }
         .provision()
         .unwrap();
@@ -202,6 +214,14 @@ mod tests {
         assert_eq!(
             provisioned.boundary_config.resource_claims,
             provisioned.runtime_descriptor.resource_claims
+        );
+        assert_eq!(
+            provisioned
+                .runtime_descriptor
+                .resource_claims
+                .get(GPU_RESOURCE_CLAIM)
+                .map(String::as_str),
+            gpu_requested.then_some("true")
         );
         assert_eq!(
             provisioned.runtime_descriptor.resource_claims["vm.generation"],

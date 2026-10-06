@@ -7,7 +7,6 @@ use crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE;
 use crate::grpc::test_support::{authed_request, test_server_state};
 use crate::persistence::WriteCondition;
 use crate::storage_proto::StoredConfigUpdateOperation;
-use openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION;
 use openshell_core::proto::SandboxSpec;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use prost::Message;
@@ -71,11 +70,11 @@ fn hello() -> SupervisorHello {
     SupervisorHello {
         sandbox_id: Uuid::new_v4().to_string(),
         instance_id: Uuid::new_v4().to_string(),
-        protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+        supports_config_snapshots: true,
         connection_epoch: 0,
         supports_provider_readiness: true,
-        image_policy: None,
         image_policy_discovery: None,
+        supports_config_apply: false,
     }
 }
 

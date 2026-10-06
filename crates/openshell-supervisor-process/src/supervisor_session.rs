@@ -25,10 +25,6 @@ use openshell_core::proto::{
     config_snapshot_revision, config_update, gateway_message, relay_open, startup_config_prepared,
     supervisor_message,
 };
-use openshell_core::proto::{
-    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-    SUPERVISOR_PROTOCOL_REVISION,
-};
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
@@ -65,7 +61,7 @@ pub enum ConfigApplyRequest {
     },
 }
 
-/// A revision-2 supervisor session that has received its required bootstrap.
+/// A supervisor session that has received its startup response.
 ///
 /// It has not yet reported runtime initialization. Holding the stream open
 /// across supervisor construction makes the bootstrap the source of initial
@@ -79,7 +75,8 @@ pub struct PreparedSupervisorSession {
     inbound: tonic::Streaming<GatewayMessage>,
     heartbeat_secs: u32,
     session_id: String,
-    protocol_revision: u32,
+    /// The gateway committed to authoritative streamed configuration.
+    config_apply_enabled: bool,
     bootstrap: Option<ConfigBootstrap>,
 }
 
@@ -89,7 +86,7 @@ impl PreparedSupervisorSession {
     }
 
     pub fn uses_stream_configuration(&self) -> bool {
-        self.protocol_revision == SUPERVISOR_PROTOCOL_REVISION
+        self.config_apply_enabled
     }
 }
 
@@ -457,8 +454,9 @@ pub fn spawn_with_readiness(
     (tokio::spawn(run_session_loop(config, None)), ready_rx)
 }
 
-/// Establish the control stream and receive the required revision-2 bootstrap
-/// before gateway-owned runtime initialization begins.
+/// Establish the control stream and, when the gateway applies configuration
+/// over the stream, receive the required bootstrap before gateway-owned runtime
+/// initialization begins.
 pub async fn prepare(
     endpoint: String,
     sandbox_id: String,
@@ -479,8 +477,8 @@ pub async fn prepare(
     )
     .await
     .map_err(|_| "timed out waiting for supervisor session bootstrap")??;
-    if prepared.protocol_revision == SUPERVISOR_PROTOCOL_REVISION && prepared.bootstrap.is_none() {
-        return Err("revision-2 gateway omitted required configuration bootstrap".into());
+    if prepared.config_apply_enabled && prepared.bootstrap.is_none() {
+        return Err("gateway enabled configuration apply without a bootstrap".into());
     }
     Ok(prepared)
 }
@@ -619,21 +617,13 @@ async fn open_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
-    let image_policy = image_policy_discovery.as_ref().and_then(|discovery| {
-        let openshell_core::proto::image_policy_discovery::Result::Policy(policy) =
-            discovery.result.as_ref()?
-        else {
-            return None;
-        };
-        Some(policy.clone())
-    });
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.clone(),
             instance_id: instance_id.clone(),
-            protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+            supports_config_snapshots: true,
+            supports_config_apply: true,
             connection_epoch,
-            image_policy,
             image_policy_discovery,
             supports_provider_readiness: true,
         })),
@@ -711,7 +701,13 @@ async fn open_session(
         .and_then(|value| openshell_core::time::duration_to_std(value).ok())
         .map_or(5, |value| value.as_secs().max(5));
     let heartbeat_secs = u32::try_from(heartbeat_secs).unwrap_or(u32::MAX);
-    validate_gateway_protocol_revision(accepted.protocol_revision)?;
+    if !accepted.config_apply_enabled {
+        debug!(
+            sandbox_id = %sandbox_id,
+            session_id = %accepted.session_id,
+            "supervisor session: gateway did not enable streamed configuration; polling remains active"
+        );
+    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         &endpoint,
@@ -720,7 +716,7 @@ async fn open_session(
     );
     ocsf_emit!(event);
 
-    let protocol_revision = accepted.protocol_revision;
+    let config_apply_enabled = accepted.config_apply_enabled;
     Ok(PreparedSupervisorSession {
         endpoint,
         sandbox_id,
@@ -730,10 +726,8 @@ async fn open_session(
         inbound,
         heartbeat_secs,
         session_id: accepted.session_id,
-        protocol_revision,
-        bootstrap: (protocol_revision == SUPERVISOR_PROTOCOL_REVISION)
-            .then_some(accepted.bootstrap)
-            .flatten(),
+        config_apply_enabled,
+        bootstrap: config_apply_enabled.then_some(accepted.bootstrap).flatten(),
     })
 }
 
@@ -746,6 +740,12 @@ async fn run_prepared_session(
         updates.send_replace(Some(prepared.session_id.clone()));
     }
     let heartbeat_secs = prepared.heartbeat_secs;
+    // Shadow updates from a gateway that did not enable apply are answered as
+    // unsupported; polling stays authoritative for that session.
+    let config_apply_tx = config
+        .config_apply_tx
+        .as_ref()
+        .filter(|_| prepared.config_apply_enabled);
     let channel = prepared.channel;
     let tx = prepared.tx;
     let mut inbound = prepared.inbound;
@@ -765,7 +765,7 @@ async fn run_prepared_session(
         .map_err(|_| "failed to queue configuration bootstrap result")?;
     }
     let config_sequences = Arc::new(Mutex::new(ConfigSequenceWatermarks::default()));
-    if prepared.protocol_revision != SUPERVISOR_PROTOCOL_REVISION {
+    if !prepared.config_apply_enabled {
         config.ready_tx.send_replace(true);
     }
 
@@ -793,7 +793,7 @@ async fn run_prepared_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
-                    config_apply_tx: config.config_apply_tx.as_ref(),
+                    config_apply_tx,
                     config_sequences: &config_sequences,
                     ready_tx: &config.ready_tx,
                     runtime_ready: &config.runtime_ready,
@@ -814,30 +814,6 @@ async fn run_prepared_session(
                 }
             }
         }
-    }
-}
-
-fn validate_gateway_protocol_revision(
-    gateway_revision: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match gateway_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
-            warn!(
-                "supervisor session: gateway uses Stage 1 stream semantics; polling remains active"
-            );
-            Ok(())
-        }
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            warn!(
-                "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
-            );
-            Ok(())
-        }
-        other => Err(format!(
-            "supervisor protocol revision mismatch: supervisor requires {SUPERVISOR_PROTOCOL_REVISION}, gateway offered {other}"
-        )
-        .into()),
     }
 }
 
@@ -937,6 +913,22 @@ pub async fn report_main_process_exit(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn test_bridge_ssh_relay(
+    target: tokio::net::UnixStream,
+    inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
+    out_tx: mpsc::Sender<RelayFrame>,
+) {
+    let _ = bridge_relay(
+        Box::new(target),
+        tokio_stream::wrappers::ReceiverStream::new(inbound),
+        out_tx,
+        "half-open-test".into(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
 }
 
 /// Confirm terminal delivery and permit ephemeral cleanup.
@@ -1225,18 +1217,67 @@ async fn handle_relay_open(
         }
         Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
     };
-    let mut inbound = response.into_inner();
+    bridge_relay(
+        target,
+        response.into_inner(),
+        out_tx,
+        channel_id,
+        terminating,
+    )
+    .await
+}
 
+/// Forward the relay's data frames without interpreting the target protocol.
+async fn bridge_relay(
+    target: Box<dyn TargetStream>,
+    inbound: impl tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    channel_id: String,
+    terminating: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the local SSH daemon on its Unix socket.
-    let (mut target_r, mut target_w) = tokio::io::split(target);
+    let (target_r, target_w) = tokio::io::split(target);
 
     debug!(
         channel_id = %channel_id,
         "relay bridge: connected to local target"
     );
 
+    bridge_relay_bytes(
+        &channel_id,
+        target_r,
+        target_w,
+        out_tx,
+        inbound,
+        &terminating,
+    )
+    .await
+}
+
+/// Bridge bytes between a local target socket and an inbound `RelayFrame`
+/// stream, sending target bytes out through `out_tx`.
+///
+/// `out_tx` is moved into the target-reading task rather than cloned. A
+/// clone would let the sender-side task's copy be dropped on target EOF
+/// while this function's own copy stayed alive until `inbound` also ended,
+/// which keeps the outbound gRPC stream open indefinitely after the target
+/// closes. Moving it in means the outbound stream (and therefore the
+/// client's view of the connection) closes as soon as the target does,
+/// regardless of whether the client side has sent anything else.
+async fn bridge_relay_bytes<S>(
+    channel_id: &str,
+    mut target_r: impl AsyncRead + Unpin + Send + 'static,
+    mut target_w: impl AsyncWrite + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    mut inbound: S,
+    terminating: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+{
     // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
-    let out_tx_writer = out_tx.clone();
+    // `out_tx` is owned by this task, so dropping it on target EOF ends the
+    // outbound stream immediately, without waiting on the inbound side.
     let target_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
@@ -1248,7 +1289,7 @@ async fn handle_relay_open(
                             buf[..n].to_vec(),
                         )),
                     };
-                    if out_tx_writer.send(chunk).await.is_err() {
+                    if out_tx.send(chunk).await.is_err() {
                         break;
                     }
                 }
@@ -1275,7 +1316,7 @@ async fn handle_relay_open(
                 }
             }
             Err(e) => {
-                if expected_transport_close_during_shutdown(&e, &terminating) {
+                if expected_transport_close_during_shutdown(&e, terminating) {
                     debug!(
                         channel_id = %channel_id,
                         error = %e,
@@ -1291,10 +1332,6 @@ async fn handle_relay_open(
 
     // Half-close the target socket's write side so the service sees EOF.
     let _ = target_w.shutdown().await;
-
-    // Dropping out_tx closes the outbound gRPC stream, letting the gateway
-    // observe EOF on its side too.
-    drop(out_tx);
     let _ = target_to_grpc.await;
 
     if let Some(e) = inbound_err {
@@ -1403,20 +1440,6 @@ mod target_tests {
     use super::*;
 
     #[test]
-    fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
-        assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_gateway_protocol_revision(PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-    }
-
-    #[test]
-    fn gateway_protocol_revision_rejects_unknown_peers() {
-        let error = validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION + 1)
-            .expect_err("version skew must be rejected");
-        assert!(error.to_string().contains("revision mismatch"));
-    }
-
-    #[test]
     fn rejected_live_update_does_not_revoke_session_readiness() {
         let (ready_tx, ready_rx) = watch::channel(false);
         update_session_readiness(true, &ready_tx);
@@ -1501,6 +1524,7 @@ mod ocsf_event_tests {
             product_version: "0.0.1".into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         }
     }
 
@@ -1761,5 +1785,137 @@ mod ocsf_event_tests {
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();
+    }
+
+    /// Regression test for #3724: when the target closes after sending
+    /// data, the outbound relay stream must close too, even though the
+    /// inbound (client) side is still open. Before the fix, `out_tx` was
+    /// cloned into the target-reading task, so the function's own copy kept
+    /// the outbound stream alive until `inbound` also ended.
+    #[tokio::test]
+    async fn bridge_closes_outbound_when_target_closes_first() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+
+        // Inbound stream the client never closes during this test.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-1", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"hello").await.unwrap();
+        remote.shutdown().await.unwrap();
+
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"hello".to_vec()
+            ))
+        );
+
+        // The outbound stream must end here, without the inbound side (still
+        // held open by `inbound_tx`) ending first.
+        assert!(
+            out_rx.recv().await.is_none(),
+            "outbound stream should close once the target closes"
+        );
+
+        drop(inbound_tx);
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly when target closes first");
+    }
+
+    /// A target that half-closes its output must still receive client data.
+    #[tokio::test]
+    async fn bridge_forwards_client_data_after_target_half_close() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-3", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"ready").await.unwrap();
+        remote.shutdown().await.unwrap();
+        assert!(out_rx.recv().await.is_some(), "greeting frame expected");
+        assert!(out_rx.recv().await.is_none(), "outbound should close");
+
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"upload".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 6];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"upload");
+
+        drop(inbound_tx);
+        bridge.await.unwrap().expect("bridge should finish cleanly");
+    }
+
+    /// A well-behaved round trip: bytes flow both directions and the bridge
+    /// ends cleanly when the client closes its side.
+    #[tokio::test]
+    async fn bridge_round_trips_bytes_until_client_closes() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-2", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        // Client -> target.
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"ping".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Target -> client.
+        remote.write_all(b"pong").await.unwrap();
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"pong".to_vec()
+            ))
+        );
+
+        // Client closes its side first; the bridge should still complete
+        // once the target also closes.
+        drop(inbound_tx);
+        remote.shutdown().await.unwrap();
+
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly on an ordinary round trip");
     }
 }

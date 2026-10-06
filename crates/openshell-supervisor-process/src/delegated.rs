@@ -295,7 +295,7 @@ pub async fn start_boundary_access(
         Some(prestarted) => (prestarted.task.take(), Some(prestarted.readiness.clone())),
         None => match (openshell_endpoint, sandbox_id) {
             (Some(endpoint), Some(id)) => {
-                let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
+                let (task, accepted) = crate::supervisor_session::spawn_with_readiness(
                     endpoint.to_string(),
                     id.to_string(),
                     ssh_socket_path,
@@ -308,27 +308,10 @@ pub async fn start_boundary_access(
                         config_apply_tx,
                     },
                 );
-                let accepted_result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    accepted.wait_for(|ready| *ready),
-                )
-                .await
-                .map(|result| result.map(|_| ()));
-                match accepted_result {
-                    Ok(Ok(())) => (Some(task), Some(accepted)),
-                    Ok(Err(_)) => {
-                        task.abort();
-                        return Err(miette::miette!(
-                            "supervisor session ended before gateway acceptance"
-                        ));
-                    }
-                    Err(_) => {
-                        task.abort();
-                        return Err(miette::miette!(
-                            "gateway did not accept supervisor session within 10 seconds"
-                        ));
-                    }
-                }
+                // Session establishment retries through gateway restarts. The
+                // readiness socket remains absent until the gateway accepts the
+                // session, so a transient delay cannot kill the supervisor.
+                (Some(task), Some(accepted))
             }
             _ => (None, None),
         },
