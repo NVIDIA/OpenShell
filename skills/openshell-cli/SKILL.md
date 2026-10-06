@@ -492,6 +492,13 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+The sandbox's SSH host identity survives stop/start and runtime restarts.
+API clients can read its public fingerprint from the sandbox resource or
+SSH-session response and pin it to the sandbox ID. Recreating a deleted
+sandbox, even under the same name, creates a different identity. See the
+[sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for verification behavior and release compatibility.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop

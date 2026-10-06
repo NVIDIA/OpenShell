@@ -229,6 +229,46 @@ mod session {
         }
     }
 
+    /// Private SSH key material is redacted from diagnostics and cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretSshHostKey(Zeroizing<String>);
+
+    impl SecretSshHostKey {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretSshHostKey {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretSshHostKey([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretSshHostKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretSshHostKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
     /// Trusted launch input delivered only to `openshell-supervisor`.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -244,6 +284,9 @@ mod session {
         pub gateway_expires_at: i64,
         pub sandbox_token: SecretJwt,
         pub sandbox_expires_at: i64,
+        /// Never delivered to the workload. Missing only in older bundles.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ssh_host_private_key: Option<SecretSshHostKey>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -329,6 +372,7 @@ mod session {
                 .field("gateway_expires_at", &self.gateway_expires_at)
                 .field("sandbox_token", &"[REDACTED]")
                 .field("sandbox_expires_at", &self.sandbox_expires_at)
+                .field("ssh_host_private_key", &self.ssh_host_private_key)
                 .finish()
         }
     }
@@ -1034,6 +1078,7 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
         }
@@ -1060,6 +1105,9 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: Some(SecretSshHostKey::new(
+                    "private-ssh-host-key".to_string(),
+                )),
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
@@ -1078,7 +1126,19 @@ mod tests {
             let debug = format!("{bundle:?}");
             assert!(!debug.contains(bundle.gateway_token.expose_secret()));
             assert!(!debug.contains(bundle.sandbox_token.expose_secret()));
-            assert_eq!(debug.matches("[REDACTED]").count(), 2);
+            assert!(!debug.contains("private-ssh-host-key"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 3);
+            assert_eq!(
+                decoded.ssh_host_private_key.unwrap().expose_secret(),
+                "private-ssh-host-key"
+            );
+            let mut legacy = serde_json::to_value(&bundle).unwrap();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("ssh_host_private_key");
+            let legacy: SupervisorAuthBundle = serde_json::from_value(legacy).unwrap();
+            assert!(legacy.ssh_host_private_key.is_none());
         }
 
         #[derive(Serialize)]

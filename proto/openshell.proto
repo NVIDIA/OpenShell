@@ -1021,6 +1021,10 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only SSH host identity in OpenSSH SHA256:<base64> form. Stable for
+  // this sandbox's lifetime, including runtime restarts. Empty on legacy
+  // runtimes that do not provide a gateway-managed SSH identity.
+  string host_key_fingerprint = 6;
   // Read-only provenance for sandboxes created from a reusable workload template.
   SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
@@ -1768,7 +1772,8 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
+  // Expected sandbox SSH host identity in OpenSSH SHA256:<base64> form.
+  // Stable for the sandbox's lifetime. Empty only for legacy runtimes.
   string host_key_fingerprint = 7;
 
   // Absolute expiry. Absence means no expiry.

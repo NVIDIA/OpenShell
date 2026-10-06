@@ -2995,6 +2995,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "workspace": sandbox.object_workspace(),
+        "host_key_fingerprint": sandbox.host_key_fingerprint,
         "labels": labels,
         "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),

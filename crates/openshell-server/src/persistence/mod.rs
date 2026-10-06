@@ -307,6 +307,19 @@ impl Store {
         }
     }
 
+    /// Independent of the cross-object lock: creation already holds that
+    /// lock when it provisions a supervisor's durable SSH identity.
+    pub(crate) async fn acquire_ssh_identity_mutation_guard(
+        &self,
+    ) -> PersistenceResult<DistributedMutationGuard> {
+        match self {
+            Self::Postgres(store) => Ok(DistributedMutationGuard {
+                _postgres: Some(store.acquire_mutation_lock(0x4f53_5348_484f_5354).await?),
+            }),
+            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+        }
+    }
+
     /// Connect to a persistence store based on the database URL.
     pub async fn connect(url: &str) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
