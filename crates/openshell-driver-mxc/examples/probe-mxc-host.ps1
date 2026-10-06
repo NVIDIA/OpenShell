@@ -120,6 +120,7 @@ if (Test-Path $WxcExecPath) {
 # ── Probe section ─────────────────────────────────────────────────────────────
 
 $probeOutput = $null
+$probeData = $null
 $dryRunExitCode = $null
 $dryRunOutput = $null
 $pcTrialResult = "absent"
@@ -135,6 +136,9 @@ if ($wxcInfo.exists) {
     # --probe
     $probeResult = Invoke-WxcProbe -wxc $WxcExecPath
     $probeOutput = $probeResult.Output
+    try {
+        $probeData = $probeOutput | ConvertFrom-Json
+    } catch {}
 
     # dry-run trial (minimal processcontainer config)
     $dryConfig = @{
@@ -279,6 +283,22 @@ if ($null -eq $dryRunExitCode) {
     $dryRunVerdict = "failed: exit $dryRunExitCode"
 }
 
+$isolationTier = "unknown"
+$hostLoopbackSupported = $null
+$governedEgressVerdict = "unavailable: wxc-exec probe data missing"
+if ($null -ne $probeData) {
+    if ($null -ne $probeData.tier) { $isolationTier = [string]$probeData.tier }
+    if ($null -ne $probeData.probes -and
+        $probeData.probes.PSObject.Properties.Name -contains "baseContainerSupportsIngressHostLoopbackAllow") {
+        $hostLoopbackSupported = [bool]$probeData.probes.baseContainerSupportsIngressHostLoopbackAllow
+        if ($hostLoopbackSupported) {
+            $governedEgressVerdict = "supported"
+        } else {
+            $governedEgressVerdict = "unavailable: isolation tier $isolationTier does not support ingress.hostLoopback=allow"
+        }
+    }
+}
+
 # ── Assemble report ───────────────────────────────────────────────────────────
 
 $report = [ordered]@{
@@ -301,12 +321,17 @@ $report = [ordered]@{
         result  = $pcTrialResult
         message = $pcTrialMessage
     }
+    processcontainerCapabilities = [ordered]@{
+        isolationTier = $isolationTier
+        ingressHostLoopbackAllow = $hostLoopbackSupported
+    }
     isolationSessionTrial = [ordered]@{
         result  = $isoTrialResult
         message = $isoTrialMessage
     }
     verdicts = [ordered]@{
         processcontainer = $pcVerdict
+        governedEgress   = $governedEgressVerdict
         isolation_session = $isoVerdict
         dryRun           = $dryRunVerdict
     }
@@ -323,6 +348,7 @@ if ($Full) {
     Write-Host "wxc-exec: $WxcExecPath (exists=$($wxcInfo.exists))"
     Write-Host "verdicts:"
     Write-Host "  processcontainer  : $pcVerdict"
+    Write-Host "  governed egress  : $governedEgressVerdict"
     Write-Host "  isolation_session : $isoVerdict"
     Write-Host "  dry-run           : $dryRunVerdict"
     Write-Host "(re-run with -Full for the complete JSON report, or -OutFile caps.json to save it)"

@@ -15,9 +15,9 @@
 //! Two families:
 //!
 //! **(a) Dry-run contract tests** — exercise `--dry-run` only; pass/fail on
-//!   schema acceptance. These pass on this box even though no enforcement
-//!   backend is live (dry-run validates the JSON schema without spinning up the
-//!   `AppContainer` or isolation session).
+//!   schema acceptance. Most require no live enforcement backend. Tests that
+//!   request a host capability such as bidirectional host loopback probe that
+//!   capability first because MXC validates platform support during dry-run.
 //!
 //! **(b) Enforcement tests** — probe-gated; print a human-readable SKIP reason
 //!   and return early when the backend is not live. The probe distinguishes
@@ -225,8 +225,10 @@ fn wxc_version(wxc: &Path) -> Option<(u64, u64, u64, String)> {
 
 // ── (a) Dry-run contract tests ────────────────────────────────────────────────
 //
-// These PASS on any box that has the wxc-exec binary — no enforcement backend
-// is required because --dry-run only validates the JSON schema.
+// Most PASS on any box that has the wxc-exec binary — no enforcement backend is
+// required. MXC also validates requested platform capabilities during dry-run,
+// so capability-specific configs probe those capabilities before asserting
+// schema acceptance.
 
 /// Minimal processcontainer one-shot config accepted by `--dry-run`.
 #[test]
@@ -430,6 +432,10 @@ fn dryrun_accepts_split_policy_output() {
         eprintln!("SKIP: wxc-exec not found");
         return;
     };
+    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+        eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
+        return;
+    }
 
     let (_tempdir, temp_path) = temp_fixture();
     let policy = SandboxPolicy {
@@ -580,6 +586,51 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Probe the MXC capability required by `OpenShell`'s loopback CONNECT proxy.
+///
+/// RC3 reports this independently from basic `ProcessContainer` availability.
+/// AppContainer+DACL fallback hosts can run ordinary one-shot workloads while
+/// correctly rejecting `ingress.hostLoopback = "allow"` during dry-run.
+fn probe_processcontainer_host_loopback(wxc: &Path) -> Result<(), String> {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|v| v == "1") {
+        return Err(
+            "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
+                .to_string(),
+        );
+    }
+
+    let out = Command::new(wxc)
+        .arg("--probe")
+        .output()
+        .map_err(|e| format!("wxc-exec --probe spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "wxc-exec --probe returned exit {}: stdout={} stderr={}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+
+    let probe: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("could not parse wxc-exec --probe JSON: {e}"))?;
+    let supported = probe
+        .pointer("/probes/baseContainerSupportsIngressHostLoopbackAllow")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "wxc-exec --probe omitted baseContainerSupportsIngressHostLoopbackAllow".to_string()
+        })?;
+    if supported {
+        return Ok(());
+    }
+
+    let tier = probe["tier"].as_str().unwrap_or("unknown");
+    Err(format!(
+        "wxc-exec --probe reports baseContainerSupportsIngressHostLoopbackAllow=false \
+         for isolation tier {tier}"
+    ))
 }
 
 /// Probe the `isolation_session` backend.
@@ -873,6 +924,10 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         eprintln!("SKIP: processcontainer not live: {reason}");
         return;
     }
+    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+        eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
+        return;
+    }
     let system_root = std::env::var("SYSTEMROOT").expect("SYSTEMROOT must be set on Windows");
     let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
     let curl = PathBuf::from(system_root).join("System32").join("curl.exe");
@@ -1050,6 +1105,10 @@ async fn pc_proxy_scopes_network_policy_to_socket_owner() {
     };
     if let Err(reason) = probe_processcontainer(&wxc) {
         eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+        eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
         return;
     }
 

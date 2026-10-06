@@ -951,6 +951,13 @@ tier and host-preparation warnings in PowerShell:
 & "C:\path\to\wxc-exec.exe" --probe
 ```
 
+Governed egress through OpenShell's host CONNECT proxy requires the probe field
+`probes.baseContainerSupportsIngressHostLoopbackAllow` to be `true`. A host that
+reports `false` can still run ordinary ProcessContainer workloads, but MXC
+rejects the bidirectional host-loopback capability required to reach the proxy.
+`prepare-system-drive` does not add this capability; use a Windows build and
+isolation tier whose MXC probe reports it as supported.
+
 If the probe selects AppContainer + DACL (`appcontainer-dacl`) and recommends
 `prepare-system-drive`, obtain `wxc-host-prep.exe` from the MXC binaries
 distribution and run this command once in an elevated PowerShell session.

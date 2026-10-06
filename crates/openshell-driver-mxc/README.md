@@ -305,9 +305,11 @@ matrix is documented and machine-validated in
 lanes are explicitly separate and cannot receive GB300 ARM64 credit.
 
 **Probe script:** `examples/probe-mxc-host.ps1` is an operator/CI preflight that emits a JSON capability report
-(OS build, wxc-exec path/version, dry-run exit code, per-backend trial result,
-and a `verdicts` object). Run it before the real-MXC lane to understand what
-will PASS vs SKIP on a given host:
+(OS build, wxc-exec path/version, isolation tier, host-loopback support, dry-run
+exit code, per-backend trial result, and a `verdicts` object). Run it before the
+real-MXC lane to understand what will PASS vs SKIP on a given host. Governed
+egress tests require `ingressHostLoopbackAllow` to be `true`; basic
+ProcessContainer tests do not.
 
 The probe uses a unique, user-owned Windows temp directory for every run.
 MXC treats config paths literally (it does not expand `%TEMP%`), and the
