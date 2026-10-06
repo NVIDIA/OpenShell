@@ -76,6 +76,11 @@ pub(super) struct ProviderEnvironment {
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
     pub files: HashMap<String, String>,
+    /// Static credential keys withheld because they were already expired at
+    /// resolution time. Excluded from `environment`/`static_credential_keys`
+    /// like any other withheld key, but tracked separately from keys that
+    /// never had an injectable credential.
+    pub expired_static_keys: HashSet<String>,
 }
 
 /// Immutable provider records used to build one provider-environment response.
@@ -1132,6 +1137,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut files = HashMap::new();
     let mut file_env_keys = HashSet::new();
     let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
+    let mut expired_static_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
     let registry = openshell_providers::ProviderRegistry::new();
@@ -1258,6 +1264,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         );
                         readiness_reason =
                             openshell_core::proto::ProviderReadinessReason::CredentialExpired;
+                        expired_static_keys.insert(key.clone());
                         continue;
                     }
                     expires.entry(key.clone()).or_insert(expires_at_ms);
@@ -1368,6 +1375,22 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             }
         }
 
+        // The credential runtime withholds expired handle-backed values. Keep
+        // the identity of otherwise injectable keys in the resolver result.
+        for key in resolved_refs.expired_keys {
+            if accepted_stored_credential_keys
+                .as_ref()
+                .is_some_and(|accepted| !accepted.contains(&key))
+                || is_non_injectable_provider_credential(provider, &key)
+                || broker_only_credential_keys.contains(&key)
+                || has_no_usable_endpoint
+                || !is_valid_env_key(&key)
+            {
+                continue;
+            }
+            expired_static_keys.insert(key);
+        }
+
         // Build each provider's emitted environment independently so another
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
@@ -1434,6 +1457,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         static_credential_bindings,
         static_credential_keys,
         files,
+        expired_static_keys,
     })
 }
 
@@ -12129,6 +12153,49 @@ mod tests {
                 .get("GITHUB_TOKEN")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_preserves_expired_handle_key_for_create_time_rejection() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        let mut provider = provider_with_credential_value(
+            "github-expired",
+            "github",
+            "GITHUB_TOKEN",
+            "github-token",
+        );
+        provider.credential_expiration_times.insert(
+            "GITHUB_TOKEN".to_string(),
+            ts(crate::persistence::current_time_ms() - 1),
+        );
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider,
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &catalog,
+            "default",
+            &["github-expired".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.contains_key("GITHUB_TOKEN"));
+        assert!(result.expired_static_keys.contains("GITHUB_TOKEN"));
     }
 
     #[tokio::test]

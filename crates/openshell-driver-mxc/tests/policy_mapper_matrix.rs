@@ -1109,6 +1109,7 @@ fn handled_fields_inventory() {
     // ── (1) Top-level keys: serialize a SandboxPolicy with every section
     // present-but-minimal, then collect YAML keys. ──────────────────────────
     let full_toplevel_policy = SandboxPolicy {
+        ui: None,
         version: 1,
         filesystem: Some(FilesystemPolicy {
             include_workdir: false,

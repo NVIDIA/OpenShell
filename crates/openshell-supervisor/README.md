@@ -16,6 +16,12 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
 
+The private startup result separates the backend transport payload from optional
+authenticated CONNECT listener settings. Shared networking starts the listener
+only after boundary attachment and confirmation; the supervisor owns policy
+evaluation, live credentials, and listener lifetime. These settings do not add
+a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

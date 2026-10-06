@@ -600,6 +600,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        None,
     )
     .await?;
 
@@ -955,7 +956,7 @@ async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let bound = selected_backend
+    let (bound, proxy_listener) = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1039,7 +1040,9 @@ async fn run_sandbox_with_backend(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let remote_network_source = remote_boundary.0.network_mediation_source();
+    let remote_network_source = proxy_listener
+        .is_none()
+        .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -1078,7 +1081,8 @@ async fn run_sandbox_with_backend(
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
-            Some(remote_network_source),
+            remote_network_source,
+            proxy_listener,
         )
         .await?,
     );

@@ -409,6 +409,7 @@ func TestLoadConfig_ActiveGateway(t *testing.T) {
 func TestListGateways_MultipleGateways(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, tmp)
 
 	for _, name := range []string{"prod", "staging", "dev"} {
 		gwDir := filepath.Join(tmp, "openshell", "gateways", name)
@@ -432,6 +433,7 @@ func TestListGateways_MultipleGateways(t *testing.T) {
 func TestListGateways_EmptyDirs(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, tmp)
 
 	gateways, err := ListGateways()
 	require.NoError(t, err)
@@ -441,6 +443,7 @@ func TestListGateways_EmptyDirs(t *testing.T) {
 func TestListGateways_ActiveStatus(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, tmp)
 
 	for _, name := range []string{"alpha", "beta"} {
 		gwDir := filepath.Join(tmp, "openshell", "gateways", name)
