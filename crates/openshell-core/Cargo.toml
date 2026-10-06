@@ -40,6 +40,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots-no-provider"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
+openshell-otel = { path = "../openshell-otel", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -56,6 +57,8 @@ telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
 oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
 jwt = ["dep:jsonwebtoken", "dep:zeroize"]
+## Propagate the active W3C trace context on supervisor gateway calls.
+trace-context = ["dep:openshell-otel"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

@@ -249,10 +249,6 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
-      upload-channel: latest/edge
-      github-environment: latest/edge
-    secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
@@ -263,6 +259,16 @@ jobs:
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
+  publish-snap:
+    name: Publish Snap
+    needs: build-snap
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/edge
+      github-environment: latest/edge
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
@@ -279,7 +285,7 @@ jobs:
       - vm-e2e
       - build-deb
       - build-rpm
-      - build-snap
+      - publish-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:

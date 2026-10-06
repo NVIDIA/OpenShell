@@ -579,6 +579,17 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
+    if let Some(endpoint) = &config.supervisor_otlp_endpoint {
+        env.insert(
+            openshell_core::sandbox_env::OTLP_ENDPOINT.into(),
+            endpoint.clone(),
+        );
+        env.extend(
+            openshell_otel::current_trace_context_environment()
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
+    }
     // Runtime capabilities are driver-owned. Override image/user input with
     // only the substrate that this driver configures for the supervisor.
     env.insert(
@@ -1406,8 +1417,6 @@ pub struct IsolationSpecInput<'a> {
     pub supervisor_bin: Option<&'a Path>,
     pub tls_secrets: Option<&'a [String; 1]>,
     pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Whether this workload is created by a rootless Podman service.
-    pub rootless: bool,
 }
 
 pub struct IsolationSpecs {
@@ -1459,44 +1468,19 @@ pub fn build_isolation_specs(
         .iter()
         .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
         .collect();
-    if input.rootless || input.identity.source == "default" {
-        // Podman's archive endpoint leaves named-volume contents owned by
-        // container root for rootless services and for a rootful USER-less
-        // image's newly-created workspace. Start the trusted runtime as root
-        // only long enough to chown the workspace, then irreversibly drop to
-        // the resolved workload identity before reading bootstrap material or
-        // accepting a control connection.
-        workload.command = vec![
-            "launch-capability-free".into(),
-            input.identity.uid.to_string(),
-            input.identity.gid.to_string(),
-            crate::isolation::BOOTSTRAP_PATH.into(),
-            driver_mounts::DEFAULT_WORKSPACE_ROOT.into(),
-        ];
-        workload.user = "0:0".into();
-        workload.groups.clear();
-        workload.cap_drop = vec!["ALL".into()];
-        workload.cap_add = vec![
-            "CHOWN".into(),
-            "SETGID".into(),
-            "SETUID".into(),
-            "SETPCAP".into(),
-        ];
-    } else {
-        workload.command = vec![
-            "--bootstrap".into(),
-            crate::isolation::BOOTSTRAP_PATH.into(),
-        ];
-        workload.user.clone_from(&user);
-        workload.groups = input
-            .identity
-            .supplementary_gids
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        workload.cap_drop = vec!["ALL".into()];
-        workload.cap_add.clear();
-    }
+    workload.command = vec![
+        "--bootstrap".into(),
+        crate::isolation::BOOTSTRAP_PATH.into(),
+    ];
+    workload.user.clone_from(&user);
+    workload.groups = input
+        .identity
+        .supplementary_gids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    workload.cap_drop = vec!["ALL".into()];
+    workload.cap_add.clear();
     workload.apparmor_profile = input
         .config
         .app_armor_profile
@@ -1790,7 +1774,6 @@ mod tests {
             supervisor_bin: None,
             tls_secrets: None,
             identity: &identity,
-            rootless: true,
         })
         .unwrap();
         for spec in [&specs.workload, &specs.supervisor] {
@@ -1798,21 +1781,14 @@ mod tests {
             assert!(spec.seccomp_profile_path.is_empty());
             assert!(spec.no_new_privileges);
         }
-        assert_eq!(specs.workload.user, "0:0");
-        assert!(specs.workload.groups.is_empty());
-        assert_eq!(
-            specs.workload.cap_add,
-            vec!["CHOWN", "SETGID", "SETUID", "SETPCAP"]
-        );
+        // The driver creates the managed workspace volume owned by the
+        // workload identity, so the workload never starts as root.
+        assert_eq!(specs.workload.user, "1000:1001");
+        assert_eq!(specs.workload.groups, vec!["2000"]);
+        assert!(specs.workload.cap_add.is_empty());
         assert_eq!(
             specs.workload.command,
-            vec![
-                "launch-capability-free",
-                "1000",
-                "1001",
-                crate::isolation::BOOTSTRAP_PATH,
-                driver_mounts::DEFAULT_WORKSPACE_ROOT,
-            ]
+            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         assert_eq!(specs.supervisor.user, "1000:1001");
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
@@ -1841,7 +1817,7 @@ mod tests {
                 "sha256:image".into(),
             )
             .unwrap();
-        let rootful_specs = build_isolation_specs(IsolationSpecInput {
+        let default_specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &config,
             token_secret: Some("jwt"),
@@ -1854,19 +1830,13 @@ mod tests {
             supervisor_bin: None,
             tls_secrets: None,
             identity: &default_identity,
-            rootless: false,
         })
         .unwrap();
-        assert_eq!(rootful_specs.workload.user, "0:0");
+        assert_eq!(default_specs.workload.user, "1000:1000");
+        assert!(default_specs.workload.cap_add.is_empty());
         assert_eq!(
-            rootful_specs.workload.command,
-            vec![
-                "launch-capability-free",
-                "1000",
-                "1000",
-                crate::isolation::BOOTSTRAP_PATH,
-                driver_mounts::DEFAULT_WORKSPACE_ROOT,
-            ]
+            default_specs.workload.command,
+            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         let workload_json = serde_json::to_string(&specs.workload).unwrap();
         assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));
@@ -2314,6 +2284,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+        use openshell_core::proto::compute::v1::DriverSandboxTemplate;
+
+        for field in ["sandbox_runtime_image", "supervisor_image"] {
+            let template = DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    (field): "registry.example.com/openshell/runtime:untrusted"
+                }))),
+                ..Default::default()
+            };
+
+            let error = PodmanSandboxDriverConfig::from_template(&template)
+                .expect_err("sandbox requests must not select trusted runtime images");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
     fn container_spec_defaults_drop_capabilities_and_keep_runtime_seccomp() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
@@ -2439,6 +2428,27 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/run/openshell/test-ssh.sock"),
             "OPENSHELL_SSH_SOCKET_PATH must not be overridden by user env"
+        );
+    }
+
+    #[test]
+    fn container_spec_passes_the_gateway_otlp_endpoint_to_the_supervisor() {
+        let sandbox = test_sandbox("test-id", "legit-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert!(
+            spec["env"]
+                .get(openshell_core::sandbox_env::OTLP_ENDPOINT)
+                .is_none()
+        );
+
+        let config = PodmanComputeConfig {
+            supervisor_otlp_endpoint: Some("http://127.0.0.1:4317".to_string()),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::OTLP_ENDPOINT],
+            "http://127.0.0.1:4317"
         );
     }
 

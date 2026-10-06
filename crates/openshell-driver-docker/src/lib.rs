@@ -178,6 +178,11 @@ pub struct DockerComputeConfig {
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
+
     /// Image containing the trusted `openshell-sandbox` binary.
     pub sandbox_runtime_image: Option<String>,
 
@@ -276,6 +281,7 @@ impl Default for DockerComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
             supervisor_image: None,
@@ -310,6 +316,7 @@ struct DockerDriverRuntimeConfig {
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
+    supervisor_otlp_endpoint: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
     gpu: DockerGpuRuntimeCapabilities,
@@ -939,6 +946,7 @@ impl DockerComputeDriver {
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
+                supervisor_otlp_endpoint: docker_config.supervisor_otlp_endpoint.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
                 gpu,
@@ -5093,6 +5101,7 @@ async fn spawn_docker_control_process(
             openshell_core::telemetry::enabled_env_value()
         ),
     ];
+    environment.extend(supervisor_tracing_environment(config));
     if config.guest_tls.is_some() {
         environment.push(format!(
             "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/ca.pem",
@@ -5532,6 +5541,17 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
         environment.remove(protected);
     }
     environment
+}
+
+/// Environment that lets the supervisor export spans and join the current trace.
+fn supervisor_tracing_environment(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+    let Some(endpoint) = &config.supervisor_otlp_endpoint else {
+        return Vec::new();
+    };
+    std::iter::once((openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint.clone()))
+        .chain(openshell_otel::current_trace_context_environment())
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect()
 }
 
 fn build_boundary_environment(

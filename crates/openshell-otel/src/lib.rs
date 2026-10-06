@@ -18,7 +18,9 @@ pub use grpc::{
     grpc_status_code_name, record_grpc_status, rpc,
 };
 pub use propagation::{
-    HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,
+    HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
+    TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
+    set_parent_from_environment, trace_context_environment,
 };
 
 use opentelemetry::KeyValue;

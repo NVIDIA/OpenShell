@@ -57,7 +57,6 @@
 
       [openshell.drivers.podman]
       default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
-      supervisor_image = "{{ openshell_supervisor_image }}"
       image_pull_policy = "always"
       network_name = "openshell-test-guest"
       grpc_endpoint = "http://host.containers.internal:8080"
@@ -97,6 +96,7 @@
       Environment=XDG_CACHE_HOME={{ openshell_gateway_state_root }}/xdg/cache
       Environment=XDG_DATA_HOME={{ openshell_gateway_state_root }}/xdg/data
       Environment=XDG_STATE_HOME={{ openshell_gateway_state_root }}/xdg/state
+      Environment=OPENSHELL_SUPERVISOR_IMAGE={{ openshell_supervisor_image }}
       ExecStart={{ openshell_gateway_bin }} --config {{ openshell_gateway_state_root }}/gateway.toml
       Restart=on-failure
 

@@ -14600,7 +14600,6 @@ mod tests {
     /// Driver watch events arrive on a background stream, so the store writes
     /// they trigger land outside the request that caused them.
     #[tokio::test]
-    #[ignore = "flaky under concurrent test execution"]
     async fn driver_watch_events_are_roots_and_store_operations_have_parents() {
         use crate::otel_tracing::test_exporter;
 
@@ -14615,20 +14614,12 @@ mod tests {
             .await
             .unwrap();
 
+        let root = traced.wait_for_span("driver_watch.sandbox_deleted").await;
         let spans = traced.finished_spans();
-        let root = spans
-            .iter()
-            .find(|s| s.name == "driver_watch.sandbox_deleted")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the event records a span of its own, got {:?}",
-                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
-                )
-            });
 
-        test_exporter::assert_is_root(root);
+        test_exporter::assert_is_root(&root);
         assert_eq!(
-            test_exporter::attribute(root, "sandbox.id").as_deref(),
+            test_exporter::attribute(&root, "sandbox.id").as_deref(),
             Some("sb-1"),
             "the span names which sandbox the driver reported on"
         );
@@ -14646,7 +14637,6 @@ mod tests {
     /// The reconciler runs on a timer with no inbound request, so without a
     /// span of its own each store call becomes its own anonymous trace.
     #[tokio::test]
-    #[ignore = "flaky under concurrent test execution"]
     async fn reconcile_sweeps_are_roots_and_operations_have_parents() {
         use crate::otel_tracing::test_exporter;
 
@@ -14661,9 +14651,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Other tests drive their own reconcile loops into the shared
-        // exporter, so match on the shape of a sweep rather than assuming
-        // there is exactly one.
+        // A closed sweep has no remaining worker-held child spans.
+        traced.wait_for_span("reconcile.sandboxes").await;
         let spans = traced.finished_spans();
         let roots = traced.spans_named("reconcile.sandboxes");
         assert!(
