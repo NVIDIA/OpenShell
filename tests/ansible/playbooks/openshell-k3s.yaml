@@ -10,166 +10,159 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Install OpenShell CLI
-      ansible.builtin.copy:
-        src: "{{ openshell_cli_binary }}"
-        dest: /usr/local/bin/openshell
-        mode: "0755"
+    - name: Provision the K3s gateway
+      block:
+        - name: Install OpenShell CLI
+          ansible.builtin.copy:
+            src: "{{ openshell_cli_binary }}"
+            dest: /usr/local/bin/openshell
+            mode: "0755"
 
-    - name: Create OpenShell artifact directory
-      ansible.builtin.file:
-        path: /var/lib/openshell/artifacts
-        state: directory
-        mode: "0700"
+        - name: Create OpenShell artifact directory
+          ansible.builtin.file:
+            path: /var/lib/openshell/artifacts
+            state: directory
+            mode: "0700"
 
-    - name: Copy OpenShell images
-      ansible.builtin.copy:
-        src: "{{ item.src }}"
-        dest: "/var/lib/openshell/artifacts/{{ item.name }}.tar"
-        mode: "0600"
-      loop:
-        - name: gateway
-          src: "{{ openshell_gateway_image }}"
-        - name: sandbox
-          src: "{{ openshell_sandbox_image }}"
-        - name: supervisor
-          src: "{{ openshell_supervisor_image }}"
+        - name: Copy OpenShell images
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "/var/lib/openshell/artifacts/{{ item.name }}.tar"
+            mode: "0600"
+          loop:
+            - name: gateway
+              src: "{{ openshell_gateway_image }}"
+            - name: sandbox
+              src: "{{ openshell_sandbox_image }}"
+            - name: supervisor
+              src: "{{ openshell_supervisor_image }}"
 
-    - name: Import OpenShell images into K3s
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/k3s
-          - ctr
-          - --namespace
-          - k8s.io
-          - images
-          - import
-          - "/var/lib/openshell/artifacts/{{ item }}.tar"
-      loop:
-        - gateway
-        - sandbox
-        - supervisor
+        - name: Import OpenShell images into K3s
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/k3s
+              - ctr
+              - --namespace
+              - k8s.io
+              - images
+              - import
+              - "/var/lib/openshell/artifacts/{{ item }}.tar"
+          loop:
+            - gateway
+            - sandbox
+            - supervisor
 
-    - name: Copy OpenShell Helm chart
-      ansible.builtin.copy:
-        src: "{{ openshell_helm_chart }}"
-        dest: /var/lib/openshell/artifacts/helm-chart.tgz
-        mode: "0600"
+        - name: Copy OpenShell Helm chart
+          ansible.builtin.copy:
+            src: "{{ openshell_helm_chart }}"
+            dest: /var/lib/openshell/artifacts/helm-chart.tgz
+            mode: "0600"
 
-    - name: Write OpenShell Helm values
-      ansible.builtin.copy:
-        dest: /var/lib/openshell/artifacts/values.yaml
-        mode: "0600"
-        content: |
-          global:
-            image:
-              registry: ""
-          gateway:
-            image:
-              repository: openshell/gateway
-              tag: tmachine
-              pullPolicy: Never
-          sandboxRuntime:
-            image:
-              repository: openshell/sandbox
-              tag: tmachine
-              pullPolicy: never
-          supervisor:
-            image:
-              repository: openshell/supervisor
-              tag: tmachine
-              pullPolicy: never
-          networkPolicy:
-            enabled: true
-          server:
-            auth:
-              allowUnauthenticatedUsers: true
-            disableTls: true
-            telemetryEnabled: false
+        - name: Write OpenShell Helm values
+          ansible.builtin.copy:
+            dest: /var/lib/openshell/artifacts/values.yaml
+            mode: "0600"
+            content: |
+              global:
+                image:
+                  registry: ""
+              gateway:
+                image:
+                  repository: openshell/gateway
+                  tag: tmachine
+                  pullPolicy: Never
+              sandboxRuntime:
+                image:
+                  repository: openshell/sandbox
+                  tag: tmachine
+                  pullPolicy: never
+              supervisor:
+                image:
+                  repository: openshell/supervisor
+                  tag: tmachine
+                  pullPolicy: never
+              networkPolicy:
+                enabled: true
+              server:
+                auth:
+                  allowUnauthenticatedUsers: true
+                disableTls: true
+                telemetryEnabled: false
 
-    - name: Install Agent Sandbox
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - apply
-          - --filename
-          - "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v{{ agent_sandbox_version }}/manifest.yaml"
+        - name: Install Agent Sandbox
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/k3s
+              - kubectl
+              - apply
+              - --filename
+              - "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v{{ agent_sandbox_version }}/manifest.yaml"
 
-    - name: Wait for Agent Sandbox CRD
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - wait
-          - --for=condition=Established
-          - crd/sandboxes.agents.x-k8s.io
-          - --timeout=120s
-      changed_when: false
+        - name: Wait for Agent Sandbox CRD
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/k3s
+              - kubectl
+              - wait
+              - --for=condition=Established
+              - crd/sandboxes.agents.x-k8s.io
+              - --timeout=120s
+          changed_when: false
 
-    - name: Wait for Agent Sandbox controller
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - --namespace
-          - agent-sandbox-system
-          - rollout
-          - status
-          - deployment/agent-sandbox-controller
-          - --timeout=300s
-      changed_when: false
+        - name: Wait for Agent Sandbox controller
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/k3s
+              - kubectl
+              - --namespace
+              - agent-sandbox-system
+              - rollout
+              - status
+              - deployment/agent-sandbox-controller
+              - --timeout=300s
+          changed_when: false
 
-    - name: Install OpenShell Helm chart
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/helm
-          - install
-          - openshell
-          - /var/lib/openshell/artifacts/helm-chart.tgz
-          - --namespace
-          - openshell
-          - --create-namespace
-          - --values
-          - /var/lib/openshell/artifacts/values.yaml
-          - --wait
-          - --timeout=5m
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+        - name: Install OpenShell Helm chart
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/helm
+              - install
+              - openshell
+              - /var/lib/openshell/artifacts/helm-chart.tgz
+              - --namespace
+              - openshell
+              - --create-namespace
+              - --values
+              - /var/lib/openshell/artifacts/values.yaml
+              - --wait
+              - --timeout=5m
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
-    - name: Install gateway port-forward service
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/openshell-k3s-port-forward.service
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=OpenShell K3s gateway port forward
-          After=k3s.service
-          Requires=k3s.service
+        - name: Discover the gateway ClusterIP
+          ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=10s --namespace openshell get service openshell --output=jsonpath={.spec.clusterIP}
+          register: k3s_gateway_ip
+          changed_when: false
 
-          [Service]
-          ExecStart=/usr/local/bin/k3s kubectl --namespace openshell port-forward --address 127.0.0.1 service/openshell 17670:8080
-          Restart=always
-          RestartSec=1
+        - name: Require a gateway Service address
+          ansible.builtin.assert:
+            that:
+              - k3s_gateway_ip.stdout | length > 0
+              - k3s_gateway_ip.stdout != 'None'
+      rescue:
+        - name: Collect K3s installation diagnostics
+          ansible.builtin.include_role:
+            name: openshell_k3s_diagnostics
 
-          [Install]
-          WantedBy=multi-user.target
-
-    - name: Start gateway port-forward service
-      ansible.builtin.systemd_service:
-        name: openshell-k3s-port-forward.service
-        daemon_reload: true
-        enabled: true
-        state: started
-
-    - name: Wait for OpenShell gateway
-      ansible.builtin.wait_for:
-        host: 127.0.0.1
-        port: 17670
-        timeout: 60
+        - name: Fail K3s installation
+          ansible.builtin.fail:
+            msg: OpenShell K3s installation failed; see K3s diagnostics
 
 - name: Register OpenShell gateway for test client
   hosts: all
   gather_facts: false
+  vars:
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_ip.stdout }}:8080"
   roles:
     - openshell_client
+    - openshell_k3s_ready

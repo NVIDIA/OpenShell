@@ -105,6 +105,16 @@ compatibility baseline for the v1beta1 Sandbox API. It does not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
+The conformance CLI runs on the K3s node inside the tmachine guest and connects
+directly to the gateway's default ClusterIP Service on port 8080. Installation
+discovers the Service IP and registers it once; the installed disk preserves that
+registration across test boots. Automated boots wait for the API, nodes, gateway
+StatefulSet and a connected CLI before conformance. Interactive shell boots skip
+this preparation so failed gateways remain debuggable. Recreating the Service
+requires reprovisioning the fixture rather than repairing registrations at boot.
+Installation, preparation and conformance failures preserve bounded diagnostics
+under `artifacts/tmachine-diagnostics`, also uploaded by `Integration Tests`.
+
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an

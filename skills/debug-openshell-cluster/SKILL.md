@@ -723,7 +723,13 @@ kubectl -n openshell get svc openshell -o wide
 kubectl -n openshell get endpoints openshell
 ```
 
-For local port-forward testing:
+Clients running on a Kubernetes node can use the Service's ClusterIP and gRPC
+port directly when node routing supports it. The IP stays stable across Pod
+replacement and node reboots while the Service exists. It is not an external
+endpoint; clients outside that network need another exposure method. Recreating
+the Service can change its IP, so check the registered endpoint afterward.
+
+For local port-forward testing from outside the cluster network:
 
 ```bash
 kubectl -n openshell port-forward service/openshell 8080:8080
