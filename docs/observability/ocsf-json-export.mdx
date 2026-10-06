@@ -71,7 +71,9 @@ do not suppress records in this explicitly enabled audit sink.
 
 For sandbox supervisors, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` in the supervisor's filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; if the supervisor falls back to stderr-only logging, enabling `ocsf_json_enabled` does not create a JSONL sink.
 
-Supervisor files rotate daily and retain the three most recent files. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
+This file contains supervisor-originated events, not the [sandbox-runtime events](/observability/accessing-logs#main-process-output) emitted into workload container logs.
+
+Supervisor files rotate daily with a configured three-file limit, but cleanup can remove JSONL history earlier. See [supervisor file retention](/observability/logging#log-file-location) for the limits. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
 
 Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. That sink also rotates daily and retains the three most recent files. The separate `[openshell.gateway.ocsf_log]` sink uses its configured path and retention.
 
