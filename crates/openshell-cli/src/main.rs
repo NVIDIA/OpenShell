@@ -1442,7 +1442,7 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Create the sandbox from a named sandbox template.
-        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
         /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
@@ -1585,6 +1585,13 @@ enum SandboxCommands {
         /// a provider and attach it with `--provider` instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Set a sandbox environment variable from the CLI process environment.
+        ///
+        /// Format: `KEY[=ENVVAR]`. When `ENVVAR` is omitted, `KEY` is used.
+        /// The value does not appear in the CLI process arguments. Repeatable.
+        #[arg(long = "env-from", value_name = "KEY[=ENVVAR]")]
+        env_from: Vec<String>,
 
         /// Suppress warnings when --env values look like credentials.
         #[arg(long = "no-credential-warnings")]
@@ -3370,6 +3377,7 @@ async fn run_async() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    env_from,
                     no_credential_warnings,
                     approval_mode,
                     output,
@@ -3407,7 +3415,12 @@ async fn run_async() -> Result<()> {
                     }
 
                     // Parse --env flags into a HashMap<String, String>.
-                    let env_map = run::parse_env_pairs(&envs)?;
+                    let mut env_map = run::parse_env_pairs(&envs)?;
+                    for (key, value) in run::parse_env_from_pairs(&env_from)? {
+                        if env_map.insert(key.clone(), value).is_some() {
+                            return Err(miette::miette!("duplicate environment key '{key}'"));
+                        }
+                    }
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload

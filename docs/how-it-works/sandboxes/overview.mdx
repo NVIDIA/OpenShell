@@ -389,6 +389,16 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
+Use `--env-from KEY[=ENVVAR]` when the value should come from the CLI process environment instead of appearing in the CLI process arguments. If `ENVVAR` is omitted, OpenShell reads `KEY`:
+
+```shell
+export SESSION_TOKEN="..."
+openshell sandbox create --env-from SESSION_TOKEN -- my-agent
+openshell sandbox create --env-from AGENT_TOKEN=SESSION_TOKEN -- my-agent
+```
+
+`--env-from` changes only how the CLI receives the value. The resulting variable is still available to processes in the sandbox, just like `--env`.
+
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:

@@ -3192,6 +3192,16 @@ async fn run_cli_sandbox_create_with_xdg(
     name: &str,
     extra_args: &[&str],
 ) -> std::process::Output {
+    run_cli_sandbox_create_with_xdg_and_env(server, xdg_dir, name, extra_args, &[]).await
+}
+
+async fn run_cli_sandbox_create_with_xdg_and_env(
+    server: &TestServer,
+    xdg_dir: &TempDir,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
     for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
         cmd.env_remove(&key);
@@ -3209,6 +3219,7 @@ async fn run_cli_sandbox_create_with_xdg(
         "--no-auto-providers",
     ])
     .args(extra_args)
+    .envs(environment.iter().copied())
     .env("XDG_CONFIG_HOME", xdg_dir.path())
     .env("HOME", xdg_dir.path())
     .env("OPENSHELL_PROVISION_TIMEOUT", "5")
@@ -3340,6 +3351,47 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
             .load(Ordering::SeqCst)
             > 0,
         "an upload outside a repository must reach the SSH transport",
+    );
+}
+
+async fn run_cli_sandbox_create_with_env(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    prepare_cli_xdg(server, &xdg_dir);
+    run_cli_sandbox_create_with_xdg_and_env(server, &xdg_dir, name, extra_args, environment).await
+}
+
+#[tokio::test]
+async fn sandbox_create_env_from_reaches_request() {
+    let server = run_server().await;
+    let value = "qualification-value-not-in-argv";
+
+    let output = run_cli_sandbox_create_with_env(
+        &server,
+        "env-from-test",
+        &["--env-from", "SANDBOX_VALUE=HOST_VALUE", "--output=json"],
+        &[("HOST_VALUE", value)],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "sandbox create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = create_requests(&server).await;
+    let environment = &requests[0]
+        .spec
+        .as_ref()
+        .expect("spec should be present")
+        .environment;
+    assert_eq!(
+        environment.get("SANDBOX_VALUE").map(String::as_str),
+        Some(value)
     );
 }
 
