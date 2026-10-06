@@ -87,5 +87,21 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 
 ["windows:e2e:mxc"]
 description = "Run real MXC Tier-3 e2e; missing runtime coverage exits non-zero (no mocks)"
+depends = ["windows:build:mxc-fixtures"]
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File crates/openshell-driver-mxc/examples/run-mxc-e2e.ps1"
+
+["windows:build:mxc-fixtures"]
+description = "Build test-only MXC forwarding fixture for the native host"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 build-mxc-fixtures native"
+
+["windows:build:mxc-fixtures:x64"]
+description = "Build test-only MXC forwarding fixture for x64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 build-mxc-fixtures x86_64-pc-windows-msvc"
+
+["windows:build:mxc-fixtures:arm64"]
+description = "Build test-only MXC forwarding fixture for ARM64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 build-mxc-fixtures aarch64-pc-windows-msvc"

@@ -363,6 +363,16 @@ test-internal `SKIP` messages from Cargo's passed count in the real integration
 suite, and report a verified unsupported-host rejection independently from
 positive admission coverage.
 
+The real `forwarding` E2E scenario uses a native test-only echo agent inside MXC and
+`openshell forward service` to verify two exact request/reply exchanges through
+the gateway, supervisor, and boundary. Dynamic ports and a per-workload nonce
+avoid mistaking unrelated listeners for success. This is managed-ingress
+coverage, not evidence that direct host ingress is fenced. Use
+`-Scenario forwarding` on the existing local or remote runner for focused checks.
+The E2E mise task and remote runner build the `mxc-forwarding-agent` Cargo example
+using `windows:build:mxc-fixtures` (or its `:x64` / `:arm64` variant). This fixture
+is not one of the four production deliverables; do not package it in releases.
+
 When reporting `windows:ci`, distinguish these categories:
 
 - Passed tests from the full x64 workspace test log.

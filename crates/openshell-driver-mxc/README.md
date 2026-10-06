@@ -164,3 +164,11 @@ run incomplete and exits non-zero; a passing exit requires all selected scenario
 to execute successfully. Unit-test mocks are separate from E2E coverage.
 `network-policy` checks admission and workload execution, not real network
 enforcement. All-skipped real runs report `INCOMPLETE`, not `PASS`.
+
+The `forwarding` scenario starts a TCP listener inside MXC, then verifies two
+nonce-bound request/reply exchanges through `openshell forward service`, the
+gateway, supervisor, and Windows boundary. Both listener ports are dynamically
+assigned. Its native echo agent is a test-only Cargo example, built automatically
+by the E2E mise task and remote runner, not a shipped runtime binary. It verifies
+managed ingress, not denial of direct host-to-workload connections. Select it with
+`-Scenario forwarding` on the local harness or remote runner.

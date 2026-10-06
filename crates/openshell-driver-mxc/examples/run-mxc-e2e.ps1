@@ -34,6 +34,7 @@
 #   fs-default-deny  - ungranted write is denied after the agent launches.
 #                      processcontainer only.
 #   network-policy   - supervisor-owned network policy permits admission.
+#   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 
 [CmdletBinding()]
 param(
@@ -118,7 +119,7 @@ function Quote-NativeArgument([string]$value) {
     return $quoted.ToString()
 }
 
-function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList, [int]$timeoutSeconds = 0) {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $filePath
     $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
@@ -142,6 +143,9 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
+    if ($timeoutSeconds -gt 0 -and -not $process.WaitForExit($timeoutSeconds * 1000)) {
+        $process.Kill()
+    }
     $process.WaitForExit()
 
     return @{
@@ -269,6 +273,66 @@ function Wait-File([string]$path, [int]$seconds) {
         Start-Sleep -Milliseconds 400
     }
     return (Test-Path $path)
+}
+
+# Exercise the public gRPC forward path, never dial the workload port directly.
+# The nonce identifies this workload, not an unrelated host-loopback listener.
+function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
+    if (-not (Wait-File $readyFile 30)) { throw "MXC forwarding listener did not report readiness" }
+    $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
+    if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw "Invalid workload listener port" }
+    $outLog = Join-Path $resultDir "forward.stdout.log"
+    $errLog = Join-Path $resultDir "forward.stderr.log"
+    $arguments = @("forward", "service", $sandboxName, "--target-port", "$targetPort", "--local", "127.0.0.1:0")
+    $forwarder = $null
+    try {
+        $forwarder = Start-Process -FilePath $cli -WindowStyle Hidden -PassThru `
+            -ArgumentList (($arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        $deadline = (Get-Date).AddSeconds(30)
+        $localPort = 0
+        while ((Get-Date) -lt $deadline) {
+            if ($forwarder.HasExited) { throw "CLI forwarder exited early (code $($forwarder.ExitCode)); see $errLog" }
+            $text = (Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue)
+            if ($text -match 'Forwarding 127\.0\.0\.1:(\d+) ->') {
+                $localPort = [int]$Matches[1]
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($localPort -eq 0) { throw "CLI forwarder did not bind within 30 seconds" }
+        for ($exchange = 1; $exchange -le 2; $exchange++) {
+            $socket = New-Object System.Net.Sockets.TcpClient
+            $reader = $null
+            try {
+                $connect = $socket.BeginConnect('127.0.0.1', $localPort, $null, $null)
+                try {
+                    if (-not $connect.AsyncWaitHandle.WaitOne(5000)) { throw "Forward client connection timed out" }
+                    $socket.EndConnect($connect)
+                } finally { $connect.AsyncWaitHandle.Close() }
+                $socket.NoDelay = $true
+                $stream = $socket.GetStream()
+                $stream.ReadTimeout = 10000
+                $stream.WriteTimeout = 10000
+                $request = "request-$exchange-$([guid]::NewGuid().ToString('N'))"
+                $bytes = [Text.Encoding]::ASCII.GetBytes("$request`n")
+                $stream.Write($bytes, 0, $bytes.Length)
+                $socket.Client.Shutdown([Net.Sockets.SocketShutdown]::Send)
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::ASCII)
+                $reply = $reader.ReadLine()
+                if ($reply -ne "$nonce`:$request") { throw "Forwarded exchange $exchange returned an unexpected response: '$reply'" }
+                Info "forwarded exchange ${exchange}: exact workload response verified"
+            } finally {
+                if ($reader) { $reader.Dispose() }
+                $socket.Close()
+            }
+        }
+    } finally {
+        if ($forwarder) {
+            if (-not $forwarder.HasExited) { Stop-Process -Id $forwarder.Id -Force -ErrorAction SilentlyContinue }
+            $forwarder.Dispose()
+        }
+    }
 }
 
 # Detect an agent *launch* failure (binary not found / not implemented) vs a
@@ -508,6 +572,13 @@ try {
             Backends = "both"; Kind = "positive"
             PosTarget = (Join-Path $DemoDir "network-policy-result.txt")
             Description = "supervisor-owned network policy is accepted and workload runs (not an egress assertion)"
+        },
+        @{
+            Name = "forwarding"; PolicyFile = Join-Path $policyDir "forwarding.yaml"
+            SandboxId = "fwd"
+            Backends = "process_container"; Kind = "forwarding"
+            ReadyFile = (Join-Path $DemoDir "forwarding-port.txt")
+            Description = "real MXC listener receives two TCP exchanges through authenticated OpenShell forwarding"
         }
     )
 
@@ -579,6 +650,19 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq "forwarding") {
+                Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
+                $forwardNonce = [guid]::NewGuid().ToString('N')
+                $fixture = Join-Path $BinaryDir 'mxc-forwarding-agent.exe'
+                if (-not (Test-Path -LiteralPath $fixture)) {
+                    $fixture = Join-Path $BinaryDir 'examples/mxc-forwarding-agent.exe'
+                }
+                if (-not (Test-Path -LiteralPath $fixture)) {
+                    throw "Missing forwarding fixture; run mise run --skip-tools windows:build:mxc-fixtures"
+                }
+                $workload = Join-Path $DemoDir 'mxc-forwarding-agent.exe'
+                Copy-Item -LiteralPath $fixture -Destination $workload -Force
+                $command = @($workload, $sc.ReadyFile, $forwardNonce)
             } else {
                 $command = @($cmdExe, "/c", "exit 0")
             }
@@ -634,6 +718,21 @@ try {
                     Info "createOut: $createOutStr"
                     if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure (not a policy result)" }
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact absent" }
+                }
+            } elseif ($sc.Kind -eq "forwarding") {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
+                    Test-Forwarding $sandboxName $sc.ReadyFile $forwardNonce
+                    Ok "$($sc.Name): both forwarded request/reply exchanges succeeded"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "two exact TCP replies through OpenShell" }
+                } catch {
+                    Bad "$($sc.Name): $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = $_.Exception.Message }
+                    try {
+                        $diagnostic = Invoke-NativeCaptured $cli @('sandbox', 'get', $sandboxName, '-o', 'json') 5
+                        $diagnostic.Output | Set-Content -LiteralPath (Join-Path $resultDir 'forward.sandbox.json') -Encoding UTF8
+                        Info "sandbox state captured in forward.sandbox.json"
+                    } catch { Info "sandbox diagnostics unavailable: $($_.Exception.Message)" }
                 }
             } else {
                 # deny
@@ -739,8 +838,10 @@ Files in this bundle ($resultDir):
 
 What PASS means: every selected scenario ran against real MXC and met its expected verdict - positive
 writes produced their artifact, deny writes were blocked with either a control
-write or driver-launch evidence. Missing coverage exits non-zero;
-network-policy proves admission and execution, not network enforcement.
+write or driver-launch evidence, and forwarding verified two exact TCP replies
+through OpenShell. Missing coverage exits non-zero; network-policy proves
+admission and execution, not network enforcement. Forwarding proves managed
+ingress works, not that direct host ingress is blocked.
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))

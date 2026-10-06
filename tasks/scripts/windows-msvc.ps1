@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -614,7 +614,7 @@ if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
+if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -640,6 +640,13 @@ switch ($Action) {
             Invoke-Build $rustTarget
         }
         Show-Artifacts $targets
+    }
+    "build-mxc-fixtures" {
+        foreach ($rustTarget in $targets) {
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $rustTarget" `
+                -LogName "build-$rustTarget-mxc-fixtures.log"
+        }
     }
     "test" {
         foreach ($rustTarget in $targets) {
