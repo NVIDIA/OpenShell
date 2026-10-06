@@ -2210,6 +2210,15 @@ pub fn validate_profile_set(
                     ));
                 }
             }
+            if credential.name.chars().any(char::is_control) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.name",
+                    "credential name must not contain control characters",
+                ));
+                continue;
+            }
             let credential_name = credential.name.trim();
             if credential_name.is_empty() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3014,6 +3023,16 @@ pub fn validate_profile_set(
             }
 
             if has_token_grant {
+                for (field, value) in [("host", &endpoint.host), ("path", &endpoint.path)] {
+                    if value.chars().any(char::is_control) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            format!("endpoints[{index}].{field}"),
+                            "token_grant endpoint selectors must not contain control characters",
+                        ));
+                    }
+                }
                 if endpoint.protocol.trim().eq_ignore_ascii_case("sql") {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
@@ -3333,6 +3352,19 @@ fn validate_token_grant_audience_overrides(
     let mut diagnostics = Vec::new();
     let mut bindings: Vec<TokenGrantOverrideBinding> = Vec::new();
     for (override_index, override_config) in token_grant.audience_overrides.iter().enumerate() {
+        for (field, value) in [
+            ("host", &override_config.host),
+            ("path", &override_config.path),
+        ] {
+            if value.chars().any(char::is_control) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("credentials.token_grant.audience_overrides[{override_index}].{field}"),
+                    "token_grant audience override selectors must not contain control characters",
+                ));
+            }
+        }
         for endpoint in endpoints {
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
                 if !token_grant_override_matches_endpoint(override_config, &endpoint.host, port) {
@@ -5422,6 +5454,94 @@ credentials:
             assert!(
                 diagnostics.is_empty(),
                 "unexpected diagnostics for {token_endpoint}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_control_characters_in_token_grant_keys() {
+        let valid = parse_profile_yaml(
+            r"
+id: grant-key
+display_name: Grant Key
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .unwrap();
+        for name in [
+            "access_token",
+            "namespace:access_token",
+            "\taccess_token",
+            "access_token\n",
+        ] {
+            let mut profile = valid.clone();
+            profile.credentials[0].name = name.into();
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            if name.chars().any(char::is_control) {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.field == "credentials.name"
+                            && diagnostic.message.contains("control characters")
+                    }),
+                    "{diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+        }
+        for (field, value) in [("host", "api.example.com\n"), ("path", "/api\t/private")] {
+            let mut profile = valid.clone();
+            if field == "host" {
+                profile.endpoints[0].host = value.into();
+            } else {
+                profile.endpoints[0].path = value.into();
+            }
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == format!("endpoints[0].{field}")
+                        && diagnostic.message.contains("control characters")
+                }),
+                "{diagnostics:?}"
+            );
+
+            let mut profile = valid.clone();
+            let grant = profile.credentials[0].token_grant.as_mut().unwrap();
+            grant
+                .audience_overrides
+                .push(super::TokenGrantAudienceOverrideProfile {
+                    host: if field == "host" {
+                        value.into()
+                    } else {
+                        String::new()
+                    },
+                    path: if field == "path" {
+                        value.into()
+                    } else {
+                        String::new()
+                    },
+                    port: 0,
+                    audience: String::new(),
+                    scopes: Vec::new(),
+                });
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field
+                        == format!("credentials.token_grant.audience_overrides[0].{field}")
+                        && diagnostic.message.contains("control characters")
+                }),
+                "{diagnostics:?}"
             );
         }
     }

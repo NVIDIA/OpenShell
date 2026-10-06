@@ -51,6 +51,22 @@ fn fixture(
 }
 
 #[tokio::test]
+async fn malformed_endpoint_key_fails_before_acquisition() {
+    let (fixture, ctx) = fixture(Ok("identity-token"));
+    {
+        let credentials = fixture.dynamic_credentials();
+        let mut credentials = credentials.write().unwrap();
+        let credential = credentials.remove(SERVICE).unwrap();
+        credentials.insert(
+            "api.example.com\t443\t/v1/**\towner\tprovider:a\tother:service".into(),
+            credential,
+        );
+    }
+    assert!(inject_if_needed(request(), &ctx).await.is_err());
+    fixture.assert_no_requests();
+}
+
+#[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
     let rewritten = inject_if_needed(request(), &ctx).await.unwrap();

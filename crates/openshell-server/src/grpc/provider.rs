@@ -1430,7 +1430,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         readiness_reason,
         environment: env,
         credential_expiration_times: expires,
-        dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
+        dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records)?,
         static_credential_bindings,
         static_credential_keys,
         files,
@@ -1544,7 +1544,7 @@ fn hash_handle_component(hasher: &mut Sha256, value: &[u8]) {
 fn resolve_dynamic_credentials_from_records(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
-) -> HashMap<String, ProviderProfileCredential> {
+) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
     let mut dynamic_creds = HashMap::new();
     for record in records {
         let provider = &record.provider;
@@ -1560,9 +1560,9 @@ fn resolve_dynamic_credentials_from_records(
             &profile,
             &record.name,
             &record.object_id,
-        );
+        )?;
     }
-    dynamic_creds
+    Ok(dynamic_creds)
 }
 
 fn insert_dynamic_credentials_for_profile(
@@ -1570,7 +1570,7 @@ fn insert_dynamic_credentials_for_profile(
     profile: &ProviderTypeProfile,
     provider_name: &str,
     provider_id: &str,
-) {
+) -> Result<(), Status> {
     // Display names and collision suffixes never participate in credential ownership.
     let rule = profile.network_policy_rule("");
     let owners = openshell_core::policy_identity::provider_token_grant_owners(provider_id, &rule);
@@ -1580,7 +1580,12 @@ fn insert_dynamic_credentials_for_profile(
             continue;
         }
         for (endpoint, owner) in profile.endpoints.iter().zip(&owners) {
-            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+            let ports = if endpoint.ports.is_empty() {
+                std::slice::from_ref(&endpoint.port)
+            } else {
+                endpoint.ports.as_slice()
+            };
+            for &port in ports {
                 insert_dynamic_credentials_for_endpoint(
                     dynamic_creds,
                     &endpoint.host,
@@ -1589,10 +1594,11 @@ fn insert_dynamic_credentials_for_profile(
                     provider_name,
                     credential,
                     owner,
-                );
+                )?;
             }
         }
     }
+    Ok(())
 }
 
 fn endpoint_ports(port: u32, ports: &[u32]) -> Vec<u32> {
@@ -1611,15 +1617,16 @@ fn insert_dynamic_credentials_for_endpoint(
     provider_name: &str,
     credential: &ProviderProfileCredential,
     owner: &str,
-) {
-    let default_key = DynamicCredentialKey {
-        host: endpoint_host,
-        port: endpoint_port,
-        path: endpoint_path,
+) -> Result<(), Status> {
+    let default_key = DynamicCredentialKey::new(
+        endpoint_host,
+        endpoint_port,
+        endpoint_path,
         owner,
         provider_name,
-        credential_name: &credential.name,
-    }
+        &credential.name,
+    )
+    .map_err(|error| Status::failed_precondition(error.to_string()))?
     .encode();
     dynamic_creds.insert(
         default_key,
@@ -1627,14 +1634,10 @@ fn insert_dynamic_credentials_for_endpoint(
     );
 
     let Some(token_grant) = credential.token_grant.as_ref() else {
-        return;
+        return Ok(());
     };
 
     for override_config in &token_grant.audience_overrides {
-        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
-            continue;
-        }
-
         let override_host = if override_config.host.is_empty() {
             endpoint_host
         } else {
@@ -1650,20 +1653,25 @@ fn insert_dynamic_credentials_for_endpoint(
         } else {
             override_config.path.as_str()
         };
-        let override_key = DynamicCredentialKey {
-            host: override_host,
-            port: override_port,
-            path: override_path,
+        let override_key = DynamicCredentialKey::new(
+            override_host,
+            override_port,
+            override_path,
             owner,
             provider_name,
-            credential_name: &credential.name,
-        }
+            &credential.name,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
         .encode();
+        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
+            continue;
+        }
         dynamic_creds.insert(
             override_key,
             resolved_dynamic_credential(credential, Some(override_config), owner),
         );
     }
+    Ok(())
 }
 
 fn resolved_dynamic_credential(
@@ -5454,7 +5462,8 @@ mod tests {
             &ProviderTypeProfile::from_proto(&profile),
             "keycloak",
             "provider-uid",
-        );
+        )
+        .expect("valid token grant keys");
 
         assert_eq!(dynamic_creds.len(), 4);
         for (host, audience) in service_audiences {
@@ -5469,6 +5478,68 @@ mod tests {
             assert_eq!(grant.audience, audience);
             assert_eq!(grant.scopes, vec![audience.to_string()]);
             assert!(grant.audience_overrides.is_empty());
+        }
+    }
+
+    #[test]
+    fn dynamic_token_grant_key_errors_reject_unvalidated_profiles() {
+        for (name, port) in [
+            ("access_token", 443),
+            ("namespace:access_token", 443),
+            ("\taccess_token", 443),
+            ("access_token\n", 443),
+            ("access_token", 0),
+            ("access_token", 65_536),
+        ] {
+            let profile = ProviderProfile {
+                credentials: vec![token_grant_credential(name)],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.test".into(),
+                    port,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut dynamic = HashMap::new();
+            let result = insert_dynamic_credentials_for_profile(
+                &mut dynamic,
+                &ProviderTypeProfile::from_proto(&profile),
+                "provider",
+                "provider-uid",
+            );
+            if name.chars().any(char::is_control) || !(1..=65_535).contains(&port) {
+                assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+                assert!(dynamic.is_empty(), "invalid key must not be published");
+            } else {
+                result.expect("valid credential key");
+                assert_eq!(dynamic.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_environment_propagates_dynamic_key_failure() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-key", "api.example.test", 443, "/api/**").await;
+        create_empty_token_grant_provider(store, "provider", "grant-key").await;
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(store, "default")
+            .await
+            .unwrap();
+        let mut records = load_provider_environment_records(store, "default", &["provider".into()])
+            .await
+            .unwrap();
+        let valid = resolve_provider_environment_from_records(store, &catalog, &records)
+            .await
+            .expect("valid dynamic environment");
+        assert_eq!(valid.dynamic_credentials.len(), 1);
+        for malformed_name in ["provider\tother", "provider\n", "provider:other"] {
+            records[0].name = malformed_name.into();
+            let error = resolve_provider_environment_from_records(store, &catalog, &records)
+                .await
+                .expect_err("invalid record key must reject the whole environment");
+            assert_eq!(error.code(), Code::FailedPrecondition);
         }
     }
 
@@ -5500,7 +5571,8 @@ mod tests {
             &ProviderTypeProfile::from_proto(&profile),
             "api",
             "provider-uid",
-        );
+        )
+        .expect("valid token grant keys");
         let private: Vec<_> = credentials
             .iter()
             .filter(|(key, _)| key.starts_with("api.example.test\t443\t/api/private/**\t"))
@@ -5646,7 +5718,8 @@ mod tests {
             &profile,
             "provider",
             "provider-uid",
-        );
+        )
+        .expect("valid token grant keys");
         assert_eq!(credentials.len(), 2);
         let owners = openshell_core::policy_identity::provider_token_grant_owners(
             "provider-uid",
@@ -5654,14 +5727,15 @@ mod tests {
         );
         assert_eq!(owners.len(), 1);
         for expected in [service, identity] {
-            let key = DynamicCredentialKey {
-                host: "api.example.com",
-                port: 443,
-                path: "/v1/**",
-                owner: &owners[0],
-                provider_name: "provider",
-                credential_name: &expected.name,
-            }
+            let key = DynamicCredentialKey::new(
+                "api.example.com",
+                443,
+                "/v1/**",
+                &owners[0],
+                "provider",
+                &expected.name,
+            )
+            .expect("valid token grant key")
             .encode();
             assert_eq!(credentials[&key].token_grant, expected.token_grant);
             assert_eq!(credentials[&key].header_name, expected.header_name);

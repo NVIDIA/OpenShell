@@ -26,24 +26,34 @@ network_policies:
       - { path: /usr/bin/node }
 "#;
 
+fn forward_inspection_fixture() -> (
+    crate::l7::L7EndpointConfig,
+    crate::opa::TunnelPolicyEngine,
+    crate::l7::relay::L7EvalContext,
+    crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+) {
+    let (config, engine, mut ctx) = forward_websocket_policy_parts(
+        POLICY,
+        "api.example.test",
+        8080,
+        "/v1/projects",
+        "rest_api",
+    );
+    let fixture = forward_token_grant_fixture(
+        "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        Ok("grant-token"),
+        false,
+    );
+    ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+    ctx.provider_credentials = Some(fixture.provider_credentials());
+    ctx.token_grant_resolver = Some(fixture.resolver());
+    (config, engine, ctx, fixture)
+}
+
 #[tokio::test]
 async fn forward_inspection_selects_only_the_owner_admitting_the_request() {
     for method in ["GET", "POST"] {
-        let (config, engine, mut ctx) = forward_websocket_policy_parts(
-            POLICY,
-            "api.example.test",
-            8080,
-            "/v1/projects",
-            "rest_api",
-        );
-        let fixture = forward_token_grant_fixture(
-            "api.example.test\t8080\t/v1/**\tprovider:access_token",
-            Ok("grant-token"),
-            false,
-        );
-        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
-        ctx.provider_credentials = Some(fixture.provider_credentials());
-        ctx.token_grant_resolver = Some(fixture.resolver());
+        let (config, engine, mut ctx, fixture) = forward_inspection_fixture();
         let info = crate::l7::L7RequestInfo {
             action: method.into(),
             target: "/v1/projects".into(),
@@ -97,22 +107,8 @@ async fn forward_inspection_selects_only_the_owner_admitting_the_request() {
 
 #[tokio::test]
 async fn forward_inspection_retains_installation_through_guarded_write() {
-    let (config, engine, mut ctx) = forward_websocket_policy_parts(
-        POLICY,
-        "api.example.test",
-        8080,
-        "/v1/projects",
-        "rest_api",
-    );
-    let fixture = forward_token_grant_fixture(
-        "api.example.test\t8080\t/v1/**\tprovider:access_token",
-        Ok("grant-token"),
-        false,
-    );
-    let state = fixture.provider_credentials();
-    ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
-    ctx.provider_credentials = Some(state.clone());
-    ctx.token_grant_resolver = Some(fixture.resolver());
+    let (config, engine, mut ctx, fixture) = forward_inspection_fixture();
+    let state = ctx.provider_credentials.as_ref().unwrap().clone();
     let info = crate::l7::L7RequestInfo {
         action: "POST".into(),
         target: "/v1/projects".into(),

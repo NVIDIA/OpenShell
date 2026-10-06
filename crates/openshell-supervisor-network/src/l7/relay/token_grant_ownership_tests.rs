@@ -572,20 +572,6 @@ fn assert_no_authorization(capture: &Capture) {
     );
 }
 
-#[tokio::test]
-async fn single_endpoint_grant_is_a_positive_control() {
-    let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
-    let mut connection = fixture.connect();
-    let response = connection.exchange("GET", "/a/item", true).await;
-    let capture = connection.finish().await;
-    assert!(response.starts_with("HTTP/1.1 204"));
-    assert_eq!(capture.requests.len(), 1);
-    assert_authorization(&capture.requests[0], "aud-a");
-    fixture
-        .resolver
-        .assert_calls(&[(&fixture.grant_key("/a/**", "a"), "aud-a")]);
-}
-
 fn native_protocol_fixture(protocol: &str, multiple_routes: bool) -> Fixture {
     let mut native = route("native", "/native");
     native.protocol = protocol;
@@ -745,26 +731,6 @@ async fn missing_grant_owner_metadata_rejects_only_matching_requests() {
 }
 
 #[tokio::test]
-async fn route_selected_grant_uses_canonical_path_and_ignores_query_selector_text() {
-    let fixture = Fixture::new(
-        &[route("a", "/a/**"), route("b", "/b/**")],
-        &[("/a/**", "a", "aud-a"), ("/b/**", "b", "aud-b")],
-        2,
-    );
-    let mut connection = fixture.connect();
-    let response = connection
-        .exchange("GET", "/a/../b/%69tem?next=/a/item", true)
-        .await;
-    let capture = connection.finish().await;
-    assert!(response.starts_with("HTTP/1.1 204"));
-    assert_eq!(capture.requests.len(), 1);
-    assert_authorization(&capture.requests[0], "aud-b");
-    fixture
-        .resolver
-        .assert_calls(&[(&fixture.grant_key("/b/**", "b"), "aud-b")]);
-}
-
-#[tokio::test]
 async fn route_selected_grants_follow_a_b_a_on_one_connection() {
     let fixture = Fixture::new(
         &[route("a", "/a/**"), route("b", "/b/**")],
@@ -773,7 +739,7 @@ async fn route_selected_grants_follow_a_b_a_on_one_connection() {
     );
     let mut connection = fixture.connect();
     let mut responses = Vec::new();
-    for path in ["/a/first", "/b/second", "/a/third"] {
+    for path in ["/a/first", "/a/../b/%69tem?next=/a/item", "/a/third"] {
         responses.push(connection.exchange("GET", path, true).await);
     }
     let capture = connection.finish().await;
@@ -787,7 +753,7 @@ async fn route_selected_grants_follow_a_b_a_on_one_connection() {
         .requests
         .iter()
         .zip(["aud-a", "aud-b", "aud-a"])
-        .zip(["/a/first", "/b/second", "/a/third"])
+        .zip(["/a/first", "/b/item?next=/a/item", "/a/third"])
     {
         assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
         assert_authorization(request, audience);

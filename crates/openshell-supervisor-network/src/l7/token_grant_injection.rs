@@ -90,7 +90,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                 ctx,
                 request_path,
                 None,
-            ))?
+            )?)?
         }
         None => Vec::new(),
     };
@@ -131,7 +131,7 @@ pub(super) async fn inject_for_admitted_owners(
         ctx,
         request_path,
         Some(admitted_owners),
-    );
+    )?;
     let credentials = select_token_grants(candidates)?
         .into_iter()
         .map(|(key, cred)| (snapshot.scoped_key(&key), cred))
@@ -238,13 +238,14 @@ fn select_token_grants(
     candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let mut selected = BTreeMap::<String, (u32, String, ProviderProfileCredential)>::new();
     for (score, key, credential) in candidates {
+        let identity =
+            credential_identity(&key).ok_or_else(|| miette!("invalid dynamic credential key"))?;
         let header = token_grant_header_name(&credential)?.to_ascii_lowercase();
         if let Some((selected_score, selected_key, _)) = selected.get(&header) {
             // Equal-specificity selectors of the same credential can overlap. A
             // different credential cannot win a tie for the same protected header.
-            if score == *selected_score
-                && credential_identity(&key) != credential_identity(selected_key)
-            {
+            let selected_identity = credential_identity(selected_key);
+            if score == *selected_score && Some(identity) != selected_identity {
                 return Err(miette!("ambiguous dynamic token grants for one header"));
             }
             continue;
@@ -267,7 +268,7 @@ fn token_grant_candidates(
     ctx: &L7EvalContext,
     request_path: &str,
     admitted_owners: Option<&HashSet<String>>,
-) -> Vec<(u32, String, ProviderProfileCredential)> {
+) -> Result<Vec<(u32, String, ProviderProfileCredential)>> {
     credentials
         .iter()
         .filter_map(|(key, cred)| {
@@ -281,8 +282,11 @@ fn token_grant_candidates(
             {
                 return None;
             }
+            if endpoint_selector(key).is_none() {
+                return Some(Err(miette!("invalid dynamic credential endpoint key")));
+            }
             let score = dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-            Some((score, key.clone(), cred.clone()))
+            Some(Ok((score, key.clone(), cred.clone())))
         })
         .collect()
 }

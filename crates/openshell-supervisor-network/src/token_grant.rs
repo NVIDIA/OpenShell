@@ -422,7 +422,7 @@ fn supervisor_sandbox_id_from_env() -> Result<String> {
 
 fn parse_provider_credential_key(key: &str) -> Result<(&str, &str)> {
     openshell_core::dynamic_credential_key::credential_identity(key)
-        .split_once(':')
+        .and_then(|identity| identity.split_once(':'))
         .ok_or_else(|| {
             miette::miette!("dynamic token grant key is missing provider credential identity")
         })
@@ -529,7 +529,7 @@ pub mod test_support {
                 .filter(|acquisition| {
                     openshell_core::dynamic_credential_key::credential_identity(
                         &acquisition.request.provider_key,
-                    ) == provider_identity
+                    ) == Some(provider_identity)
                         && acquisition.request.audience == audience
                 })
                 .map(|acquisition| acquisition.cache_key.as_str())
@@ -989,13 +989,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_credential_key_parser_ignores_revision_segment() {
+    fn provider_credential_key_parser_preserves_identity_and_rejects_extra_fields() {
         assert_eq!(
             parse_provider_credential_key(
                 "api.example.test\t443\t/v1/**\trev:42\tprovider:access_token"
             )
             .expect("parse provider credential key"),
             ("provider", "access_token")
+        );
+        assert!(
+            parse_provider_credential_key(
+                "api.example.test\t443\t/v1/**\towner\tprovider:a\tother:access_token"
+            )
+            .is_err()
         );
     }
 
