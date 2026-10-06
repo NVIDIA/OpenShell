@@ -28,7 +28,7 @@ use openshell_core::proto::{
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WorkspaceSelector,
 };
-use openshell_core::{GetResourceVersion, ObjectId};
+use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
@@ -360,8 +360,12 @@ macro_rules! mutation {
             fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
                 ($capture)(response).map(Success::Ordinary)
             }
-            async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
-                ($restore)(store, outcome(success)?).await
+            async fn restore(
+                store: &Store,
+                config: &openshell_core::Config,
+                success: Success,
+            ) -> Result<Self::Output, Status> {
+                ($restore)(store, config, outcome(success)?).await
             }
         }
     };
@@ -436,7 +440,7 @@ macro_rules! sandbox_mutation {
                 false,
                 HashMap::new(),
             ),
-            async |store: &Store, outcome: Outcome| {
+            async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
                 let Outcome::Sandbox { id, .. } = outcome else {
                     return Err(replay_unavailable());
                 };
@@ -459,15 +463,31 @@ scoped_mutation!(
         false,
         response.get_ref().service_urls.clone(),
     ),
-    async |store: &Store, outcome: Outcome| {
+    async |store: &Store, config: &openshell_core::Config, outcome: Outcome| {
         let Outcome::Sandbox {
             id, service_urls, ..
         } = outcome
         else {
             return Err(replay_unavailable());
         };
+        let sandbox: Sandbox = live(store, &id).await?;
+        // Keep the originally exposed service names, but render their URLs
+        // using today's listeners and domains instead of the durable URL text.
+        let service_urls = service_urls
+            .into_keys()
+            .map(|name| {
+                let url = crate::service_routing::endpoint_url(
+                    config,
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                    &name,
+                )
+                .unwrap_or_default();
+                (name, url)
+            })
+            .collect();
         Ok(SandboxResponse {
-            sandbox: Some(live(store, &id).await?),
+            sandbox: Some(sandbox),
             service_urls,
         })
     }
@@ -506,7 +526,7 @@ macro_rules! attachment_mutation {
                     ),
                 })
             },
-            async |store: &Store, outcome: Outcome| {
+            async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
                 let Outcome::Attachment {
                     id,
                     changed,
@@ -549,7 +569,7 @@ sandbox_scoped_mutation!(
         id: response.get_ref().sandbox_id.clone(),
         outcome: response.get_ref().outcome
     }),
-    async |_store: &Store, value: Outcome| {
+    async |_store: &Store, _config: &openshell_core::Config, value: Outcome| {
         let Outcome::SandboxDeletion { id, outcome } = value else {
             return Err(replay_unavailable());
         };
@@ -575,18 +595,26 @@ sandbox_scoped_mutation!(
             url: value.url.clone(),
         })
     },
-    async |store: &Store, outcome: Outcome| {
+    async |store: &Store, config: &openshell_core::Config, outcome: Outcome| {
         let Outcome::Service {
             reference,
             sandbox_id,
-            url,
+            ..
         } = outcome
         else {
             return Err(replay_unavailable());
         };
         let _: Sandbox = live(store, &sandbox_id).await?;
+        let endpoint: openshell_core::proto::ServiceEndpoint = reference.restore(store).await?;
+        let url = crate::service_routing::endpoint_url(
+            config,
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+        )
+        .unwrap_or_default();
         Ok(ServiceEndpointResponse {
-            endpoint: Some(reference.restore(store).await?),
+            endpoint: Some(endpoint),
             url,
         })
     }
@@ -612,7 +640,7 @@ macro_rules! provider_mutation {
                         .collect(),
                 })
             },
-            async |store: &Store, outcome: Outcome| {
+            async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
                 let Outcome::Provider {
                     reference,
                     mutation_id,
@@ -676,7 +704,11 @@ macro_rules! ordinary_deletion {
                     outcome: response.get_ref().outcome,
                 })
             }
-            async fn restore(_store: &Store, success: Success) -> Result<Self::Output, Status> {
+            async fn restore(
+                _store: &Store,
+                _config: &openshell_core::Config,
+                success: Success,
+            ) -> Result<Self::Output, Status> {
                 let Success::Deletion { outcome } = success else {
                     return Err(replay_unavailable());
                 };
@@ -775,7 +807,7 @@ mutation!(
             changed: value.imported,
         })
     },
-    async |store: &Store, outcome: Outcome| {
+    async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
         let Outcome::Profiles {
             references,
             diagnostics,
@@ -812,7 +844,7 @@ mutation!(
             changed: value.updated,
         })
     },
-    async |store: &Store, outcome: Outcome| {
+    async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
         let Outcome::Profiles {
             references,
             diagnostics,
@@ -841,7 +873,7 @@ macro_rules! refresh_mutation {
             |response: &Response<$resp>| Ok(Outcome::Refresh(
                 facts(response)?.refresh.ok_or_else(uncertain)?
             )),
-            async |store: &Store, outcome: Outcome| {
+            async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
                 let Outcome::Refresh(reference) = outcome else {
                     return Err(replay_unavailable());
                 };
@@ -917,7 +949,7 @@ mutation!(
             annotations: value.annotations.clone(),
         })
     },
-    async |store: &Store, outcome: Outcome| {
+    async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
         let Outcome::Config {
             sandbox_id,
             version,
@@ -961,7 +993,7 @@ macro_rules! policy_mutation {
                     cleared,
                 })
             },
-            async |store: &Store, outcome: Outcome| {
+            async |store: &Store, _config: &openshell_core::Config, outcome: Outcome| {
                 let Outcome::Policy {
                     sandbox_id,
                     version,

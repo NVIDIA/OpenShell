@@ -195,6 +195,12 @@ service:
   type: ClusterIP
   # -- Gateway gRPC/HTTP service port.
   port: 8080
+  # -- Dedicated sandbox service ingress port. Set to 0 to share the primary gateway port.
+  ingressPort: 0
+  # -- Fixed NodePort for dedicated ingress (requires service.type=NodePort and ingressPort). Used in service URLs unless ingressPublicPort overrides it.
+  ingressNodePort: 0
+  # -- Externally reachable dedicated ingress port for generated URLs. Set when a proxy or port mapping changes ingressPort; 0 uses ingressNodePort or ingressPort.
+  ingressPublicPort: 0
   # -- Gateway health service port.
   healthPort: 8081
   # -- Gateway metrics service port.

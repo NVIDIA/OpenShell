@@ -199,17 +199,40 @@ pub fn service_http_router(state: Arc<crate::ServerState>) -> Router {
         .with_state(state)
 }
 
+/// Service-only router for dedicated ingress, without the plaintext loopback
+/// browser-context restriction. Application authorization still applies.
+pub fn service_ingress_router(state: Arc<crate::ServerState>) -> Router {
+    Router::new()
+        .fallback(sandbox_service_ingress_only)
+        .with_state(state)
+}
+
 async fn sandbox_service_routing_first(
     State(state): State<Arc<crate::ServerState>>,
     req: Request,
     next: Next,
 ) -> impl IntoResponse {
     if crate::service_routing::is_sandbox_service_request(&req, &state.config.service_routing) {
+        if state.config.service_bind_address.is_some() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return crate::service_routing::proxy_sandbox_service_request(state, req)
             .await
             .into_response();
     }
     next.run(req).await.into_response()
+}
+
+async fn sandbox_service_ingress_only(
+    State(state): State<Arc<crate::ServerState>>,
+    req: Request,
+) -> impl IntoResponse {
+    if !crate::service_routing::is_sandbox_service_request(&req, &state.config.service_routing) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    crate::service_routing::proxy_sandbox_service_request(state, req)
+        .await
+        .into_response()
 }
 
 async fn sandbox_service_routing_only(

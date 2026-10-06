@@ -103,7 +103,11 @@ impl Mutation for ExecSandboxRequest {
         Err(uncertain())
     }
 
-    async fn restore(_: &Store, success: Success) -> Result<Self::Output, Status> {
+    async fn restore(
+        _: &Store,
+        _: &openshell_core::Config,
+        success: Success,
+    ) -> Result<Self::Output, Status> {
         Err(stream_unavailable(success))
     }
 }
@@ -142,7 +146,11 @@ impl Mutation for ExecSandboxInput {
         Err(uncertain())
     }
 
-    async fn restore(_: &Store, success: Success) -> Result<Self::Output, Status> {
+    async fn restore(
+        _: &Store,
+        _: &openshell_core::Config,
+        success: Success,
+    ) -> Result<Self::Output, Status> {
         Err(stream_unavailable(success))
     }
 }

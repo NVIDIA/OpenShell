@@ -94,6 +94,10 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub bind_address: Option<SocketAddr>,
     #[serde(default)]
+    pub service_bind_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub service_public_port: Option<u16>,
+    #[serde(default)]
     pub health_bind_address: Option<SocketAddr>,
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,

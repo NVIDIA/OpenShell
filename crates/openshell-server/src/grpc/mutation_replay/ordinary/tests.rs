@@ -819,7 +819,7 @@ async fn refresh_receipts_never_replay_a_new_grant_epoch() {
             epoch: refresh.authorization_epoch.clone(),
         }))
     };
-    ConfigureProviderRefreshRequest::restore(&state.store, receipt())
+    ConfigureProviderRefreshRequest::restore(&state.store, &state.config, receipt())
         .await
         .unwrap();
     let original = receipt();
@@ -827,7 +827,7 @@ async fn refresh_receipts_never_replay_a_new_grant_epoch() {
     state.store.put_message(&refresh).await.unwrap();
     assert_eq!(
         reason(
-            &ConfigureProviderRefreshRequest::restore(&state.store, original)
+            &ConfigureProviderRefreshRequest::restore(&state.store, &state.config, original)
                 .await
                 .unwrap_err()
         ),
@@ -861,10 +861,10 @@ async fn refresh_receipts_reject_epoch_deletion_timestamps() {
         }))
     };
     for error in [
-        ConfigureProviderRefreshRequest::restore(&state.store, receipt())
+        ConfigureProviderRefreshRequest::restore(&state.store, &state.config, receipt())
             .await
             .unwrap_err(),
-        RotateProviderCredentialRequest::restore(&state.store, receipt())
+        RotateProviderCredentialRequest::restore(&state.store, &state.config, receipt())
             .await
             .unwrap_err(),
     ] {

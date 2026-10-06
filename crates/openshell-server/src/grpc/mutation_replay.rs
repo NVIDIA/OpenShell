@@ -121,7 +121,13 @@ pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
         request: Request<Self>,
     ) -> Result<Response<Self::Output>, Status>;
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status>;
-    async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status>;
+    /// Preserve the admitted effects and resource identity, while rendering
+    /// transport-dependent fields from the current gateway configuration.
+    async fn restore(
+        store: &Store,
+        config: &openshell_core::Config,
+        success: Success,
+    ) -> Result<Self::Output, Status>;
 }
 
 /// Empty IDs preserve the existing RPC contract, including cancellation.
@@ -300,7 +306,8 @@ async fn execute_owned<M: Mutation>(
                 return Err(replay_unavailable());
             }
             let success = previous.success.ok_or_else(uncertain)?;
-            let mut response = Response::new(M::restore(&state.store, success).await?);
+            let mut response =
+                Response::new(M::restore(&state.store, &state.config, success).await?);
             response.metadata_mut().insert(
                 "openshell-replayed",
                 "true".parse().expect("static metadata"),
@@ -693,7 +700,11 @@ macro_rules! resource_mutation {
             fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
                 resource_success(response.get_ref().$field.as_ref())
             }
-            async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
+            async fn restore(
+                store: &Store,
+                _config: &openshell_core::Config,
+                success: Success,
+            ) -> Result<Self::Output, Status> {
                 Ok($resp {
                     $field: Some(restore_resource(store, success).await?),
                 })
@@ -729,7 +740,11 @@ macro_rules! deletion_mutation {
                     outcome: response.get_ref().outcome,
                 })
             }
-            async fn restore(_store: &Store, success: Success) -> Result<Self::Output, Status> {
+            async fn restore(
+                _store: &Store,
+                _config: &openshell_core::Config,
+                success: Success,
+            ) -> Result<Self::Output, Status> {
                 let Success::Deletion { outcome } = success else {
                     return Err(replay_unavailable());
                 };
