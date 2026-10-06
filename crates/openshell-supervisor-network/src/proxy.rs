@@ -220,12 +220,7 @@ fn revision_scoped_dynamic_credentials(
     snapshot
         .dynamic_credentials
         .iter()
-        .map(|(key, credential)| {
-            (
-                crate::l7::token_grant_injection::revision_scoped_credential_key(key, snapshot),
-                credential.clone(),
-            )
-        })
+        .map(|(key, credential)| (snapshot.scoped_key(key), credential.clone()))
         .collect()
 }
 

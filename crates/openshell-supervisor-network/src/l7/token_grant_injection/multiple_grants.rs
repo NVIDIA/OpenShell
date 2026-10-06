@@ -255,3 +255,63 @@ async fn concurrent_requests_keep_credential_snapshots_separate() {
     first.assert_requested_keys(&[SERVICE, IDENTITY]);
     second.assert_requested_keys(&[SERVICE, IDENTITY]);
 }
+
+#[tokio::test]
+async fn admitted_owners_select_grants_independently_per_header() {
+    // The service grant keeps the fixture owner; the identity grant belongs to a
+    // different endpoint. Each case lists the owners that admitted the request and
+    // whether the service and identity headers are replaced.
+    let cases: [(&[&str], bool, bool); 4] = [
+        (&[], false, false),
+        (&["test-owner"], true, false),
+        (&["identity-owner"], false, true),
+        (&["test-owner", "identity-owner"], true, true),
+    ];
+    for (admitted, service, identity) in cases {
+        let (fixture, mut ctx) = fixture(Ok("identity-token"));
+        fixture
+            .dynamic_credentials()
+            .write()
+            .unwrap()
+            .get_mut(IDENTITY)
+            .unwrap()
+            .token_grant_owners = vec!["identity-owner".into()];
+        let state = fixture.provider_credentials();
+        ctx.provider_credentials = Some(state.clone());
+        let owners = admitted
+            .iter()
+            .map(|owner| (*owner).to_string())
+            .collect::<HashSet<_>>();
+
+        let rewritten = inject_for_admitted_owners(request(), &ctx, &state.snapshot(), &owners)
+            .await
+            .unwrap();
+        let bytes = String::from_utf8(rewritten.raw_header).unwrap();
+
+        // A grant whose owner did not admit the request is never acquired, and its
+        // header keeps the workload's own value.
+        assert_eq!(
+            bytes.contains("Authorization: Bearer service-token\r\n"),
+            service,
+            "service header for {admitted:?}"
+        );
+        assert_eq!(
+            bytes.contains("Authorization: Bearer agent-token\r\n"),
+            !service,
+            "workload Authorization for {admitted:?}"
+        );
+        assert_eq!(
+            bytes.contains("X-Workload-Jwt: identity-token\r\n"),
+            identity,
+            "identity header for {admitted:?}"
+        );
+        let mut expected = Vec::new();
+        if service {
+            expected.push(SERVICE);
+        }
+        if identity {
+            expected.push(IDENTITY);
+        }
+        fixture.assert_requested_keys(&expected);
+    }
+}

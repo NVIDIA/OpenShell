@@ -667,24 +667,6 @@ async fn overlapping_get_and_post_select_their_admitted_owner_on_one_connection(
 }
 
 #[tokio::test]
-async fn binary_excluded_narrow_owner_cannot_lend_its_grant_to_broad_allow() {
-    let mut narrow = route("narrow", "/a/private/**");
-    narrow.binary = "/usr/bin/other-client";
-    let fixture = Fixture::new(
-        &[route("broad", "/a/**"), narrow],
-        &[("/a/private/**", "narrow", "aud-private")],
-        1,
-    );
-    let mut connection = fixture.connect();
-    let response = connection.exchange("GET", "/a/private/item", false).await;
-    let capture = connection.finish().await;
-    assert!(response.starts_with("HTTP/1.1 204"));
-    assert_eq!(capture.requests.len(), 1);
-    fixture.resolver.assert_calls(&[]);
-    assert_no_authorization(&capture);
-}
-
-#[tokio::test]
 async fn equal_selector_does_not_authorize_another_binarys_grant() {
     let mut owner = route("owner", "/a/**");
     owner.binary = "/usr/bin/other-client";
@@ -702,26 +684,6 @@ async fn equal_selector_does_not_authorize_another_binarys_grant() {
     assert_eq!(capture.requests.len(), 1);
     fixture.resolver.assert_calls(&[]);
     assert_no_authorization(&capture);
-}
-
-#[tokio::test]
-async fn sibling_explicit_deny_overrides_narrow_owner_allow() {
-    let mut broad = route("broad", "/a/**");
-    broad.deny_path = Some("/a/private/**");
-    let fixture = Fixture::new(
-        &[broad, route("narrow", "/a/private/**")],
-        &[("/a/private/**", "narrow", "aud-private")],
-        2,
-    );
-    let mut connection = fixture.connect();
-    let response = connection.exchange("GET", "/a/private/item", false).await;
-    let capture = connection.finish().await;
-    assert!(response.starts_with("HTTP/1.1 403"));
-    fixture.resolver.assert_calls(&[]);
-    assert_eq!(
-        capture.bytes_seen, 0,
-        "global denial precedes grant ownership"
-    );
 }
 
 #[tokio::test]

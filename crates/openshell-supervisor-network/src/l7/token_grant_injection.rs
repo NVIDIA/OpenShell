@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
+use openshell_core::dynamic_credential_key::{credential_identity, endpoint_selector};
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
 use openshell_core::provider_credentials::ProviderCredentialSnapshot;
 use openshell_ocsf::{
@@ -78,56 +79,62 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// Each header independently uses its most-specific matching binding. Every selected
 /// grant must succeed; callers must not forward the request when this returns an error.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
-    inject(req, ctx, None, None).await
+    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    let credentials = match ctx.dynamic_credentials.as_ref() {
+        Some(dynamic_credentials) => {
+            let credentials = dynamic_credentials
+                .read()
+                .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
+            select_token_grants(token_grant_candidates(
+                &credentials,
+                ctx,
+                request_path,
+                None,
+            ))?
+        }
+        None => Vec::new(),
+    };
+    inject_selected(req, ctx, credentials).await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
 /// An empty owner set permits no acquisition, including audit-only forwarding.
 /// L4-only forwarding continues to use `inject_if_needed` with its existing
 /// endpoint-selector contract; it has no per-request L7 admission decision.
+///
+/// Credentials come from the pinned `snapshot`, and each selected key is scoped
+/// to its revision and installation after selection so the one-grant-per-header
+/// ambiguity check still compares the original credential identities.
 pub(super) async fn inject_for_admitted_owners(
     req: L7Request,
     ctx: &L7EvalContext,
-    snapshot: Option<&ProviderCredentialSnapshot>,
+    snapshot: &ProviderCredentialSnapshot,
     admitted_owners: &HashSet<String>,
 ) -> Result<L7Request> {
-    inject(req, ctx, snapshot, Some(admitted_owners)).await
+    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    let candidates = token_grant_candidates(
+        &snapshot.dynamic_credentials,
+        ctx,
+        request_path,
+        Some(admitted_owners),
+    );
+    let credentials = select_token_grants(candidates)?
+        .into_iter()
+        .map(|(key, cred)| (snapshot.scoped_key(&key), cred))
+        .collect();
+    inject_selected(req, ctx, credentials).await
 }
 
-async fn inject(
+/// Acquires every selected grant and rewrites the request headers.
+///
+/// An empty selection forwards the request unchanged. Any failed acquisition
+/// returns an error before any header is written.
+async fn inject_selected(
     req: L7Request,
     ctx: &L7EvalContext,
-    snapshot: Option<&ProviderCredentialSnapshot>,
-    admitted_owners: Option<&HashSet<String>>,
+    credentials: Vec<(String, ProviderProfileCredential)>,
 ) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let credentials = if let Some(snapshot) = snapshot {
-        let candidates = token_grant_candidates(
-            &snapshot.dynamic_credentials,
-            ctx,
-            request_path,
-            admitted_owners,
-        );
-        // Scope each selected key to the pinned revision after selection, so the
-        // one-grant-per-header ambiguity check still compares the original
-        // credential names.
-        select_token_grants(candidates)?
-            .into_iter()
-            .map(|(key, cred)| (revision_scoped_credential_key(&key, snapshot), cred))
-            .collect()
-    } else if let Some(dynamic_credentials) = ctx.dynamic_credentials.as_ref() {
-        let credentials = dynamic_credentials
-            .read()
-            .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
-        select_token_grants(token_grant_candidates(
-            &credentials,
-            ctx,
-            request_path,
-            admitted_owners,
-        ))?
-    } else {
-        Vec::new()
-    };
     if credentials.is_empty() {
         return Ok(req);
     }
@@ -222,7 +229,7 @@ fn select_token_grants(
             // Equal-specificity selectors of the same credential can overlap. A
             // different credential cannot win a tie for the same protected header.
             if score == *selected_score
-                && key.rsplit('\t').next() != selected_key.rsplit('\t').next()
+                && credential_identity(&key) != credential_identity(selected_key)
             {
                 return Err(miette!("ambiguous dynamic token grants for one header"));
             }
@@ -266,23 +273,6 @@ fn token_grant_candidates(
         .collect()
 }
 
-pub fn revision_scoped_credential_key(key: &str, snapshot: &ProviderCredentialSnapshot) -> String {
-    key.rsplit_once('\t').map_or_else(
-        || {
-            format!(
-                "rev:{}\tinstallation:{}\t{key}",
-                snapshot.revision, snapshot.installation_id
-            )
-        },
-        |(endpoint_selector, provider_credential)| {
-            format!(
-                "{endpoint_selector}\trev:{}\tinstallation:{}\t{provider_credential}",
-                snapshot.revision, snapshot.installation_id
-            )
-        },
-    )
-}
-
 fn ocsf_message_field(value: &str) -> String {
     value
         .chars()
@@ -324,25 +314,21 @@ fn dynamic_credential_key_match_score(
     port: u16,
     request_path: &str,
 ) -> Option<u32> {
-    let mut parts = key.splitn(4, '\t');
-    let endpoint_host = parts.next()?;
-    let endpoint_port = parts.next()?;
-    let endpoint_path = parts.next()?;
-    let _provider_key = parts.next()?;
+    let selector = endpoint_selector(key)?;
 
-    if endpoint_port.parse::<u16>().ok() != Some(port) {
+    if selector.port.parse::<u16>().ok() != Some(port) {
         return None;
     }
 
-    if !openshell_core::host_pattern::host_matches(endpoint_host, host).unwrap_or(false)
-        || !crate::l7::endpoint_path_matches(endpoint_path, request_path)
+    if !openshell_core::host_pattern::host_matches(selector.host, host).unwrap_or(false)
+        || !crate::l7::endpoint_path_matches(selector.path, request_path)
     {
         return None;
     }
 
     Some(
-        host_pattern_specificity(&endpoint_host.to_ascii_lowercase())
-            + endpoint_path_specificity(endpoint_path),
+        host_pattern_specificity(&selector.host.to_ascii_lowercase())
+            + endpoint_path_specificity(selector.path),
     )
 }
 
@@ -524,9 +510,20 @@ pub mod test_support {
         resolver: Arc<dyn TokenGrantResolver>,
         requests: Arc<Mutex<Vec<OwnedTokenGrantRequest>>>,
         responses: Arc<Mutex<HashMap<String, std::result::Result<String, String>>>>,
+        /// Revision-scoped key -> installed key, so assertions can name the key a
+        /// test installed even when injection requests its scoped form.
+        scoped_keys: Mutex<HashMap<String, String>>,
     }
 
     impl TokenGrantTestFixture {
+        fn installed_key(&self, requested: &str) -> String {
+            self.scoped_keys
+                .lock()
+                .unwrap()
+                .get(requested)
+                .map_or_else(|| requested.to_string(), Clone::clone)
+        }
+
         pub fn success(key: &str, token: &str) -> Self {
             Self::new(key, Ok(token))
         }
@@ -580,6 +577,7 @@ pub mod test_support {
                 resolver,
                 requests,
                 responses,
+                scoped_keys: Mutex::new(HashMap::new()),
             }
         }
 
@@ -604,7 +602,7 @@ pub mod test_support {
             assert_eq!(
                 requests
                     .iter()
-                    .map(|r| r.provider_key.as_str())
+                    .map(|r| self.installed_key(&r.provider_key))
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -618,7 +616,7 @@ pub mod test_support {
             let requests = self.requests.lock().unwrap();
             let request = requests
                 .iter()
-                .find(|r| r.provider_key == key)
+                .find(|r| self.installed_key(&r.provider_key) == key)
                 .expect("grant was requested");
             assert_eq!(request.token_endpoint, grant.token_endpoint);
             assert_eq!(request.jwt_svid_audience, grant.jwt_svid_audience);
@@ -648,6 +646,32 @@ pub mod test_support {
             self.resolver.clone()
         }
 
+        /// Installs this fixture's credentials as a pinned provider-credential
+        /// snapshot. Admission-gated injection requests grants by revision-scoped
+        /// key, so each scripted response is also registered under that key.
+        pub fn provider_credentials(
+            &self,
+        ) -> openshell_core::provider_credentials::ProviderCredentialState {
+            let credentials = self.dynamic_credentials.read().unwrap().clone();
+            let state =
+                openshell_core::provider_credentials::ProviderCredentialState::from_environment(
+                    1,
+                    HashMap::new(),
+                    HashMap::new(),
+                    credentials.clone(),
+                );
+            let snapshot = state.snapshot();
+            let mut responses = self.responses.lock().unwrap();
+            for key in credentials.keys() {
+                let scoped = snapshot.scoped_key(key);
+                if let Some(response) = responses.get(key).cloned() {
+                    responses.insert(scoped.clone(), response);
+                }
+                self.scoped_keys.lock().unwrap().insert(scoped, key.clone());
+            }
+            state
+        }
+
         pub fn assert_no_requests(&self) {
             let requests = self
                 .requests
@@ -664,7 +688,10 @@ pub mod test_support {
             assert_eq!(requests.len(), 1);
 
             let request = &requests[0];
-            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(
+                self.installed_key(&request.provider_key),
+                expected_provider_key
+            );
             assert_eq!(request.token_endpoint, "https://auth.example.com/token");
             assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
             assert_eq!(
@@ -689,7 +716,10 @@ pub mod test_support {
             assert_eq!(requests.len(), 1);
 
             let request = &requests[0];
-            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(
+                self.installed_key(&request.provider_key),
+                expected_provider_key
+            );
             assert_eq!(request.token_endpoint, "https://auth.example.com/token");
             assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
             assert_eq!(

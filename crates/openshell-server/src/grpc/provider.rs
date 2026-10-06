@@ -20,6 +20,7 @@ use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
     StoredProviderProfile,
 };
+use openshell_core::dynamic_credential_key::DynamicCredentialKey;
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
@@ -1602,23 +1603,6 @@ fn endpoint_ports(port: u32, ports: &[u32]) -> Vec<u32> {
     }
 }
 
-fn dynamic_credential_key(
-    host: &str,
-    port: u32,
-    path: &str,
-    provider_name: &str,
-    credential_name: &str,
-    owner: &str,
-) -> String {
-    format!(
-        "{}\t{port}\t{}\t{owner}\t{}:{}",
-        host.to_ascii_lowercase(),
-        path,
-        provider_name,
-        credential_name
-    )
-}
-
 fn insert_dynamic_credentials_for_endpoint(
     dynamic_creds: &mut HashMap<String, ProviderProfileCredential>,
     endpoint_host: &str,
@@ -1628,14 +1612,15 @@ fn insert_dynamic_credentials_for_endpoint(
     credential: &ProviderProfileCredential,
     owner: &str,
 ) {
-    let default_key = dynamic_credential_key(
-        endpoint_host,
-        endpoint_port,
-        endpoint_path,
-        provider_name,
-        &credential.name,
+    let default_key = DynamicCredentialKey {
+        host: endpoint_host,
+        port: endpoint_port,
+        path: endpoint_path,
         owner,
-    );
+        provider_name,
+        credential_name: &credential.name,
+    }
+    .encode();
     dynamic_creds.insert(
         default_key,
         resolved_dynamic_credential(credential, None, owner),
@@ -1665,14 +1650,15 @@ fn insert_dynamic_credentials_for_endpoint(
         } else {
             override_config.path.as_str()
         };
-        let override_key = dynamic_credential_key(
-            override_host,
-            override_port,
-            override_path,
-            provider_name,
-            &credential.name,
+        let override_key = DynamicCredentialKey {
+            host: override_host,
+            port: override_port,
+            path: override_path,
             owner,
-        );
+            provider_name,
+            credential_name: &credential.name,
+        }
+        .encode();
         dynamic_creds.insert(
             override_key,
             resolved_dynamic_credential(credential, Some(override_config), owner),
@@ -5668,14 +5654,15 @@ mod tests {
         );
         assert_eq!(owners.len(), 1);
         for expected in [service, identity] {
-            let key = dynamic_credential_key(
-                "api.example.com",
-                443,
-                "/v1/**",
-                "provider",
-                &expected.name,
-                &owners[0],
-            );
+            let key = DynamicCredentialKey {
+                host: "api.example.com",
+                port: 443,
+                path: "/v1/**",
+                owner: &owners[0],
+                provider_name: "provider",
+                credential_name: &expected.name,
+            }
+            .encode();
             assert_eq!(credentials[&key].token_grant, expected.token_grant);
             assert_eq!(credentials[&key].header_name, expected.header_name);
             assert!(credentials[&key].env_vars.is_empty());

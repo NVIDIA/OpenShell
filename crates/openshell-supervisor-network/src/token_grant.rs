@@ -421,12 +421,11 @@ fn supervisor_sandbox_id_from_env() -> Result<String> {
 }
 
 fn parse_provider_credential_key(key: &str) -> Result<(&str, &str)> {
-    let provider_and_credential = key
-        .rsplit_once('\t')
-        .map_or(key, |(_, provider_and_credential)| provider_and_credential);
-    provider_and_credential.split_once(':').ok_or_else(|| {
-        miette::miette!("dynamic token grant key is missing provider credential identity")
-    })
+    openshell_core::dynamic_credential_key::credential_identity(key)
+        .split_once(':')
+        .ok_or_else(|| {
+            miette::miette!("dynamic token grant key is missing provider credential identity")
+        })
 }
 
 struct TokenCacheKeyInput<'a> {
@@ -528,7 +527,9 @@ pub mod test_support {
             let keys = acquisitions
                 .iter()
                 .filter(|acquisition| {
-                    acquisition.request.provider_key.rsplit('\t').next() == Some(provider_identity)
+                    openshell_core::dynamic_credential_key::credential_identity(
+                        &acquisition.request.provider_key,
+                    ) == provider_identity
                         && acquisition.request.audience == audience
                 })
                 .map(|acquisition| acquisition.cache_key.as_str())

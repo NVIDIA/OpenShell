@@ -161,16 +161,15 @@ async fn inject_inspected_request_grant(
         scoped.provider_credential_revision = Some(snapshot.revision);
         scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
     }
-    let has_grants = snapshot.as_ref().map_or_else(
-        || scoped.dynamic_credentials.is_some(),
-        |snapshot| {
-            snapshot
-                .dynamic_credentials
-                .values()
-                .any(|credential| credential.token_grant.is_some())
-        },
-    );
-    let req = if has_grants {
+    // Admission-gated injection reads credentials only from the pinned snapshot,
+    // so a context without one never acquires a grant.
+    let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
+        snapshot
+            .dynamic_credentials
+            .values()
+            .any(|credential| credential.token_grant.is_some())
+    });
+    let req = if let Some(snapshot) = grant_snapshot {
         // Middleware can replace an inspected body. Recompute owner admission for
         // the body that will be sent, even when another endpoint allowed both the
         // original and transformed requests. Request method/path/query are immutable.
@@ -202,10 +201,7 @@ async fn inject_inspected_request_grant(
         }
         let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
         crate::l7::token_grant_injection::inject_for_admitted_owners(
-            req,
-            &scoped,
-            snapshot.as_deref(),
-            &owners,
+            req, &scoped, snapshot, &owners,
         )
         .await?
     } else {
@@ -4421,6 +4417,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -4454,6 +4451,7 @@ network_policies:
             }
         };
         ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         ctx.token_grant_resolver = Some(fixture.resolver());
 
         (config, tunnel_engine, ctx, fixture)
@@ -4789,6 +4787,7 @@ network_policies:
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -5250,7 +5249,7 @@ network_policies:
     }
 
     async fn assert_multiple_grants_tls_relay(identity_result: std::result::Result<&str, &str>) {
-        let (config, tunnel_engine, ctx, fixture) =
+        let (config, tunnel_engine, mut ctx, fixture) =
             rest_token_grant_relay_context(Ok("service-token"));
         let service_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
         let identity_key = "api.example.test\t8080\t/v1/**\tprovider:identity";
@@ -5259,6 +5258,8 @@ network_policies:
         identity.auth_style = "header".into();
         identity.header_name = "X-Workload-Jwt".into();
         fixture.add_credential(identity_key, identity, identity_result);
+        // The context's snapshot predates the second credential; pin a new one.
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         // Both sides verify a synthetic certificate: the test exercises encrypted
         // application traffic, inspection and credential injection, then upstream TLS.
         let (mut app, mut relay_client) = token_grant_tls_pair().await;
