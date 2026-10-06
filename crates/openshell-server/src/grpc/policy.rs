@@ -13343,6 +13343,81 @@ mod tests {
         );
     }
 
+    fn waited_setting_update(sandbox: &str) -> UpdateConfigRequest {
+        UpdateConfigRequest {
+            sandbox: sandbox.to_string(),
+            setting_key: "ocsf_json_enabled".to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::BoolValue(true)),
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+            wait_timeout: openshell_core::time::duration_from_std(std::time::Duration::from_secs(
+                5,
+            ))
+            .ok(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_mode_waited_update_succeeds_through_the_service() {
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-poll-service",
+            "poll-service",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let response = crate::grpc::OpenShellService::new(Arc::clone(&state))
+            .update_config(with_user(Request::new(waited_setting_update(
+                "poll-service",
+            ))))
+            .await
+            .expect("a waited update succeeds when completion is not tracked")
+            .into_inner();
+        assert!(response.operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_mode_waited_update_finishes_for_a_legacy_supervisor() {
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
+        let sandbox = test_sandbox(
+            "sb-legacy-operation",
+            "legacy-operation",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        // A supervisor without snapshot support is never registered with the
+        // delivery scheduler.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state.supervisor_sessions.register(
+            "sb-legacy-operation".into(),
+            "session-1".into(),
+            tx,
+            tokio::sync::oneshot::channel().0,
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::grpc::OpenShellService::new(Arc::clone(&state)).update_config(with_user(
+                Request::new(waited_setting_update("legacy-operation")),
+            )),
+        )
+        .await
+        .expect("an untracked operation must not wait for its timeout")
+        .unwrap()
+        .into_inner();
+        assert!(response.operation.is_none());
+    }
+
     #[tokio::test]
     async fn push_mode_operation_finishes_for_a_polling_supervisor() {
         let mut state = test_server_state().await;

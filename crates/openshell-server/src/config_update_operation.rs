@@ -489,6 +489,28 @@ pub async fn finish_untracked(state: &ServerState, operation_id: &str) -> Result
     .await
 }
 
+/// True for an operation finished because completion was not tracked.
+pub fn is_untracked(operation: &ConfigUpdateOperation) -> bool {
+    operation.state == i32::from(ConfigUpdateOperationState::Inactive)
+        && operation.sanitized_error == UNTRACKED_COMPLETION
+}
+
+/// Finish pending operations when this replica's current session for the
+/// sandbox keeps polling. Sessions on other replicas are handled there.
+pub async fn finish_pending_if_polling(
+    state: &ServerState,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    if state
+        .supervisor_sessions
+        .current_session_applies_config(sandbox_id)
+        == Some(false)
+    {
+        finish_pending_untracked(state, sandbox_id).await?;
+    }
+    Ok(())
+}
+
 /// Finish every pending operation for a sandbox whose supervisor polls.
 pub async fn finish_pending_untracked(state: &ServerState, sandbox_id: &str) -> Result<(), Status> {
     let records = state
@@ -666,6 +688,34 @@ async fn reconcile_records_for_sandbox(
             return Ok(());
         }
         _ => {}
+    }
+
+    // Without push delivery, or with a local supervisor that keeps polling,
+    // no apply result can complete these operations. This also drains records
+    // left pending by a rollback from push to poll mode.
+    if !crate::config_delivery::push_enabled(state)
+        || state
+            .supervisor_sessions
+            .current_session_applies_config(&sandbox_id)
+            == Some(false)
+    {
+        let components = if records
+            .iter()
+            .any(|record| operation_dimension(record) == OperationDimension::Policy)
+        {
+            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+        } else {
+            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+        };
+        for record in records {
+            if let Some(operation) = record.operation.as_ref() {
+                finish_untracked(state, &operation.operation_id).await?;
+            }
+        }
+        // A snapshot-only session still receives the change. Without push
+        // delivery this publishes nothing.
+        crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
+        return Ok(());
     }
 
     let now = current_time_ms();
@@ -1031,6 +1081,21 @@ mod tests {
             state.clone(),
             get_record(&state, operation_id).await.unwrap().unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn reconcile_drains_pending_operations_without_push_delivery() {
+        // The fixture state polls, as after a rollback from push mode.
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        reconcile_one(&state, &operation_id).await.unwrap();
+        let operation = get_record(&state, &operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .unwrap();
+        assert!(is_untracked(&operation));
     }
 
     #[test]

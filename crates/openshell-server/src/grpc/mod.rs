@@ -643,18 +643,21 @@ impl OpenShell for OpenShellService {
         }
         let timeout = policy::config_wait_timeout(request.get_ref().wait_timeout.as_ref())?;
         let mut response = mutation_replay::run(&self.state, request).await?;
-        if wait {
-            let id = response
+        // A response without an operation means completion is not tracked,
+        // for example because the gateway keeps configuration polling. Clients
+        // then confirm application through policy status.
+        if wait
+            && let Some(id) = response
                 .get_ref()
                 .operation
                 .as_ref()
-                .ok_or_else(|| Status::internal("gateway omitted completion operation"))?
-                .operation_id
-                .clone();
-            response.get_mut().operation = Some(
+                .map(|operation| operation.operation_id.clone())
+        {
+            let operation =
                 crate::config_update_operation::wait_for_terminal(&self.state, &id, timeout)
-                    .await?,
-            );
+                    .await?;
+            response.get_mut().operation =
+                (!crate::config_update_operation::is_untracked(&operation)).then_some(operation);
         }
         Ok(response)
     }

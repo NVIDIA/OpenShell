@@ -592,11 +592,14 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
                 .await;
             record_delivery(key.component, disposition.metric_label());
             // A session that keeps polling never reports a result for the
-            // pending operations bound to this snapshot.
+            // pending operations bound to this snapshot. A replaced session
+            // says nothing about its successor, which may apply.
             if require_acknowledgement
-                && !state
+                && disposition != DeliveryDisposition::NoActiveSession
+                && state
                     .supervisor_sessions
                     .session_applies_config(&key.sandbox_id, session_id)
+                    == Some(false)
                 && let Err(error) =
                     crate::config_update_operation::finish_pending_untracked(state, &key.sandbox_id)
                         .await
@@ -900,6 +903,20 @@ pub fn handle_peer_config_update_hint(
                     scheduler.publish_sandbox(&target.sandbox_id, components, Instant::now())
                 });
                 kick(state);
+                // A session without snapshot support is never registered, so
+                // no build reaches the operations a peer is reconciling.
+                let state = Arc::clone(state);
+                let sandbox_id = target.sandbox_id;
+                tokio::spawn(async move {
+                    if let Err(error) = crate::config_update_operation::finish_pending_if_polling(
+                        &state,
+                        &sandbox_id,
+                    )
+                    .await
+                    {
+                        warn!(sandbox_id, error = %error, "failed to finish configuration operations for a polling supervisor");
+                    }
+                });
             } else {
                 response.stale_owner = true;
             }

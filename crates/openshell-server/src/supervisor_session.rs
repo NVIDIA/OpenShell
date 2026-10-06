@@ -1141,16 +1141,25 @@ impl SupervisorSessionRegistry {
         true
     }
 
-    /// True when this exact session applies and acknowledges streamed
-    /// configuration.
-    pub fn session_applies_config(&self, sandbox_id: &str, session_id: &str) -> bool {
+    /// Whether this exact session applies and acknowledges streamed
+    /// configuration, or `None` when it is no longer the current session.
+    pub fn session_applies_config(&self, sandbox_id: &str, session_id: &str) -> Option<bool> {
         self.sessions
             .lock()
             .unwrap()
             .get(sandbox_id)
-            .is_some_and(|session| {
-                session.session_id == session_id && session.config_sequences.acknowledged
-            })
+            .filter(|session| session.session_id == session_id)
+            .map(|session| session.config_sequences.acknowledged)
+    }
+
+    /// Whether the current local session applies streamed configuration, or
+    /// `None` when this replica has no session for the sandbox.
+    pub fn current_session_applies_config(&self, sandbox_id: &str) -> Option<bool> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .map(|session| session.config_sequences.acknowledged)
     }
 
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
@@ -2814,6 +2823,20 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         .supervisor_sessions
         .replay_pending_relays(&sandbox_id, &session_id, &session_tx)
         .await;
+
+    // Operations committed before a polling supervisor connected can never
+    // receive its apply result.
+    if crate::config_delivery::push_enabled(&state) && mode != SessionMode::ConfigApply {
+        let state = Arc::clone(&state);
+        let sandbox_id = sandbox_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::config_update_operation::finish_pending_if_polling(&state, &sandbox_id).await
+            {
+                warn!(sandbox_id, error = %error, "failed to finish configuration operations for a polling supervisor");
+            }
+        });
+    }
 
     if let Some(setup) = config_push {
         crate::config_delivery::register_session(

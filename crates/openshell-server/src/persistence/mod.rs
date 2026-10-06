@@ -592,23 +592,6 @@ impl Store {
     /// * `Err(Conflict)` - Resource version mismatch
     #[tracing::instrument(
         name = "store",
-        skip_all,
-        fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
-    )]
-
-    /// Delete an object by id with compare-and-swap support.
-    ///
-    /// # Arguments
-    /// * `object_type` - Type discriminator for the object
-    /// * `id` - Stable object identifier
-    /// * `expected_resource_version` - Required resource version for the delete to proceed
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Object was deleted
-    /// * `Ok(false)` - Object not found
-    /// * `Err(Conflict)` - Resource version mismatch
-    #[tracing::instrument(
-        name = "store",
         level = "debug",
         skip_all,
         fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)

@@ -1575,6 +1575,22 @@ describe('config / policy', () => {
     expect(result.operationError).toBe('optional component unavailable');
   });
 
+  it('setPolicy returns the committed result when completion is not tracked', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      updateConfig: () => ({
+        version: 5,
+        policyHash: 'target',
+        settingsRevision: 10n,
+        deleted: false,
+      }),
+    });
+
+    const result = await sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true });
+    expect(result.version).toBe(5);
+    expect(result.operationId).toBeUndefined();
+  });
+
   it('setPolicy rejects a terminal failed durable operation', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),

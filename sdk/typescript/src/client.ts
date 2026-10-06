@@ -452,7 +452,11 @@ export interface SandboxConfig {
 export interface SetPolicyOptions extends SandboxWorkspaceOptions {
   /** Pin the sandbox resource version for optimistic concurrency (u64 as string). */
   expectedResourceVersion?: string;
-  /** Ask the gateway to wait for a durable terminal apply result. */
+  /**
+   * Ask the gateway to wait for a durable terminal apply result. Gateways that
+   * do not track completion, such as those that keep configuration polling,
+   * return the committed result without an operation.
+   */
   wait?: boolean;
   /** Bound the server-side wait in seconds. Default 60. */
   waitTimeoutSecs?: number;
@@ -1767,8 +1771,7 @@ export class SandboxClient {
         waitTimeout: durationFromMs(Math.max(0, (options?.waitTimeoutSecs ?? 60) * 1000)),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait) {
-        if (!resp.operation) throw new SdkError('rpc', 'gateway omitted the requested apply operation');
+      if (options?.wait && resp.operation) {
         if (
           resp.operation.state === ConfigUpdateOperationState.FAILED ||
           resp.operation.state === ConfigUpdateOperationState.SUPERSEDED ||
