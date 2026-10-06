@@ -228,18 +228,16 @@ impl ResolvedPodmanImage {
     /// - a malformed or reserved working directory;
     /// - for a custom working directory, an image volume with an invalid or
     ///   reserved target, or one covering the resolved workspace.
-    pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
-        let image_config = inspected.config.as_ref();
-        let workspace_root = driver_mounts::resolve_oci_workspace_root(
-            image_config.map_or("", |config| config.working_dir.as_str()),
-        )
-        .map_err(ComputeDriverError::Precondition)?;
+    pub fn from_inspect(inspected: ImageInspect) -> Result<Self, ComputeDriverError> {
+        let config = inspected.config.unwrap_or_default();
+        let workspace_root = driver_mounts::resolve_oci_workspace_root(&config.working_dir)
+            .map_err(ComputeDriverError::Precondition)?;
         for control_path in PODMAN_WORKLOAD_CONTROL_PATHS {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
         if workspace_root != driver_mounts::DEFAULT_WORKSPACE_ROOT
-            && let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref())
+            && let Some(volumes) = config.volumes.as_ref()
         {
             for volume in volumes.keys() {
                 validate_podman_mount_target(volume).map_err(|error| {
@@ -257,29 +255,29 @@ impl ResolvedPodmanImage {
             }
         }
         Ok(Self {
-            id: inspected.id.clone(),
-            oci_user: image_config
-                .map_or("", |config| config.user.as_str())
-                .to_string(),
-            environment: image_config.map_or_else(Vec::new, |config| config.env.clone()),
+            id: inspected.id,
+            oci_user: config.user,
+            environment: config.env,
             workspace_root,
         })
-    }
-
-    /// Image reference without inspected metadata; uses the managed workspace.
-    #[cfg(test)]
-    fn unpinned(image: &str) -> Self {
-        Self {
-            id: image.to_string(),
-            oci_user: String::new(),
-            environment: Vec::new(),
-            workspace_root: driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
-        }
     }
 
     pub(crate) fn uses_managed_workspace(&self) -> bool {
         self.workspace_root == driver_mounts::DEFAULT_WORKSPACE_ROOT
     }
+}
+
+#[cfg(test)]
+fn resolved_image(id: &str, user: &str, working_dir: &str) -> ResolvedPodmanImage {
+    ResolvedPodmanImage::from_inspect(ImageInspect {
+        id: id.to_string(),
+        config: Some(crate::client::ImageConfig {
+            user: user.to_string(),
+            working_dir: working_dir.to_string(),
+            ..Default::default()
+        }),
+    })
+    .expect("fixture image metadata should be valid")
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1140,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
-    let resolved_image = ResolvedPodmanImage::unpinned(image);
+    let resolved_image = resolved_image(image, "", "");
     build_container_spec_for_image(
         sandbox,
         config,
@@ -1822,22 +1820,6 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-    fn resolved_image(id: &str, user: &str, working_dir: &str) -> ResolvedPodmanImage {
-        ResolvedPodmanImage::from_inspect(&ImageInspect {
-            id: id.to_string(),
-            config: Some(ImageConfig {
-                user: user.to_string(),
-                env: vec![
-                    "LD_PRELOAD=/hostile.so".into(),
-                    "HTTP_PROXY=http://bypass".into(),
-                ],
-                working_dir: working_dir.to_string(),
-                volumes: None,
-            }),
-        })
-        .unwrap()
-    }
-
     #[test]
     fn isolated_pair_keeps_privileges_network_and_secrets_out_of_workload() {
         let sandbox = DriverSandbox {
@@ -1858,7 +1840,11 @@ mod tests {
             "sha256:image".into(),
         )
         .unwrap();
-        let image = resolved_image("sha256:image", "1000:1001", "");
+        let mut image = resolved_image("sha256:image", "1000:1001", "");
+        image.environment = vec![
+            "LD_PRELOAD=/hostile.so".into(),
+            "HTTP_PROXY=http://bypass".into(),
+        ];
         let specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &config,
@@ -2024,14 +2010,14 @@ mod tests {
             }),
         };
 
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/workspace")).is_err());
-        let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
+        assert!(ResolvedPodmanImage::from_inspect(inspect("/workspace")).is_err());
+        let image = ResolvedPodmanImage::from_inspect(inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
 
         let mut fallback = inspect("/etc/openshell");
         fallback.config.as_mut().unwrap().working_dir = "/sandbox".into();
-        ResolvedPodmanImage::from_inspect(&fallback)
+        ResolvedPodmanImage::from_inspect(fallback)
             .expect("existing /sandbox images keep their image-volume behavior");
     }
 
@@ -3162,19 +3148,16 @@ mod tests {
 
     #[test]
     fn resolved_workspace_rejects_covering_driver_mount() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
-
         let image = resolved_image("sha256:immutable", "1000:1000", "/workspace/project");
         let mut sandbox = test_sandbox("test-id", "test-name");
-        sandbox.spec = Some(DriverSandboxSpec {
-            template: Some(DriverSandboxTemplate {
-                driver_config: Some(json_struct(serde_json::json!({
-                    "mounts": [{"type": "tmpfs", "target": "/workspace"}]
-                }))),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+        sandbox
+            .spec
+            .get_or_insert_default()
+            .template
+            .get_or_insert_default()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+        })));
         let error = build_container_spec_for_image(
             &sandbox,
             &test_config(),

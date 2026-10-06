@@ -1305,22 +1305,13 @@ mod tests {
             .expect("image inspect should parse");
 
         assert_eq!(image.id, "sha256:immutable");
-        assert_eq!(
-            image.config.as_ref().map(|config| config.user.as_str()),
-            Some("app:staff")
-        );
-        assert_eq!(
-            image
-                .config
-                .as_ref()
-                .map(|config| config.working_dir.as_str()),
-            Some("/workspace/project")
-        );
+        let config = image.config.expect("fixture image config");
+        assert_eq!(config.user, "app:staff");
+        assert_eq!(config.working_dir, "/workspace/project");
         assert!(
-            image
-                .config
+            config
+                .volumes
                 .as_ref()
-                .and_then(|config| config.volumes.as_ref())
                 .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
         );
         handle.await.expect("stub task should finish");

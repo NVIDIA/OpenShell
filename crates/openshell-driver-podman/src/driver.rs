@@ -1001,7 +1001,7 @@ impl PodmanComputeDriver {
                     )));
                 }
                 let resolved_image =
-                    container::ResolvedPodmanImage::from_inspect(&inspected_image)?;
+                    container::ResolvedPodmanImage::from_inspect(inspected_image)?;
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
