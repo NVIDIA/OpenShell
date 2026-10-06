@@ -105,19 +105,14 @@ function isLoopbackHost(host: string): boolean {
 // Attaching a bearer/CF token to a plaintext `http://` request to a non-loopback
 // host puts the credential on the wire in the clear. Refuse it unless the caller
 // explicitly opts in. Loopback (local-dev / edge-sidecar) is always fine.
-function assertTokenTransportSecurity(opts: ConnectOptions): void {
+function assertTokenTransportSecurity(opts: ConnectOptions, gatewayUrl: URL | undefined): void {
   const hasToken = opts.oidcToken !== undefined || opts.oidcTokenProvider !== undefined || opts.edgeToken !== undefined;
-  if (!hasToken || opts.allowInsecureAuth || opts.gateway.startsWith('https://')) return;
-  let host: string;
-  try {
-    host = new URL(opts.gateway).hostname;
-  } catch {
-    return; // A malformed gateway URL surfaces from the transport itself.
-  }
-  if (!isLoopbackHost(host)) {
+  if (!hasToken || opts.allowInsecureAuth || gatewayUrl?.protocol === 'https:') return;
+  if (!gatewayUrl) return; // A malformed gateway URL surfaces from the transport itself.
+  if (!isLoopbackHost(gatewayUrl.hostname)) {
     throw new SdkError(
       'invalid_config',
-      `refusing to send an auth token over plaintext http:// to non-loopback host '${host}'; use https:// or set allowInsecureAuth`,
+      `refusing to send an auth token over plaintext http:// to non-loopback host '${gatewayUrl.hostname}'; use https:// or set allowInsecureAuth`,
     );
   }
 }
@@ -126,8 +121,14 @@ export function buildTransport(opts: ConnectOptions): Transport {
   assertMtlsPair(opts);
   assertTokenExclusivity(opts);
   assertEdgeToken(opts);
-  assertTokenTransportSecurity(opts);
-  const isTls = opts.gateway.startsWith('https://');
+  let gatewayUrl: URL | undefined;
+  try {
+    gatewayUrl = new URL(opts.gateway);
+  } catch {
+    // Leave malformed gateway URL errors to the transport.
+  }
+  assertTokenTransportSecurity(opts, gatewayUrl);
+  const isTls = gatewayUrl?.protocol === 'https:';
   return createGrpcTransport({
     baseUrl: opts.gateway,
     interceptors: [authInterceptor(opts)],
