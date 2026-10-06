@@ -153,6 +153,33 @@ async fn finish_config_update_operation(
     consistency: ConfigUpdateConsistency,
     timeout: std::time::Duration,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    // Boxed so the many call sites in the update handler stay small.
+    Box::pin(finish_config_update_operation_inner(
+        state,
+        operation_id,
+        consistency,
+        timeout,
+    ))
+    .await
+}
+
+async fn finish_config_update_operation_inner(
+    state: &Arc<ServerState>,
+    operation_id: &str,
+    consistency: ConfigUpdateConsistency,
+    timeout: std::time::Duration,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    if !crate::config_delivery::push_enabled(state) {
+        // Polling supervisors report no apply results, so completion is not
+        // tracked. Respond as a commit-only update without an operation.
+        config_update_operation::finish_untracked(state, operation_id).await?;
+        let record = config_update_operation::get_record(state, operation_id)
+            .await?
+            .ok_or_else(|| Status::internal("committed update operation disappeared"))?;
+        let mut response = config_update_operation::response_from_record(&record)?;
+        response.operation = None;
+        return Ok(Response::new(response));
+    }
     config_update_operation::reconcile_one(state, operation_id).await?;
     if consistency == ConfigUpdateConsistency::WaitForCompletion {
         config_update_operation::wait_for_terminal(state, operation_id, timeout).await?;
@@ -13271,6 +13298,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_mode_waited_update_returns_without_completion_operation() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-poll-wait",
+            "poll-wait",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // A polling supervisor reports no apply result, so the gateway answers
+        // a waited update as committed instead of waiting for completion.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox.object_name().to_string(),
+                    setting_key: "ocsf_json_enabled".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+                    idempotency_key: "poll-wait".to_string(),
+                    ..Default::default()
+                })),
+            ),
+        )
+        .await
+        .expect("poll mode must not wait for completion")
+        .unwrap()
+        .into_inner();
+        assert!(response.operation.is_none());
+        assert!(
+            state
+                .store
+                .list_pending_config_operations_for_scope(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_empty(),
+            "poll mode leaves no pending operation behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_mode_operation_finishes_for_a_polling_supervisor() {
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
+        let sandbox = test_sandbox(
+            "sb-shadow-operation",
+            "shadow-operation",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        // A snapshot-only session keeps polling and never reports results.
+        let _session =
+            crate::config_delivery::register_test_push_session(&state, &sandbox, "session-1");
+        crate::supervisor_owner::SupervisorOwnerIndex::new(
+            Arc::clone(&state.store),
+            crate::supervisor_owner::OWNER_TTL,
+        )
+        .publish(
+            "sb-shadow-operation",
+            "session-1",
+            "test-supervisor",
+            1,
+            &state.replica_id,
+            "local://test",
+        )
+        .await
+        .unwrap();
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox.object_name().to_string(),
+                setting_key: "ocsf_json_enabled".to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+                wait_timeout: openshell_core::time::duration_from_std(
+                    std::time::Duration::from_secs(5),
+                )
+                .ok(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let operation = response.operation.expect("push mode tracks the operation");
+        assert_eq!(
+            openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state).unwrap(),
+            openshell_core::proto::ConfigUpdateOperationState::Inactive
+        );
+    }
+
+    #[tokio::test]
     async fn committed_policy_update_publishes_complete_snapshot() {
         let mut state = test_server_state().await;
         Arc::get_mut(&mut state)
@@ -23099,7 +23228,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_config_same_policy_hash_with_new_provenance_creates_revision() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
         let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         let hash = deterministic_policy_hash(&policy);
         let sandbox = test_sandbox("sb-same-hash", "same-hash", policy.clone(), Vec::new());
@@ -24599,7 +24729,8 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_sandbox_setting_update_with_default_version_commits_with_annotations() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
         let mut sandbox = test_sandbox(
             "sb-inactive-operation",
             "inactive-operation",
@@ -24704,7 +24835,8 @@ mod tests {
 
     #[tokio::test]
     async fn settings_operation_without_policy_history_applies_and_wakes_local_waiter() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
         let sandbox = test_sandbox(
             "sb-operation-wake",
             "operation-wake",
@@ -24784,7 +24916,8 @@ mod tests {
 
     #[tokio::test]
     async fn operation_waiter_recovers_when_notification_is_missed() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        crate::grpc::test_support::enable_push_delivery(&mut state);
         let sandbox = test_sandbox(
             "sb-operation-poll",
             "operation-poll",

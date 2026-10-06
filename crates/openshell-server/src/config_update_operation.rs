@@ -472,6 +472,38 @@ async fn finish(
     Ok(())
 }
 
+/// Completion of streamed configuration is not tracked here: the gateway keeps
+/// configuration polling, or the sandbox's supervisor does not apply streamed
+/// snapshots.
+const UNTRACKED_COMPLETION: &str = "the sandbox supervisor polls for configuration";
+
+/// Finish an operation whose completion the gateway cannot observe.
+pub async fn finish_untracked(state: &ServerState, operation_id: &str) -> Result<(), Status> {
+    finish(
+        state,
+        operation_id,
+        ConfigUpdateOperationState::Inactive,
+        ConfigApplyOutcome::Unspecified,
+        UNTRACKED_COMPLETION,
+    )
+    .await
+}
+
+/// Finish every pending operation for a sandbox whose supervisor polls.
+pub async fn finish_pending_untracked(state: &ServerState, sandbox_id: &str) -> Result<(), Status> {
+    let records = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list pending operations failed: {error}")))?;
+    for record in records {
+        if let Some(operation) = record.operation.as_ref() {
+            finish_untracked(state, &operation.operation_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn finish_if_target_matches(
     state: &ServerState,
     operation_id: &str,

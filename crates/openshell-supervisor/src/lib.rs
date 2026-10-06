@@ -11614,5 +11614,4 @@ network_policies:
         assert_eq!(duplicate, result);
         assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
     }
-
 }

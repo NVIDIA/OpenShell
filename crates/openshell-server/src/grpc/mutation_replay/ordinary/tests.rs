@@ -1163,7 +1163,8 @@ async fn config_completion_timeout_preserves_replayable_committed_operation() {
         ConfigUpdateConsistency, ConfigUpdateOperationState, Sandbox, SandboxPhase, SandboxSpec,
         SandboxStatus, SettingValue, UpdateConfigRequest, setting_value,
     };
-    let (_directory, state) = protected_state().await;
+    let (_directory, mut state) = protected_state().await;
+    crate::grpc::test_support::enable_push_delivery(&mut state);
     state
         .store
         .put_message(&Sandbox {

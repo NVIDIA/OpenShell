@@ -152,6 +152,77 @@ fn report_config_update_operation(
     }
 }
 
+/// Wait for a policy revision by polling its load status. Gateways that do not
+/// track completion, such as those that keep configuration polling, return no
+/// completion operation for a waited update.
+async fn wait_for_policy_load(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+    workspace: &str,
+    version: u32,
+    timeout_secs: u64,
+) -> Result<i32> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if Instant::now() > deadline {
+            eprintln!(
+                "{} Timeout waiting for policy version {} to load",
+                "✗".red().bold(),
+                version
+            );
+            return Ok(POLICY_WAIT_TIMEOUT_EXIT_CODE);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let inner = client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
+                version,
+                global: false,
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        let Some(rev) = &inner.revision else {
+            continue;
+        };
+        match PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified) {
+            PolicyStatus::Loaded => {
+                eprintln!(
+                    "{} Policy version {} loaded (active version: {})",
+                    "✓".green().bold(),
+                    rev.version,
+                    inner.active_version
+                );
+                return Ok(0);
+            }
+            PolicyStatus::Failed => {
+                eprintln!(
+                    "{} Policy version {} failed to load: {}",
+                    "✗".red().bold(),
+                    rev.version,
+                    rev.load_error
+                );
+                return Ok(1);
+            }
+            PolicyStatus::Superseded => {
+                eprintln!(
+                    "{} Policy version {} was superseded (active version: {})",
+                    "⚠".yellow().bold(),
+                    rev.version,
+                    inner.active_version
+                );
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
     timestamp
         .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
@@ -5562,6 +5633,10 @@ pub async fn sandbox_policy_set(
         return Ok(0);
     }
 
+    if resp.operation.is_none() {
+        return wait_for_policy_load(&mut client, name, workspace, resp.version, timeout_secs)
+            .await;
+    }
     report_config_update_operation(resp.operation.as_ref(), resp.version)?;
     Ok(0)
 }
@@ -5692,6 +5767,10 @@ pub async fn sandbox_policy_update(
         return Ok(0);
     }
 
+    if response.operation.is_none() {
+        return wait_for_policy_load(&mut client, name, workspace, response.version, timeout_secs)
+            .await;
+    }
     report_config_update_operation(response.operation.as_ref(), response.version)?;
     Ok(0)
 }

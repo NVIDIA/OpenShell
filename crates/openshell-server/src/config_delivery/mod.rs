@@ -311,7 +311,7 @@ fn bootstrap_revisions_match(bootstrap: &ConfigBootstrap) -> bool {
         })
 }
 
-fn push_enabled(state: &ServerState) -> bool {
+pub fn push_enabled(state: &ServerState) -> bool {
     state.config.config_delivery_mode == ConfigDeliveryMode::Push
 }
 
@@ -583,9 +583,30 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
         OwnerCheck::Current => {
             let disposition = state
                 .supervisor_config_router()
-                .deliver(&key.sandbox_id, session_id, message, require_acknowledgement)
+                .deliver(
+                    &key.sandbox_id,
+                    session_id,
+                    message,
+                    require_acknowledgement,
+                )
                 .await;
             record_delivery(key.component, disposition.metric_label());
+            // A session that keeps polling never reports a result for the
+            // pending operations bound to this snapshot.
+            if require_acknowledgement
+                && !state
+                    .supervisor_sessions
+                    .session_applies_config(&key.sandbox_id, session_id)
+                && let Err(error) =
+                    crate::config_update_operation::finish_pending_untracked(state, &key.sandbox_id)
+                        .await
+            {
+                warn!(
+                    sandbox_id = %key.sandbox_id,
+                    error = %error,
+                    "failed to finish configuration operations for a polling supervisor"
+                );
+            }
             false
         }
         OwnerCheck::Remote => {

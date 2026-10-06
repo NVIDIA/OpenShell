@@ -1141,6 +1141,18 @@ impl SupervisorSessionRegistry {
         true
     }
 
+    /// True when this exact session applies and acknowledges streamed
+    /// configuration.
+    pub fn session_applies_config(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| {
+                session.session_id == session_id && session.config_sequences.acknowledged
+            })
+    }
+
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
         self.sessions
             .lock()
@@ -6816,9 +6828,12 @@ mod tests {
         };
         let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
         assert_eq!(
-            state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, "session-1", message.clone(), false),
+            state.supervisor_sessions.deliver_config(
+                sandbox_id,
+                "session-1",
+                message.clone(),
+                false
+            ),
             DeliveryDisposition::Queued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =
@@ -6911,9 +6926,12 @@ mod tests {
         };
         let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
         assert_eq!(
-            state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, "session-1", message.clone(), false),
+            state.supervisor_sessions.deliver_config(
+                sandbox_id,
+                "session-1",
+                message.clone(),
+                false
+            ),
             DeliveryDisposition::Queued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =

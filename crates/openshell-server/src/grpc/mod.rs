@@ -1020,6 +1020,14 @@ pub mod test_support {
         }
     }
 
+    /// Switch a test state to push delivery, which tracks durable completion.
+    pub fn enable_push_delivery(state: &mut Arc<ServerState>) {
+        Arc::get_mut(state)
+            .expect("test state is not shared yet")
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+    }
+
     /// Configuration stream features advertised by a test supervisor hello.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum StreamFeatures {

@@ -28,9 +28,9 @@ import {
   ConfigUpdateConsistency,
   ConfigUpdateOperationState,
   OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
   SandboxRestartPolicy,
-  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   ServiceStatus,
 } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
