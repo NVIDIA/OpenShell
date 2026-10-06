@@ -19,10 +19,6 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
-/// Compute drivers advertising this capability enforce the complete startup UI
-/// policy contract. Absence means explicit UI policy must be rejected.
-pub const POLICY_UI_V1: &str = "openshell.policy.ui.v1";
-
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -399,36 +395,6 @@ mod tests {
                 Some(extension)
             )
             .is_ok()
-        );
-    }
-
-    #[test]
-    fn ui_policy_capability_uses_existing_optional_negotiation() {
-        let gateway = gateway_metadata(ExtensionFamily::Compute);
-        let extension = extension_metadata(
-            ExtensionFamily::Compute,
-            "openshell/test-ui-driver",
-            "test",
-            [POLICY_UI_V1.to_string()],
-        );
-        let result = negotiate(
-            ExtensionFamily::Compute,
-            "test-ui-driver",
-            &gateway,
-            Some(extension),
-        )
-        .unwrap();
-        assert!(
-            result
-                .supported_capabilities
-                .iter()
-                .any(|value| value == POLICY_UI_V1)
-        );
-        assert!(
-            !result
-                .required_capabilities
-                .iter()
-                .any(|value| value == POLICY_UI_V1)
         );
     }
 

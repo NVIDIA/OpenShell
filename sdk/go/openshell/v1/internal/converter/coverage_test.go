@@ -171,7 +171,6 @@ func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 		"network_policies":    true,
 		"process":             true,
 		"landlock":            true,
-		"ui":                  true,
 		"network_middlewares": true,
 	}
 

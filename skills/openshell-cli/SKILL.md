@@ -506,13 +506,7 @@ for verification behavior and release compatibility.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`, `ui`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
-
-Explicit `ui` requires the selected driver to advertise
-`openshell.policy.ui.v1` in its existing supported extension capabilities,
-visible through `openshell gateway info`. Unsupported drivers reject even
-`ui: {}` before provisioning. Omit UI unless requested. UI changes require
-sandbox recreation.
+**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload

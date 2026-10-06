@@ -1099,7 +1099,6 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
-        self.validate_policy_capabilities(sandbox, runtime_inputs.effective_policy.as_ref())?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         if let Some(effective_policy) = runtime_inputs.effective_policy.as_ref()
@@ -1127,30 +1126,6 @@ impl ComputeRuntime {
             )
             .await
             .map(|_| ())
-    }
-
-    fn validate_policy_capabilities(
-        &self,
-        sandbox: &Sandbox,
-        effective_policy: Option<&ProtoSandboxPolicy>,
-    ) -> Result<(), Status> {
-        let has_explicit_ui = effective_policy
-            .or_else(|| sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()))
-            .and_then(|policy| policy.ui.as_ref())
-            .is_some();
-        let supports_ui = self
-            .driver_info
-            .negotiated_extension
-            .supported_capabilities
-            .iter()
-            .any(|capability| capability == openshell_core::extension_protocol::POLICY_UI_V1);
-        if has_explicit_ui && !supports_ui {
-            return Err(Status::failed_precondition(format!(
-                "compute driver '{}' does not support the complete UI policy contract; remove the explicit ui section or select a supporting driver/backend",
-                self.driver_info.name
-            )));
-        }
-        Ok(())
     }
 
     pub async fn create_sandbox(
@@ -1286,7 +1261,6 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
-        self.validate_policy_capabilities(&sandbox, runtime_inputs.effective_policy.as_ref())?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -7571,12 +7545,12 @@ pub fn new_test_runtime_with_driver(
 mod tests {
     use super::*;
     use futures::stream;
+    use openshell_core::proto::SandboxPolicy as PublicSandboxPolicy;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
         ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
-    use openshell_core::proto::{SandboxPolicy as PublicSandboxPolicy, UiPolicy};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as TestMutex};
@@ -8669,131 +8643,6 @@ mod tests {
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
         }
-    }
-
-    fn sandbox_with_explicit_ui(id: &str) -> Sandbox {
-        let mut sandbox = sandbox_record(id, "ui-policy", SandboxPhase::Provisioning);
-        sandbox.spec = Some(SandboxSpec {
-            policy: Some(PublicSandboxPolicy {
-                ui: Some(UiPolicy::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        sandbox
-    }
-
-    #[tokio::test]
-    async fn explicit_ui_policy_rejects_before_unsupported_driver_validation() {
-        let driver = Arc::new(TestDriver::default());
-        let runtime = test_runtime(driver.clone()).await;
-
-        let error = runtime
-            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-validate"))
-            .await
-            .expect_err("an unsupported driver must reject explicit UI policy");
-
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("complete UI policy contract"));
-        assert_eq!(
-            driver.validate_create_calls.load(Ordering::Relaxed),
-            0,
-            "gateway capability validation must run before the driver RPC"
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_ui_policy_rejects_before_unsupported_driver_create() {
-        let driver = Arc::new(TestDriver::default());
-        let runtime = test_runtime(driver.clone()).await;
-
-        let error = runtime
-            .create_sandbox(sandbox_with_explicit_ui("sb-ui-create"), None, false)
-            .await
-            .expect_err("an internal caller must not bypass UI capability validation");
-
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert_eq!(
-            driver.create_calls.load(Ordering::Relaxed),
-            0,
-            "unsupported UI policy must fail before provisioning"
-        );
-    }
-
-    #[tokio::test]
-    async fn effective_ui_policy_rejects_before_unsupported_driver_validation() {
-        let driver = Arc::new(TestDriver::default());
-        let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record(
-            "sb-effective-ui",
-            "effective-ui-policy",
-            SandboxPhase::Provisioning,
-        );
-        let runtime_inputs = SandboxCreateRuntimeInputs::new(PublicSandboxPolicy {
-            ui: Some(UiPolicy::default()),
-            ..Default::default()
-        });
-
-        let error = runtime
-            .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
-            .await
-            .expect_err("an unsupported driver must reject the effective UI policy");
-
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn explicit_ui_policy_reaches_driver_when_capability_is_complete() {
-        let driver = Arc::new(TestDriver::default());
-        let mut runtime = test_runtime(driver.clone()).await;
-        runtime
-            .driver_info
-            .negotiated_extension
-            .supported_capabilities
-            .push(openshell_core::extension_protocol::POLICY_UI_V1.to_string());
-
-        runtime
-            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-supported"))
-            .await
-            .expect("a driver advertising complete UI support accepts validation");
-
-        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn effective_ui_policy_rejects_before_unsupported_driver_create() {
-        let driver = Arc::new(TestDriver::default());
-        let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record(
-            "sb-effective-ui-create",
-            "ui-policy",
-            SandboxPhase::Provisioning,
-        );
-        let runtime_inputs = SandboxCreateRuntimeInputs::new(PublicSandboxPolicy {
-            ui: Some(UiPolicy::default()),
-            ..Default::default()
-        });
-        let error = runtime
-            .create_sandbox_with_runtime_inputs(sandbox, None, false, runtime_inputs)
-            .await
-            .expect_err("effective UI must be checked on internal creation");
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert_eq!(driver.create_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn absent_ui_policy_preserves_unsupported_driver_behavior() {
-        let driver = Arc::new(TestDriver::default());
-        let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record("sb-no-ui", "no-ui-policy", SandboxPhase::Provisioning);
-
-        runtime
-            .validate_sandbox_create(&sandbox)
-            .await
-            .expect("an absent UI section must preserve existing behavior");
-
-        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
