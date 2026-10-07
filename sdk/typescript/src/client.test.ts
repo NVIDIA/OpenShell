@@ -25,8 +25,8 @@ import {
 } from './client.js';
 import {
   ConfigApplyOutcome,
-  ConfigUpdateConsistency,
   ConfigUpdateOperationState,
+  ConfigUpdateWaitMode,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
@@ -1550,7 +1550,7 @@ describe('config / policy', () => {
       global?: boolean;
       expectedResourceVersion?: bigint;
       policy?: unknown;
-      consistency?: ConfigUpdateConsistency;
+      waitMode?: ConfigUpdateWaitMode;
     } = {};
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
@@ -1583,7 +1583,7 @@ describe('config / policy', () => {
     expect(updateReq.global).toBe(false);
     expect(updateReq.expectedResourceVersion).toBe(7n);
     expect(updateReq.policy).toBeDefined();
-    expect(updateReq.consistency).toBe(ConfigUpdateConsistency.WAIT_FOR_COMPLETION);
+    expect(updateReq.waitMode).toBe(ConfigUpdateWaitMode.WAIT_FOR_COMPLETION);
     expect(result.version).toBe(5);
     expect(result.policyHash).toBe('target');
     expect(result.settingsRevision).toBe('10');

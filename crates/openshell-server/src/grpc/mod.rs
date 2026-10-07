@@ -632,10 +632,10 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let consistency =
-            openshell_core::proto::ConfigUpdateConsistency::try_from(request.get_ref().consistency)
-                .map_err(|_| Status::invalid_argument("unknown update consistency"))?;
-        let wait = consistency == openshell_core::proto::ConfigUpdateConsistency::WaitForCompletion;
+        let wait_mode =
+            openshell_core::proto::ConfigUpdateWaitMode::try_from(request.get_ref().wait_mode)
+                .map_err(|_| Status::invalid_argument("unknown configuration update wait mode"))?;
+        let wait = wait_mode == openshell_core::proto::ConfigUpdateWaitMode::WaitForCompletion;
         if wait && request.get_ref().global {
             return Err(Status::invalid_argument(
                 "WAIT_FOR_COMPLETION is only supported for sandbox-scoped updates",

@@ -482,7 +482,7 @@ pub(super) fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
     message.clear_field_by_name("request_id");
     if M::METHOD == "UpdateConfig" {
         // Waiting changes response timing, never the admitted mutation identity.
-        message.clear_field_by_name("consistency");
+        message.clear_field_by_name("wait_mode");
         message.clear_field_by_name("wait_timeout");
     }
     let value = serde_json::to_value(message)

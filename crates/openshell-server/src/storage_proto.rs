@@ -234,7 +234,7 @@ mod tests {
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8ad3b7b06720a458ad497701ce96531fafb01c4ba622a6f9b937e00b206e1fec";
+        "c628cc935f0f8b41a9bfeea2342cde6f4e0da9a58bdaf96d533606ff3d6309a7";
     const DURABLE_SCHEMA_SHA256: &str =
         "947396e9e9f73b8e2971e923137eea4b9d5bdc4f67d88db6237c358756ffd8a8";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

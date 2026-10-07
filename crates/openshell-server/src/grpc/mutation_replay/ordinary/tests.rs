@@ -1160,7 +1160,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
 async fn config_completion_timeout_preserves_replayable_committed_operation() {
     use openshell_core::proto::open_shell_server::OpenShell;
     use openshell_core::proto::{
-        ConfigUpdateConsistency, ConfigUpdateOperationState, Sandbox, SandboxPhase, SandboxSpec,
+        ConfigUpdateOperationState, ConfigUpdateWaitMode, Sandbox, SandboxPhase, SandboxSpec,
         SandboxStatus, SettingValue, UpdateConfigRequest, setting_value,
     };
     let (_directory, mut state) = protected_state().await;
@@ -1192,7 +1192,7 @@ async fn config_completion_timeout_preserves_replayable_committed_operation() {
             value: Some(setting_value::Value::BoolValue(true)),
         }),
         request_id: uuid::Uuid::new_v4().to_string(),
-        consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+        wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
         wait_timeout: Some(prost_types::Duration {
             seconds: 1,
             nanos: 0,
@@ -1204,7 +1204,7 @@ async fn config_completion_timeout_preserves_replayable_committed_operation() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::DeadlineExceeded, "{error:?}");
-    request.consistency = ConfigUpdateConsistency::CommitOnly.into();
+    request.wait_mode = ConfigUpdateWaitMode::CommitOnly.into();
     request.wait_timeout = None;
     let response = service
         .update_config(authed_request(request.clone()))
@@ -1247,7 +1247,7 @@ async fn config_completion_timeout_preserves_replayable_committed_operation() {
         .unwrap();
     assert_eq!(pending.len(), 2);
 
-    request.consistency = i32::MAX;
+    request.wait_mode = i32::MAX;
     let error = service
         .update_config(authed_request(request))
         .await

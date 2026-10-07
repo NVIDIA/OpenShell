@@ -193,11 +193,11 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		IdempotencyKey:          cu.IdempotencyKey,
 		WaitTimeout:             durationpb.New(time.Duration(cu.WaitTimeoutSeconds) * time.Second),
 	}
-	switch cu.Consistency {
+	switch cu.WaitMode {
 	case v1.ConfigUpdateWaitForCompletion:
-		req.Consistency = pb.ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION
+		req.WaitMode = pb.ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION
 	case v1.ConfigUpdateCommitOnly:
-		req.Consistency = pb.ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY
+		req.WaitMode = pb.ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY
 	}
 	if !cu.Global {
 		req.Sandbox = cu.Name

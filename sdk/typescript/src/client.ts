@@ -21,8 +21,8 @@ import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
   ConfigApplyOutcome,
-  ConfigUpdateConsistency,
   ConfigUpdateOperationState,
+  ConfigUpdateWaitMode,
   type ExecSandboxInputSchema,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
@@ -1770,7 +1770,7 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        consistency: options?.wait ? ConfigUpdateConsistency.WAIT_FOR_COMPLETION : ConfigUpdateConsistency.COMMIT_ONLY,
+        waitMode: options?.wait ? ConfigUpdateWaitMode.WAIT_FOR_COMPLETION : ConfigUpdateWaitMode.COMMIT_ONLY,
         waitTimeout: durationFromMs(Math.max(0, (options?.waitTimeoutSecs ?? 60) * 1000)),
       });
       const result = updateConfigResult(resp);

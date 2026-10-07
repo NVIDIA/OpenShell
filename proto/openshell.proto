@@ -2789,9 +2789,8 @@ message UpdateConfigRequest {
   map<string, string> annotations = 9;
   // Controls whether the RPC returns after commit or after the runtime reaches
   // a terminal outcome, including failure, supersession, cancellation or inactivity.
-  // This is a completion mode, not a database consistency level.
   // Unspecified preserves commit-only compatibility.
-  ConfigUpdateConsistency consistency = 12;
+  ConfigUpdateWaitMode wait_mode = 12;
   // Optional retry key scoped to the sandbox. Reusing a key returns the
   // original operation and never creates another desired-state revision.
   string idempotency_key = 13;
@@ -2807,10 +2806,10 @@ message UpdateConfigRequest {
   string request_id = 11;
 }
 
-enum ConfigUpdateConsistency {
-  CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED = 0;
-  CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY = 1;
-  CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION = 2;
+enum ConfigUpdateWaitMode {
+  CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED = 0;
+  CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY = 1;
+  CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION = 2;
 }
 
 message GetConfigUpdateOperationRequest {

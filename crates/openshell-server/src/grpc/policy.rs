@@ -54,7 +54,7 @@ use openshell_core::proto::{
     AddAllowRules as ProtoAddAllowRules, AddDenyRules as ProtoAddDenyRules,
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
-    ConfigUpdateConsistency, DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse,
+    ConfigUpdateWaitMode, DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse,
     EffectiveSetting, GetConfigUpdateOperationRequest, GetConfigUpdateOperationResponse,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetSandboxConfigRequest,
@@ -150,14 +150,14 @@ pub(super) fn config_wait_timeout(
 async fn finish_config_update_operation(
     state: &Arc<ServerState>,
     operation_id: &str,
-    consistency: ConfigUpdateConsistency,
+    wait_mode: ConfigUpdateWaitMode,
     timeout: std::time::Duration,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     // Boxed so the many call sites in the update handler stay small.
     Box::pin(finish_config_update_operation_inner(
         state,
         operation_id,
-        consistency,
+        wait_mode,
         timeout,
     ))
     .await
@@ -166,7 +166,7 @@ async fn finish_config_update_operation(
 async fn finish_config_update_operation_inner(
     state: &Arc<ServerState>,
     operation_id: &str,
-    consistency: ConfigUpdateConsistency,
+    wait_mode: ConfigUpdateWaitMode,
     timeout: std::time::Duration,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     if !crate::config_delivery::push_enabled(state) {
@@ -181,7 +181,7 @@ async fn finish_config_update_operation_inner(
         return Ok(Response::new(response));
     }
     config_update_operation::reconcile_one(state, operation_id).await?;
-    if consistency == ConfigUpdateConsistency::WaitForCompletion {
+    if wait_mode == ConfigUpdateWaitMode::WaitForCompletion {
         config_update_operation::wait_for_terminal(state, operation_id, timeout).await?;
     }
     let record = config_update_operation::get_record(state, operation_id)
@@ -205,7 +205,7 @@ async fn finish_unchanged_config_update(
     workspace: &str,
     identity: ConfigOperationIdentity<'_>,
     response: Response<UpdateConfigResponse>,
-    consistency: ConfigUpdateConsistency,
+    wait_mode: ConfigUpdateWaitMode,
     timeout: std::time::Duration,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let response = response.into_inner();
@@ -235,7 +235,7 @@ async fn finish_unchanged_config_update(
             super::persistence_error_to_status(error, "persist unchanged update operation")
         })?;
     let operation_id = config_update_operation::public_operation(&record)?.operation_id;
-    finish_config_update_operation(state, &operation_id, consistency, timeout).await
+    finish_config_update_operation(state, &operation_id, wait_mode, timeout).await
 }
 
 // Private wire-only compatibility types for policy history written before
@@ -3990,9 +3990,9 @@ pub(super) async fn handle_update_config_commit(
     mut request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     if !request.get_ref().global
-        && request.get_ref().consistency == ConfigUpdateConsistency::WaitForCompletion as i32
+        && request.get_ref().wait_mode == ConfigUpdateWaitMode::WaitForCompletion as i32
     {
-        request.get_mut().consistency = ConfigUpdateConsistency::CommitOnly as i32;
+        request.get_mut().wait_mode = ConfigUpdateWaitMode::CommitOnly as i32;
     }
     handle_update_config(state, request).await
 }
@@ -4050,12 +4050,12 @@ async fn handle_update_config_inner(
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let wait_timeout = config_wait_timeout(req.wait_timeout.as_ref())?;
-    let consistency = ConfigUpdateConsistency::try_from(req.consistency)
-        .map_err(|_| Status::invalid_argument("unknown update consistency"))?;
-    let consistency = if consistency == ConfigUpdateConsistency::Unspecified {
-        ConfigUpdateConsistency::CommitOnly
+    let wait_mode = ConfigUpdateWaitMode::try_from(req.wait_mode)
+        .map_err(|_| Status::invalid_argument("unknown configuration update wait mode"))?;
+    let wait_mode = if wait_mode == ConfigUpdateWaitMode::Unspecified {
+        ConfigUpdateWaitMode::CommitOnly
     } else {
-        consistency
+        wait_mode
     };
     if req.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
         return Err(Status::invalid_argument(format!(
@@ -4120,7 +4120,7 @@ async fn handle_update_config_inner(
         ));
     }
     if req.global {
-        if consistency == ConfigUpdateConsistency::WaitForCompletion {
+        if wait_mode == ConfigUpdateWaitMode::WaitForCompletion {
             return Err(Status::invalid_argument(
                 "WAIT_FOR_COMPLETION is only supported for sandbox-scoped updates",
             ));
@@ -4351,7 +4351,7 @@ async fn handle_update_config_inner(
         return finish_config_update_operation(
             state,
             &operation.operation_id,
-            consistency,
+            wait_mode,
             wait_timeout,
         )
         .await;
@@ -4442,7 +4442,7 @@ async fn handle_update_config_inner(
                 return finish_config_update_operation(
                     state,
                     &operation_id,
-                    consistency,
+                    wait_mode,
                     wait_timeout,
                 )
                 .await;
@@ -4471,7 +4471,7 @@ async fn handle_update_config_inner(
                     removed,
                     response_annotations,
                 ),
-                consistency,
+                wait_mode,
                 wait_timeout,
             ))
             .await;
@@ -4526,7 +4526,7 @@ async fn handle_update_config_inner(
 
         drop(config_guard);
         if let Some(operation_id) = operation_id {
-            return finish_config_update_operation(state, &operation_id, consistency, wait_timeout)
+            return finish_config_update_operation(state, &operation_id, wait_mode, wait_timeout)
                 .await;
         }
         response_annotations = persist_update_config_annotations(
@@ -4553,7 +4553,7 @@ async fn handle_update_config_inner(
                 false,
                 response_annotations,
             ),
-            consistency,
+            wait_mode,
             wait_timeout,
         ))
         .await;
@@ -4654,7 +4654,7 @@ async fn handle_update_config_inner(
         emit_config_update_policy_success(sandbox_caller);
 
         if let Some(operation_id) = operation_id {
-            return finish_config_update_operation(state, &operation_id, consistency, wait_timeout)
+            return finish_config_update_operation(state, &operation_id, wait_mode, wait_timeout)
                 .await;
         }
         return Box::pin(finish_unchanged_config_update(
@@ -4673,7 +4673,7 @@ async fn handle_update_config_inner(
                 false,
                 response_annotations,
             ),
-            consistency,
+            wait_mode,
             wait_timeout,
         ))
         .await;
@@ -4804,7 +4804,7 @@ async fn handle_update_config_inner(
                         false,
                         response_annotations,
                     ),
-                    consistency,
+                    wait_mode,
                     wait_timeout,
                 ))
                 .await;
@@ -4901,7 +4901,7 @@ async fn handle_update_config_inner(
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    finish_config_update_operation(state, &operation_id, consistency, wait_timeout).await
+    finish_config_update_operation(state, &operation_id, wait_mode, wait_timeout).await
 }
 
 // ---------------------------------------------------------------------------
@@ -13321,7 +13321,7 @@ mod tests {
                         value: Some(setting_value::Value::BoolValue(true)),
                     }),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                    consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+                    wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
                     idempotency_key: "poll-wait".to_string(),
                     ..Default::default()
                 })),
@@ -13351,7 +13351,7 @@ mod tests {
                 value: Some(setting_value::Value::BoolValue(true)),
             }),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-            consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+            wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
             wait_timeout: openshell_core::time::duration_from_std(std::time::Duration::from_secs(
                 5,
             ))
@@ -13396,7 +13396,7 @@ mod tests {
         );
         state.store.put_message(&sandbox).await.unwrap();
         // A supervisor without snapshot support is never registered with the
-        // delivery scheduler.
+        // delivery queue.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         state.supervisor_sessions.register(
             "sb-legacy-operation".into(),
@@ -13456,7 +13456,7 @@ mod tests {
                     value: Some(setting_value::Value::BoolValue(true)),
                 }),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+                wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
                 wait_timeout: openshell_core::time::duration_from_std(
                     std::time::Duration::from_secs(5),
                 )
@@ -23153,7 +23153,7 @@ mod tests {
                 expected_resource_version: current_version,
                 annotations: HashMap::new(),
 
-                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                 idempotency_key: String::new(),
                 wait_timeout: None,
             }),
@@ -23256,7 +23256,7 @@ mod tests {
                 expected_resource_version: current_version,
                 annotations: annotations.clone(),
 
-                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                 idempotency_key: String::new(),
                 wait_timeout: None,
             }),
@@ -24314,7 +24314,7 @@ mod tests {
                 expected_resource_version: 99, // stale version
                 annotations: HashMap::new(),
 
-                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                 idempotency_key: String::new(),
                 wait_timeout: None,
             }),
@@ -24420,7 +24420,7 @@ mod tests {
                         expected_resource_version: initial_version,
                         annotations: HashMap::new(),
 
-                        consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                        wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                         idempotency_key: String::new(),
                         wait_timeout: None,
                     }),
@@ -24822,7 +24822,7 @@ mod tests {
                     value: Some(setting_value::Value::BoolValue(true)),
                 }),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+                wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
                 idempotency_key: "inactive-setting-1".to_string(),
                 expected_resource_version: 0,
                 annotations: HashMap::from([("change-ticket".to_string(), "1234".to_string())]),
@@ -24928,7 +24928,7 @@ mod tests {
                     value: Some(setting_value::Value::BoolValue(true)),
                 }),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                 idempotency_key: "wake-local-waiter".to_string(),
                 ..Default::default()
             })),
@@ -25021,7 +25021,7 @@ mod tests {
                     value: Some(setting_value::Value::BoolValue(true)),
                 }),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
                 idempotency_key: "poll-missed-notification".to_string(),
                 ..Default::default()
             })),

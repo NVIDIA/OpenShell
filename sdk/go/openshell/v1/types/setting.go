@@ -104,22 +104,22 @@ type ConfigUpdate struct {
 	ExpectedResourceVersion uint64
 	// Annotations is caller-provided metadata for sandbox-scoped updates.
 	Annotations map[string]string
-	// Consistency controls whether Update returns after commit or completion.
-	Consistency ConfigUpdateConsistency
+	// WaitMode controls whether Update returns after commit or completion.
+	WaitMode ConfigUpdateWaitMode
 	// IdempotencyKey maps retries to the original durable operation.
 	IdempotencyKey string
 	// WaitTimeoutSeconds bounds WaitForCompletion on the server. Zero uses the server default.
 	WaitTimeoutSeconds uint32
 }
 
-// ConfigUpdateConsistency controls configuration mutation response timing.
-type ConfigUpdateConsistency string
+// ConfigUpdateWaitMode controls configuration mutation response timing.
+type ConfigUpdateWaitMode string
 
 const (
 	// ConfigUpdateCommitOnly returns after desired state and its operation commit.
-	ConfigUpdateCommitOnly ConfigUpdateConsistency = "commit_only"
+	ConfigUpdateCommitOnly ConfigUpdateWaitMode = "commit_only"
 	// ConfigUpdateWaitForCompletion waits for a durable terminal result, including failure.
-	ConfigUpdateWaitForCompletion ConfigUpdateConsistency = "wait_for_completion"
+	ConfigUpdateWaitForCompletion ConfigUpdateWaitMode = "wait_for_completion"
 )
 
 // ConfigUpdateOperation records the durable state and outcome of a sandbox update.

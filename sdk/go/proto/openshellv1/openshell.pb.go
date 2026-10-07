@@ -780,52 +780,52 @@ func (ProviderEnvironmentValueClassification) EnumDescriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{11}
 }
 
-type ConfigUpdateConsistency int32
+type ConfigUpdateWaitMode int32
 
 const (
-	ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED         ConfigUpdateConsistency = 0
-	ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY         ConfigUpdateConsistency = 1
-	ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION ConfigUpdateConsistency = 2
+	ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED         ConfigUpdateWaitMode = 0
+	ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY         ConfigUpdateWaitMode = 1
+	ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION ConfigUpdateWaitMode = 2
 )
 
-// Enum value maps for ConfigUpdateConsistency.
+// Enum value maps for ConfigUpdateWaitMode.
 var (
-	ConfigUpdateConsistency_name = map[int32]string{
-		0: "CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED",
-		1: "CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY",
-		2: "CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION",
+	ConfigUpdateWaitMode_name = map[int32]string{
+		0: "CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED",
+		1: "CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY",
+		2: "CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION",
 	}
-	ConfigUpdateConsistency_value = map[string]int32{
-		"CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED":         0,
-		"CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY":         1,
-		"CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION": 2,
+	ConfigUpdateWaitMode_value = map[string]int32{
+		"CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED":         0,
+		"CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY":         1,
+		"CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION": 2,
 	}
 )
 
-func (x ConfigUpdateConsistency) Enum() *ConfigUpdateConsistency {
-	p := new(ConfigUpdateConsistency)
+func (x ConfigUpdateWaitMode) Enum() *ConfigUpdateWaitMode {
+	p := new(ConfigUpdateWaitMode)
 	*p = x
 	return p
 }
 
-func (x ConfigUpdateConsistency) String() string {
+func (x ConfigUpdateWaitMode) String() string {
 	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
 }
 
-func (ConfigUpdateConsistency) Descriptor() protoreflect.EnumDescriptor {
+func (ConfigUpdateWaitMode) Descriptor() protoreflect.EnumDescriptor {
 	return file_openshell_proto_enumTypes[12].Descriptor()
 }
 
-func (ConfigUpdateConsistency) Type() protoreflect.EnumType {
+func (ConfigUpdateWaitMode) Type() protoreflect.EnumType {
 	return &file_openshell_proto_enumTypes[12]
 }
 
-func (x ConfigUpdateConsistency) Number() protoreflect.EnumNumber {
+func (x ConfigUpdateWaitMode) Number() protoreflect.EnumNumber {
 	return protoreflect.EnumNumber(x)
 }
 
-// Deprecated: Use ConfigUpdateConsistency.Descriptor instead.
-func (ConfigUpdateConsistency) EnumDescriptor() ([]byte, []int) {
+// Deprecated: Use ConfigUpdateWaitMode.Descriptor instead.
+func (ConfigUpdateWaitMode) EnumDescriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{12}
 }
 
@@ -11763,9 +11763,8 @@ type UpdateConfigRequest struct {
 	Annotations map[string]string `protobuf:"bytes,9,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Controls whether the RPC returns after commit or after the runtime reaches
 	// a terminal outcome, including failure, supersession, cancellation or inactivity.
-	// This is a completion mode, not a database consistency level.
 	// Unspecified preserves commit-only compatibility.
-	Consistency ConfigUpdateConsistency `protobuf:"varint,12,opt,name=consistency,proto3,enum=openshell.v1.ConfigUpdateConsistency" json:"consistency,omitempty"`
+	WaitMode ConfigUpdateWaitMode `protobuf:"varint,12,opt,name=wait_mode,json=waitMode,proto3,enum=openshell.v1.ConfigUpdateWaitMode" json:"wait_mode,omitempty"`
 	// Optional retry key scoped to the sandbox. Reusing a key returns the
 	// original operation and never creates another desired-state revision.
 	IdempotencyKey string               `protobuf:"bytes,13,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
@@ -11872,11 +11871,11 @@ func (x *UpdateConfigRequest) GetAnnotations() map[string]string {
 	return nil
 }
 
-func (x *UpdateConfigRequest) GetConsistency() ConfigUpdateConsistency {
+func (x *UpdateConfigRequest) GetWaitMode() ConfigUpdateWaitMode {
 	if x != nil {
-		return x.Consistency
+		return x.WaitMode
 	}
-	return ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED
+	return ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED
 }
 
 func (x *UpdateConfigRequest) GetIdempotencyKey() string {
@@ -20461,7 +20460,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rexpires_after\x18f \x01(\v2\x19.google.protobuf.DurationR\fexpiresAfter\x12\x1d\n" +
 	"\n" +
 	"token_type\x18\x03 \x01(\tR\ttokenTypeJ\x04\b\x02\x10\x03R\n" +
-	"expires_in\"\xf2\x06\n" +
+	"expires_in\"\xea\x06\n" +
 	"\x13UpdateConfigRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\n" +
 	" \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12;\n" +
@@ -20473,8 +20472,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06global\x18\x06 \x01(\bR\x06global\x12M\n" +
 	"\x10merge_operations\x18\a \x03(\v2\".openshell.v1.PolicyMergeOperationR\x0fmergeOperations\x12:\n" +
 	"\x19expected_resource_version\x18\b \x01(\x04R\x17expectedResourceVersion\x12T\n" +
-	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12G\n" +
-	"\vconsistency\x18\f \x01(\x0e2%.openshell.v1.ConfigUpdateConsistencyR\vconsistency\x12'\n" +
+	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12?\n" +
+	"\twait_mode\x18\f \x01(\x0e2\".openshell.v1.ConfigUpdateWaitModeR\bwaitMode\x12'\n" +
 	"\x0fidempotency_key\x18\r \x01(\tR\x0eidempotencyKey\x12<\n" +
 	"\fwait_timeout\x18r \x01(\v2\x19.google.protobuf.DurationR\vwaitTimeout\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1d\n" +
@@ -21154,11 +21153,11 @@ const file_openshell_proto_rawDesc = "" +
 	"&ProviderEnvironmentValueClassification\x129\n" +
 	"5PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_UNSPECIFIED\x10\x00\x128\n" +
 	"4PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_NON_SECRET\x10\x01\x12?\n" +
-	";PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_STATIC_CREDENTIAL\x10\x02*\xa2\x01\n" +
-	"\x17ConfigUpdateConsistency\x12)\n" +
-	"%CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED\x10\x00\x12)\n" +
-	"%CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY\x10\x01\x121\n" +
-	"-CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION\x10\x02*\xcf\x01\n" +
+	";PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_STATIC_CREDENTIAL\x10\x02*\x99\x01\n" +
+	"\x14ConfigUpdateWaitMode\x12'\n" +
+	"#CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED\x10\x00\x12'\n" +
+	"#CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY\x10\x01\x12/\n" +
+	"+CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION\x10\x02*\xcf\x01\n" +
 	"\x1bConfigurationAdmissionState\x12-\n" +
 	")CONFIGURATION_ADMISSION_STATE_UNSPECIFIED\x10\x00\x12)\n" +
 	"%CONFIGURATION_ADMISSION_STATE_PENDING\x10\x01\x12*\n" +
@@ -21413,7 +21412,7 @@ var file_openshell_proto_goTypes = []any{
 	(ProviderCredentialRefreshStrategy)(0),               // 9: openshell.v1.ProviderCredentialRefreshStrategy
 	(ProviderProfileCategory)(0),                         // 10: openshell.v1.ProviderProfileCategory
 	(ProviderEnvironmentValueClassification)(0),          // 11: openshell.v1.ProviderEnvironmentValueClassification
-	(ConfigUpdateConsistency)(0),                         // 12: openshell.v1.ConfigUpdateConsistency
+	(ConfigUpdateWaitMode)(0),                            // 12: openshell.v1.ConfigUpdateWaitMode
 	(ConfigurationAdmissionState)(0),                     // 13: openshell.v1.ConfigurationAdmissionState
 	(PolicyStatus)(0),                                    // 14: openshell.v1.PolicyStatus
 	(ServiceStatus)(0),                                   // 15: openshell.v1.ServiceStatus
@@ -21949,7 +21948,7 @@ var file_openshell_proto_depIdxs = []int32{
 	308, // 224: openshell.v1.UpdateConfigRequest.setting_value:type_name -> openshell.sandbox.v1.SettingValue
 	167, // 225: openshell.v1.UpdateConfigRequest.merge_operations:type_name -> openshell.v1.PolicyMergeOperation
 	294, // 226: openshell.v1.UpdateConfigRequest.annotations:type_name -> openshell.v1.UpdateConfigRequest.AnnotationsEntry
-	12,  // 227: openshell.v1.UpdateConfigRequest.consistency:type_name -> openshell.v1.ConfigUpdateConsistency
+	12,  // 227: openshell.v1.UpdateConfigRequest.wait_mode:type_name -> openshell.v1.ConfigUpdateWaitMode
 	302, // 228: openshell.v1.UpdateConfigRequest.wait_timeout:type_name -> google.protobuf.Duration
 	303, // 229: openshell.v1.GetConfigUpdateOperationRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
 	80,  // 230: openshell.v1.GetConfigUpdateOperationResponse.operation:type_name -> openshell.v1.ConfigUpdateOperation

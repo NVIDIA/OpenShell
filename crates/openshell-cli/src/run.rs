@@ -48,8 +48,8 @@ use openshell_bootstrap::{
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
-    ClearDraftChunksRequest, ConfigUpdateConsistency, ConfigUpdateOperation,
-    ConfigUpdateOperationState, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    ClearDraftChunksRequest, ConfigUpdateOperation, ConfigUpdateOperationState,
+    ConfigUpdateWaitMode, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
     DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
@@ -5699,10 +5699,10 @@ pub async fn sandbox_policy_set(
                 workspace.to_string(),
             )),
             policy: Some(policy),
-            consistency: if wait {
-                ConfigUpdateConsistency::WaitForCompletion.into()
+            wait_mode: if wait {
+                ConfigUpdateWaitMode::WaitForCompletion.into()
             } else {
-                ConfigUpdateConsistency::CommitOnly.into()
+                ConfigUpdateWaitMode::CommitOnly.into()
             },
             wait_timeout: Some(
                 openshell_core::time::duration_from_std(Duration::from_secs(timeout_secs))
@@ -5833,10 +5833,10 @@ pub async fn sandbox_policy_update(
                 workspace.to_string(),
             )),
             merge_operations: plan.merge_operations,
-            consistency: if wait {
-                ConfigUpdateConsistency::WaitForCompletion.into()
+            wait_mode: if wait {
+                ConfigUpdateWaitMode::WaitForCompletion.into()
             } else {
-                ConfigUpdateConsistency::CommitOnly.into()
+                ConfigUpdateWaitMode::CommitOnly.into()
             },
             wait_timeout: Some(
                 openshell_core::time::duration_from_std(Duration::from_secs(timeout_secs))
