@@ -84,9 +84,9 @@ PATH-lookup or working-directory-relative resolution execute an unapproved
 binary with the gateway's identity instead of the approved `wxc-exec`. There
 is no usable default.
 
-MXC 1.0 removed the IsolationSession `configurationId`. The driver still
-accepts the legacy `default_configuration_id` gateway setting so existing TOML
-files load, but it ignores the value and does not send it to `wxc-exec`.
+MXC 1.0 removed the IsolationSession `configurationId`. The driver implements
+only the MXC 1.0 contract and rejects the legacy `default_configuration_id`
+gateway setting. Remove that setting from older TOML files before upgrading.
 
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. For policies with explicit network rules, the driver preserves

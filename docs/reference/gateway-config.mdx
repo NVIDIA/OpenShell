@@ -694,9 +694,9 @@ binary with the gateway's identity instead of the intended `wxc-exec`. There
 is no usable default; older configurations that relied on the bare relative
 filename `wxc-exec.exe` must set an absolute path before upgrading.
 
-MXC 1.0 removed the IsolationSession `configurationId`. OpenShell continues to
-accept the legacy `default_configuration_id` setting for configuration-file
-compatibility, but ignores it and does not send it to `wxc-exec`.
+MXC 1.0 removed the IsolationSession `configurationId`. OpenShell implements
+only the MXC 1.0 contract and rejects the legacy `default_configuration_id`
+setting. Remove it from older gateway configurations before upgrading.
 
 `etw_audit` defaults to `false`. When enabled, the gateway account must be an
 administrator or belong to the Windows Performance Log Users group. Workload
