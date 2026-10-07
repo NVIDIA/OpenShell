@@ -336,7 +336,14 @@ The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
-profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+profiles. Each profile is a named Rust test. The suite runs serially against
+the shared gateway; a guest-side file lock also protects separate invocations.
+The Rust fixture restores the original gateway configuration, restarts and
+checks gateway health, and verifies sandbox cleanup after each test, including
+assertion failures. A dirty marker stops later tests after interruption or failed
+restoration; start a fresh tmachine invocation to recover.
+
+The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, host fixtures, missing guest tools, or nondeterministic relay
 setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
 binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses

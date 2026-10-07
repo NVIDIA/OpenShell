@@ -7,7 +7,6 @@
   gather_facts: false
   vars:
     podman_test_root: /var/lib/openshell-driver-tests/podman
-    podman_test_input_dir: /var/lib/openshell-test-inputs/podman
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -51,11 +50,10 @@
 
     - name: Run Podman archive tests
       ansible.builtin.command:
-        argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --no-capture]
+        argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --test-threads, "1", --success-output, immediate, --failure-output, immediate]
       environment:
         OPENSHELL_BIN: /usr/local/bin/openshell
-        OPENSHELL_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
-        OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default('') }}"
+        OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default(openshell_podman_reference_image) }}"
       register: podman_test_result
       changed_when: false
       failed_when: false
