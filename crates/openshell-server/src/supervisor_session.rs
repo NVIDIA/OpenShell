@@ -27,10 +27,10 @@ use openshell_core::proto::{
     ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
     ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
     ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox,
-    SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRejected, SshRelayTarget,
-    StartupConfigCandidate, SupervisorHello, SupervisorMessage, config_snapshot_revision,
-    config_update, gateway_message, open_shell_client, peer_relay_frame, relay_open,
-    startup_config_prepared, supervisor_message,
+    SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRedirect, SessionRejected,
+    SshRelayTarget, StartupConfigCandidate, SupervisorHello, SupervisorMessage,
+    config_snapshot_revision, config_update, gateway_message, open_shell_client, peer_relay_frame,
+    relay_open, startup_config_prepared, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -52,7 +52,9 @@ use crate::persistence::{
     current_time_ms,
 };
 use crate::storage_proto::StoredConfigComponentObservation;
-use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
+use crate::supervisor_owner::{
+    OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex, can_supersede,
+};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2291,6 +2293,37 @@ fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
     owner.is_fresh(OWNER_TTL)
 }
 
+/// The replica currently holding this sandbox's supervisor session, if known.
+pub async fn owner_replica_id(state: &Arc<ServerState>, sandbox_id: &str) -> Option<String> {
+    if state.store.is_single_replica() {
+        return None;
+    }
+    let local = state.supervisor_sessions.has_session(sandbox_id);
+    let owner = if local {
+        None
+    } else {
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        resolve_owner(state, &owner_index, sandbox_id)
+            .await
+            .ok()
+            .flatten()
+    };
+    owner_hint(&state.replica_id, local, owner.as_ref())
+}
+
+fn owner_hint(
+    self_replica_id: &str,
+    local: bool,
+    owner: Option<&crate::supervisor_owner::OwnerRecord>,
+) -> Option<String> {
+    if local {
+        return Some(self_replica_id.to_string());
+    }
+    owner
+        .filter(|owner| owner_is_fresh(owner))
+        .map(|owner| owner.owner_replica_id.clone())
+}
+
 /// Endpoint recorded when this replica advertises none.
 fn local_owner_endpoint(replica_id: &str) -> String {
     format!("{LOCAL_OWNER_ENDPOINT_SCHEME}{replica_id}")
@@ -2299,6 +2332,67 @@ fn local_owner_endpoint(replica_id: &str) -> String {
 /// True when an owner record names a gateway that no peer can dial.
 fn owner_endpoint_is_local_only(endpoint: &str) -> bool {
     endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)
+}
+
+/// Where the ring says this sandbox belongs, when that is not this replica.
+///
+/// Returns `None` whenever this replica should serve the session itself, which
+/// covers single-replica mode, an empty ring, the ring naming this replica, and
+/// a preferred replica with no dialable peer endpoint. Falling back to local
+/// ownership keeps a stale or incomplete ring from making a sandbox
+/// unreachable.
+fn preferred_peer_redirect(state: &Arc<ServerState>, sandbox_id: &str) -> Option<SessionRedirect> {
+    if state.store.is_single_replica() {
+        return None;
+    }
+
+    let preferred = {
+        let ring = state.gateway_ring.read().ok()?;
+        if state.gateway_shutting_down.load(Ordering::Acquire) {
+            ring.without(&state.replica_id)
+                .owner_for(sandbox_id)?
+                .to_string()
+        } else {
+            ring.owner_for(sandbox_id)?.to_string()
+        }
+    };
+    let peer_endpoint = {
+        let peers = state.gateway_peers.read().ok()?;
+        peers.get(&preferred).cloned()
+    };
+
+    ring_redirect(&state.replica_id, &preferred, peer_endpoint)
+}
+
+/// Decide whether a preferred replica is worth redirecting to.
+///
+/// Split out from the lock reads so the rules are testable on their own.
+/// A replica that is shutting down redirects even an already-redirected
+/// supervisor, since a peer with a stale ring may have sent it here; refusing
+/// would cost the supervisor a failed attempt and its reconnect backoff.
+fn may_redirect(hello: &SupervisorHello, shutting_down: bool) -> bool {
+    hello.supports_session_redirect && (!hello.redirected || shutting_down)
+}
+
+fn ring_redirect(
+    self_replica_id: &str,
+    preferred_replica_id: &str,
+    preferred_peer_endpoint: Option<String>,
+) -> Option<SessionRedirect> {
+    if preferred_replica_id == self_replica_id {
+        return None;
+    }
+    let peer_endpoint = preferred_peer_endpoint?;
+    // `local://` endpoints are placeholders used when no peer endpoint is
+    // configured, so they are not dialable from another replica.
+    if peer_endpoint.is_empty() || owner_endpoint_is_local_only(&peer_endpoint) {
+        return None;
+    }
+
+    Some(SessionRedirect {
+        peer_endpoint,
+        owner_replica_id: preferred_replica_id.to_string(),
+    })
 }
 
 async fn open_peer_relay(
@@ -2591,6 +2685,7 @@ struct SessionSetup {
     sandbox_id: String,
     instance_id: String,
     connection_epoch: u64,
+    supports_session_redirect: bool,
     mode: SessionMode,
     bootstrap: Option<ConfigBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
@@ -2607,6 +2702,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         sandbox_id,
         instance_id,
         connection_epoch,
+        supports_session_redirect,
         mode,
         bootstrap,
         provider_readiness,
@@ -2822,6 +2918,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             &sandbox_id,
             &session_id,
             &instance_id,
+            supports_session_redirect,
             stream_applies_config,
             &expected_bootstrap_revisions,
             expected_bootstrap_admission.as_ref(),
@@ -3084,6 +3181,48 @@ pub async fn handle_connect_supervisor(
     // supervisors remain usable but cannot assert provider installation.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
+    // If the ring places this sandbox on a different live replica, send the
+    // supervisor there instead of claiming ownership here. Decided before the
+    // session is tracked and before startup policy preparation, so a redirect
+    // never consumes a session slot or the supervisor's one-time preparer. An
+    // established session is only relocated when this replica shuts down.
+    if may_redirect(&hello, state.gateway_shutting_down.load(Ordering::Acquire))
+        && let Some(redirect) = preferred_peer_redirect(state, &sandbox_id)
+    {
+        info!(
+            sandbox_id = %sandbox_id,
+            owner_replica_id = %redirect.owner_replica_id,
+            replica_id = %state.replica_id,
+            "supervisor session: redirecting to ring-preferred replica"
+        );
+        if state.supervisor_sessions.has_session(&sandbox_id) {
+            let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+            let supersedes = match owner_index.read(&sandbox_id).await {
+                Ok(Some(owner)) => can_supersede(
+                    &owner,
+                    &hello.instance_id,
+                    hello.connection_epoch,
+                    OWNER_TTL,
+                ),
+                Ok(None) => true,
+                Err(_) => false,
+            };
+            if supersedes {
+                state.supervisor_sessions.disconnect(&sandbox_id);
+            }
+        }
+        let (tx, rx) = mpsc::channel::<Result<GatewayMessage, Status>>(1);
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
+        };
+        // Capacity 1 and a fresh receiver, so this cannot block. Dropping the
+        // sender ends the stream, which closes the supervisor's connection.
+        let _ = tx.send(Ok(message)).await;
+        drop(tx);
+        return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+    }
+
+    // Build the bootstrap only for a session this replica keeps.
     let config_push = captured_seq.map(|captured_seq| ConfigPushSetup {
         captured_seq,
         workspace: sandbox.object_workspace().to_string(),
@@ -3119,6 +3258,7 @@ pub async fn handle_connect_supervisor(
             sandbox_id,
             instance_id: hello.instance_id,
             connection_epoch: hello.connection_epoch,
+            supports_session_redirect: hello.supports_session_redirect,
             mode,
             bootstrap,
             provider_readiness,
@@ -3253,6 +3393,7 @@ pub async fn handle_connect_supervisor(
                 sandbox_id: sandbox_id.clone(),
                 instance_id: hello.instance_id,
                 connection_epoch: hello.connection_epoch,
+                supports_session_redirect: hello.supports_session_redirect,
                 mode,
                 bootstrap: Some(bootstrap),
                 provider_readiness,
@@ -3348,6 +3489,7 @@ async fn run_session_loop(
     sandbox_id: &str,
     session_id: &str,
     instance_id: &str,
+    supports_session_redirect: bool,
     stream_applies_config: bool,
     expected_bootstrap_revisions: &[(
         ConfigComponent,
@@ -3373,6 +3515,13 @@ async fn run_session_loop(
         tokio::select! {
             () = async { let _ = gateway_shutdown.wait_for(|shutdown| *shutdown).await; } => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: gateway shutting down");
+                if supports_session_redirect
+                    && let Some(redirect) = preferred_peer_redirect(state, sandbox_id)
+                {
+                    let _ = tx.try_send(GatewayMessage {
+                        payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
+                    });
+                }
                 break;
             }
             _ = &mut shutdown_rx => {
@@ -7676,5 +7825,84 @@ mod tests {
             .expect("authoritative sandbox snapshot");
         assert_eq!(snapshot.policy, Some(image_policy));
         assert_eq!(snapshot.version, 1);
+    }
+
+    // ---- ring_redirect: placement handoff rules ----
+
+    #[test]
+    fn ring_redirect_targets_the_preferred_replica() {
+        let redirect = ring_redirect("gw-0", "gw-1", Some("https://gw-1:8443".to_string()))
+            .expect("should redirect to another replica");
+        assert_eq!(redirect.owner_replica_id, "gw-1");
+        assert_eq!(redirect.peer_endpoint, "https://gw-1:8443");
+    }
+
+    #[test]
+    fn owner_hint_names_the_replica_holding_the_session() {
+        assert_eq!(owner_hint("gw-0", true, None).as_deref(), Some("gw-0"));
+        assert_eq!(
+            owner_hint("gw-0", false, Some(&owner_record("gw-1"))).as_deref(),
+            Some("gw-1")
+        );
+        assert_eq!(owner_hint("gw-0", false, None), None);
+
+        let mut stale = owner_record("gw-1");
+        stale.updated_at_ms = 0;
+        assert_eq!(owner_hint("gw-0", false, Some(&stale)), None);
+    }
+
+    #[test]
+    fn shutdown_ring_redirects_every_owned_sandbox_to_a_remaining_replica() {
+        let ring = crate::gateway_ring::GatewayRing::new(["gw-0", "gw-1", "gw-2"]);
+        let draining = ring.without("gw-0");
+        let owned: Vec<String> = (0..300)
+            .map(|i| format!("sb-{i}"))
+            .filter(|id| ring.owner_for(id) == Some("gw-0"))
+            .collect();
+        assert!(!owned.is_empty());
+        for id in owned {
+            let preferred = draining.owner_for(&id).unwrap();
+            let redirect =
+                ring_redirect("gw-0", preferred, Some(format!("https://{preferred}:8443")))
+                    .expect("a draining replica must hand off its own sandboxes");
+            assert_ne!(redirect.owner_replica_id, "gw-0");
+        }
+    }
+
+    #[test]
+    fn redirected_supervisors_are_only_bounced_by_a_shutting_down_replica() {
+        let hello = |redirected| SupervisorHello {
+            redirected,
+            supports_session_redirect: true,
+            ..Default::default()
+        };
+        assert!(may_redirect(&hello(false), false));
+        assert!(!may_redirect(&hello(true), false));
+        assert!(may_redirect(&hello(true), true));
+    }
+
+    #[test]
+    fn supervisors_without_redirect_support_are_never_redirected() {
+        let hello = SupervisorHello::default();
+        assert!(!may_redirect(&hello, false));
+        assert!(!may_redirect(&hello, true));
+    }
+
+    #[test]
+    fn ring_redirect_serves_locally_when_this_replica_is_preferred() {
+        assert!(ring_redirect("gw-0", "gw-0", Some("https://gw-0:8443".to_string())).is_none());
+    }
+
+    /// Without a dialable address we must keep the session rather than send
+    /// the supervisor somewhere it cannot reach.
+    #[test]
+    fn ring_redirect_serves_locally_when_the_peer_endpoint_is_unknown() {
+        assert!(ring_redirect("gw-0", "gw-1", None).is_none());
+    }
+
+    #[test]
+    fn ring_redirect_serves_locally_for_placeholder_endpoints() {
+        assert!(ring_redirect("gw-0", "gw-1", Some(String::new())).is_none());
+        assert!(ring_redirect("gw-0", "gw-1", Some("local://gw-1".to_string())).is_none());
     }
 }

@@ -1109,6 +1109,8 @@ pub mod test_support {
                     connection_epoch: 0,
                     image_policy_discovery,
                     supports_provider_readiness: false,
+                    redirected: false,
+                    supports_session_redirect: false,
                 })),
             })
             .await

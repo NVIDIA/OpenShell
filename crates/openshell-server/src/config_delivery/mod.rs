@@ -40,13 +40,19 @@ pub use session_slots::{ConfigSlots, SessionOutbound};
 /// Leaves headroom below tonic's default 4 MiB decode limit for framing and
 /// future envelope fields.
 pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
-const CONFIG_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
+/// Sandbox configuration builds only read the store, which answers in
+/// milliseconds when healthy; anything slower means the store is in trouble.
+const SANDBOX_CONFIG_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Provider environment builds also resolve credentials. Covers a cold Vault
+/// Kubernetes-auth login plus a read at the default 10-second request timeout.
+const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 // A shadow bootstrap is optional. Keep credential backend stalls well below
 // the 15-second relay session-wait budget while polling remains authoritative.
 pub const OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
-// Streamed-apply supervisors start from the bootstrap, so allow the same
-// bounded build window as an ordinary snapshot before rejecting the session.
-pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = CONFIG_SNAPSHOT_BUILD_TIMEOUT;
+// Streamed-apply supervisors start from the bootstrap, so allow several
+// concurrent component builds, including revision-mismatch retries, before
+// rejecting the session. Session setup does not hold a delivery build slot.
+pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
 /// pool busy without stacking every waiter on the acquire timeout.
@@ -555,7 +561,7 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
         reroute: false,
     };
     let built =
-        tokio::time::timeout(CONFIG_SNAPSHOT_BUILD_TIMEOUT, build_component(state, key)).await;
+        tokio::time::timeout(build_timeout(key.component), build_component(state, key)).await;
     let (message, providers) = match built {
         Ok(Ok(Some(built))) => built,
         Ok(Ok(None)) => {
@@ -602,6 +608,13 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
             providers: Some(providers),
         },
         reroute,
+    }
+}
+
+const fn build_timeout(component: ConfigComponentKind) -> Duration {
+    match component {
+        ConfigComponentKind::SandboxConfig => SANDBOX_CONFIG_BUILD_TIMEOUT,
+        ConfigComponentKind::ProviderEnvironment => PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
     }
 }
 
@@ -1344,6 +1357,18 @@ mod tests {
         };
         assert_eq!(builds(10), 20);
         assert_eq!(builds(1), MIN_CONCURRENT_SNAPSHOT_BUILDS);
+    }
+
+    #[test]
+    fn credential_resolving_builds_get_a_longer_deadline() {
+        assert_eq!(
+            build_timeout(ConfigComponentKind::SandboxConfig),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            build_timeout(ConfigComponentKind::ProviderEnvironment),
+            Duration::from_secs(20)
+        );
     }
 
     #[test]

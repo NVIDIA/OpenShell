@@ -216,6 +216,8 @@ export interface SandboxRef {
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
+  /** Stable SSH host identity; absent on older runtimes. */
+  hostKeyFingerprint?: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
@@ -535,6 +537,7 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
+    hostKeyFingerprint: sandbox.hostKeyFingerprint || undefined,
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
     createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate

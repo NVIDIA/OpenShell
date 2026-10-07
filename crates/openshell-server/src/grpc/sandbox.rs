@@ -574,6 +574,7 @@ async fn handle_create_sandbox_inner(
     let now_ms = current_time_ms();
 
     let mut sandbox = Sandbox {
+        host_key_fingerprint: String::new(),
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: name.clone(),
@@ -885,11 +886,18 @@ fn template_resource_struct(resources: &SandboxResources) -> Option<Struct> {
     }
 }
 
+fn owner_requested<T>(request: &Request<T>) -> bool {
+    request
+        .metadata()
+        .contains_key(openshell_core::replica_routing::OWNER_REQUEST_HEADER)
+}
+
 pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let wants_owner = owner_requested(&request);
     let req = request.into_inner();
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
@@ -899,10 +907,21 @@ pub(super) async fn handle_get_sandbox(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(SandboxResponse {
+    let owner = if wants_owner {
+        crate::supervisor_session::owner_replica_id(state, sandbox.object_id()).await
+    } else {
+        None
+    };
+    let mut response = Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-    }))
+    });
+    if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
+        response
+            .metadata_mut()
+            .insert(openshell_core::replica_routing::OWNER_REPLICA_HEADER, value);
+    }
+    Ok(response)
 }
 
 pub(super) async fn handle_list_sandboxes(
@@ -1769,7 +1788,7 @@ async fn handle_start_sandbox_inner(
     }))
 }
 
-pub fn mint_persisted_authentication(
+pub async fn mint_persisted_authentication(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
@@ -1784,7 +1803,13 @@ pub fn mint_persisted_authentication(
     let identity =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    authority.mint_persisted_launch(sandbox.object_id(), &identity)
+    let mut authentication = authority.mint_persisted_launch(sandbox.object_id(), &identity)?;
+    let mut with_identity = sandbox.clone();
+    state
+        .compute
+        .prepare_ssh_identity(&mut with_identity, &mut authentication)
+        .await?;
+    Ok(authentication)
 }
 
 async fn providers_for_sandbox(
@@ -2645,14 +2670,20 @@ impl Drop for ForwardConnectionGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.as_deref() {
             decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
-            decrement_ssh_connection_count(
-                &self.state.ssh_connections_by_sandbox,
-                &self.sandbox_id,
-            );
         }
+        decrement_ssh_connection_count(&self.state.ssh_connections_by_sandbox, &self.sandbox_id);
     }
 }
 
+/// Reserve a relay slot for one `ForwardTcp` stream.
+///
+/// `target.tcp` streams are authorized by the caller's gateway principal, which
+/// `handle_forward_tcp` has already checked against the sandbox's workspace, so
+/// they carry no session token and touch no store: the only per-connection
+/// state is the in-memory per-sandbox connection count. `target.ssh` streams
+/// keep requiring the `CreateSshSession` token because the process that opens
+/// them is an ssh `ProxyCommand` that holds nothing else. A token supplied with
+/// a TCP target (older clients) is still validated and counted per token.
 async fn acquire_forward_connection_guard(
     state: &Arc<ServerState>,
     init: &TcpForwardInit,
@@ -2661,9 +2692,17 @@ async fn acquire_forward_connection_guard(
     let sandbox_id = sandbox.object_id().to_string();
     let token = init.authorization_token.trim();
     if token.is_empty() {
-        return Err(Status::unauthenticated(
-            "authorization_token is required for ForwardTcp",
-        ));
+        if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
+            return Err(Status::unauthenticated(
+                "authorization_token is required for SSH targets",
+            ));
+        }
+        acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
+        return Ok(ForwardConnectionGuard {
+            state: state.clone(),
+            token: None,
+            sandbox_id,
+        });
     }
 
     validate_ssh_forward_token(state, token, &sandbox_id).await?;
@@ -2677,7 +2716,7 @@ async fn acquire_forward_connection_guard(
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
-        sandbox_id: sandbox_id.clone(),
+        sandbox_id,
     })
 }
 
@@ -2709,15 +2748,15 @@ async fn validate_ssh_forward_token(
     Ok(())
 }
 
+const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
+const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
 fn acquire_ssh_connection_slots(
     token_counts: &std::sync::Mutex<HashMap<String, u32>>,
     sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
-    const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
-
     {
         let mut counts = token_counts.lock().unwrap();
         let count = counts.entry(token.to_string()).or_insert(0);
@@ -2729,18 +2768,28 @@ fn acquire_ssh_connection_slots(
         *count += 1;
     }
 
-    {
-        let mut counts = sandbox_counts.lock().unwrap();
-        let count = counts.entry(sandbox_id.to_string()).or_insert(0);
-        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-            decrement_ssh_connection_count(token_counts, token);
-            return Err(Status::resource_exhausted(
-                "sandbox SSH connection limit reached",
-            ));
-        }
-        *count += 1;
+    if let Err(status) = acquire_sandbox_connection_slot(sandbox_counts, sandbox_id) {
+        decrement_ssh_connection_count(token_counts, token);
+        return Err(status);
     }
 
+    Ok(())
+}
+
+/// Reserve one of the per-sandbox relay slots shared by SSH sessions and
+/// service forwards.
+fn acquire_sandbox_connection_slot(
+    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let mut counts = sandbox_counts.lock().unwrap();
+    let count = counts.entry(sandbox_id.to_string()).or_insert(0);
+    if *count >= MAX_CONNECTIONS_PER_SANDBOX {
+        return Err(Status::resource_exhausted(
+            "sandbox SSH connection limit reached",
+        ));
+    }
+    *count += 1;
     Ok(())
 }
 
@@ -3141,7 +3190,7 @@ pub(super) async fn handle_create_ssh_session(
         gateway_host,
         gateway_port: gateway_port.into(),
         gateway_scheme: scheme.to_string(),
-        host_key_fingerprint: String::new(),
+        host_key_fingerprint: sandbox.host_key_fingerprint.clone(),
         expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?,
     }))
@@ -4315,6 +4364,135 @@ mod tests {
             cmd.contains("'print('\"'\"'one'\"'\"')\r\nprint('\"'\"'two'\"'\"')'"),
             "CR/LF with embedded single quotes must compose correctly: {cmd}"
         );
+    }
+
+    fn forward_init(target: tcp_forward_init::Target, token: &str) -> TcpForwardInit {
+        TcpForwardInit {
+            sandbox: "sbx".to_string(),
+            workspace: String::new(),
+            service_id: String::new(),
+            target: Some(target),
+            authorization_token: token.to_string(),
+        }
+    }
+
+    fn loopback_tcp_target() -> tcp_forward_init::Target {
+        tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+        })
+    }
+
+    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> u32 {
+        state
+            .ssh_connections_by_sandbox
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_without_token_is_admitted_on_the_principal_alone() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .expect("tcp forward without a session token");
+
+        assert!(
+            guard.token.is_none(),
+            "no per-token accounting without a token"
+        );
+        assert!(state.ssh_connections_by_token.lock().unwrap().is_empty());
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 1);
+        drop(guard);
+        assert_eq!(
+            sandbox_connection_count(&state, sandbox.object_id()),
+            0,
+            "dropping the guard releases the sandbox slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_forward_without_token_is_rejected() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let err = acquire_forward_connection_guard(
+            &state,
+            &forward_init(tcp_forward_init::Target::Ssh(SshRelayTarget::default()), ""),
+            &sandbox,
+        )
+        .await
+        .err()
+        .expect("ssh targets keep requiring the session token");
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            err.message(),
+            "authorization_token is required for SSH targets"
+        );
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_with_unknown_token_is_still_rejected() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let err = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), "not-a-session"),
+            &sandbox,
+        )
+        .await
+        .err()
+        .expect("a supplied token is always validated");
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.message(), "SSH session token not found");
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forwards_without_token_share_the_per_sandbox_connection_cap() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+        let init = forward_init(loopback_tcp_target(), "");
+
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+            guards.push(
+                acquire_forward_connection_guard(&state, &init, &sandbox)
+                    .await
+                    .expect("within the per-sandbox cap"),
+            );
+        }
+        let err = acquire_forward_connection_guard(&state, &init, &sandbox)
+            .await
+            .err()
+            .expect("cap reached");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(err.message(), "sandbox SSH connection limit reached");
+        assert_eq!(
+            sandbox_connection_count(&state, sandbox.object_id()),
+            MAX_CONNECTIONS_PER_SANDBOX
+        );
+
+        guards.pop();
+        let guard = acquire_forward_connection_guard(&state, &init, &sandbox)
+            .await
+            .expect("slot freed by a closed connection");
+        drop(guard);
+        drop(guards);
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
     }
 
     #[test]
@@ -6850,6 +7028,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_replica_get_sandbox_sends_no_owner_hint() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("hinted", Vec::new());
+        sandbox.metadata.as_mut().unwrap().workspace = "default".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "session-a".to_string(),
+            mpsc::channel(1).0,
+            oneshot::channel().0,
+        );
+
+        let mut request = authed_request(GetSandboxRequest {
+            name: "hinted".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        });
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::OWNER_REQUEST_HEADER,
+            "1".parse().unwrap(),
+        );
+        let response = handle_get_sandbox(&state, request).await.unwrap();
+        assert!(
+            response
+                .metadata()
+                .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_is_resolved_only_when_requested() {
+        let mut request = Request::new(());
+        assert!(!owner_requested(&request));
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::OWNER_REQUEST_HEADER,
+            "1".parse().unwrap(),
+        );
+        assert!(owner_requested(&request));
+    }
+
+    #[tokio::test]
     async fn create_sandbox_registers_requested_service_exposures() {
         let state = test_server_state().await;
 
@@ -8474,11 +8695,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_create_ssh_session_prevents_duplicate_tokens() {
         let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_sandbox("work", Vec::new()))
-            .await
-            .unwrap();
+        let mut sandbox = test_sandbox("work", Vec::new());
+        sandbox.host_key_fingerprint = "SHA256:public-host-identity".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
 
         // Both requests try to create sessions for the same sandbox
         // The token generation is random, so we can't force a collision,
@@ -8518,8 +8737,12 @@ mod tests {
         assert!(result1.is_ok(), "first create should succeed");
         assert!(result2.is_ok(), "second create should succeed");
 
-        let token1 = result1.unwrap().into_inner().token;
-        let token2 = result2.unwrap().into_inner().token;
+        let response1 = result1.unwrap().into_inner();
+        let response2 = result2.unwrap().into_inner();
+        assert_eq!(response1.host_key_fingerprint, sandbox.host_key_fingerprint);
+        assert_eq!(response2.host_key_fingerprint, sandbox.host_key_fingerprint);
+        let token1 = response1.token;
+        let token2 = response2.token;
 
         // Tokens must be different
         assert_ne!(token1, token2, "tokens should be unique");
