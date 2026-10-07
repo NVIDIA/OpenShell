@@ -13,6 +13,7 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::BTreeSet;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -105,6 +106,124 @@ mod linux {
     /// workload. The supervisor's device namespace can differ from the
     /// workload's, so discovery must happen here, gated by the resource claim.
     fn enrich_gpu_filesystem_paths(
+        policy: &mut openshell_core::policy::SandboxPolicy,
+        gpu_requested: bool,
+        cdi_context: Option<&openshell_core::cdi::CdiContext>,
+    ) -> Result<bool, String> {
+        if let Some(context) = cdi_context {
+            if !gpu_requested {
+                return Err("CDI context was provided without a GPU resource claim".to_string());
+            }
+            return enrich_cdi_filesystem_paths(policy, context);
+        }
+        Ok(enrich_legacy_gpu_filesystem_paths(policy, gpu_requested))
+    }
+
+    fn enrich_cdi_filesystem_paths(
+        policy: &mut openshell_core::policy::SandboxPolicy,
+        context: &openshell_core::cdi::CdiContext,
+    ) -> Result<bool, String> {
+        let writable_file_allowlist = policy
+            .filesystem
+            .read_write
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<std::collections::HashSet<_>>();
+        let requirements = openshell_core::cdi::resolve_cdi_context(context)
+            .map_err(|error| format!("resolve workload CDI requirements: {error}"))?;
+        openshell_core::cdi::validate_cdi_requirements(&requirements, &writable_file_allowlist)
+            .map_err(|error| format!("validate workload CDI requirements: {error}"))?;
+
+        let mut read_only = requirements
+            .read_only_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if Path::new("/sys").exists() {
+            read_only.push("/sys".into());
+        }
+        read_only.sort_by(path_depth_order);
+        read_only.dedup();
+
+        let mut modified = false;
+        for path in read_only {
+            if path_is_covered_by_policy(policy, &path) {
+                continue;
+            }
+            policy.filesystem.read_only.push(path);
+            modified = true;
+        }
+
+        let mut read_write = requirements
+            .device_node_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        read_write.push("/proc".into());
+        read_write.sort_by(path_depth_order);
+        read_write.dedup();
+        for path in read_write {
+            if path_is_covered(&path, &policy.filesystem.read_write) {
+                continue;
+            }
+            if policy.filesystem.read_only.contains(&path) {
+                if path != Path::new("/proc") {
+                    continue;
+                }
+                policy
+                    .filesystem
+                    .read_only
+                    .retain(|allowed| allowed != &path);
+            }
+            policy.filesystem.read_write.push(path);
+            modified = true;
+        }
+
+        let mut supplemental_groups = policy
+            .process
+            .supplemental_groups
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let original_group_count = supplemental_groups.len();
+        supplemental_groups.extend(requirements.additional_gids);
+        if supplemental_groups.len() != original_group_count {
+            policy.process.supplemental_groups = supplemental_groups.into_iter().collect();
+            modified = true;
+        }
+
+        Ok(modified)
+    }
+
+    fn required_cdi_groups_present(required: &[u32], primary: u32, actual: &[u32]) -> bool {
+        required
+            .iter()
+            .all(|gid| *gid != 0 && (*gid == primary || actual.contains(gid)))
+    }
+
+    fn path_depth_order(
+        left: &std::path::PathBuf,
+        right: &std::path::PathBuf,
+    ) -> std::cmp::Ordering {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    }
+
+    fn path_is_covered_by_policy(
+        policy: &openshell_core::policy::SandboxPolicy,
+        candidate: &Path,
+    ) -> bool {
+        path_is_covered(candidate, &policy.filesystem.read_only)
+            || path_is_covered(candidate, &policy.filesystem.read_write)
+    }
+
+    fn path_is_covered(candidate: &Path, allowed: &[std::path::PathBuf]) -> bool {
+        allowed.iter().any(|path| candidate.starts_with(path))
+    }
+
+    fn enrich_legacy_gpu_filesystem_paths(
         policy: &mut openshell_core::policy::SandboxPolicy,
         gpu_requested: bool,
     ) -> bool {
@@ -2576,7 +2695,15 @@ mod linux {
                 .resource_claims
                 .get(GPU_RESOURCE_CLAIM)
                 .is_some_and(|value| value == "true");
-            if enrich_gpu_filesystem_paths(&mut policy, gpu_requested) {
+            let enriched = match enrich_gpu_filesystem_paths(
+                &mut policy,
+                gpu_requested,
+                self.config.cdi_context.as_ref(),
+            ) {
+                Ok(enriched) => enriched,
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
+            };
+            if enriched {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                         .severity(openshell_ocsf::SeverityId::Informational)
@@ -2585,6 +2712,30 @@ mod linux {
                         .message("Added workload-local GPU filesystem paths".to_string())
                         .build()
                 );
+            }
+            if !policy.process.supplemental_groups.is_empty() {
+                let actual_groups = match nix::unistd::getgroups() {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        return guest_error(
+                            BoundaryErrorKind::Process,
+                            format!("read workload CDI groups: {error}"),
+                        );
+                    }
+                };
+                if !required_cdi_groups_present(
+                    &policy.process.supplemental_groups,
+                    nix::unistd::getegid().as_raw(),
+                    &actual_groups
+                        .iter()
+                        .map(|gid| gid.as_raw())
+                        .collect::<Vec<_>>(),
+                ) {
+                    return guest_error(
+                        BoundaryErrorKind::Process,
+                        "workload runtime did not supply the required CDI groups",
+                    );
+                }
             }
             policy.process.run_as_user = Some(self.config.workload_identity.uid.to_string());
             policy.process.run_as_group = Some(self.config.workload_identity.gid.to_string());
@@ -3788,6 +3939,86 @@ mod linux {
         };
         use rcgen::{KeyPair, PKCS_ED25519};
 
+        fn cdi_test_policy(read_only: &[&str]) -> openshell_core::policy::SandboxPolicy {
+            openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy {
+                    read_only: read_only.iter().map(std::path::PathBuf::from).collect(),
+                    read_write: Vec::new(),
+                    include_workdir: false,
+                },
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            }
+        }
+
+        fn cdi_test_context() -> (tempfile::TempDir, openshell_core::cdi::CdiContext) {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("nvidia.yaml"),
+                r#"
+cdiVersion: 0.7.0
+kind: nvidia.com/gpu
+devices:
+  - name: "0"
+    containerEdits:
+      deviceNodes:
+        - path: /dev/null
+containerEdits:
+  mounts:
+    - hostPath: /host/libfake.so.1
+      containerPath: /usr/lib/libfake.so.1
+      options: [ro]
+    - hostPath: /host/nvidia-info
+      containerPath: /etc/hosts
+      options: [ro]
+  additionalGids: [44]
+"#,
+            )
+            .unwrap();
+            let context = openshell_core::cdi::CdiContext::new(
+                vec!["nvidia.com/gpu=0".to_string()],
+                vec![openshell_core::cdi::CdiSpecDirectory::new(
+                    directory.path().to_string_lossy(),
+                    "/var/run/cdi",
+                )],
+            );
+            (directory, context)
+        }
+
+        #[test]
+        fn workload_cdi_enrichment_respects_authored_ancestors() {
+            let (_directory, context) = cdi_test_context();
+            let mut policy = cdi_test_policy(&["/usr"]);
+
+            assert!(enrich_cdi_filesystem_paths(&mut policy, &context).unwrap());
+
+            assert!(policy.filesystem.read_only.contains(&"/usr".into()));
+            assert!(!policy.filesystem.read_only.contains(&"/usr/lib".into()));
+            assert!(policy.filesystem.read_only.contains(&"/etc/hosts".into()));
+            assert!(policy.filesystem.read_only.contains(&"/sys".into()));
+            assert!(policy.filesystem.read_write.contains(&"/dev/null".into()));
+            assert!(policy.filesystem.read_write.contains(&"/proc".into()));
+            assert_eq!(policy.process.supplemental_groups, vec![44]);
+        }
+
+        #[test]
+        fn cdi_groups_require_runtime_access() {
+            assert!(required_cdi_groups_present(&[44, 107], 44, &[107]));
+            assert!(!required_cdi_groups_present(&[44, 107], 44, &[]));
+            assert!(!required_cdi_groups_present(&[0], 1000, &[0]));
+        }
+
+        #[test]
+        fn workload_cdi_enrichment_is_idempotent() {
+            let (_directory, context) = cdi_test_context();
+            let mut policy = cdi_test_policy(&["/usr"]);
+
+            assert!(enrich_cdi_filesystem_paths(&mut policy, &context).unwrap());
+            assert!(!enrich_cdi_filesystem_paths(&mut policy, &context).unwrap());
+        }
+
         #[test]
         fn exec_tombstones_expire_without_a_lifetime_limit() {
             let mut ledger = ExecRequestLedger::default();
@@ -3992,6 +4223,7 @@ mod linux {
                 },
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
+                cdi_context: None,
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
@@ -4106,6 +4338,7 @@ mod linux {
                     "true".to_string(),
                 )]),
                 resource_claim_files: std::collections::BTreeMap::new(),
+                cdi_context: None,
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
@@ -4177,6 +4410,7 @@ mod linux {
                         },
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
+                        cdi_context: None,
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
@@ -4772,6 +5006,7 @@ mod linux {
                 },
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
+                cdi_context: None,
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
@@ -4823,6 +5058,7 @@ mod linux {
                 process: openshell_core::policy::ProcessPolicy {
                     run_as_user: user.map(str::to_string),
                     run_as_group: group.map(str::to_string),
+                    ..Default::default()
                 },
             })
         }
@@ -5041,6 +5277,7 @@ mod linux {
                     "kubernetes.pod_uid".to_string(),
                     pod_uid_path,
                 )]),
+                cdi_context: None,
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
@@ -5081,6 +5318,7 @@ mod linux {
                         },
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
+                        cdi_context: None,
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
@@ -5285,6 +5523,7 @@ mod linux {
                         },
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
+                        cdi_context: None,
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
@@ -5620,6 +5859,7 @@ mod linux {
                         },
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
+                        cdi_context: None,
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
