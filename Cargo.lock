@@ -4722,6 +4722,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-otel",
  "opentelemetry-proto",
+ "prost",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -5004,8 +5005,13 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -5013,6 +5019,7 @@ dependencies = [
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
@@ -5020,6 +5027,7 @@ dependencies = [
  "openshell-supervisor-network",
  "openshell-supervisor-process",
  "opentelemetry",
+ "opentelemetry-proto",
  "prost",
  "prost-types",
  "rustix 1.1.4",
@@ -5032,6 +5040,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tonic",
+ "tonic-types",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

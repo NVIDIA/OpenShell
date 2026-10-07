@@ -27,10 +27,16 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
+bytes = { workspace = true }
 clap = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio", "http1", "server", "server-graceful"] }
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
+opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rustls = { workspace = true }
@@ -41,6 +47,7 @@ socket2 = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tonic-types = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -54,6 +61,7 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 temp-env = "0.3"

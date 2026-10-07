@@ -233,7 +233,14 @@ name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
+[[test]]
+name = "otlp_relay"
+path = "tests/otlp_relay.rs"
+required-features = ["e2e-local-container-driver"]
+
 [dependencies]
+openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
