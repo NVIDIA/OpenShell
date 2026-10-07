@@ -45,8 +45,18 @@ const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Time budget for the supervisor relay to register after a fast canonical
 /// command has already reported its terminal result.
-const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
+const TERMINAL_RELAY_REGISTRATION_WAIT: SessionReadyWait = SessionReadyWait {
+    timeout: Duration::from_secs(5),
+    interval: Duration::from_millis(50),
+};
+/// Time budget for a sync retry to wait for the sandbox to report Ready again.
+/// A gateway replica restart drops the supervisor session it held, and the
+/// gateway reports the sandbox as not ready until the supervisor reconnects
+/// to a surviving replica with its own backoff.
+const SYNC_RETRY_READY_WAIT: SessionReadyWait = SessionReadyWait {
+    timeout: Duration::from_secs(30),
+    interval: Duration::from_millis(250),
+};
 /// An SSH client that remained alive for this long was attached successfully,
 /// rather than failing during initial authentication or setup.
 const CONNECT_ESTABLISHED_DURATION: Duration = Duration::from_secs(2);
@@ -100,12 +110,20 @@ struct SshSessionConfig {
     replica: Option<AsciiMetadataValue>,
 }
 
+/// Bounded wait for `CreateSshSession` to stop rejecting the sandbox as not
+/// ready.
+#[derive(Clone, Copy, Debug)]
+struct SessionReadyWait {
+    timeout: Duration,
+    interval: Duration,
+}
+
 async fn ssh_session_config(
     server: &str,
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
-    terminal_relay_registration_timeout: Option<Duration>,
+    ready_wait: Option<SessionReadyWait>,
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -125,8 +143,8 @@ async fn ssh_session_config(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let relay_registration_deadline =
-        terminal_relay_registration_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let ready_deadline =
+        ready_wait.map(|wait| (tokio::time::Instant::now() + wait.timeout, wait.interval));
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
@@ -138,13 +156,12 @@ async fn ssh_session_config(
             .await
         {
             Ok(response) => break response,
-            Err(status)
-                if status.code() == Code::FailedPrecondition
-                    && relay_registration_deadline
-                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline) =>
-            {
-                tokio::time::sleep(TERMINAL_RELAY_REGISTRATION_INTERVAL).await;
-            }
+            Err(status) if status.code() == Code::FailedPrecondition => match ready_deadline {
+                Some((deadline, interval)) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(interval).await;
+                }
+                _ => return Err(status).into_diagnostic(),
+            },
             Err(status) => return Err(status).into_diagnostic(),
         }
     };
@@ -679,16 +696,9 @@ async fn sandbox_connect_with_mode(
     tls: &TlsOptions,
     replace_process: bool,
     workspace: &str,
-    terminal_relay_registration_timeout: Option<Duration>,
+    ready_wait: Option<SessionReadyWait>,
 ) -> Result<i32> {
-    let session = ssh_session_config(
-        server,
-        name,
-        tls,
-        workspace,
-        terminal_relay_registration_timeout,
-    )
-    .await?;
+    let session = ssh_session_config(server, name, tls, workspace, ready_wait).await?;
 
     run_main_attach(&session, replace_process).await
 }
@@ -724,7 +734,7 @@ pub(crate) async fn sandbox_connect_terminal_main(
         tls,
         false,
         workspace,
-        Some(TERMINAL_RELAY_REGISTRATION_TIMEOUT),
+        Some(TERMINAL_RELAY_REGISTRATION_WAIT),
     )
     .await
 }
@@ -1235,8 +1245,9 @@ async fn ssh_tar_upload(
     source: UploadSource,
     tls: &TlsOptions,
     workspace: &str,
+    ready_wait: Option<SessionReadyWait>,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace, None).await?;
+    let session = ssh_session_config(server, name, tls, workspace, ready_wait).await?;
 
     let dest_dir = dest_dir.unwrap_or(".");
     let escaped_dest = shell_escape(dest_dir);
@@ -1450,9 +1461,9 @@ pub async fn sandbox_sync_up_files(
         files: files.to_vec(),
         archive_prefix: file_list_archive_prefix(local_path),
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_sync("upload", |ready_wait| {
         let source = source.clone();
-        async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
+        async move { ssh_tar_upload(server, name, dest, source, tls, workspace, ready_wait).await }
     })
     .await
 }
@@ -1492,10 +1503,19 @@ pub async fn sandbox_sync_up(
                 local_path: local_path.to_path_buf(),
                 tar_name: target_name.into(),
             };
-            return retry_sandbox_sync("upload", || {
+            return retry_sandbox_sync("upload", |ready_wait| {
                 let source = source.clone();
                 async move {
-                    ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await
+                    ssh_tar_upload(
+                        server,
+                        name,
+                        Some(parent),
+                        source,
+                        tls,
+                        workspace,
+                        ready_wait,
+                    )
+                    .await
                 }
             })
             .await;
@@ -1519,9 +1539,20 @@ pub async fn sandbox_sync_up(
         local_path: local_path.to_path_buf(),
         tar_name,
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_sync("upload", |ready_wait| {
         let source = source.clone();
-        async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
+        async move {
+            ssh_tar_upload(
+                server,
+                name,
+                sandbox_path,
+                source,
+                tls,
+                workspace,
+                ready_wait,
+            )
+            .await
+        }
     })
     .await
 }
@@ -1662,8 +1693,8 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    retry_sandbox_sync("download", || async {
-        sandbox_sync_down_once(server, name, sandbox_path, dest, tls, workspace).await
+    retry_sandbox_sync("download", |ready_wait| async move {
+        sandbox_sync_down_once(server, name, sandbox_path, dest, tls, workspace, ready_wait).await
     })
     .await
 }
@@ -1675,8 +1706,9 @@ async fn sandbox_sync_down_once(
     dest: &str,
     tls: &TlsOptions,
     workspace: &str,
+    ready_wait: Option<SessionReadyWait>,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace, None).await?;
+    let session = ssh_session_config(server, name, tls, workspace, ready_wait).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
@@ -1688,14 +1720,22 @@ async fn sandbox_sync_down_once(
     }
 }
 
+/// Run a sync operation, retrying transient transport failures.
+///
+/// Retries tolerate a sandbox that is briefly not ready: the failure being
+/// retried may be a gateway replica restart that also dropped the supervisor
+/// session. The first attempt fails fast so a sandbox that is genuinely not
+/// ready is reported immediately.
 async fn retry_sandbox_sync<F, Fut>(operation: &str, mut run: F) -> Result<()>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(Option<SessionReadyWait>) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     let mut attempt = 1;
     loop {
-        match run().await {
+        // Box each attempt so callers that embed a sync operation, such as
+        // sandbox creation with an upload, keep a small future.
+        match Box::pin(run(sync_attempt_ready_wait(attempt))).await {
             Ok(()) => return Ok(()),
             Err(error) if attempt < SYNC_RETRY_ATTEMPTS && sync_error_is_retryable(&error) => {
                 tracing::warn!(
@@ -1711,6 +1751,10 @@ where
             Err(error) => return Err(error),
         }
     }
+}
+
+fn sync_attempt_ready_wait(attempt: usize) -> Option<SessionReadyWait> {
+    (attempt > 1).then_some(SYNC_RETRY_READY_WAIT)
 }
 
 fn sync_error_is_retryable(error: &Report) -> bool {
@@ -2330,6 +2374,16 @@ mod tests {
     fn sync_error_retry_filter_rejects_validation_failures() {
         let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
         assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn sync_retries_wait_for_sandbox_ready_but_first_attempt_fails_fast() {
+        assert!(sync_attempt_ready_wait(1).is_none());
+        for attempt in 2..=SYNC_RETRY_ATTEMPTS {
+            let wait = sync_attempt_ready_wait(attempt).expect("retry should wait for readiness");
+            assert_eq!(wait.timeout, SYNC_RETRY_READY_WAIT.timeout);
+            assert_eq!(wait.interval, SYNC_RETRY_READY_WAIT.interval);
+        }
     }
 
     #[test]
