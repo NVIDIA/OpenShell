@@ -3,6 +3,10 @@
 
 //! Endpoint-bound dynamic token grant injection for HTTP relay paths.
 
+#[cfg(test)]
+mod multiple_grants;
+
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -68,13 +72,18 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
     Arc::new(SpiffeTokenGrantResolver)
 }
 
-/// Checks for endpoint-bound token grant credentials and injects an
-/// Authorization header before forwarding the request upstream.
+/// Resolves one endpoint-bound grant per protected header before rewriting a request.
+///
+/// Each header independently uses its most-specific matching binding. Every selected
+/// grant must succeed; callers must not forward the request when this returns an error.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
-        dyn_creds.read().map_or(None, |creds_guard| {
-            creds_guard
+    let credentials = match ctx.dynamic_credentials.as_ref() {
+        Some(dynamic_credentials) => {
+            let credentials = dynamic_credentials
+                .read()
+                .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
+            let candidates = credentials
                 .iter()
                 .filter_map(|(key, cred)| {
                     let score =
@@ -83,83 +92,117 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                         .is_some()
                         .then(|| (score, key.clone(), cred.clone()))
                 })
-                .max_by_key(|(score, key, _)| (*score, key.clone()))
-                .map(|(_, key, cred)| (key, cred))
-        })
-    });
+                .collect();
+            select_token_grants(candidates)?
+        }
+        None => Vec::new(),
+    };
+    if credentials.is_empty() {
+        return Ok(req);
+    }
+    let resolver = ctx
+        .token_grant_resolver
+        .as_ref()
+        .ok_or_else(|| miette!("token grant resolver unavailable"))?;
 
-    if let Some((provider_key, cred)) = token_grant_credential
-        && let Some(ref token_grant) = cred.token_grant
-    {
-        let resolver = ctx
-            .token_grant_resolver
+    // Release the credential snapshot lock before acquisition. Keep all token values
+    // local until every selected grant and header has been validated, so a later
+    // failure cannot expose a partially authenticated request to a relay caller.
+    let mut headers = Vec::with_capacity(credentials.len());
+    for (provider_key, cred) in &credentials {
+        let token_grant = cred
+            .token_grant
             .as_ref()
-            .ok_or_else(|| miette!("token grant resolver unavailable"))?;
-        let request = token_grant_request(&provider_key, token_grant)?;
-
-        match resolver.obtain(request).await {
-            Ok(access_token) => {
-                let modified_raw_header =
-                    inject_token_grant_header(&req.raw_header, &cred, &access_token)?;
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Allowed)
-                        .disposition(DispositionId::Allowed)
-                        .severity(SeverityId::Informational)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant successful for {} to {}:{}",
-                            provider_key, ctx.host, ctx.port
-                        ))
-                        .build()
-                );
-                return Ok(L7Request {
-                    action: req.action,
-                    target: req.target,
-                    query_params: req.query_params,
-                    raw_header: modified_raw_header,
-                    body_length: req.body_length,
-                });
-            }
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    provider = %provider_key,
-                    error = %e,
-                    "Token grant failed: {e}"
-                );
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant failed for {} to {}:{}: {}",
-                            provider_key, ctx.host, ctx.port, e
-                        ))
-                        .build()
-                );
-                return Err(miette!("Token grant failed: {}", e));
-            }
+            .ok_or_else(|| miette!("selected credential has no token grant"))?;
+        let request = token_grant_request(provider_key, token_grant)?;
+        if let Ok(access_token) = resolver.obtain(request).await {
+            crate::token_grant::validate_access_token(&access_token)?;
+            headers.push(token_grant_header(cred, &access_token)?);
+        } else {
+            // An issuer may echo credentials in its error description. Only the
+            // binding identity is safe to include in diagnostics or relay errors.
+            let provider_key = ocsf_message_field(provider_key);
+            warn!(
+                host = %ctx.host,
+                port = ctx.port,
+                provider = %provider_key,
+                "Token grant failed"
+            );
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Token grant failed for {} to {}:{}",
+                        provider_key, ctx.host, ctx.port
+                    ))
+                    .build()
+            );
+            return Err(miette!("Token grant failed"));
         }
     }
 
-    Ok(req)
+    let mut raw_header = req.raw_header;
+    for (name, value) in headers {
+        raw_header = inject_header(&raw_header, &name, &value)?;
+    }
+    for (provider_key, _) in credentials {
+        ocsf_emit!(
+            HttpActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .http_request(HttpRequest::new(
+                    &req.action,
+                    OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .message(format!(
+                    "Token grant successful for {} to {}:{}",
+                    ocsf_message_field(&provider_key),
+                    ctx.host,
+                    ctx.port
+                ))
+                .build()
+        );
+    }
+    Ok(L7Request { raw_header, ..req })
+}
+
+fn select_token_grants(
+    mut candidates: Vec<(u32, String, ProviderProfileCredential)>,
+) -> Result<Vec<(String, ProviderProfileCredential)>> {
+    // Examine the strongest bindings first. The complete binding key stays with
+    // its grant because the resolver uses it to separate cache entries and revisions.
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut selected = BTreeMap::<String, (u32, String, ProviderProfileCredential)>::new();
+    for (score, key, credential) in candidates {
+        let header = token_grant_header_name(&credential)?.to_ascii_lowercase();
+        if let Some((selected_score, selected_key, _)) = selected.get(&header) {
+            // Equal-specificity selectors of the same credential can overlap. A
+            // different credential cannot win a tie for the same protected header.
+            if score == *selected_score
+                && key.rsplit('\t').next() != selected_key.rsplit('\t').next()
+            {
+                return Err(miette!("ambiguous dynamic token grants for one header"));
+            }
+            continue;
+        }
+        selected.insert(header, (score, key, credential));
+    }
+    Ok(selected
+        .into_values()
+        .map(|(_, key, cred)| (key, cred))
+        .collect())
 }
 
 fn ocsf_message_field(value: &str) -> String {
@@ -246,6 +289,7 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
 fn inject_token_grant_header(
     raw_header: &[u8],
     credential: &ProviderProfileCredential,
@@ -260,6 +304,16 @@ fn token_grant_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<(String, String)> {
+    let header_name = token_grant_header_name(credential)?;
+    let header_value = if credential.auth_style.trim().eq_ignore_ascii_case("header") {
+        access_token.to_string()
+    } else {
+        format!("Bearer {access_token}")
+    };
+    Ok((header_name.to_string(), header_value))
+}
+
+fn token_grant_header_name(credential: &ProviderProfileCredential) -> Result<&str> {
     match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" => {
             let header_name = if credential.header_name.trim().is_empty() {
@@ -268,7 +322,7 @@ fn token_grant_header(
                 credential.header_name.trim()
             };
             validate_header_name(header_name)?;
-            Ok((header_name.to_string(), format!("Bearer {access_token}")))
+            Ok(header_name)
         }
         "header" => {
             let header_name = credential.header_name.trim();
@@ -278,7 +332,7 @@ fn token_grant_header(
                 ));
             }
             validate_header_name(header_name)?;
-            Ok((header_name.to_string(), access_token.to_string()))
+            Ok(header_name)
         }
         other => Err(miette!(
             "token grant auth_style '{other}' is not supported; use bearer or header"
@@ -371,7 +425,7 @@ pub mod test_support {
 
     struct FakeTokenGrantResolver {
         requests: Arc<Mutex<Vec<OwnedTokenGrantRequest>>>,
-        response: std::result::Result<String, String>,
+        responses: Arc<Mutex<HashMap<String, std::result::Result<String, String>>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +445,7 @@ pub mod test_support {
         dynamic_credentials: Arc<std::sync::RwLock<HashMap<String, ProviderProfileCredential>>>,
         resolver: Arc<dyn TokenGrantResolver>,
         requests: Arc<Mutex<Vec<OwnedTokenGrantRequest>>>,
+        responses: Arc<Mutex<HashMap<String, std::result::Result<String, String>>>>,
     }
 
     impl TokenGrantTestFixture {
@@ -420,9 +475,13 @@ pub mod test_support {
             token_grant: ProviderCredentialTokenGrant,
         ) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(Mutex::new(HashMap::from([(
+                key.to_string(),
+                response.map(str::to_string).map_err(str::to_string),
+            )])));
             let resolver = Arc::new(FakeTokenGrantResolver {
                 requests: requests.clone(),
-                response: response.map(str::to_string).map_err(str::to_string),
+                responses: responses.clone(),
             });
 
             let mut dynamic_credentials = HashMap::new();
@@ -441,7 +500,63 @@ pub mod test_support {
                 dynamic_credentials: Arc::new(std::sync::RwLock::new(dynamic_credentials)),
                 resolver,
                 requests,
+                responses,
             }
+        }
+
+        pub fn add_credential(
+            &self,
+            key: &str,
+            credential: ProviderProfileCredential,
+            response: std::result::Result<&str, &str>,
+        ) {
+            self.dynamic_credentials
+                .write()
+                .unwrap()
+                .insert(key.to_string(), credential);
+            self.responses.lock().unwrap().insert(
+                key.to_string(),
+                response.map(str::to_string).map_err(str::to_string),
+            );
+        }
+
+        pub fn assert_requested_keys(&self, expected: &[&str]) {
+            let requests = self.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|r| r.provider_key.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        pub fn assert_request_configuration(
+            &self,
+            key: &str,
+            grant: &ProviderCredentialTokenGrant,
+        ) {
+            let requests = self.requests.lock().unwrap();
+            let request = requests
+                .iter()
+                .find(|r| r.provider_key == key)
+                .expect("grant was requested");
+            assert_eq!(request.token_endpoint, grant.token_endpoint);
+            assert_eq!(request.jwt_svid_audience, grant.jwt_svid_audience);
+            assert_eq!(request.client_assertion_type, grant.client_assertion_type);
+            assert_eq!(request.audience, grant.audience);
+            assert_eq!(request.scopes, grant.scopes);
+            assert_eq!(
+                request.cache_ttl,
+                grant
+                    .cache_ttl
+                    .as_ref()
+                    .map(openshell_core::time::duration_to_std)
+                    .transpose()
+                    .unwrap()
+            );
+            assert_eq!(request.grant_type, grant.grant_type);
+            assert_eq!(request.requested_token_type, grant.requested_token_type);
         }
 
         pub fn dynamic_credentials(
@@ -571,7 +686,16 @@ pub mod test_support {
                     .lock()
                     .expect("fake token grant requests lock poisoned")
                     .push(owned);
-                self.response.clone().map_err(|err| miette!("{err}"))
+                // Keep acquisition pending once so joined request tests exercise
+                // overlapping grants instead of completing each branch in one poll.
+                tokio::task::yield_now().await;
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .get(request.provider_key)
+                    .expect("fake grant response configured")
+                    .clone()
+                    .map_err(|err| miette!("{err}"))
             })
         }
     }

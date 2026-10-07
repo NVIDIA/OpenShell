@@ -811,6 +811,29 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 ## SSH Config
 
+Each sandbox has its own SSH host key. The key stays the same when the
+supervisor or container restarts, a pod is rescheduled, or the sandbox is
+stopped and started. Deleting the sandbox removes its key. Creating another
+sandbox with the same name creates a different key.
+
+The gateway returns the public fingerprint in `Sandbox.host_key_fingerprint`
+from sandbox creation, lookup, and listing, and in
+`CreateSshSessionResponse.host_key_fingerprint`. The value uses OpenSSH's
+`SHA256:<base64>` format. Read it over an authenticated gateway connection,
+pin it to the sandbox ID, and reject SSH connections that present a different
+fingerprint. This also applies to clients that connect directly to the
+supervisor's SSH socket.
+
+The gateway keeps the private key in its credential store and delivers it
+only to the supervisor. The sandbox workload cannot read the key. Drivers,
+gateway, and supervisor must use the matching OpenShell release. Older
+runtimes can return an empty fingerprint; an empty value cannot verify an
+SSH server's identity.
+
+The CLI and TUI continue to use their existing SSH connection settings.
+Exposing the fingerprint does not enable automatic host-key verification in
+those clients.
+
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
 ```shell
@@ -871,12 +894,13 @@ repository stops the upload. Pass `--no-git-ignore` to intentionally upload
 without filtering. These rules apply to both `sandbox upload` and
 `sandbox create --upload`.
 
-`sandbox create --upload` provisions the sandbox before checking Git filtering.
-If filtering rejects an upload, the command exits with an error, but the sandbox
-remains running. Earlier uploads in the same command may already have completed.
-Use `openshell sandbox upload` to retry against the existing sandbox, or
-`openshell sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
-if you intend to upload without filtering.
+`sandbox create --upload` checks every upload locally before it provisions the
+sandbox. If any upload is rejected, including a missing path or a Git filtering
+failure, the command exits with an error and creates no sandbox. If a transfer
+fails after provisioning, the sandbox remains running and earlier uploads may
+have completed. Use `openshell sandbox upload` to retry against the existing
+sandbox, or `openshell sandbox delete` to remove it. Add `--no-git-ignore` to the
+retry only if you intend to upload without filtering.
 
 Uploads preserve symlinks, including dangling links, instead of dereferencing
 their targets. A symlink source bypasses Git filtering so the link itself is
@@ -941,30 +965,24 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
-The gateway enforces a 300-second provisioning repair window, independently of
-the CLI wait timeout. An effective policy, settings, provider, profile, or
-attachment change resets the window from its stored change time. The first
-failed configuration load for that change grants another full window. Repeated
-failures and reconnects do not extend it; reaching `Ready` clears it.
+Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
-When the window expires, the sandbox enters `Error` with reason
-`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
-retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
-remain pending if the backend is unavailable; the gateway retries it. Inspect
-`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
-TUI NOTES distinguishes pending cleanup from reclaimed compute.
+The first authenticated configuration report from the current supervisor ends preparation and starts a separate 300-second admission repair window. A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 
-Repair the configuration, wait for cleanup to complete, then explicitly restart:
+Preparation expiry sets the sandbox to `Error` with reason `ImagePreparationTimedOut`; admission repair expiry uses `ProvisioningTimedOut`. The gateway stops its workload and supervisor compute, retaining the sandbox record, diagnostic, and restartable storage. Cleanup can remain pending if the backend is unavailable; the gateway retries it. Inspect `provisioning` in JSON output for the active `phase`, `deadline`, original `preparation_deadline`, `admission_start_time`, and cleanup timestamps. TUI NOTES identifies preparation timeout and distinguishes pending cleanup from reclaimed compute.
+
+The gateway keeps each submitted create or start operation running after its caller disconnects, its deadline expires, or monitoring fails. This includes recovery and the stop/start sequence for automatic restart. While `driver_operation_pending` is true, explicit start, stop, and deletion are blocked; automatic restart keeps its schedule and waits. Timeout cleanup can try to stop partial compute, but it cannot declare completion until the original driver call returns and a subsequent stop succeeds. This prevents a stop that observed missing compute from allowing a retry just before the original create finishes. Uploaded rootfs archives remain available to the owned operation.
+
+An actual driver response clears the pending flag, including ordinary rejection errors. The gateway retains `driver_operation_id` so a delayed response handler cannot change newer recovery work on the same provisioning attempt. Both fields appear in the `provisioning` JSON object. Backend behavior after a transport error still follows the driver's existing contract. If the owning gateway crashes before recording the response, the flag and any protected upload can remain indefinitely; restart and age alone cannot establish that the operation finished. There is currently no API to resolve that lost ownership, so automatic cleanup completion, retry, and deletion remain blocked for that record.
+
+For `ImagePreparationTimedOut`, inspect image preparation and supervisor startup diagnostics and check whether the configured preparation budget is sufficient. For `ProvisioningTimedOut`, repair the rejected configuration. In either case, wait for cleanup to complete, then explicitly restart:
 
 ```shell
 openshell sandbox get my-sandbox --output json
 openshell sandbox start my-sandbox
 ```
 
-Editing configuration after expiry does not restart compute. A retry gets a new
-300-second window, while static-policy restrictions from any previous activation
-remain in force. Timed-out records are retained even for ephemeral creates; use
-`sandbox delete` when you no longer need the diagnostic or stored state.
+Editing configuration after expiry does not restart compute. An explicit retry gets a new preparation deadline and a separate admission repair window, while static-policy restrictions from any previous activation remain in force. Attempts already active when the gateway is upgraded retain their stored deadline. Timed-out records are retained even for ephemeral creates; use `sandbox delete` when you no longer need the diagnostic or stored state.
 
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

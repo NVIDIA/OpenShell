@@ -206,6 +206,22 @@ This situation can occur if you set `pkiInitJob.failOnTimeout=false` and cert-ma
 
 For OpenShift 4.22+, see [OpenShift](/kubernetes/openshift#end-to-end-tls-using-gateway-api-and-backendtlspolicy-openshift-422) for platform-specific instructions including Gateway and GatewayClass setup.
 
+## Replica Routing
+
+With more than one gateway replica, a sandbox's SSH, port-forward, and exec connections can land on a replica that does not hold the sandbox's supervisor session, and that replica relays them to the one that does. Enable replica routing to send those connections straight to the owning replica:
+
+```shell
+helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
+  --reuse-values --namespace <namespace> \
+  --set workload.kind=statefulset \
+  --set workload.allowMultiReplicaStatefulSet=true \
+  --set grpcRoute.replicaRouting.enabled=true
+```
+
+The chart renders one Service per replica and a GRPCRoute rule that matches the `x-openshell-replica` request header. The CLI sets that header from the owner the gateway reports and retries without it if the named replica is unavailable. Replica routing requires `workload.kind=statefulset`, `workload.allowMultiReplicaStatefulSet=true`, and at most 15 replicas.
+
+If the release uses `workload.kind=deployment`, this upgrade replaces the Deployment with a StatefulSet, so every gateway pod restarts at once. The StatefulSet also requests a 1Gi PersistentVolumeClaim per replica, which stays `Pending` on clusters without a default StorageClass.
+
 ## SSH Relay
 
 Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm SSH host or port values are required.

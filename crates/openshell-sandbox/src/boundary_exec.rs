@@ -168,7 +168,7 @@ impl LocalBoundaryExec {
             command.env("SHELL", shell);
         }
         for (key, value) in &self.user_environment {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }
@@ -184,7 +184,7 @@ impl LocalBoundaryExec {
         }
         crate::process::strip_proxy_env_std(&mut command);
         for (key, value) in &spec.env {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }

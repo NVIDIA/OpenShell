@@ -37,7 +37,9 @@ pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provi
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{
+    TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -71,6 +73,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -542,6 +545,12 @@ pub async fn sandbox_create(
         return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
 
+    // Plan every upload before provisioning so a rejected one leaves no sandbox.
+    let upload_plans = uploads
+        .iter()
+        .map(|(local_path, _, git_ignore)| sandbox_upload_plan(Path::new(local_path), *git_ignore))
+        .collect::<Result<Vec<_>>>()?;
+
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
     if let Some(ref spec) = forward {
@@ -800,11 +809,8 @@ pub async fn sandbox_create(
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
 
-    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
-    // briefly report a stale Ready status before the controller reconciles
-    // a newly created sandbox.  Instead we handle termination client-side:
-    // we wait until we have observed at least one non-Ready phase followed
-    // by Ready (a genuine Provisioning → Ready transition).
+    // Handle terminal states here so a provisional container exit can wait
+    // for the supervisor's canonical-process result before cleanup.
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
@@ -832,8 +838,6 @@ pub async fn sandbox_create(
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
-    // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -911,10 +915,6 @@ pub async fn sandbox_create(
                     last_condition_message = Some(message);
                 }
 
-                if phase != SandboxPhase::Ready {
-                    saw_non_ready = true;
-                }
-
                 let main_process_result = has_main_process_result(&s);
                 if matches!(
                     phase,
@@ -949,9 +949,10 @@ pub async fn sandbox_create(
                     break;
                 }
 
-                // Only accept Ready as terminal after we've observed a
-                // non-Ready phase, proving the controller has reconciled.
-                if saw_non_ready && phase == SandboxPhase::Ready {
+                // The gateway owns readiness. Its initial watch snapshot may
+                // already be Ready if provisioning finished before CREATE
+                // returned; requiring an earlier phase would miss that state.
+                if phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
@@ -1041,7 +1042,9 @@ pub async fn sandbox_create(
             drop(client);
 
             let upload_count = uploads.len();
-            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
+            for (idx, ((local_path, sandbox_path, _), upload_plan)) in
+                uploads.iter().zip(upload_plans).enumerate()
+            {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
                 if upload_count > 1 {
@@ -1057,38 +1060,21 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                let local = Path::new(local_path);
-                let upload_plan = sandbox_upload_plan(local, *git_ignore).wrap_err_with(|| {
+                sandbox_upload_planned(
+                    upload_plan,
+                    &effective_server,
+                    &sandbox_name,
+                    Path::new(local_path),
+                    dest,
+                    &effective_tls,
+                    workspace,
+                )
+                .await
+                .wrap_err_with(|| {
                     format!(
                         "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
                     )
                 })?;
-                match upload_plan {
-                    SandboxUploadPlan::GitAware { base_dir, files } => {
-                        sandbox_sync_up_files(
-                            &effective_server,
-                            &sandbox_name,
-                            &base_dir,
-                            &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::Regular => {
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                }
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
@@ -1218,25 +1204,31 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let provisioning_timed_out = last_sandbox
+            let timed_out_provisioning = last_sandbox
                 .status
                 .as_ref()
                 .and_then(|status| status.provisioning.as_ref())
-                .is_some_and(|record| record.timeout_time.is_some());
-            let create_result = if provisioning_timed_out {
-                Err(miette::miette!(
-                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
-                ))
-            } else if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
+                .filter(|record| record.timeout_time.is_some());
+            let create_result = timed_out_provisioning.map_or_else(
+                || {
+                    if last_error_reason.is_empty() {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning"
+                        ))
+                    } else {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning: {}",
+                            last_error_reason
+                        ))
+                    }
+                },
+                |record| {
+                    Err(miette::miette!(
+                        "{}",
+                        retained_sandbox_timeout_message(&sandbox_name, &last_error_reason, record)
+                    ))
+                },
+            );
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1257,6 +1249,24 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+/// Use the persisted phase to select recovery guidance. Preparation may expire
+/// before any policy is evaluated, so it must not tell the user to repair policy.
+fn retained_sandbox_timeout_message(
+    sandbox_name: &str,
+    error_reason: &str,
+    record: &openshell_core::proto::SandboxProvisioning,
+) -> String {
+    let recovery = if record.preparation_deadline.is_some() && record.admission_start_time.is_none()
+    {
+        "check image preparation and supervisor startup diagnostics and the gateway's `image_preparation_timeout_seconds` budget"
+    } else {
+        "repair its configuration"
+    };
+    format!(
+        "{error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; {recovery}, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+    )
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -1868,7 +1878,7 @@ enum PipedStdin {
 /// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
 /// read error, or when the receiver is dropped.
 fn spawn_piped_stdin_reader(
-    mut reader: impl Read + Send + 'static,
+    mut reader: impl PipedInput,
 ) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
     std::thread::spawn(move || {
@@ -1877,6 +1887,16 @@ fn spawn_piped_stdin_reader(
             match reader.read(&mut buf) {
                 Ok(0) => return,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                // Processes that inherit the same stdin share its open file
+                // description, so another process may have made it
+                // nonblocking. Wait for input instead of failing.
+                #[cfg(unix)]
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Err(error) = wait_until_readable(&reader) {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
+                }
                 Err(error) => {
                     let _ = tx.blocking_send(Err(error));
                     return;
@@ -1890,6 +1910,30 @@ fn spawn_piped_stdin_reader(
         }
     });
     rx
+}
+
+/// Input the piped-stdin reader accepts. On Unix it must expose a descriptor
+/// so a nonblocking stream can be waited on.
+#[cfg(unix)]
+trait PipedInput: Read + std::os::fd::AsFd + Send + 'static {}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd + Send + 'static> PipedInput for T {}
+#[cfg(not(unix))]
+trait PipedInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> PipedInput for T {}
+
+/// Block until `reader` has input or reaches end of file.
+#[cfg(unix)]
+fn wait_until_readable(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(nix::errno::Errno::EINTR) => {}
+            result => return result.map(drop).map_err(std::io::Error::from),
+        }
+    }
 }
 
 /// Collect piped stdin until EOF or until `grace` elapses, whichever comes
@@ -1940,15 +1984,17 @@ pub async fn sandbox_exec_grpc(
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
+    let response = client
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
-        .into_diagnostic()?
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -2036,16 +2082,26 @@ pub async fn sandbox_exec_grpc(
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
             stdin_rest,
+            replica.as_ref(),
         )
         .await;
     }
 
     // Make the streaming gRPC call.
-    let mut stream = client
-        .exec_sandbox(request)
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    let retry = replica.is_some().then(|| request.clone());
+    let mut stream = match (
+        client
+            .exec_sandbox(routed_to(request, replica.as_ref()))
+            .await,
+        retry,
+    ) {
+        (Err(status), Some(request)) if retry_unrouted(replica.as_ref(), &status) => {
+            client.exec_sandbox(request).await
+        }
+        (response, _) => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
@@ -2098,7 +2154,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2120,6 +2176,9 @@ pub async fn service_forward_tcp(
     let sandbox_name = name.to_string();
     let sandbox_workspace = workspace.to_string();
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    // Set once this forward learns that the gateway predates principal-authorized
+    // TCP forwards and still requires a `CreateSshSession` token per connection.
+    let legacy_session_tokens = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut health_check = tokio::time::interval(Duration::from_secs(2));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -2129,7 +2188,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2143,21 +2202,9 @@ pub async fn service_forward_tcp(
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
+                let legacy_session_tokens = legacy_session_tokens.clone();
+                let replica = replica.clone();
                 tokio::spawn(async move {
-                    let token = match create_forward_session_token(
-                        &mut client,
-                        &sandbox_name,
-                        &sandbox_workspace,
-                    ).await {
-                        Ok(token) => token,
-                        Err(err) => {
-                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
-                            if err.fatal {
-                                let _ = fatal_tx.send(err.message).await;
-                            }
-                            return;
-                        }
-                    };
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
                         socket,
@@ -2166,7 +2213,8 @@ pub async fn service_forward_tcp(
                         target_host,
                         target_port,
                         service_id,
-                        token.clone(),
+                        legacy_session_tokens,
+                        replica.as_ref(),
                     )
                     .await
                     {
@@ -2175,9 +2223,6 @@ pub async fn service_forward_tcp(
                             let _ = fatal_tx.send(err.message).await;
                         }
                     }
-                    let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { allow_missing: true, token })
-                        .await;
                 });
             }
         }
@@ -2201,18 +2246,27 @@ async fn create_forward_session_token(
     Ok(response.into_inner().token)
 }
 
+/// Older gateways reject a token-less `ForwardTcp` init with this
+/// `Unauthenticated` status; newer ones authorize TCP targets on the caller's
+/// principal and only demand a token for SSH targets.
+fn forward_requires_session_token(status: &Status) -> bool {
+    status.code() == Code::Unauthenticated
+        && status.message().contains("authorization_token is required")
+}
+
+/// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Sandbox> {
+) -> Result<Option<AsciiMetadataValue>> {
     let response = match client
-        .get_sandbox(GetSandboxRequest {
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
     {
         Ok(response) => response,
@@ -2224,6 +2278,7 @@ async fn fetch_ready_sandbox_for_forward(
         Err(status) => return Err(status).into_diagnostic(),
     };
 
+    let replica = owner_replica(&response);
     let sandbox = response
         .into_inner()
         .sandbox
@@ -2237,7 +2292,7 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(sandbox)
+    Ok(replica)
 }
 
 #[derive(Debug)]
@@ -2302,37 +2357,113 @@ async fn forward_one_tcp_connection(
     target_host: String,
     target_port: u16,
     service_id: String,
-    authorization_token: String,
+    legacy_session_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio_stream::wrappers::ReceiverStream;
+    let mut init = TcpForwardInit {
+        sandbox: sandbox_name.clone(),
+        workspace: workspace.clone(),
+        service_id,
+        target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: target_host,
+            port: u32::from(target_port),
+        })),
+        // The gateway authorizes TCP forwards on this client's credentials for
+        // every stream, so no per-connection session token is minted unless the
+        // gateway turns out to predate that (`forward_requires_session_token`),
+        // which this forward remembers in `legacy_session_tokens`.
+        authorization_token: String::new(),
+    };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
-        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
-            TcpForwardInit {
-                sandbox: sandbox_name,
-                workspace: workspace.clone(),
-                service_id,
-                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
-                    host: target_host,
-                    port: u32::from(target_port),
-                })),
-                authorization_token,
-            },
-        )),
-    })
-    .await
-    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+    let mut session_token = None;
+    if legacy_session_tokens.load(std::sync::atomic::Ordering::Relaxed) {
+        match create_forward_session_token(client, &sandbox_name, &workspace).await {
+            Ok(token) => {
+                init.authorization_token.clone_from(&token);
+                session_token = Some(token);
+            }
+            Err(err) => {
+                drain_and_shutdown_local_socket(socket).await;
+                return Err(err);
+            }
+        }
+    }
 
-    let response = match client.forward_tcp(ReceiverStream::new(rx)).await {
-        Ok(response) => response.into_inner(),
+    let opened = match open_forward_tcp_stream(client, init.clone(), replica).await {
+        Ok(opened) => opened,
+        Err(status) if session_token.is_none() && forward_requires_session_token(&status) => {
+            tracing::info!(
+                "gateway requires an SSH session token per forwarded connection; \
+                 minting one per connection for the rest of this forward"
+            );
+            legacy_session_tokens.store(true, std::sync::atomic::Ordering::Relaxed);
+            let token = match create_forward_session_token(client, &sandbox_name, &workspace).await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    return Err(err);
+                }
+            };
+            init.authorization_token.clone_from(&token);
+            session_token = Some(token);
+            match open_forward_tcp_stream(client, init, replica).await {
+                Ok(opened) => opened,
+                Err(status) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    revoke_forward_session_token(client, session_token).await;
+                    return Err(ForwardTcpConnectionError::from_status(status));
+                }
+            }
+        }
         Err(status) => {
-            let err = ForwardTcpConnectionError::from_status(status);
             drain_and_shutdown_local_socket(socket).await;
-            return Err(err);
+            revoke_forward_session_token(client, session_token).await;
+            return Err(ForwardTcpConnectionError::from_status(status));
         }
     };
 
+    let result = bridge_local_socket_to_forward_stream(socket, opened).await;
+    revoke_forward_session_token(client, session_token).await;
+    result
+}
+
+/// An open `ForwardTcp` stream: the sender for local-to-gateway frames and the
+/// gateway-to-local response stream.
+type OpenForwardTcpStream = (
+    tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    tonic::Streaming<TcpForwardFrame>,
+);
+
+async fn open_forward_tcp_stream(
+    client: &mut crate::tls::GrpcClient,
+    init: TcpForwardInit,
+    replica: Option<&AsciiMetadataValue>,
+) -> std::result::Result<OpenForwardTcpStream, Status> {
+    let init = TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            init,
+        )),
+    };
+    let (tx, response) = crate::ssh::open_forward_tcp(client, init, replica).await;
+    Ok((tx, response?.into_inner()))
+}
+
+async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
+    if let Some(token) = token {
+        let _ = client
+            .revoke_ssh_session(RevokeSshSessionRequest {
+                allow_missing: true,
+                token,
+            })
+            .await;
+    }
+}
+
+async fn bridge_local_socket_to_forward_stream(
+    socket: tokio::net::TcpStream,
+    (tx, response): OpenForwardTcpStream,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
     let (local_read, local_write) = socket.into_split();
     relay_local_socket(local_read, local_write, tx, response).await
 }
@@ -2443,6 +2574,7 @@ async fn sandbox_exec_streaming_grpc(
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -2455,36 +2587,44 @@ async fn sandbox_exec_streaming_grpc(
         (0, 0)
     };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    // The start message carries the exec metadata.
+    let start = ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+            request_id: String::new(),
+            sandbox: sandbox.object_name().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (sandbox.object_workspace()).to_string(),
+            )),
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: environment.clone(),
+            no_login_shell,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
+            stdin: Vec::new(),
+            tty,
+            cols,
+            rows,
+        })),
+    };
 
-    // Send the start message with exec metadata.
-    input_tx
-        .send(ExecSandboxInput {
-            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                request_id: String::new(),
-                sandbox: sandbox.object_name().to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    (sandbox.object_workspace()).to_string(),
-                )),
-                command: command.to_vec(),
-                workdir: workdir.unwrap_or_default().to_string(),
-                environment: environment.clone(),
-                no_login_shell,
-                execution_timeout: proto_execution_timeout(timeout_seconds)?,
-                stdin: Vec::new(),
-                tty,
-                cols,
-                rows,
-            })),
-        })
+    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    input_tx.send(start.clone()).await.into_diagnostic()?;
+    let mut stream = match client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
         .await
-        .into_diagnostic()?;
-
-    let mut stream = client
-        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+            tx.send(start).await.into_diagnostic()?;
+            input_tx = tx;
+            client
+                .exec_sandbox_interactive(ReceiverStream::new(rx))
+                .await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
     let raw_guard = if tty && stdin_is_terminal {
@@ -2924,16 +3064,28 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "configuration_change_id": record.configuration_change_id,
             "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
             "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
             "deadline": record.deadline.as_ref().map(ToString::to_string),
             "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
             "cleanup_error": record.cleanup_error,
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "workspace": sandbox.object_workspace(),
+        "host_key_fingerprint": sandbox.host_key_fingerprint,
         "labels": labels,
         "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
@@ -4963,6 +5115,35 @@ fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
     Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
+async fn sandbox_upload_planned(
+    plan: SandboxUploadPlan,
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    match plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+                workspace,
+            )
+            .await
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await
+        }
+    }
+}
+
 /// Upload a local path to a sandbox.
 ///
 /// Symlink sources, including dangling links, bypass Git-aware filtering so
@@ -4984,24 +5165,16 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    match upload_plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-    }
+    sandbox_upload_planned(
+        upload_plan,
+        server,
+        name,
+        local_path,
+        sandbox_path,
+        tls,
+        workspace,
+    )
+    .await?;
 
     eprintln!("{} Upload complete", "✓".green().bold());
     Ok(())
@@ -6727,13 +6900,14 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        format_endpoint, format_log_line, git_sync_files, has_main_process_result,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
-        relay_local_socket, resolve_from, rootfs_tar_sources_supported_for_gateway,
-        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
-        service_status_error, service_url_for_gateway, workspace_member_to_json,
+        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
+        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
+        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
+        ready_false_condition_message, relay_local_socket, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -8194,6 +8368,101 @@ mod tests {
     }
 
     #[test]
+    fn retained_sandbox_timeout_message_matches_expired_phase() {
+        let mut record = openshell_core::proto::SandboxProvisioning {
+            preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            ..Default::default()
+        };
+        let message = super::retained_sandbox_timeout_message(
+            "cold-image",
+            "ImagePreparationTimedOut: preparation expired",
+            &record,
+        );
+        assert!(message.starts_with("ImagePreparationTimedOut: preparation expired\n"));
+        assert!(message.contains("Sandbox 'cold-image' was retained"));
+        assert!(message.contains("image preparation and supervisor startup diagnostics"));
+        assert!(message.contains("image_preparation_timeout_seconds"));
+        assert!(!message.contains("repair its configuration"));
+        assert!(message.contains("openshell sandbox get cold-image"));
+        assert!(message.contains("openshell sandbox start cold-image` after cleanup completes"));
+
+        // An admission timeout retains preparation timestamps. Its completed
+        // transition must select configuration repair rather than a larger budget.
+        record.admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        let admission_without_preparation = openshell_core::proto::SandboxProvisioning {
+            timeout_time: record.timeout_time,
+            ..Default::default()
+        };
+        for admission_record in [&record, &admission_without_preparation] {
+            let message = super::retained_sandbox_timeout_message(
+                "invalid-policy",
+                "ProvisioningTimedOut: repair window expired",
+                admission_record,
+            );
+            assert!(message.contains("repair its configuration"));
+            assert!(!message.contains("image_preparation_timeout_seconds"));
+            assert!(
+                message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
+        assert_eq!(
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
+        );
+    }
+
+    #[test]
     fn sandbox_json_exposes_repair_diagnostic_and_accepted_generation() {
         use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
 
@@ -8751,6 +9020,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn piped_stdin_left_nonblocking_by_another_process_still_streams() {
+        // Processes that inherit the same stdin share one open file
+        // description, so any of them can make it nonblocking for all. A
+        // read with no input yet then fails with EAGAIN instead of waiting.
+        use std::os::fd::AsRawFd as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        nix::fcntl::fcntl(
+            reader.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("make the shared pipe nonblocking");
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_millis(100),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert!(prefix.is_empty());
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
     #[test]
     fn piped_stdin_over_the_limit_is_rejected_with_the_upload_hint() {
         let (reader, mut writer) = std::io::pipe().expect("pipe");
@@ -8765,5 +9070,18 @@ mod tests {
             .err()
             .expect("over the limit must fail");
         assert!(error.to_string().contains("sandbox upload"), "{error}");
+    }
+
+    #[test]
+    fn forward_requires_session_token_matches_only_the_legacy_gateway_error() {
+        assert!(forward_requires_session_token(&Status::unauthenticated(
+            "authorization_token is required for ForwardTcp"
+        )));
+        assert!(!forward_requires_session_token(&Status::unauthenticated(
+            "SSH session token not found"
+        )));
+        assert!(!forward_requires_session_token(&Status::permission_denied(
+            "authorization_token is required for ForwardTcp"
+        )));
     }
 }

@@ -35,7 +35,6 @@ async fn failed_store_calls_are_marked_on_the_span() {
 /// the span must stay clean — otherwise every lease a replica does not win, and
 /// every gateway restart, exports as a failure.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn expected_conflicts_leave_the_span_unmarked() {
     use crate::otel_tracing::test_exporter;
 
@@ -66,6 +65,7 @@ async fn expected_conflicts_leave_the_span_unmarked() {
         .await
         .expect_err("the name is already taken");
 
+    traced.wait_for_span("store.put_if").await;
     let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
 
     assert_eq!(
@@ -79,7 +79,6 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 /// Span names stay low-cardinality so they group across object types; what
 /// each call touched is carried as attributes.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_spans_record_what_they_touched_as_attributes() {
     use crate::otel_tracing::test_exporter;
 
@@ -97,6 +96,13 @@ async fn store_spans_record_what_they_touched_as_attributes() {
         .unwrap();
     store.list("sandbox", "default", 10, 0).await.unwrap();
 
+    traced
+        .wait_for_spans(|spans| {
+            ["store.get", "store.get_by_name", "store.list"]
+                .iter()
+                .all(|name| spans.iter().any(|span| &span.name == name))
+        })
+        .await;
     let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
     assert_eq!(
         test_exporter::attribute(&by_name, "object_type").as_deref(),
@@ -2807,7 +2813,6 @@ async fn membership_selector_escapes_adversarial_label_key() {
 /// so a trace decomposes an RPC into the storage work it did rather than
 /// bottoming out at the request boundary.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_operations_export_spans_with_parents() {
     use tracing::Instrument as _;
 
@@ -2827,7 +2832,7 @@ async fn store_operations_export_spans_with_parents() {
     .await;
     drop(request_span);
 
-    let root = traced.span_named("request");
+    let root = traced.wait_for_span("request").await;
     let spans = traced.finished_spans();
     let child = spans
         .iter()

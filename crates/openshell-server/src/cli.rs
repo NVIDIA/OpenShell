@@ -368,7 +368,15 @@ fn prepare_server_config_with_drivers(
         args.disable_tls,
     )
     .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
-    let local_jwt = defaults::complete_local_jwt_config()?;
+    // Explicit signing configuration must not depend on an unrelated, partial
+    // local bundle left by a package-managed installation.
+    let explicit_jwt = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.gateway_jwt.clone());
+    let gateway_jwt = match explicit_jwt {
+        Some(jwt) => Some(jwt),
+        None => defaults::complete_local_jwt_config()?,
+    };
 
     let bind = SocketAddr::new(args.bind_address, args.port);
 
@@ -556,6 +564,18 @@ fn prepare_server_config_with_drivers(
         config.policy_validation_failure_mode = mode;
     }
 
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.image_preparation_timeout_seconds)
+    {
+        if !(1..=86_400).contains(&seconds) {
+            return Err(miette::miette!(
+                "image_preparation_timeout_seconds must be between 1 and 86400"
+            ));
+        }
+        config.image_preparation_timeout_seconds = seconds;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -574,14 +594,7 @@ fn prepare_server_config_with_drivers(
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
-    if let Some(jwt) = file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
-    {
-        config.gateway_jwt = Some(jwt);
-    } else if let Some(jwt) = local_jwt {
-        config.gateway_jwt = Some(jwt);
-    }
+    config.gateway_jwt = gateway_jwt;
 
     Ok(ServerStartupConfig {
         config,
@@ -3307,6 +3320,7 @@ version = 2
 
 [openshell.gateway]
 policy_validation_failure_mode = "retain_last_valid"
+image_preparation_timeout_seconds = 2400
 
 [openshell.drivers.docker]
 unknown_docker_key = true
@@ -3332,6 +3346,7 @@ mem_mib = "not-a-number"
             super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
 
         assert_eq!(prepared.config.compute_driver.as_deref(), Some("podman"));
+        assert_eq!(prepared.config.image_preparation_timeout_seconds, 2400);
         assert_eq!(
             prepared.config.policy_validation_failure_mode,
             openshell_core::PolicyValidationFailureMode::RetainLastValid
@@ -3339,5 +3354,88 @@ mem_mib = "not-a-number"
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_image_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _tls = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+        let config_path = state.path().join("gateway.toml");
+        for seconds in [0, 86_401] {
+            std::fs::write(&config_path, format!(
+                "[openshell]\nversion = 2\n[openshell.gateway]\nimage_preparation_timeout_seconds = {seconds}\n"
+            )).unwrap();
+            let (mut args, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "podman",
+                "--disable-tls",
+            ]);
+            let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                panic!("unbounded preparation must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("image_preparation_timeout_seconds must be between 1 and 86400")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_launch_signing_config_ignores_partial_local_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", directory.path().to_str().unwrap());
+        let _local = EnvVarGuard::set(
+            "OPENSHELL_LOCAL_TLS_DIR",
+            directory.path().to_str().unwrap(),
+        );
+        std::fs::create_dir(directory.path().join("jwt")).unwrap();
+        std::fs::write(
+            directory.path().join("jwt/signing.pem"),
+            "incomplete local bundle",
+        )
+        .unwrap();
+        let config_path = directory.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/explicit/signing.pem"
+public_key_path = "/explicit/public.pem"
+kid_path = "/explicit/kid"
+gateway_id = "explicit-gateway"
+"#,
+        )
+        .unwrap();
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+        let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+        assert_eq!(
+            prepared.config.gateway_jwt.unwrap().gateway_id,
+            "explicit-gateway"
+        );
     }
 }

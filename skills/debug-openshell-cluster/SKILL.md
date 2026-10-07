@@ -93,6 +93,11 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+The gateway container uses a Distroless Debian runtime. For OS-library
+vulnerability findings, check the deployed image digest and package version;
+deploy a rebuilt gateway image with the patched base. Updating the gateway
+binary alone does not update the libraries supplied by its container image.
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
@@ -213,6 +218,8 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
+runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
@@ -291,6 +298,7 @@ Common findings:
 - Local Docker gateway setup cannot copy `openshell-sandbox` after exporting a supervisor image: the sandbox runtime and supervisor are separate artifacts. The runtime image must provide `/openshell-sandbox`; the supervisor image provides `/openshell-supervisor`.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
+- SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
 - Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean host networking is disabled. Enable host networking in Docker
@@ -510,6 +518,41 @@ name and load the chart CA plus client identity from
 `OPENSHELL_PEER_TLS_KEY_FILE`. If peer calls fail during TLS negotiation, verify
 the `peer-client-tls` volume exists, those files are readable, and the server
 certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
+
+To check per-replica capacity on a multi-replica gateway, read each gateway
+pod's metrics and the autoscaler:
+
+```bash
+for pod in $(kubectl -n openshell get pod \
+    -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
+  echo "${pod}"
+  kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+done
+kubectl -n openshell get hpa
+kubectl -n openshell describe hpa openshell
+```
+
+The JSONPath filter keeps only pods whose first container is the gateway
+(`openshell-gateway`). It skips certificate hook Job pods, which older charts
+labeled like gateway pods. The metrics port is `service.metricsPort` (default
+`9090`).
+
+The API server proxy connects to each pod from the control plane. A
+NetworkPolicy that accepts the metrics port only from a monitoring namespace
+blocks it unless the policy also allows the control plane. In that case,
+read one pod at a time through `kubectl port-forward`, which reaches the pod
+through the kubelet and is not blocked by NetworkPolicy:
+
+```bash
+kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
+pf_pid=$!
+sleep 2
+curl -s http://localhost:9090/metrics \
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+kill "${pf_pid}"
+```
 
 Check required Helm deployment secrets:
 
@@ -962,6 +1005,9 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
+| One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
@@ -984,6 +1030,7 @@ credential failures.
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
+| With `grpcRoute.replicaRouting.enabled=true`, sandbox SSH, forward, or exec still relay through a peer replica | A `<release>-replica-<i>` Service has no endpoint, so Envoy returns `Unavailable` and the CLI retries unrouted | `kubectl -n openshell get endpoints <release>-replica-0 <release>-replica-1`; confirm `workload.kind=statefulset` and the GRPCRoute status is `Accepted`/`ResolvedRefs` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
 | Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |

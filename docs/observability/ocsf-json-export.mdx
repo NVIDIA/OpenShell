@@ -15,7 +15,7 @@ Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-or
 
 The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/how-it-works/gateways/configuration#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
 
-This output is separate from the sandbox-local file described below. Enabling one does not enable the other.
+This output is separate from the supervisor-local file described below. Enabling one does not enable the other. The gateway JSONL sink does not archive supervisor log lines pushed to the gateway; those lines carry OCSF shorthand text, not the full structured record.
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
 
@@ -69,10 +69,13 @@ do not suppress records in this explicitly enabled audit sink.
 
 ## Output Location
 
-For sandbox supervisors, OCSF JSON records are written to
-`/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. Windows MXC gateway
-records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. Both
-sinks rotate daily and retain the three most recent files.
+For sandbox supervisors, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` in the supervisor's filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; if the supervisor falls back to stderr-only logging, enabling `ocsf_json_enabled` does not create a JSONL sink.
+
+This file contains supervisor-originated events, not the [sandbox-runtime events](/observability/accessing-logs#main-process-output) emitted into workload container logs.
+
+Supervisor files rotate daily with a configured three-file limit, but cleanup can remove JSONL history earlier. See [supervisor file retention](/observability/logging#log-file-location) for the limits. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
+
+Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. That sink also rotates daily and retains the three most recent files. The separate `[openshell.gateway.ocsf_log]` sink uses its configured path and retention.
 
 ## JSON Record Structure
 
@@ -271,11 +274,10 @@ The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 | Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
 | Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
-Example with `jq` to extract all denied connections:
+After [copying supervisor files](/observability/accessing-logs#direct-filesystem-access) into `./supervisor-logs`, use `jq` to extract all denied connections:
 
 ```shell
-cat /var/log/openshell-ocsf.2026-04-01.log | \
-  jq -c 'select(.action == "Denied")'
+jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.log
 ```
 
 ## Relationship to Shorthand Logs
@@ -284,7 +286,7 @@ Sandbox events identify the sandbox environment with `device.type_id: 99` (Other
 
 The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
 
-The shorthand log is always active. The JSON export is opt-in through `ocsf_json_enabled`.
+Shorthand output is always active on stderr; its local file is available when file logging starts successfully. JSON file export is opt-in through `ocsf_json_enabled` and requires the supervisor's JSONL sink to start successfully.
 
 ## Next Steps
 

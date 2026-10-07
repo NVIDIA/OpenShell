@@ -2909,9 +2909,6 @@ mod tests {
                 retained_socket_operation: true,
                 proc_fd_identity: true,
                 task_memory_read: true,
-                task_memory_write: true,
-                cancellation: true,
-                task_memory_writes_disabled: false,
             },
             landlock_abi: 3,
             landlock_allow_deny: true,
@@ -2919,6 +2916,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         };
         openshell_isolation_interface::contract::BoundaryConfirmation {
             generation: "test-generation".to_string(),

@@ -217,6 +217,49 @@ podLifecycle:
   # covers supervisor session cleanup and draining queued OCSF records.
   terminationGracePeriodSeconds: 30
 
+# Optional HorizontalPodAutoscaler (autoscaling/v2) for the gateway workload.
+# When enabled, the Deployment or StatefulSet omits spec.replicas and the HPA
+# owns the replica count; replicaCount is ignored. Multi-replica limits
+# (server.externalDbSecret, and workload.allowMultiReplicaStatefulSet for a
+# StatefulSet) apply to maxReplicas. Scaling out does not move established
+# supervisor sessions; read the High Availability guide before choosing metrics.
+# The workload can drop to one replica when you enable this on an existing
+# release, until the HPA scales it back up; read the chart README before you
+# upgrade.
+autoscaling:
+  # -- Render a HorizontalPodAutoscaler and stop rendering spec.replicas.
+  enabled: false
+  # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
+  minReplicas: 2
+  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
+  # connection pool; size the database for rollouts at this count, as the High
+  # Availability guide describes.
+  maxReplicas: 4
+  # -- Target average CPU utilization, as a percentage of
+  # resources.requests.cpu. Set to null to disable. Requires
+  # resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies
+  # into the request.
+  targetCPUUtilizationPercentage: 80
+  # -- (int) Target average memory utilization, as a percentage of
+  # resources.requests.memory. Null disables it. Requires
+  # resources.requests.memory, or resources.limits.memory, which Kubernetes
+  # copies into the request.
+  targetMemoryUtilizationPercentage: null
+  # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
+  # Pods metrics served by prometheus-adapter.
+  metrics: []
+  # -- HPA scaling behavior. Scale-down hands the removed pod's supervisor
+  # sessions to the remaining replicas, so the default removes at most one
+  # replica every two minutes after a five-minute stabilization window. Helm
+  # merges maps: set autoscaling.behavior.scaleDown to null to drop the default.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
 probes:
   startup:
     # -- Startup probe period, in seconds.
@@ -671,6 +714,14 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  replicaRouting:
+    # -- Route requests carrying an `x-openshell-replica` header straight to
+    # that gateway replica. The CLI sets the header on long-lived sandbox
+    # connections (SSH, port forwards, exec) using the owner the gateway
+    # reports, so they skip the relay through a peer replica. Renders one
+    # Service per replica. Requires workload.kind=statefulset,
+    # workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas.
+    enabled: false
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates
   # client-facing TLS at the listener and re-encrypts when connecting to the

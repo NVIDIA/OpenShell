@@ -20,6 +20,37 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
 
+### Trusted runtime image overrides
+
+Docker, Podman, and Kubernetes consume two gateway-owned trusted runtime
+images. Set complete tagged or digest-pinned OCI references for the gateway
+process when you need to qualify exact artifacts or use a registry mirror:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor:1.2.3
+```
+
+These settings follow the gateway's normal environment-over-file precedence:
+
+```text
+process environment > [openshell.drivers.<selected>] TOML > compiled release default
+```
+
+`openshell-gateway config preflight` and gateway startup use the same effective
+references. Environment values are handled exactly like the corresponding TOML
+fields and passed to the selected container runtime; this feature does not add
+separate OCI-reference validation. Configure registry credentials in Docker,
+Podman, or Kubernetes image-pull secrets instead of embedding them in a
+reference.
+
+The variables affect only the built-in Docker, Podman, and Kubernetes drivers.
+They do not affect VM, MXC, or extension drivers. They are trusted gateway
+operator inputs and are never accepted from sandbox create requests. For
+Debian and RPM user services, place them in
+`~/.config/openshell/gateway.env`; the service supplies that file to both
+preflight and gateway startup.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -138,6 +169,10 @@ compute_driver        = "kubernetes"
 credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
+
+# Absolute image preparation and initial supervisor startup budget.
+# Applies to new attempts only; allowed values are 1 through 86400 seconds.
+image_preparation_timeout_seconds = 1800
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -271,6 +306,12 @@ The client-certificate handshake policy has no `require_client_auth` TOML field.
 
 `[openshell.gateway.gateway_jwt] ttl_secs` controls generation-bound gateway-facing and Sandbox Protocol credentials minted for a sandbox session, plus typed extension JWTs. Omit it for non-expiring local sandbox session credentials: both session tokens carry `exp = 0`, supervisors skip periodic session-token renewal, and refresh responses omit their expiration timestamps. Typed extension JWTs retain a 900-second default when the field is omitted. Use omission only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
+Listener TLS and sandbox launch signing use separate keys. A working HTTPS listener or mTLS client certificate does not supply the signing key needed to start a VM sandbox. Configure `signing_key_path`, `public_key_path`, `kid_path`, and `gateway_id` in `[openshell.gateway.gateway_jwt]`, as shown above. For a local installation, `openshell-gateway generate-certs --output-dir <tls-dir>` writes a signing bundle alongside the TLS bundle. Without explicit `gateway_jwt` configuration, the gateway discovers `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under `OPENSHELL_LOCAL_TLS_DIR`, or under the OpenShell state directory's `tls/` directory when that variable is unset. Explicit signing configuration takes precedence over local discovery.
+
+The gateway rejects partial or invalid signing bundles at startup, including private and public keys that do not match. When the selected driver requires launch signing and no bundle is configured, sandbox creation fails before the driver validates or prepares the sandbox. The error names the signing configuration and discovery location; it does not print keys or tokens. The VM driver also validates launch material before resolving images or creating sandbox state.
+
+External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
+
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 ## OCSF JSONL Output
@@ -333,6 +374,10 @@ The OpenTelemetry SDK logs export failures after startup. Spans in a failed batc
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Compute-driver operations appear as child spans. Internal reconciliation and driver-watch loops create operation roots because no inbound request supplies a parent, and credential refresh creates one only when a credential is due or needs cleanup. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Store operation spans, health endpoint spans, and spans for RPCs that sandbox supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`, including its peer-forwarded form) use DEBUG level. The default INFO filter does not export them. Set the gateway log level to `debug` to include them.
 
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
+
+Sandbox supervisors export spans to the same collector, so the endpoint must also be reachable from sandboxes.
+
+Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. Set the gateway or sandbox log level to `debug` to include them.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
@@ -1124,6 +1169,8 @@ runtime-selected profile.
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
 
+The example uses explicit launch-signing paths. Point them at an existing signing bundle, or omit the `gateway_jwt` table to use local discovery. Listener and guest TLS certificates do not supply these signing credentials.
+
 ```toml
 [openshell]
 version = 2
@@ -1135,6 +1182,13 @@ log_level       = "info"
 compute_driver = "vm"
 # Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/var/lib/openshell/guest-tls/ca.pem"
+
+# Sandbox launch signing is separate from listener and guest TLS.
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/etc/openshell/jwt/signing.pem"
+public_key_path  = "/etc/openshell/jwt/public.pem"
+kid_path         = "/etc/openshell/jwt/kid"
+gateway_id       = "openshell"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
@@ -1203,6 +1257,15 @@ overlay_disk_mib = 4096
 # rootfs_tar_max_bytes = 10737418240
 ```
 
+To generate a local bundle for discovery, run these commands in fish and retain the same environment when starting the gateway:
+
+```shell
+set -gx OPENSHELL_LOCAL_TLS_DIR ~/.local/state/openshell/tls
+openshell-gateway generate-certs --output-dir "$OPENSHELL_LOCAL_TLS_DIR"
+```
+
+The command also installs local CLI mTLS credentials. For explicit signing configuration, set the example's signing paths to `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under that directory. The gateway loads those paths in preference to local discovery.
+
 Rootfs tar staging requires the gateway and the VM driver to share a filesystem
 and run as the same user. That holds for the managed VM driver, which the
 gateway starts as a subprocess. If you point `compute_driver_endpoints` at an
@@ -1241,6 +1304,8 @@ openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
 Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
+
+Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
