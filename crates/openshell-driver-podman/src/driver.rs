@@ -942,7 +942,7 @@ impl PodmanComputeDriver {
             "Creating sandbox container"
         );
 
-        let (image, resolved_image) = async {
+        let resolved_image = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 // The sandbox runtime is shipped in a standalone OCI image.
@@ -1001,7 +1001,7 @@ impl PodmanComputeDriver {
                     )));
                 }
                 let resolved_image =
-                    container::ResolvedPodmanImage::from_inspect(inspected_image)?;
+                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?;
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
@@ -1016,7 +1016,7 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?;
                 }
 
-                Ok((image.to_string(), resolved_image))
+                Ok(resolved_image)
             }
             .await;
             phase_status.finish(result)
@@ -1199,7 +1199,6 @@ impl PodmanComputeDriver {
                     token_secret: token_secret_name.as_deref(),
                     resolver_secret: &resolver_secret_name,
                     gpu_devices: gpu_devices.as_deref(),
-                    requested_image: &image,
                     image: &resolved_image,
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),

@@ -181,15 +181,11 @@ pub struct ImageInspect {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(default, rename_all = "PascalCase")]
 pub struct ImageConfig {
-    #[serde(default)]
     pub user: String,
-    #[serde(default)]
     pub env: Vec<String>,
-    #[serde(default)]
     pub working_dir: String,
-    #[serde(default)]
     pub volumes: Option<HashMap<String, Value>>,
 }
 
@@ -1288,6 +1284,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_config_defaults_missing_oci_fields() {
+        let empty: ImageConfig = serde_json::from_str("{}").unwrap();
+        assert!(empty.user.is_empty());
+        assert!(empty.env.is_empty());
+        assert!(empty.working_dir.is_empty());
+        assert!(empty.volumes.is_none());
+
+        let partial: ImageConfig = serde_json::from_str(r#"{"User":"app:staff"}"#).unwrap();
+        assert_eq!(partial.user, "app:staff");
+        assert!(partial.env.is_empty());
+        assert!(partial.working_dir.is_empty());
+        assert!(partial.volumes.is_none());
+    }
+
     #[tokio::test]
     async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
@@ -1307,6 +1318,7 @@ mod tests {
         assert_eq!(image.id, "sha256:immutable");
         let config = image.config.expect("fixture image config");
         assert_eq!(config.user, "app:staff");
+        assert_eq!(config.env, vec!["A=one"]);
         assert_eq!(config.working_dir, "/workspace/project");
         assert!(
             config

@@ -5701,18 +5701,21 @@ fn build_container_create_body_for_image(
         driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
             .map_err(Status::failed_precondition)?;
     }
-    for mount in &driver_config.mounts {
-        let target = match mount {
+    let mount_targets = driver_config.mounts.iter().map(|mount| {
+        match mount {
             DockerDriverMountConfig::Bind { target, .. }
             | DockerDriverMountConfig::Volume { target, .. }
             | DockerDriverMountConfig::Tmpfs { target, .. }
             | DockerDriverMountConfig::Image { target, .. } => target,
-        };
-        driver_mounts::validate_workspace_mount_target(target, &workspace_root)
-            .map_err(Status::failed_precondition)?;
-        driver_mounts::validate_mount_control_path(target, BOUNDARY_MOUNT_PATH)
-            .map_err(Status::failed_precondition)?;
-    }
+        }
+        .as_str()
+    });
+    driver_mounts::validate_workspace_mount_targets(
+        mount_targets,
+        &workspace_root,
+        &[BOUNDARY_MOUNT_PATH],
+    )
+    .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),

@@ -107,6 +107,10 @@ permissions. The workload starts as the final non-root user, which must be able
 to reach and write the directory. Agent commands use the path as their working
 directory.
 
+Custom workspace contents survive stop/start of the same workload container,
+but are removed with that container. They do not live in a managed named volume
+and are not copied to a replacement container.
+
 ## Lifecycle and readiness
 
 Create builds both stopped containers and stages the private archives before
