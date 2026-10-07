@@ -875,6 +875,10 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
+        && flag_covers(
+            loaded.allow_uninspected_credentials,
+            proposed.allow_uninspected_credentials,
+        )
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -5078,6 +5082,74 @@ mod tests {
                 ..
             }) if undeclared_binaries == ["/usr/bin/curl"]
         ));
+    }
+
+    /// An endpoint flag applies to every binary on the rule, so an update that
+    /// turns one on must declare the rule's whole binary scope.
+    #[test]
+    fn enabling_an_endpoint_flag_requires_the_whole_binary_scope() {
+        let base = endpoint("api.example.com", 443);
+        for flag in [
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "allow_uninspected_credentials",
+        ] {
+            let mut widened = base.clone();
+            match flag {
+                "allow_encoded_slash" => widened.allow_encoded_slash = true,
+                "websocket_credential_rewrite" => widened.websocket_credential_rewrite = true,
+                "request_body_credential_rewrite" => widened.request_body_credential_rewrite = true,
+                _ => widened.allow_uninspected_credentials = true,
+            }
+            let existing = rule_with_authorizations(
+                "realtime",
+                vec![base.clone()],
+                &["/usr/bin/tool-a", "/usr/bin/tool-b"],
+            );
+            let merge = |binaries: &[&str]| {
+                merge_policy(
+                    policy_with_rule("realtime", existing.clone()),
+                    &[PolicyMergeOp::AddRule {
+                        rule_name: "realtime".to_string(),
+                        rule: rule_with_authorizations("realtime", vec![widened.clone()], binaries),
+                    }],
+                )
+            };
+
+            assert!(
+                matches!(
+                    merge(&["/usr/bin/tool-a"]),
+                    Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                        undeclared_binaries,
+                        ..
+                    }) if undeclared_binaries == ["/usr/bin/tool-b"]
+                ),
+                "{flag}: tool-b would inherit the flag undeclared"
+            );
+            assert!(
+                merge(&["/usr/bin/tool-a", "/usr/bin/tool-b"]).is_ok(),
+                "{flag}: naming every binary must succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_requires_a_proposed_uninspected_credentials_exception() {
+        let loaded = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/client"],
+            ),
+        );
+        let mut proposed_endpoint = endpoint("api.example.com", 443);
+        proposed_endpoint.allow_uninspected_credentials = true;
+        let proposed =
+            rule_with_authorizations("realtime", vec![proposed_endpoint], &["/usr/bin/client"]);
+
+        assert!(!policy_covers_rule(&loaded, &proposed));
     }
 
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {

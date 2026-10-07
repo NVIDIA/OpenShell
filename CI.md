@@ -72,8 +72,8 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification builds and installs
+`Branch E2E Checks` builds binaries and images only when an E2E suite is
+selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev and Release Tag use the same package installers.
@@ -433,8 +433,6 @@ Important: if a PR requires manual admission, every new commit needs another `/o
 GitHub merge queue is required for `main`. Repository administrators must enable **Require merge queue** in the branch ruleset for `main` and keep these required status contexts aligned with the PR gates:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 
@@ -445,7 +443,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -471,7 +469,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -507,10 +505,13 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 Require these statuses in the branch ruleset for PR and merge-queue CI:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+
+The following statuses are opt-in and controlled by labels:
+
+- `OpenShell / E2E`: `test:e2e`
+- `OpenShell / GPU E2E`: `test:e2e-gpu`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
