@@ -117,6 +117,14 @@ impl PostgresStore {
     pub(super) async fn acquire_cross_object_lock(
         &self,
     ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        self.acquire_mutation_lock(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .await
+    }
+
+    pub(super) async fn acquire_mutation_lock(
+        &self,
+        key: i64,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
         let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         connection.close_on_drop();
         sqlx::query("SELECT set_config('lock_timeout', $1, false)")
@@ -125,7 +133,7 @@ impl PostgresStore {
             .await
             .map_err(|e| map_db_error(&e))?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .bind(key)
             .execute(&mut *connection)
             .await
             .map_err(|e| map_db_error(&e))?;

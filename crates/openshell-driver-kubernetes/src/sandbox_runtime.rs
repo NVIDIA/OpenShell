@@ -233,6 +233,7 @@ pub fn supervisor_pod(
     upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
+    tracing_environment: &[(&str, String)],
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -269,6 +270,17 @@ pub fn supervisor_pod(
             "",
         ),
     ];
+    environment.extend(
+        tracing_environment
+            .iter()
+            .map(|(name, value)| env_var(name, value)),
+    );
+    if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
+        environment.push(env_var(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+            &server_name,
+        ));
+    }
     let mut volume_mounts = vec![
         volume_mount("bootstrap", "/.openshell/supervisor", true),
         volume_mount("sa-token", "/var/run/secrets/openshell", true),
@@ -653,6 +665,18 @@ fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String
     labels
 }
 
+/// The gateway may redirect the supervisor to a specific replica by pod
+/// address, which the server certificate does not name. Verifying every dial
+/// against the configured endpoint's host keeps those redirects valid.
+fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
+    let uri = grpc_endpoint.parse::<tonic::transport::Uri>().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn env_var(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -811,6 +835,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }
@@ -838,6 +863,58 @@ mod tests {
             .map(|volume| volume.name.clone())
             .collect();
         (env, volumes)
+    }
+
+    #[test]
+    fn supervisor_pod_carries_tracing_environment() {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let client_tls = SupervisorClientTls::Disabled;
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            client_tls,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            owner(),
+            &[
+                (
+                    "OPENSHELL_OTLP_ENDPOINT",
+                    "http://collector:4317".to_string(),
+                ),
+                ("TRACEPARENT", TRACEPARENT.to_string()),
+            ],
+        )
+        .expect("render supervisor Pod");
+        let environment = pod.spec.expect("Pod spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment["OPENSHELL_OTLP_ENDPOINT"],
+            "http://collector:4317"
+        );
+        assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
     }
 
     #[test]
@@ -888,6 +965,29 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_verifies_redirected_dials_against_the_configured_host() {
+        let pod = supervisor_pod_with_client_tls(SupervisorClientTls::Disabled);
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let server_name = env
+            .iter()
+            .find(|variable| variable.name == "OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .and_then(|variable| variable.value.as_deref());
+        assert_eq!(server_name, Some("gateway"));
+
+        assert_eq!(
+            gateway_tls_server_name("https://openshell.openshell.svc.cluster.local:8080")
+                .as_deref(),
+            Some("openshell.openshell.svc.cluster.local")
+        );
+        assert_eq!(
+            gateway_tls_server_name("https://[fd00::1]:8080").as_deref(),
+            Some("fd00::1")
+        );
+        assert_eq!(gateway_tls_server_name("http://gateway:8080"), None);
+        assert_eq!(gateway_tls_server_name("not a uri"), None);
+    }
+
+    #[test]
     fn owner_reference_does_not_require_finalizer_mutation_permission() {
         assert_eq!(owner().block_owner_deletion, Some(false));
     }
@@ -920,6 +1020,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1177,6 +1278,7 @@ mod tests {
             staged,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }

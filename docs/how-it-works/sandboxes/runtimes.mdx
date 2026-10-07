@@ -36,6 +36,19 @@ When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 
+Docker, Podman, and Kubernetes also accept process overrides for the trusted
+sandbox-runtime and supervisor images through
+`OPENSHELL_SANDBOX_RUNTIME_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE`. The
+environment overrides values in the selected driver's TOML table, and the
+driver TOML overrides the compiled release defaults. Helm renders Kubernetes
+image fields into TOML, so they apply when these environment variables are
+unset. Sandbox requests cannot override either trusted image.
+
+When building your own gateway or supervisor image, the `GATEWAY_BASE_IMAGE`
+and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
+[Container Image Base Overrides](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
+for build commands and base compatibility requirements.
+
 For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
 `[openshell.gateway]` or use the package-managed local CA. Remove the retired
 `guest_tls_cert` and `guest_tls_key` fields. Supervisors receive only the

@@ -147,9 +147,12 @@ During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Failed qualification prevents stable
-publication but still allows pre-release artifacts to publish with the failure
-recorded.
+the `release-tag-v1` qualification profile. Both tagged pre-release and stable
+publication require this profile to pass. Failed, cancelled, or skipped suites
+block publication; build artifacts and qualification evidence remain in Actions
+storage for diagnosis. Source-SHA images are staging inputs for qualification.
+Snap builds run in parallel with qualification, but tagged stable Store uploads
+consume those built artifacts only after qualification passes.
 
 View logs for a specific run:
 

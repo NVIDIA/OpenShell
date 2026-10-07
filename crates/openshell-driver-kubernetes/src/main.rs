@@ -116,13 +116,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
     sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),

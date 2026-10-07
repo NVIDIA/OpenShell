@@ -18,6 +18,7 @@ use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::Subscriber
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
+const SERVICE_NAME: &str = "openshell-supervisor";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum SupervisorRole {
@@ -79,6 +80,10 @@ struct Args {
 
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
+
+    /// OTLP/gRPC collector endpoint for supervisor trace export.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_ENDPOINT)]
+    otlp_endpoint: Option<String>,
 
     /// Create the private readiness socket after boundary and gateway attach.
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
@@ -327,6 +332,22 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .into_diagnostic()?;
+    // The tonic exporter must be created inside the runtime that drives it.
+    let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
+        openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(|endpoint| {
+            openshell_otel::OtlpTraceConfig {
+                endpoint,
+                service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+                service_version: Some(openshell_core::VERSION),
+                resource_attributes: args
+                    .sandbox_id
+                    .iter()
+                    .map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.clone()))
+                    .collect(),
+            }
+        }))
+    });
+    let otlp_layer_provider = otlp_provider.clone();
 
     let exit_code = runtime.block_on(async move {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -378,6 +399,12 @@ fn main() -> Result<()> {
                 )
                 .with(jsonl_layer.with_filter(LevelFilter::INFO))
                 .with(push_layer.clone())
+                .with(
+                    otlp_layer_provider
+                        .as_ref()
+                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
+                        .with_filter(otlp_span_filter(&args.log_level)),
+                )
                 .init();
             (Some(file_guard), jsonl_guard)
         } else {
@@ -388,10 +415,21 @@ fn main() -> Result<()> {
                         .with_filter(console_filter),
                 )
                 .with(push_layer)
+                .with(
+                    otlp_layer_provider
+                        .as_ref()
+                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
+                        .with_filter(otlp_span_filter(&args.log_level)),
+                )
                 .init();
             warn!("Could not open /var/log for log rotation; using stderr-only logging");
             (None, None)
         };
+        if let Some(error) = otlp_setup_error {
+            warn!(%error, "OTLP exporting could not be started; continuing without it");
+        } else if let Some(endpoint) = &args.otlp_endpoint {
+            info!(endpoint, "OTLP exporting enabled");
+        }
 
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
@@ -473,14 +511,39 @@ fn main() -> Result<()> {
                 .await
             }
         }
-    })?;
+    });
+    // Flush spans before `process::exit` skips destructors.
+    if let Some(provider) = otlp_provider
+        && let Err(error) = provider.shutdown()
+    {
+        warn!(%error, "OTLP tracer provider shutdown failed");
+    }
 
-    std::process::exit(exit_code);
+    std::process::exit(exit_code?);
+}
+
+/// A more verbose log level raises `openshell*` spans; dependency spans stay at
+/// INFO so they do not flood the exporter queue.
+fn otlp_span_filter(log_level: &str) -> EnvFilter {
+    let level = log_level
+        .parse::<LevelFilter>()
+        .unwrap_or(LevelFilter::INFO)
+        .max(LevelFilter::INFO);
+    EnvFilter::new(format!("info,openshell={level}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otlp_span_filter_raises_only_openshell_targets() {
+        let directives = |log_level: &str| otlp_span_filter(log_level).to_string();
+        assert_eq!(directives("warn"), "openshell=info,info");
+        assert_eq!(directives("info"), "openshell=info,info");
+        assert_eq!(directives("debug"), "openshell=debug,info");
+        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
+    }
 
     #[test]
     fn isolation_backend_is_the_default_role() {

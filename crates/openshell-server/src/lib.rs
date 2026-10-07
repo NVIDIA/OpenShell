@@ -22,7 +22,10 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_members;
+mod gateway_metrics;
 mod gateway_ocsf;
+mod gateway_ring;
 mod grpc;
 mod http;
 mod middleware;
@@ -38,6 +41,7 @@ mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
@@ -53,7 +57,6 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -318,6 +321,15 @@ pub struct ServerState {
     /// relay instead of opening one per request.
     pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
 
+    /// Latest placement ring, refreshed from live gateway membership. Decides
+    /// which replica *should* own a sandbox; the owner record in the store
+    /// remains authoritative for which one does.
+    pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
+
+    /// Peer endpoints of live replicas, keyed by replica ID. Refreshed
+    /// alongside `gateway_ring` so a redirect can name a dialable address.
+    pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -414,6 +426,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
@@ -438,6 +451,8 @@ impl ServerState {
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
+            gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -851,9 +866,9 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle =
+            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
+                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -927,6 +942,7 @@ pub(crate) async fn run_server(
                         return Ok(Vec::new());
                     }
                     let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .await
                         .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&authentication)
                         .map_err(|error| format!("encode launch authentication: {error}"))
@@ -951,6 +967,11 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         );
     }
+    gateway_members::spawn_membership_worker(
+        state.clone(),
+        gateway_members::MEMBER_REFRESH_INTERVAL,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));

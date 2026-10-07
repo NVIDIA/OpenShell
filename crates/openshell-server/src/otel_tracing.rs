@@ -146,6 +146,113 @@ where
 /// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
 pub mod test_exporter {
+    use std::sync::{Arc, OnceLock};
+
+    use tracing::{Dispatch, Subscriber, dispatcher::WeakDispatch};
+
+    /// Keep parent-span cleanup on the registry that created the span.
+    ///
+    /// `SQLx` moves spans onto its `SQLite` worker without installing the test's
+    /// thread-local dispatcher. `tracing-subscriber` closes a child's parent
+    /// through the current dispatcher, so the worker can otherwise look up the
+    /// parent in the unrelated global registry when it drops the last reference.
+    struct CloseWithDispatch<S> {
+        inner: S,
+        dispatch: OnceLock<WeakDispatch>,
+        closed: Arc<tokio::sync::Notify>,
+    }
+
+    impl<S: Subscriber> Subscriber for CloseWithDispatch<S> {
+        fn on_register_dispatch(&self, dispatch: &Dispatch) {
+            self.dispatch
+                .set(dispatch.downgrade())
+                .expect("test subscriber is registered once");
+            self.inner.on_register_dispatch(dispatch);
+        }
+
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            self.inner.register_callsite(metadata)
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.inner.enabled(metadata)
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            self.inner.max_level_hint()
+        }
+
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.inner.new_span(attributes)
+        }
+
+        fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            self.inner.record(id, values);
+        }
+
+        fn record_follows_from(&self, id: &tracing::span::Id, follows: &tracing::span::Id) {
+            self.inner.record_follows_from(id, follows);
+        }
+
+        fn event_enabled(&self, event: &tracing::Event<'_>) -> bool {
+            self.inner.event_enabled(event)
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.inner.event(event);
+        }
+
+        fn enter(&self, id: &tracing::span::Id) {
+            self.inner.enter(id);
+        }
+
+        fn exit(&self, id: &tracing::span::Id) {
+            self.inner.exit(id);
+        }
+
+        fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+            self.inner.clone_span(id)
+        }
+
+        fn try_close(&self, id: tracing::span::Id) -> bool {
+            // The span being closed owns a strong dispatcher reference. Store
+            // only a weak reference here to avoid a subscriber/dispatcher cycle.
+            let dispatch = self
+                .dispatch
+                .get()
+                .and_then(WeakDispatch::upgrade)
+                .expect("a live span keeps its test dispatcher alive");
+            let closed = tracing::dispatcher::with_default(&dispatch, || self.inner.try_close(id));
+            if closed {
+                // The simple exporter has finished before try_close returns.
+                // Wake assertions only after the owning registry and layers
+                // have completed cleanup, including recursive parent closure.
+                self.closed.notify_waiters();
+            }
+            closed
+        }
+
+        fn current_span(&self) -> tracing_core::span::Current {
+            self.inner.current_span()
+        }
+
+        // OpenTelemetrySpanExt downcasts through the subscriber to its layer.
+        // SAFETY: Forward the unchanged TypeId to the inner subscriber, which
+        // owns the returned pointer for exactly as long as this wrapper lives.
+        #[allow(unsafe_code)]
+        unsafe fn downcast_raw(&self, id: std::any::TypeId) -> Option<*const ()> {
+            if id == std::any::TypeId::of::<Self>() {
+                Some(std::ptr::from_ref(self).cast())
+            } else {
+                // SAFETY: The inner subscriber owns and validates this downcast.
+                unsafe { self.inner.downcast_raw(id) }
+            }
+        }
+    }
+
     /// Installs a process-wide registry before any scoped test subscriber is
     /// used.
     ///
@@ -174,11 +281,17 @@ pub mod test_exporter {
             .with_simple_exporter(exporter.clone())
             .build();
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
-        let dispatch = tracing::Dispatch::new(subscriber);
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let dispatch = Dispatch::new(CloseWithDispatch {
+            inner: subscriber,
+            dispatch: OnceLock::new(),
+            closed: Arc::clone(&closed),
+        });
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
             _provider: provider,
             exporter,
+            closed,
             _lock: lock,
         }
     }
@@ -187,6 +300,52 @@ pub mod test_exporter {
         /// Every span recorded by this test's in-memory exporter.
         pub fn finished_spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
             self.exporter.get_finished_spans().expect("in-memory spans")
+        }
+
+        /// Wait for expected spans to finish before taking an assertion snapshot.
+        ///
+        /// A completed `SQLx` query may still have its span held by a `SQLite`
+        /// worker. Export is synchronous once the span closes, but flushing
+        /// cannot close that live span. Await closure notifications instead of
+        /// assuming the query result also means tracing cleanup has completed.
+        pub async fn wait_for_spans(
+            &self,
+            predicate: impl Fn(&[opentelemetry_sdk::trace::SpanData]) -> bool + Send + Sync,
+        ) -> Vec<opentelemetry_sdk::trace::SpanData> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    // notify_waiters wakes futures created before notification,
+                    // even before polling. Subscribe before reading so closure
+                    // between the snapshot and await cannot lose a wakeup.
+                    let notified = self.closed.notified();
+                    let spans = self.finished_spans();
+                    if predicate(&spans) {
+                        return spans;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for expected spans, got {:?}",
+                    self.finished_spans()
+                        .iter()
+                        .map(|span| &span.name)
+                        .collect::<Vec<_>>()
+                )
+            })
+        }
+
+        /// Wait for the completed span named `name`.
+        pub async fn wait_for_span(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
+            let spans = self
+                .wait_for_spans(|spans| spans.iter().any(|span| span.name == name))
+                .await;
+            spans
+                .into_iter()
+                .find(|span| span.name == name)
+                .expect("the awaited snapshot contains the expected span")
         }
 
         /// Spans named `name`.
@@ -255,7 +414,7 @@ pub mod test_exporter {
     /// Forces the global subscriber up first so callsite interest is decided
     /// by a registry that records, not by the no-op default.
     #[must_use]
-    pub fn install_scoped(subscriber: impl Into<tracing::Dispatch>) -> ScopedTracingTestGuard {
+    pub fn install_scoped(subscriber: impl Into<Dispatch>) -> ScopedTracingTestGuard {
         let lock = crate::TEST_TRACING_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -276,6 +435,7 @@ pub mod test_exporter {
         _default: tracing::dispatcher::DefaultGuard,
         _provider: opentelemetry_sdk::trace::SdkTracerProvider,
         exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+        closed: Arc<tokio::sync::Notify>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -516,6 +676,109 @@ mod tests {
             "a bad endpoint degrades to no export rather than failing startup"
         );
         assert!(err.is_some(), "the failure is reportable, not swallowed");
+    }
+
+    #[tokio::test]
+    async fn tracing_child_closed_on_worker_keeps_its_parent_and_exporter() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let traced = test_exporter::install_traced();
+        let parent = tracing::info_span!("worker_parent");
+        let child = tracing::info_span!(parent: &parent, "worker_child");
+        // Also exercise layer downcasting through the fixture's subscriber.
+        let parent_context = parent.context();
+        let child_context = child.context();
+        drop(parent);
+
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            released.recv().expect("test releases the worker's span");
+            // Like SQLx, enter the carried span without installing its dispatcher.
+            let entered = child.enter();
+            drop(entered);
+            // This is deliberately the child's last reference. Its parent has
+            // no remaining references either, so both must close on this worker.
+            drop(child);
+            // Closing the carried span must also restore the worker's default,
+            // so unrelated work cannot leak into this test's private exporter.
+            drop(tracing::info_span!("unrelated_worker_span"));
+        });
+
+        assert!(traced.finished_spans().is_empty());
+        let waiting = traced.wait_for_span("worker_parent");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        let parent = waiting.await;
+        worker
+            .join()
+            .expect("worker closes spans without consulting the global registry");
+        let child = traced.span_named("worker_child");
+        test_exporter::assert_is_root(&parent);
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+        assert_eq!(
+            child.span_context.trace_id(),
+            parent.span_context.trace_id()
+        );
+        assert_eq!(parent_context.span().span_context(), &parent.span_context);
+        assert_eq!(child_context.span().span_context(), &child.span_context);
+        assert_eq!(traced.finished_spans().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tracing_exporters_isolate_unrelated_threads_and_successive_tests() {
+        // Use the same callsite under all dispatchers to exercise the global
+        // interest cache without sharing their captured spans.
+        fn emit_span() {
+            drop(tracing::info_span!("isolated_test_span"));
+        }
+
+        let traced = test_exporter::install_traced();
+        emit_span();
+        std::thread::spawn(emit_span)
+            .join()
+            .expect("unrelated worker records only into the global registry");
+        let first = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&first);
+        assert_eq!(traced.finished_spans().len(), 1);
+        drop(traced);
+
+        let traced = test_exporter::install_traced();
+        assert!(traced.finished_spans().is_empty());
+        emit_span();
+        let second = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&second);
+        assert_eq!(traced.finished_spans().len(), 1);
+        assert_ne!(
+            first.span_context.trace_id(),
+            second.span_context.trace_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn tracing_wait_does_not_lose_closure_between_snapshot_and_await() {
+        let traced = test_exporter::install_traced();
+        let span = std::sync::Mutex::new(Some(tracing::info_span!("close_before_await")));
+        let spans = traced
+            .wait_for_spans(|spans| {
+                // The first snapshot is empty. Close its span before polling
+                // the notification future, as a worker could do concurrently.
+                drop(span.lock().unwrap().take());
+                spans.iter().any(|span| span.name == "close_before_await")
+            })
+            .await;
+        assert_eq!(spans.len(), 1);
+        test_exporter::assert_is_root(&spans[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "timed out waiting for expected spans")]
+    async fn tracing_wait_times_out_when_a_span_never_closes() {
+        let traced = test_exporter::install_traced();
+        let _span = tracing::info_span!("still_open");
+        traced.wait_for_span("still_open").await;
     }
 
     #[tokio::test]

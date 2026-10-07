@@ -106,6 +106,7 @@ glob = { workspace = true }
 hex = "0.4"
 russh = "0.63.1"
 rand = { workspace = true }
+rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"
 ipnet = "2"
 tempfile = "3"
@@ -129,6 +130,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+tracing-core = "0.1"
 tokio = { workspace = true, features = ["test-util"] }
 # Tests import the example profiles from providers/ the way an operator
 # would; the feature is test-only and never reaches a release binary.

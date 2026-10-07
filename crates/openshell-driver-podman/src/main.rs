@@ -110,11 +110,11 @@ struct Args {
     health_check_interval_secs: Option<NonZeroU64>,
 
     /// OCI image containing the `openshell-sandbox` runtime binary.
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     /// OCI image containing the `openshell-supervisor` control binary.
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     /// Host path to the CA certificate for supervisor-to-gateway TLS.
@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip

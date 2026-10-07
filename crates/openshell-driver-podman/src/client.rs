@@ -166,6 +166,8 @@ pub struct PortBinding {
 pub struct ContainerConfig {
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub user: String,
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.
@@ -238,6 +240,38 @@ pub struct VolumeInspect {
 }
 
 impl VolumeInspect {
+    /// Whether metadata matches a managed local volume with the exact labels
+    /// and requested ownership options. This does not inspect filesystem ownership.
+    pub(crate) fn matches_managed_volume(
+        &self,
+        labels: &HashMap<String, String>,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        self.driver == "local"
+            && self.labels.as_ref() == Some(labels)
+            && self.options_match_requested_owner(requested_owner)
+    }
+
+    /// Whether option metadata matches the requested owner. `None` means no
+    /// ownership options were requested and requires an empty options map.
+    /// This does not inspect filesystem ownership. Podman records the parsed
+    /// `UID` and `GID` next to the raw `o` option.
+    pub(crate) fn options_match_requested_owner(
+        &self,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        let Some((uid, gid)) = requested_owner else {
+            return self.options.is_empty();
+        };
+        self.options.get("o").map(String::as_str) == Some(format!("uid={uid},gid={gid}").as_str())
+            && self.options.iter().all(|(key, value)| match key.as_str() {
+                "o" => true,
+                "UID" => *value == uid.to_string(),
+                "GID" => *value == gid.to_string(),
+                _ => false,
+            })
+    }
+
     pub(crate) fn admission_identity(&self) -> Value {
         serde_json::json!({"name": self.name, "driver": self.driver, "options": self.options, "created_at": self.created_at})
     }
@@ -700,12 +734,38 @@ impl PodmanClient {
 
     // ── Volume operations ────────────────────────────────────────────────
 
+    /// Create and inspect a local volume. HTTP 409 conflicts also proceed to
+    /// inspection; callers must verify the returned labels and options.
+    async fn create_volume(
+        &self,
+        name: &str,
+        labels: &HashMap<String, String>,
+        options: &HashMap<String, String>,
+    ) -> Result<VolumeInspect, PodmanApiError> {
+        validate_name(name)?;
+        let mut body = serde_json::json!({
+            "Name": name,
+            "Driver": "local",
+            "Labels": labels,
+        });
+        if !options.is_empty() {
+            body["Options"] = serde_json::json!(options);
+        }
+        self.create_ignore_conflict("/libpod/volumes/create", &body)
+            .await?;
+        self.inspect_volume(name).await
+    }
+
     /// Never adopt an unrelated existing volume on a private provisioning path.
+    ///
+    /// With `owner`, Podman creates the volume root owned by that UID and GID,
+    /// so a non-root workload can use it without a privileged chown.
     pub(crate) async fn create_owned_volume(
         &self,
         name: &str,
         sandbox_id: &str,
         workspace: &str,
+        owner: Option<(u32, u32)>,
     ) -> Result<(), PodmanApiError> {
         let labels = HashMap::from([
             (
@@ -719,10 +779,7 @@ impl PodmanClient {
         ]);
         match self.inspect_volume(name).await {
             Ok(existing) => {
-                if existing.driver != "local"
-                    || !existing.options.is_empty()
-                    || existing.labels.as_ref() != Some(&labels)
-                {
+                if !existing.matches_managed_volume(&labels, owner) {
                     return Err(PodmanApiError::InvalidInput(
                         "private volume name collides with an unrelated resource".into(),
                     ));
@@ -732,16 +789,11 @@ impl PodmanClient {
             Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        self.create_ignore_conflict(
-            "/libpod/volumes/create",
-            &serde_json::json!({"Name":name,"Driver":"local","Labels":labels}),
-        )
-        .await?;
-        let created = self.inspect_volume(name).await?;
-        if created.driver != "local"
-            || !created.options.is_empty()
-            || created.labels.as_ref() != Some(&labels)
-        {
+        let options = owner.map_or_else(HashMap::new, |(uid, gid)| {
+            HashMap::from([("o".to_string(), format!("uid={uid},gid={gid}"))])
+        });
+        let created = self.create_volume(name, &labels, &options).await?;
+        if !created.matches_managed_volume(&labels, owner) {
             return Err(PodmanApiError::InvalidInput(
                 "private volume ownership verification failed".into(),
             ));
@@ -1155,6 +1207,81 @@ mod tests {
             ["GET /v5.0.0/libpod/volumes/work-bind/json"]
         );
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_owned_volume_verifies_requested_options() {
+        let labels =
+            r#"{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-workspace":"team-a"}"#;
+        for (owner, options, accepted) in [
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"}"#,
+                true,
+            ),
+            (Some((1234, 1235)), r#"{"o":"uid=1234,gid=1235"}"#, true),
+            // Podman accepts either order, but OpenShell always requests uid first.
+            (Some((1234, 1235)), r#"{"o":"gid=1235,uid=1234"}"#, false),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","UID":"0","GID":"1235"}"#,
+                false,
+            ),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","device":"/srv/work"}"#,
+                false,
+            ),
+            (Some((1234, 1235)), "{}", false),
+            (None, "{}", true),
+            (None, r#"{"o":"uid=1234,gid=1235"}"#, false),
+            (None, r#"{"o":"bind","device":"/srv/work"}"#, false),
+        ] {
+            for existing in [false, true] {
+                let inspected = || {
+                    StubResponse::new(
+                        StatusCode::OK,
+                        format!(
+                            r#"{{"Name":"work","Driver":"local","Options":{options},"Labels":{labels}}}"#
+                        ),
+                    )
+                };
+                let responses = if existing {
+                    vec![inspected()]
+                } else {
+                    vec![
+                        StubResponse::new(StatusCode::NOT_FOUND, ""),
+                        StubResponse::new(StatusCode::CREATED, "{}"),
+                        inspected(),
+                    ]
+                };
+                let (socket_path, request_log, handle) =
+                    spawn_podman_stub("owned-volume", responses);
+                let result = PodmanClient::new(socket_path.clone())
+                    .create_owned_volume("work", "sandbox-1", "team-a", owner)
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "owner {owner:?}, options {options}, existing {existing}: {result:?}"
+                );
+                handle.await.expect("stub task should finish");
+                let expected_requests = if existing {
+                    vec!["GET /v5.0.0/libpod/volumes/work/json"]
+                } else {
+                    vec![
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                        "POST /v5.0.0/libpod/volumes/create",
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                    ]
+                };
+                assert_eq!(
+                    request_log.lock().expect("request log lock").as_slice(),
+                    expected_requests,
+                );
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
     }
 
     #[tokio::test]

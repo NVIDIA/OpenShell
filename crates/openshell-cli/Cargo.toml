@@ -88,7 +88,7 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["poll"] }
 
 [dev-dependencies]
 # Tests import the example profiles from providers/ the way an operator
