@@ -153,6 +153,27 @@ Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each r
 
 Endpoints are parsed as REST by default. Add `@protocol("json-rpc")` to an `HttpRequest` policy to inspect JSON-RPC and match on `context.jsonrpc_method`. All policies that declare a protocol for one endpoint must agree. SQL, GraphQL, and MCP inspection need request details the schema does not carry, so those protocols are rejected.
 
+## Audit Mode
+
+Add `@enforcement("audit")` to an `HttpRequest` policy to make it audit-only. The policy's action scope must be exactly `HttpRequest`.
+
+When every `HttpRequest` policy for an endpoint is audit-only, the endpoint runs in audit mode, like a YAML endpoint with `enforcement: audit`. OpenShell evaluates each request against those policies, logs a request they deny with decision `audit`, and forwards it.
+
+On an endpoint that has other `HttpRequest` policies, audit-only policies are staged. They never change a decision. OpenShell logs each request whose decision they would change, with `cedar_audit:staged_deny` or `cedar_audit:staged_allow` and the policies that would decide it. Use a staged `forbid` to see what a new restriction would block before you enforce it:
+
+```cedar
+@enforcement("audit")
+@id("no-webhook-changes")
+forbid (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.path like("/repos/*/*/hooks/**", "/") };
+```
+
+Logs name policies by their `@id` annotation when they have one.
+
 ## Providers and Credentials
 
 Providers attached to a Cedar sandbox supply credentials but never grant access. The Cedar policy alone decides which endpoints a process can reach. Attaching a provider makes its credentials available on connections that Cedar already allows to the provider's endpoints, with the provider's credential settings, such as request signing and body rewriting.

@@ -148,6 +148,7 @@ expect_eq "network: method outside the permit is denied" "$(status "-X DELETE" /
 expect_eq "network: forbid overrides permit" "$(status "" /allowed/secret)" "403"
 expect_eq "network: delimited path glob stays within one segment" \
     "$(status "" /allowed/deeper/path)" "403"
+expect_eq "network: a staged audit forbid does not deny" "$(status "" /allowed/staged)" "200"
 
 github_status() {
     capture_in_sandbox "curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://$1/" | tail -1
@@ -309,8 +310,9 @@ fi
 # Observability and policy view
 # ---------------------------------------------------------------------------
 
-expect_contains "logs: Cedar is recorded as the deciding engine" \
-    "$("$OPENSHELL_BIN" logs "$SANDBOX" 2>&1 || true)" "engine:cedar"
+sandbox_logs="$("$OPENSHELL_BIN" logs "$SANDBOX" 2>&1 || true)"
+expect_contains "logs: Cedar is recorded as the deciding engine" "$sandbox_logs" "engine:cedar"
+expect_contains "logs: a staged audit forbid is logged" "$sandbox_logs" "cedar_audit:staged_deny"
 
 policy_view="$("$OPENSHELL_BIN" policy get "$SANDBOX" --full 2>&1 || true)"
 expect_contains "policy get: shows the Cedar policy" "$policy_view" 'Sandbox::Action::"NetworkConnect"'

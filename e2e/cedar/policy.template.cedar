@@ -59,3 +59,13 @@ forbid (
     resource == Sandbox::NetworkEndpoint::"__HOST__:__PORT__"
 )
 when { context.path == "__PREFIX__/allowed/secret" };
+
+// A staged restriction: audit-only, so it is logged but never denies.
+@enforcement("audit")
+@id("staged-no-staged-path")
+forbid (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"__HOST__:__PORT__"
+)
+when { context.path == "__PREFIX__/allowed/staged" };

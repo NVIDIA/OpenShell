@@ -21,7 +21,12 @@
 //!   to inspect a connection per request. Every policy that can apply to
 //!   `HttpRequest` must therefore name its endpoint literally in the scope,
 //!   and every endpoint so named is inspected. An `HttpRequest` policy the
-//!   proxy could not route would otherwise be silently skipped.
+//!   proxy could not route would otherwise be silently skipped. An
+//!   `@enforcement("audit")` annotation marks an `HttpRequest` policy as
+//!   audit-only: an endpoint whose policies are all audit-only logs denials
+//!   instead of enforcing them, like a YAML `enforcement: audit` endpoint, and
+//!   on an enforced endpoint audit-only policies are staged, so requests whose
+//!   decision they would change are logged without being affected.
 //! - **DNS eligibility.** A `NetworkConnect` `permit` makes a host eligible
 //!   for policy DNS when it names the endpoint in its scope, or when its
 //!   `when` conditions require both `resource.host` and `resource.port`: the
@@ -52,6 +57,11 @@ use crate::{AuthorizedNetworkEndpoint, CedarEngineError, FilesystemGrants};
 /// Read only from policies that can apply to `HttpRequest`; see
 /// [`L7Protocol`] for accepted values.
 const PROTOCOL_ANNOTATION: &str = "protocol";
+
+/// Annotation that marks an `HttpRequest` policy as audit-only.
+///
+/// See [`L7Enforcement`] for accepted values.
+const ENFORCEMENT_ANNOTATION: &str = "enforcement";
 
 /// Annotation whose value, when present, names a policy in error messages.
 ///
@@ -99,6 +109,76 @@ impl fmt::Display for L7Protocol {
     }
 }
 
+/// Whether the proxy blocks requests an endpoint's policies deny.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum L7Enforcement {
+    /// Denied requests are blocked.
+    #[default]
+    Enforce,
+    /// Denied requests are logged and forwarded.
+    Audit,
+}
+
+impl L7Enforcement {
+    /// Returns the enforcement label the proxy's L7 config parser expects.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Audit => "audit",
+        }
+    }
+
+    fn from_annotation(value: &str) -> Option<Self> {
+        match value {
+            "enforce" => Some(Self::Enforce),
+            "audit" => Some(Self::Audit),
+            _ => None,
+        }
+    }
+}
+
+/// How the proxy inspects one endpoint named by `HttpRequest` policies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct L7Endpoint {
+    /// Wire protocol parsed per request.
+    pub protocol: L7Protocol,
+    /// [`L7Enforcement::Audit`] when every `HttpRequest` policy naming the
+    /// endpoint is audit-only.
+    pub enforcement: L7Enforcement,
+    /// True when the endpoint is enforced but some of its policies are
+    /// audit-only, so they are staged: evaluated for logging alone.
+    pub(crate) staged_audit: bool,
+}
+
+/// Returns whether a policy is annotated `@enforcement("audit")`.
+pub fn is_audit_only(policy: &Policy) -> bool {
+    policy.annotation(ENFORCEMENT_ANNOTATION) == Some(L7Enforcement::Audit.as_str())
+}
+
+/// `HttpRequest` policies seen for one endpoint while analyzing.
+#[derive(Default)]
+struct DeclaredEndpoint {
+    protocol: Option<L7Protocol>,
+    enforced_policies: usize,
+    audit_policies: usize,
+}
+
+impl DeclaredEndpoint {
+    fn finish(self) -> L7Endpoint {
+        let audit_only = self.audit_policies > 0 && self.enforced_policies == 0;
+        L7Endpoint {
+            protocol: self.protocol.unwrap_or_default(),
+            enforcement: if audit_only {
+                L7Enforcement::Audit
+            } else {
+                L7Enforcement::Enforce
+            },
+            staged_audit: self.audit_policies > 0 && self.enforced_policies > 0,
+        }
+    }
+}
+
 /// Everything derived from an authored policy set at load time.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyAnalysis {
@@ -107,7 +187,7 @@ pub struct PolicyAnalysis {
     /// Exact `NetworkConnect` endpoints eligible for policy DNS, by host.
     pub(crate) dns_endpoints: Vec<AuthorizedNetworkEndpoint>,
     /// Endpoints routed into L7 inspection, keyed by `(host, port)`.
-    pub(crate) l7_endpoints: BTreeMap<(String, u16), L7Protocol>,
+    pub(crate) l7_endpoints: BTreeMap<(String, u16), L7Endpoint>,
 }
 
 /// Validates `policies` against `schema` and derives a [`PolicyAnalysis`].
@@ -137,7 +217,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
     let mut read_only = BTreeSet::new();
     let mut read_write = BTreeSet::new();
     let mut dns_ports: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
-    let mut l7_declared: BTreeMap<(String, u16), Option<L7Protocol>> = BTreeMap::new();
+    let mut l7_declared: BTreeMap<(String, u16), DeclaredEndpoint> = BTreeMap::new();
 
     for policy in policies.policies() {
         let policy_id = display_id(policy);
@@ -155,6 +235,30 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             return Err(CedarEngineError::UnsupportedPolicy {
                 policy_id,
                 reason: "@protocol only applies to policies on the HttpRequest action".to_string(),
+            });
+        }
+        let enforcement = policy
+            .annotation(ENFORCEMENT_ANNOTATION)
+            .map(|value| {
+                L7Enforcement::from_annotation(value).ok_or_else(|| {
+                    CedarEngineError::UnsupportedEnforcement {
+                        policy_id: policy_id.clone(),
+                        enforcement: value.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        if enforcement == Some(L7Enforcement::Audit)
+            && !(touches_http_request && scope.is_only(actions::HTTP_REQUEST))
+        {
+            // Audit-only policies are left out of every NetworkConnect
+            // decision, so they may only name the HttpRequest action.
+            // `@enforcement("enforce")` is the default and allowed anywhere.
+            return Err(CedarEngineError::UnsupportedPolicy {
+                policy_id,
+                reason: "@enforcement(\"audit\") only applies to policies whose action scope \
+                         is exactly the HttpRequest action"
+                    .to_string(),
             });
         }
 
@@ -188,8 +292,8 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
                     })
                 })
                 .transpose()?;
-            let declared = l7_declared.entry(key).or_insert(None);
-            match (*declared, protocol) {
+            let declared = l7_declared.entry(key).or_default();
+            match (declared.protocol, protocol) {
                 (Some(first), Some(second)) if first != second => {
                     return Err(CedarEngineError::ConflictingL7Protocol {
                         endpoint,
@@ -197,8 +301,13 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
                         second: second.to_string(),
                     });
                 }
-                (None, Some(protocol)) => *declared = Some(protocol),
+                (None, Some(protocol)) => declared.protocol = Some(protocol),
                 _ => {}
+            }
+            if enforcement == Some(L7Enforcement::Audit) {
+                declared.audit_policies += 1;
+            } else {
+                declared.enforced_policies += 1;
             }
         }
 
@@ -226,7 +335,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             .collect(),
         l7_endpoints: l7_declared
             .into_iter()
-            .map(|(key, protocol)| (key, protocol.unwrap_or_default()))
+            .map(|(key, declared)| (key, declared.finish()))
             .collect(),
     })
 }
@@ -259,6 +368,11 @@ impl ActionScope {
             Self::Any => true,
             Self::Listed(ids) => ids.contains(action),
         }
+    }
+
+    /// True if the scope lists exactly `action`.
+    fn is_only(&self, action: &str) -> bool {
+        matches!(self, Self::Listed(ids) if ids.len() == 1 && ids.contains(action))
     }
 
     /// True if every action in scope is `ReadFile` or `WriteFile`.
@@ -691,7 +805,7 @@ fn collect_resource_in_paths(expr: &Value, paths: &mut Vec<String>) -> bool {
 }
 
 /// Returns the policy's `@id` annotation, or its Cedar-assigned id.
-fn display_id(policy: &Policy) -> String {
+pub fn display_id(policy: &Policy) -> String {
     policy
         .annotation(ID_ANNOTATION)
         .map_or_else(|| policy.id().to_string(), ToString::to_string)

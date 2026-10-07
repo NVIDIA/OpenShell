@@ -8,7 +8,7 @@ layer enforces it:
 
 | Area | Source | Checks |
 |---|---|---|
-| Network | `policy.template.cedar` | Permitted `GET` reaches the upstream; other paths, a path one segment deeper than a delimited glob allows, other methods, a `forbid`, another binary, and an unlisted host are denied. A delimited host glob (`*.github.com`) admits `api.github.com` through policy DNS but not `github.com`. |
+| Network | `policy.template.cedar` | Permitted `GET` reaches the upstream; other paths, a path one segment deeper than a delimited glob allows, other methods, a `forbid`, another binary, and an unlisted host are denied. A delimited host glob (`*.github.com`) admits `api.github.com` through policy DNS but not `github.com`. A staged `@enforcement("audit")` `forbid` lets its request through and is logged. |
 | Middleware | `middleware.template.yaml` via `--middleware` | The `openshell/regex` middleware redacts a secret in the request body before it reaches the upstream. |
 | Filesystem | `policy.template.cedar` | A `WriteFile` grant makes `/sandbox` writable, a `ReadFile` grant makes `/opt` readable, and `/srv` stays unreadable. |
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |

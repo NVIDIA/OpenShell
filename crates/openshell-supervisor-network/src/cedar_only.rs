@@ -42,7 +42,13 @@ use std::sync::{Arc, RwLock};
 
 use miette::Result;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
-use openshell_policy_cedar::{CedarEngine, Decision, L7Request, NetworkRequest, normalize_host};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
+    Url as OcsfUrl, ocsf_emit,
+};
+use openshell_policy_cedar::{
+    CedarEngine, Decision, L7Endpoint, L7Request, NetworkRequest, normalize_host,
+};
 use tokio::sync::watch;
 
 use crate::opa::{
@@ -105,24 +111,21 @@ impl LoadedPolicy {
     /// covers every path, a path-less config keeps the remaining paths
     /// inspected.
     fn endpoint_configs(&self, host: &str, port: u16) -> Result<Vec<regorus::Value>> {
-        let protocol = self
-            .cedar
-            .l7_protocol(host, port)
-            .map(openshell_policy_cedar::L7Protocol::as_str);
+        let inspection = self.cedar.l7_endpoint(host, port);
         let host = normalize_host(host);
         let mut configs: Vec<serde_json::Value> = self
             .providers
             .iter()
             .filter(|endpoint| endpoint.matches(&host, port))
-            .map(|endpoint| with_cedar_inspection(endpoint.config.clone(), protocol))
+            .map(|endpoint| with_cedar_inspection(endpoint.config.clone(), inspection))
             .collect();
         let covers_every_path = configs.iter().any(|config| config.get("path").is_none());
-        if let Some(protocol) = protocol
+        if let Some(inspection) = inspection
             && !covers_every_path
         {
             configs.push(serde_json::json!({
-                "protocol": protocol,
-                "enforcement": ENFORCEMENT_ENFORCE,
+                "protocol": inspection.protocol.as_str(),
+                "enforcement": inspection.enforcement.as_str(),
             }));
         }
         configs
@@ -217,18 +220,22 @@ const PROVIDER_RULE_KEYS: &[&str] = &[
     "policy_hash",
 ];
 
-/// Replaces a provider endpoint's rules and protocol with Cedar's decision.
+/// Replaces a provider endpoint's rules, protocol, and enforcement with
+/// Cedar's inspection of the endpoint.
 fn with_cedar_inspection(
     mut config: serde_json::Value,
-    protocol: Option<&str>,
+    inspection: Option<L7Endpoint>,
 ) -> serde_json::Value {
     if let Some(fields) = config.as_object_mut() {
         for key in PROVIDER_RULE_KEYS {
             fields.remove(*key);
         }
-        if let Some(protocol) = protocol {
-            fields.insert("protocol".to_string(), protocol.into());
-            fields.insert("enforcement".to_string(), ENFORCEMENT_ENFORCE.into());
+        if let Some(inspection) = inspection {
+            fields.insert("protocol".to_string(), inspection.protocol.as_str().into());
+            fields.insert(
+                "enforcement".to_string(),
+                inspection.enforcement.as_str().into(),
+            );
         }
     }
     config
@@ -531,11 +538,6 @@ impl CedarOnlyEngine {
 #[derive(Debug)]
 pub struct StagedCedarPolicy(Option<(LoadedPolicy, PolicyInputs)>);
 
-/// Value of an L7 endpoint config's `enforcement` key that makes the relay
-/// deny requests the policy does not allow. Any other value means audit-only
-/// (see `crate::l7::parse_l7_config`). Cedar decisions are always enforced.
-const ENFORCEMENT_ENFORCE: &str = "enforce";
-
 impl CedarOnlyEngine {
     /// Authorizes one egress request against the active Cedar policy.
     ///
@@ -722,11 +724,19 @@ impl CedarL7TunnelEngine {
             jsonrpc_method,
         };
 
-        let allowed = guard
+        let evaluation = guard
             .cedar
             .evaluate_l7(&l7_request)
-            .map_err(|e| miette::miette!("{e}"))?
-            .is_allow();
+            .map_err(|e| miette::miette!("{e}"))?;
+        if let Some(staged) = &evaluation.staged {
+            ocsf_emit!(staged_audit_event(
+                ctx,
+                request,
+                evaluation.is_allow(),
+                staged
+            ));
+        }
+        let allowed = evaluation.is_allow();
         let reason = if allowed {
             String::new()
         } else {
@@ -734,6 +744,53 @@ impl CedarL7TunnelEngine {
         };
         Ok((allowed, reason))
     }
+}
+
+/// Builds the event for a request whose decision staged audit-only policies
+/// would change.
+///
+/// The request itself is decided, and logged by the relay, without them.
+fn staged_audit_event(
+    ctx: &crate::l7::relay::L7EvalContext,
+    request: &crate::l7::L7RequestInfo,
+    allowed: bool,
+    staged: &Decision,
+) -> openshell_ocsf::OcsfEvent {
+    let (action_id, disposition_id) = if allowed {
+        (ActionId::Allowed, DispositionId::Allowed)
+    } else {
+        (ActionId::Denied, DispositionId::Blocked)
+    };
+    let (outcome, policies) = match staged {
+        Decision::Allow { matched_policies } => ("allow", matched_policies),
+        Decision::Deny { matched_policies } => ("deny", matched_policies),
+    };
+    let method = if request.action.is_empty() {
+        "-"
+    } else {
+        request.action.as_str()
+    };
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(action_id)
+        .disposition(disposition_id)
+        .severity(SeverityId::Informational)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", &ctx.host, &request.target, ctx.port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, "cedar")
+        .unmapped("cedar_audit", format!("staged_{outcome}"))
+        .unmapped("cedar_audit_policies", policies.join(","))
+        .message(format!(
+            "L7_AUDIT staged {outcome} {method} {}:{}{} policies={}",
+            ctx.host,
+            ctx.port,
+            request.target,
+            policies.join(","),
+        ))
+        .build()
 }
 
 #[cfg(test)]
@@ -1168,5 +1225,74 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
             );
             assert!(!authorization.exact_declared_endpoint_host, "{host}");
         }
+    }
+
+    const AUDIT_POLICY: &str = r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"api.example.com:443"
+);
+
+@enforcement("audit")
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"HttpRequest",
+    resource  == Sandbox::NetworkEndpoint::"api.example.com:443"
+)
+when { context.method == "GET" };
+"#;
+
+    #[test]
+    fn audit_endpoint_configs_use_audit_enforcement() {
+        let engine = CedarOnlyEngine::from_proto(&provider_policy(
+            AUDIT_POLICY,
+            vec![credentialed_endpoint()],
+        ))
+        .expect("policy loads");
+        let authorization = engine
+            .authorize_egress(&curl_input("api.example.com"))
+            .expect("request evaluates");
+        assert!(!authorization.endpoint_configs.is_empty());
+        for value in &authorization.endpoint_configs {
+            let config = crate::l7::parse_l7_config(value).expect("config must parse");
+            assert_eq!(config.enforcement, crate::l7::EnforcementMode::Audit);
+        }
+    }
+
+    #[test]
+    fn audit_endpoint_reports_the_policy_decision_for_the_relay_to_log() {
+        let engine = CedarOnlyEngine::from_policy_str(AUDIT_POLICY).expect("policy parses");
+        let tunnel = engine.l7_handle(engine.current_generation());
+        let (allowed, reason) = tunnel
+            .evaluate_request(&ctx(), &request("DELETE", "/v1/items/1"))
+            .expect("request evaluates");
+        assert!(!allowed, "the relay logs and forwards an audit deny");
+        assert!(!reason.is_empty());
+        let (allowed, _) = tunnel
+            .evaluate_request(&ctx(), &request("GET", "/v1/items/1"))
+            .expect("request evaluates");
+        assert!(allowed);
+    }
+
+    #[test]
+    fn staged_audit_event_reports_the_staged_outcome() {
+        let staged = Decision::Deny {
+            matched_policies: vec!["no-hooks".to_string()],
+        };
+        let event = staged_audit_event(&ctx(), &request("GET", "/v1/hooks"), true, &staged)
+            .to_json()
+            .expect("serialize");
+        let message = event["message"].as_str().expect("message");
+        assert_eq!(
+            message,
+            "L7_AUDIT staged deny GET api.example.com:443/v1/hooks policies=no-hooks"
+        );
+        assert_eq!(
+            event["action_id"],
+            serde_json::json!(ActionId::Allowed as u8)
+        );
+        assert_eq!(event["unmapped"]["cedar_audit"], "staged_deny");
+        assert_eq!(event["unmapped"]["cedar_audit_policies"], "no-hooks");
     }
 }

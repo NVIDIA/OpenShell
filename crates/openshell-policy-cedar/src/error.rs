@@ -20,6 +20,11 @@ pub enum CedarEngineError {
     #[diagnostic(code(openshell::policy_cedar::policy_parse))]
     PolicyParse(#[source] Box<cedar_policy::ParseErrors>),
 
+    /// The enforced subset of a policy set could not be assembled.
+    #[error("Cedar policy set error: {0}")]
+    #[diagnostic(code(openshell::policy_cedar::policy_set))]
+    PolicySet(#[source] Box<cedar_policy::PolicySetError>),
+
     /// An entity type name used to build a request did not parse (e.g.
     /// `Sandbox::Process`).
     #[error("invalid Cedar entity type name: {0}")]
@@ -105,6 +110,19 @@ pub enum CedarEngineError {
         policy_id: String,
         /// The annotation value as written.
         protocol: String,
+    },
+
+    /// An `@enforcement` annotation has a value other than `audit` or `enforce`.
+    #[error(
+        "policy {policy_id:?} declares @enforcement({enforcement:?}); supported values are \
+         \"enforce\" and \"audit\""
+    )]
+    #[diagnostic(code(openshell::policy_cedar::unsupported_enforcement))]
+    UnsupportedEnforcement {
+        /// The `@id` annotation of the policy, or its Cedar-assigned id.
+        policy_id: String,
+        /// The annotation value as written.
+        enforcement: String,
     },
 
     /// Two policies declare different `@protocol` values for one endpoint.

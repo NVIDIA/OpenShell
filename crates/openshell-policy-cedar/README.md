@@ -51,6 +51,14 @@ with a matching `allow-git` exception in `deny.toml`.
   policy leaves both engines on the previous revision. A rejected revision
   quarantines or retains the Cedar engine according to
   `policy_validation_failure_mode`, as for YAML.
+- `@enforcement("audit")` marks an `HttpRequest`-only policy as audit-only.
+  An endpoint whose policies are all audit-only gets `enforcement: audit` in its
+  L7 config, so the relay logs and forwards denials as it does for YAML. On an
+  enforced endpoint, audit-only policies are staged: `CedarEngine` decides with
+  the enforced policies, and reports a staged decision only when adding the
+  audit-only policies would change it. Comparing decisions, not evaluating the
+  audit-only policies alone, matters because Cedar denies by default. The
+  supervisor logs staged decisions as `cedar_audit` events.
 - Cedar-derived Landlock grants pass the same path checks as YAML paths and get
   the same baseline enrichment.
 

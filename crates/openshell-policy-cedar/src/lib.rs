@@ -19,7 +19,7 @@
 mod analysis;
 mod error;
 
-pub use analysis::L7Protocol;
+pub use analysis::{L7Endpoint, L7Enforcement, L7Protocol};
 pub use error::CedarEngineError;
 
 use std::collections::{HashMap, HashSet};
@@ -73,12 +73,14 @@ pub struct NetworkRequest {
 pub enum Decision {
     /// A `permit` policy matched and no `forbid` overrode it.
     Allow {
-        /// Ids of the policies that contributed to the decision.
+        /// Policies that contributed to the decision, by `@id` annotation or
+        /// Cedar-assigned id.
         matched_policies: Vec<String>,
     },
     /// No `permit` matched, or a `forbid` matched.
     Deny {
-        /// Ids of the policies that contributed to the decision.
+        /// Policies that contributed to the decision, by `@id` annotation or
+        /// Cedar-assigned id.
         matched_policies: Vec<String>,
     },
 }
@@ -88,6 +90,29 @@ impl Decision {
     #[must_use]
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
+    }
+}
+
+/// Outcome of evaluating one `HttpRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L7Evaluation {
+    /// The decision of the endpoint's policies.
+    ///
+    /// On an [`L7Enforcement::Audit`] endpoint every policy is audit-only, so
+    /// this is evaluated with all of them and the proxy logs a deny instead
+    /// of blocking it. On an enforced endpoint it is evaluated without the
+    /// audit-only policies.
+    pub decision: Decision,
+    /// The decision with the endpoint's staged audit-only policies included,
+    /// present only when it differs from [`Self::decision`].
+    pub staged: Option<Decision>,
+}
+
+impl L7Evaluation {
+    /// Returns `true` if [`Self::decision`] allows the request.
+    #[must_use]
+    pub fn is_allow(&self) -> bool {
+        self.decision.is_allow()
     }
 }
 
@@ -181,7 +206,10 @@ impl RequestUids {
 #[derive(Debug)]
 pub struct CedarEngine {
     schema: Schema,
+    /// Every authored policy, including audit-only ones.
     policies: PolicySet,
+    /// The policies that decide requests: every policy except audit-only ones.
+    enforced_policies: PolicySet,
     authorizer: Authorizer,
     analysis: PolicyAnalysis,
     uids: RequestUids,
@@ -202,9 +230,17 @@ impl CedarEngine {
         let policies = PolicySet::from_str(policy_src)
             .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
         let analysis = analysis::analyze(&schema, &policies)?;
+        let enforced_policies = PolicySet::from_policies(
+            policies
+                .policies()
+                .filter(|policy| !analysis::is_audit_only(policy))
+                .cloned(),
+        )
+        .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))?;
         Ok(Self {
             schema,
             policies,
+            enforced_policies,
             authorizer: Authorizer::new(),
             analysis,
             uids: RequestUids::new()?,
@@ -229,6 +265,14 @@ impl CedarEngine {
     /// allowed connection to it is relayed without per-request checks.
     #[must_use]
     pub fn l7_protocol(&self, host: &str, port: u16) -> Option<L7Protocol> {
+        self.l7_endpoint(host, port)
+            .map(|endpoint| endpoint.protocol)
+    }
+
+    /// Returns how the proxy inspects `host:port`, if any `HttpRequest`
+    /// policy names it.
+    #[must_use]
+    pub fn l7_endpoint(&self, host: &str, port: u16) -> Option<L7Endpoint> {
         self.analysis
             .l7_endpoints
             .get(&(normalize_host(host), port))
@@ -244,6 +288,7 @@ impl CedarEngine {
     /// policy.
     pub fn evaluate_network(&self, request: &NetworkRequest) -> Result<Decision, CedarEngineError> {
         self.authorize(
+            &self.enforced_policies,
             &self.uids.network_connect,
             &Principal {
                 user: &request.user,
@@ -268,32 +313,56 @@ impl CedarEngine {
     /// Returns [`CedarEngineError`] if the request cannot be represented in
     /// the loaded schema, or if Cedar reports an error while evaluating any
     /// policy.
-    pub fn evaluate_l7(&self, request: &L7Request) -> Result<Decision, CedarEngineError> {
-        self.authorize(
-            &self.uids.http_request,
-            &Principal {
-                user: &request.user,
-                group: &request.group,
-            },
-            &request.host,
-            request.port,
-            [
-                (context_fields::BINARY_PATH, string(&request.binary_path)),
-                (context_fields::ANCESTORS, string_set(&request.ancestors)),
-                (context_fields::METHOD, string(&request.method)),
-                (context_fields::PATH, string(&request.path)),
-                (context_fields::COMMAND, string(&request.command)),
-                (
-                    context_fields::JSONRPC_METHOD,
-                    string(&request.jsonrpc_method),
-                ),
-            ],
-        )
+    pub fn evaluate_l7(&self, request: &L7Request) -> Result<L7Evaluation, CedarEngineError> {
+        let endpoint = self.l7_endpoint(&request.host, request.port);
+        let audit_endpoint =
+            endpoint.is_some_and(|endpoint| endpoint.enforcement == L7Enforcement::Audit);
+        let evaluate = |policies: &PolicySet| {
+            self.authorize(
+                policies,
+                &self.uids.http_request,
+                &Principal {
+                    user: &request.user,
+                    group: &request.group,
+                },
+                &request.host,
+                request.port,
+                [
+                    (context_fields::BINARY_PATH, string(&request.binary_path)),
+                    (context_fields::ANCESTORS, string_set(&request.ancestors)),
+                    (context_fields::METHOD, string(&request.method)),
+                    (context_fields::PATH, string(&request.path)),
+                    (context_fields::COMMAND, string(&request.command)),
+                    (
+                        context_fields::JSONRPC_METHOD,
+                        string(&request.jsonrpc_method),
+                    ),
+                ],
+            )
+        };
+        if audit_endpoint {
+            return Ok(L7Evaluation {
+                decision: evaluate(&self.policies)?,
+                staged: None,
+            });
+        }
+        let decision = evaluate(&self.enforced_policies)?;
+        // Compare decisions, not the staged set's decision alone: Cedar denies
+        // by default, so a set of only audit-only `forbid`s denies every
+        // request whether or not one of them matched.
+        let staged = if endpoint.is_some_and(|endpoint| endpoint.staged_audit) {
+            let staged = evaluate(&self.policies)?;
+            (staged.is_allow() != decision.is_allow()).then_some(staged)
+        } else {
+            None
+        };
+        Ok(L7Evaluation { decision, staged })
     }
 
     /// Runs one authorization query.
     fn authorize<const N: usize>(
         &self,
+        policies: &PolicySet,
         action: &EntityUid,
         principal: &Principal<'_>,
         host: &str,
@@ -306,7 +375,7 @@ impl CedarEngine {
             .analysis
             .l7_endpoints
             .get(&(host.clone(), port))
-            .map_or("", |protocol| protocol.as_str());
+            .map_or("", |endpoint| endpoint.protocol.as_str());
 
         let user_uid = EntityUid::from_type_name_and_id(
             self.uids.user_type.clone(),
@@ -380,9 +449,7 @@ impl CedarEngine {
         )
         .map_err(|e| CedarEngineError::RequestBuild(Box::new(e)))?;
 
-        let response = self
-            .authorizer
-            .is_authorized(&request, &self.policies, &entities);
+        let response = self.authorizer.is_authorized(&request, policies, &entities);
         let errors: Vec<String> = response
             .diagnostics()
             .errors()
@@ -396,7 +463,11 @@ impl CedarEngine {
         let matched_policies = response
             .diagnostics()
             .reason()
-            .map(ToString::to_string)
+            .map(|id| {
+                policies
+                    .policy(id)
+                    .map_or_else(|| id.to_string(), analysis::display_id)
+            })
             .collect();
         Ok(match response.decision() {
             cedar_policy::Decision::Allow => Decision::Allow { matched_policies },
