@@ -239,7 +239,7 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
     grpc_rate_limit_window_seconds: Option<u64>,
 
-    /// Supervisor configuration delivery. Push sends shadow snapshots in this release.
+    /// Supervisor configuration delivery: poll (default) or push over the supervisor session.
     #[arg(long, env = "OPENSHELL_CONFIG_DELIVERY_MODE")]
     config_delivery_mode: Option<ConfigDeliveryMode>,
 

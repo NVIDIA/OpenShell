@@ -295,7 +295,7 @@ type OpenShellClient interface {
 	PeerGetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
 	// Best-effort notification to the replica that owns a supervisor session.
 	// The receiver rebuilds snapshots from authoritative state.
-	PeerNotifyConfigUpdate(ctx context.Context, in *PeerConfigUpdateHintRequest, opts ...grpc.CallOption) (*PeerConfigUpdateHintResponse, error)
+	PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1025,9 +1025,9 @@ func (c *openShellClient) PeerGetSandboxProviderStatus(ctx context.Context, in *
 	return out, nil
 }
 
-func (c *openShellClient) PeerNotifyConfigUpdate(ctx context.Context, in *PeerConfigUpdateHintRequest, opts ...grpc.CallOption) (*PeerConfigUpdateHintResponse, error) {
+func (c *openShellClient) PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PeerConfigUpdateHintResponse)
+	out := new(PeerNotifyConfigUpdateResponse)
 	err := c.cc.Invoke(ctx, OpenShell_PeerNotifyConfigUpdate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -1420,7 +1420,7 @@ type OpenShellServer interface {
 	PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
 	// Best-effort notification to the replica that owns a supervisor session.
 	// The receiver rebuilds snapshots from authoritative state.
-	PeerNotifyConfigUpdate(context.Context, *PeerConfigUpdateHintRequest) (*PeerConfigUpdateHintResponse, error)
+	PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1675,7 +1675,7 @@ func (UnimplementedOpenShellServer) PeerReportEndpointStatus(context.Context, *R
 func (UnimplementedOpenShellServer) PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PeerGetSandboxProviderStatus not implemented")
 }
-func (UnimplementedOpenShellServer) PeerNotifyConfigUpdate(context.Context, *PeerConfigUpdateHintRequest) (*PeerConfigUpdateHintResponse, error) {
+func (UnimplementedOpenShellServer) PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PeerNotifyConfigUpdate not implemented")
 }
 func (UnimplementedOpenShellServer) WatchSandbox(*WatchSandboxRequest, grpc.ServerStreamingServer[SandboxStreamEvent]) error {
@@ -2836,7 +2836,7 @@ func _OpenShell_PeerGetSandboxProviderStatus_Handler(srv interface{}, ctx contex
 }
 
 func _OpenShell_PeerNotifyConfigUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PeerConfigUpdateHintRequest)
+	in := new(PeerNotifyConfigUpdateRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -2848,7 +2848,7 @@ func _OpenShell_PeerNotifyConfigUpdate_Handler(srv interface{}, ctx context.Cont
 		FullMethod: OpenShell_PeerNotifyConfigUpdate_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, req.(*PeerConfigUpdateHintRequest))
+		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, req.(*PeerNotifyConfigUpdateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }

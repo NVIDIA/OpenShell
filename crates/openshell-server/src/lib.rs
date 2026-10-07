@@ -311,11 +311,11 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
-    /// Coalescing scheduler for supervisor configuration delivery.
+    /// Coalescing queue and delivery worker for supervisor configuration delivery.
     pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Routing boundary for local or remote supervisor configuration delivery.
-    pub(crate) supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter>,
+    pub(crate) supervisor_config_transport: Arc<dyn config_delivery::SupervisorConfigTransport>,
 
     /// Stable identity for this gateway process.
     pub replica_id: String,
@@ -394,8 +394,10 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 impl ServerState {
     /// Return the configuration delivery boundary for supervisor sessions.
     #[must_use]
-    pub fn supervisor_config_router(&self) -> Arc<dyn config_delivery::SupervisorConfigRouter> {
-        Arc::clone(&self.supervisor_config_router)
+    pub fn supervisor_config_transport(
+        &self,
+    ) -> Arc<dyn config_delivery::SupervisorConfigTransport> {
+        Arc::clone(&self.supervisor_config_transport)
     }
 
     /// Create new server state.
@@ -449,9 +451,10 @@ impl ServerState {
             .oidc
             .as_ref()
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
-        let supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter> = Arc::new(
-            config_delivery::LocalSupervisorConfigRouter::new(Arc::clone(&supervisor_sessions)),
-        );
+        let supervisor_config_transport: Arc<dyn config_delivery::SupervisorConfigTransport> =
+            Arc::new(config_delivery::LocalSupervisorConfigTransport::new(
+                Arc::clone(&supervisor_sessions),
+            ));
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
@@ -470,7 +473,7 @@ impl ServerState {
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             config_delivery,
-            supervisor_config_router,
+            supervisor_config_transport,
             replica_id,
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
