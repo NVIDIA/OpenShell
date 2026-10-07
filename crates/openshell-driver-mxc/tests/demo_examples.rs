@@ -138,6 +138,25 @@ fn shipped_aggregate_e2e_assets_support_mock_wiring_validation() {
 }
 
 #[test]
+fn shipped_runners_isolate_cli_state_and_gateway_overrides() {
+    for name in ["run-mxc-e2e.ps1", "run-ocsf-audit.ps1"] {
+        let runner = read_example(name);
+        for required in [
+            "Enter-IsolatedCliEnvironment",
+            "Exit-IsolatedCliEnvironment",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "OPENSHELL_GATEWAY",
+            "OPENSHELL_GATEWAY_ENDPOINT",
+            "Remove-Item \"Env:$name\"",
+            "CLI inspection endpoint:",
+        ] {
+            assert!(runner.contains(required), "{name} is missing {required}");
+        }
+    }
+}
+
+#[test]
 fn shipped_audit_and_websocket_configs_use_current_schema() {
     for name in ["mxc-ocsf-audit.toml", "mxc-ws-gateway.toml"] {
         let source = read_example(name);

@@ -129,7 +129,10 @@ function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
   if (-not $AllowFailure -and $process.ExitCode -ne 0) {
     throw "openshell $($CommandArgs -join ' ') failed (exit $($process.ExitCode)): $text"
   }
-  return @{ ExitCode = $process.ExitCode; Text = $text }
+  return @{
+    ExitCode = $process.ExitCode
+    Text = $text
+  }
 }
 
 function Resolve-Artifact([string]$explicit, [string]$leaf) {
@@ -152,6 +155,103 @@ function Get-MxcEtwSessions {
   }
 }
 
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+  "APPDATA",
+  "LOCALAPPDATA",
+  "XDG_CONFIG_HOME",
+  "XDG_STATE_HOME",
+  "XDG_DATA_HOME",
+  "OPENSHELL_GATEWAY",
+  "OPENSHELL_GATEWAY_ENDPOINT",
+  "OPENSHELL_GATEWAY_INSECURE",
+  "OPENSHELL_GATEWAY_CONFIG",
+  "OPENSHELL_GATEWAY_NAME"
+)
+
+function Set-ProcessEnvironmentVariableExact {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $Name,
+    [Parameter(Mandatory = $true)]
+    [bool] $Exists,
+    [AllowNull()]
+    [string] $Value
+  )
+
+  if (-not $Exists) {
+    Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+    return
+  }
+
+  if ($Value.Length -eq 0) {
+    # Windows PowerShell 5.1 maps an empty value passed through
+    # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+    # so an inherited empty entry remains distinguishable from absence.
+    if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+      Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+    }
+    if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+      $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+    }
+    return
+  }
+
+  [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Enter-IsolatedCliEnvironment {
+  $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+  foreach ($name in $cliEnvironmentNames) {
+    $exists = $processEnvironment.Contains($name)
+    $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+      Exists = $exists
+      Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+    }
+  }
+  $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-ocsf-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+  $isolatedPaths = @{
+    APPDATA = Join-Path $script:cliStateRoot "appdata"
+    LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+    XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+    XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+    XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+  }
+  try {
+    New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+    foreach ($entry in $isolatedPaths.GetEnumerator()) {
+      [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+    foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+      Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+  } catch {
+    Exit-IsolatedCliEnvironment
+    throw
+  }
+}
+
+function Exit-IsolatedCliEnvironment {
+  foreach ($name in $cliEnvironmentNames) {
+    $snapshot = $script:cliEnvironmentSnapshot[$name]
+    Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+  }
+  if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+    Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 $gateway = Resolve-Artifact $GatewayPath "openshell-gateway.exe"
 $cli     = Resolve-Artifact $CliPath "openshell.exe"
 $policySrc = Join-Path $here "ocsf-audit.yaml"
@@ -167,6 +267,8 @@ $proxyOn  = -not $NoProxy
 $oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 
 try {
+  Enter-IsolatedCliEnvironment
+
   # 1. Validate artifacts + privilege.
   Step "Validate package artifacts"
   foreach ($f in @($gateway, $cli, $policySrc, $tomlSrc)) {
@@ -319,10 +421,10 @@ try {
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
-  $env:OPENSHELL_GATEWAY = ""
-  $gatewayAdd = Invoke-Cli @("gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName) -AllowFailure
+  $expectedEndpoint = "http://127.0.0.1:$Port"
+  $gatewayAdd = Invoke-Cli @("gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName) -AllowFailure
   if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
-  if ($gatewayAdd.ExitCode -ne 0 -and $gatewayAdd.Text -notmatch '(?i)already exists') {
+  if ($gatewayAdd.ExitCode -ne 0) {
     throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
   }
   $gatewaySelect = Invoke-Cli @("gateway", "select", $GatewayName)
@@ -364,6 +466,7 @@ finally {
   # Stop the gateway FIRST so it releases its log + JSONL file handles.
   if ($KeepRunning -and $gw -and -not $gw.HasExited) {
     Info "leaving gateway pid $($gw.Id) running (-KeepRunning); stop it with: Stop-Process -Id $($gw.Id) -Force"
+    Info "CLI inspection endpoint: `$env:OPENSHELL_GATEWAY_ENDPOINT='http://127.0.0.1:$Port'"
   } elseif ($gw -and -not $gw.HasExited) {
     Step "Cleanup"
     Stop-Process -Id $gw.Id -Force -ErrorAction SilentlyContinue
@@ -382,6 +485,7 @@ finally {
   } else {
     $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
   }
+  Exit-IsolatedCliEnvironment
 
   # ---- summarise the OCSF audit trail --------------------------------------
   $logText = @()
