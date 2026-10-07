@@ -26,6 +26,9 @@ mod token_grant;
 pub mod upstream_proxy;
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicU64, Ordering};

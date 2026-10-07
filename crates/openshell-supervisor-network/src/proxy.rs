@@ -7029,6 +7029,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use crate::test_support::{executable_path, policy_with_native_executable_paths};
     use openshell_core::proposals::AgentProposals;
     use std::collections::HashMap as TestHashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -7040,7 +7041,8 @@ mod tests {
     fn supplied_identity_preserves_authorized_endpoint_metadata() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   inspected:
     name: inspected
@@ -7065,11 +7067,12 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = Ok(ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/usr/bin/python3"),
+                path: executable_path("/usr/bin/python3"),
                 digest: Some("00".repeat(32).parse().expect("digest")),
             },
             ancestors: Vec::new(),
@@ -7097,7 +7100,8 @@ process:
     fn supplied_identity_rejects_same_path_replacement() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   credentialed:
     name: credentialed
@@ -7120,12 +7124,13 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = |digest_byte: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some(digest_byte.repeat(32).parse().expect("digest")),
                 },
                 ancestors: Vec::new(),
@@ -7154,7 +7159,8 @@ process:
     fn supplied_identity_rejects_replaced_authorizing_ancestor() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7173,16 +7179,17 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = |ancestor_digest: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some("11".repeat(32).parse().expect("digest")),
                 },
                 ancestors: vec![ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/launcher"),
+                    path: executable_path("/sandbox/bin/launcher"),
                     digest: Some(ancestor_digest.repeat(32).parse().expect("digest")),
                 }],
                 cmdline_paths: Vec::new(),
@@ -7225,11 +7232,13 @@ process:
   run_as_group: sandbox
 "#;
         let rego = include_str!("../data/sandbox-policy.rego");
-        let engine = OpaEngine::from_strings(rego, POLICY_DATA).expect("load policy");
+        let engine =
+            OpaEngine::from_strings(rego, &policy_with_native_executable_paths(POLICY_DATA))
+                .expect("load policy");
         let identity = |digest_byte: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some(digest_byte.repeat(32).parse().expect("digest")),
                 },
                 ancestors: Vec::new(),
@@ -7243,7 +7252,9 @@ process:
             authorize_supplied_identity(&engine, &identity_cache, intent(), &identity("11"));
         assert!(matches!(original.action, NetworkAction::Allow { .. }));
 
-        engine.reload(rego, POLICY_DATA).expect("reload policy");
+        engine
+            .reload(rego, &policy_with_native_executable_paths(POLICY_DATA))
+            .expect("reload policy");
         let replacement =
             authorize_supplied_identity(&engine, &identity_cache, intent(), &identity("22"));
 
@@ -7259,7 +7270,8 @@ process:
     fn supplied_identity_rejects_missing_ancestor_digest_before_policy() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7278,15 +7290,16 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = Ok(ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/sandbox/bin/client"),
+                path: executable_path("/sandbox/bin/client"),
                 digest: Some("11".repeat(32).parse().expect("digest")),
             },
             ancestors: vec![ContractExecutableIdentity {
-                path: PathBuf::from("/sandbox/bin/launcher"),
+                path: executable_path("/sandbox/bin/launcher"),
                 digest: None,
             }],
             cmdline_paths: Vec::new(),
@@ -7310,7 +7323,8 @@ process:
     async fn staged_transparent_open_waits_for_l4_policy() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7331,6 +7345,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -7338,7 +7353,7 @@ process:
         let identity = || {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: Some("00".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
@@ -7431,7 +7446,10 @@ process:
             .expect("policy denial is sent to mapper");
         assert_eq!(event.host, "203.0.113.8");
         assert_eq!(event.port, 443);
-        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(
+            event.binary,
+            executable_path("/usr/bin/curl").to_str().unwrap()
+        );
         assert_eq!(event.denial_stage, "transparent_tcp_connect");
         assert!(denial_rx.try_recv().is_err(), "exactly one mapper event");
     }
@@ -7533,7 +7551,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 stream: Box::new(stream),
                 binary_identity: Ok(ContractBinaryIdentity {
                     executable: ContractExecutableIdentity {
-                        path: PathBuf::from("/usr/bin/curl"),
+                        path: executable_path("/usr/bin/curl"),
                         digest: Some("00".repeat(32).parse().unwrap()),
                     },
                     ancestors: Vec::new(),
@@ -7719,7 +7737,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     async fn staged_transparent_open_dials_only_pinned_policy_dns_addresses() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7759,7 +7777,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7792,14 +7810,17 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let event = denial_rx.try_recv().expect("denial is sent to the mapper");
         assert_eq!(event.host, "unknown.example");
         assert_eq!(event.port, 443);
-        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(
+            event.binary,
+            executable_path("/usr/bin/curl").to_str().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn staged_transparent_open_never_relays_an_observation_that_policy_allows() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -7865,7 +7886,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     fn pinned_plan_requires_the_mapping_of_the_deciding_generation() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7908,7 +7929,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         engine
             .reload(
                 include_str!("../data/sandbox-policy.rego"),
-                POLICY_DNS_OPEN_POLICY,
+                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
             )
             .unwrap();
         let reloaded = decide("db.example", 5432);
@@ -7931,7 +7952,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         assert_eq!(
             mapped.format_shorthand(),
-            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]"
+            format!(
+                "NET:OPEN [MED] DENIED {}(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]",
+                executable_path("/usr/bin/curl").display()
+            )
         );
         assert_eq!(
             serde_json::to_value(mapped).unwrap()["dst_endpoint"],
@@ -7963,7 +7987,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let cache = Arc::new(BinaryIdentityCache::new());
         let identity = ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/usr/bin/bash"),
+                path: executable_path("/usr/bin/bash"),
                 digest: Some("44".repeat(32).parse().unwrap()),
             },
             ancestors: Vec::new(),
@@ -8075,7 +8099,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let engine = Arc::new(
             OpaEngine::from_strings(
                 include_str!("../data/sandbox-policy.rego"),
-                &format!(
+                &policy_with_native_executable_paths(&format!(
                     r#"
 network_policies:
   allowed:
@@ -8088,7 +8112,7 @@ network_policies:
       - path: /usr/bin/curl
 "#,
                     port = destination.port()
-                ),
+                )),
             )
             .unwrap(),
         );
@@ -8099,7 +8123,7 @@ network_policies:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: Some("44".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
@@ -8210,7 +8234,8 @@ network_policies:
     async fn staged_transparent_open_reports_invalid_identity_as_unavailable() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -8229,6 +8254,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -8238,7 +8264,7 @@ process:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: None,
                 },
                 ancestors: Vec::new(),
@@ -8279,7 +8305,8 @@ process:
     async fn staged_transparent_open_reports_identity_cache_capacity_exhaustion() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -8298,6 +8325,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -8305,7 +8333,7 @@ process:
             identity_cache
                 .verify_or_cache_supplied_identity(&ContractBinaryIdentity {
                     executable: ContractExecutableIdentity {
-                        path: PathBuf::from(format!("/sandbox/pinned-{index}")),
+                        path: executable_path(&format!("/sandbox/pinned-{index}")),
                         digest: Some("11".repeat(32).parse().unwrap()),
                     },
                     ancestors: Vec::new(),
@@ -8319,7 +8347,7 @@ process:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/overflow"),
+                    path: executable_path("/sandbox/overflow"),
                     digest: Some("22".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
