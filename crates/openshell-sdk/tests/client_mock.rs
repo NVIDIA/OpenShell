@@ -236,8 +236,8 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 impl OpenShell for TestOpenShell {
     async fn peer_notify_config_update(
         &self,
-        _request: tonic::Request<proto::PeerConfigUpdateHintRequest>,
-    ) -> Result<Response<proto::PeerConfigUpdateHintResponse>, Status> {
+        _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<proto::PeerNotifyConfigUpdateResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 

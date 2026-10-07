@@ -15560,7 +15560,7 @@ func (*PeerRelayFrame_Data) isPeerRelayFrame_Payload() {}
 type PeerConfigSandboxTarget struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	// Fences a targeted hint to the session observed by the sending replica.
+	// Fences a targeted notification to the session observed by the sending replica.
 	SessionId     string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -15663,35 +15663,35 @@ func (x *PeerConfigProviderTarget) GetName() string {
 	return ""
 }
 
-type PeerConfigUpdateHintRequest struct {
+type PeerNotifyConfigUpdateRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Scope:
 	//
-	//	*PeerConfigUpdateHintRequest_Sandbox
-	//	*PeerConfigUpdateHintRequest_Workspace
-	//	*PeerConfigUpdateHintRequest_AllConnected
-	//	*PeerConfigUpdateHintRequest_Provider
-	Scope               isPeerConfigUpdateHintRequest_Scope `protobuf_oneof:"scope"`
-	SandboxConfig       bool                                `protobuf:"varint,4,opt,name=sandbox_config,json=sandboxConfig,proto3" json:"sandbox_config,omitempty"`
-	ProviderEnvironment bool                                `protobuf:"varint,5,opt,name=provider_environment,json=providerEnvironment,proto3" json:"provider_environment,omitempty"`
+	//	*PeerNotifyConfigUpdateRequest_Sandbox
+	//	*PeerNotifyConfigUpdateRequest_Workspace
+	//	*PeerNotifyConfigUpdateRequest_AllConnected
+	//	*PeerNotifyConfigUpdateRequest_Provider
+	Scope               isPeerNotifyConfigUpdateRequest_Scope `protobuf_oneof:"scope"`
+	SandboxConfig       bool                                  `protobuf:"varint,4,opt,name=sandbox_config,json=sandboxConfig,proto3" json:"sandbox_config,omitempty"`
+	ProviderEnvironment bool                                  `protobuf:"varint,5,opt,name=provider_environment,json=providerEnvironment,proto3" json:"provider_environment,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
 
-func (x *PeerConfigUpdateHintRequest) Reset() {
-	*x = PeerConfigUpdateHintRequest{}
+func (x *PeerNotifyConfigUpdateRequest) Reset() {
+	*x = PeerNotifyConfigUpdateRequest{}
 	mi := &file_openshell_proto_msgTypes[197]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PeerConfigUpdateHintRequest) String() string {
+func (x *PeerNotifyConfigUpdateRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PeerConfigUpdateHintRequest) ProtoMessage() {}
+func (*PeerNotifyConfigUpdateRequest) ProtoMessage() {}
 
-func (x *PeerConfigUpdateHintRequest) ProtoReflect() protoreflect.Message {
+func (x *PeerNotifyConfigUpdateRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[197]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -15703,118 +15703,118 @@ func (x *PeerConfigUpdateHintRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PeerConfigUpdateHintRequest.ProtoReflect.Descriptor instead.
-func (*PeerConfigUpdateHintRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use PeerNotifyConfigUpdateRequest.ProtoReflect.Descriptor instead.
+func (*PeerNotifyConfigUpdateRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{197}
 }
 
-func (x *PeerConfigUpdateHintRequest) GetScope() isPeerConfigUpdateHintRequest_Scope {
+func (x *PeerNotifyConfigUpdateRequest) GetScope() isPeerNotifyConfigUpdateRequest_Scope {
 	if x != nil {
 		return x.Scope
 	}
 	return nil
 }
 
-func (x *PeerConfigUpdateHintRequest) GetSandbox() *PeerConfigSandboxTarget {
+func (x *PeerNotifyConfigUpdateRequest) GetSandbox() *PeerConfigSandboxTarget {
 	if x != nil {
-		if x, ok := x.Scope.(*PeerConfigUpdateHintRequest_Sandbox); ok {
+		if x, ok := x.Scope.(*PeerNotifyConfigUpdateRequest_Sandbox); ok {
 			return x.Sandbox
 		}
 	}
 	return nil
 }
 
-func (x *PeerConfigUpdateHintRequest) GetWorkspace() string {
+func (x *PeerNotifyConfigUpdateRequest) GetWorkspace() string {
 	if x != nil {
-		if x, ok := x.Scope.(*PeerConfigUpdateHintRequest_Workspace); ok {
+		if x, ok := x.Scope.(*PeerNotifyConfigUpdateRequest_Workspace); ok {
 			return x.Workspace
 		}
 	}
 	return ""
 }
 
-func (x *PeerConfigUpdateHintRequest) GetAllConnected() bool {
+func (x *PeerNotifyConfigUpdateRequest) GetAllConnected() bool {
 	if x != nil {
-		if x, ok := x.Scope.(*PeerConfigUpdateHintRequest_AllConnected); ok {
+		if x, ok := x.Scope.(*PeerNotifyConfigUpdateRequest_AllConnected); ok {
 			return x.AllConnected
 		}
 	}
 	return false
 }
 
-func (x *PeerConfigUpdateHintRequest) GetProvider() *PeerConfigProviderTarget {
+func (x *PeerNotifyConfigUpdateRequest) GetProvider() *PeerConfigProviderTarget {
 	if x != nil {
-		if x, ok := x.Scope.(*PeerConfigUpdateHintRequest_Provider); ok {
+		if x, ok := x.Scope.(*PeerNotifyConfigUpdateRequest_Provider); ok {
 			return x.Provider
 		}
 	}
 	return nil
 }
 
-func (x *PeerConfigUpdateHintRequest) GetSandboxConfig() bool {
+func (x *PeerNotifyConfigUpdateRequest) GetSandboxConfig() bool {
 	if x != nil {
 		return x.SandboxConfig
 	}
 	return false
 }
 
-func (x *PeerConfigUpdateHintRequest) GetProviderEnvironment() bool {
+func (x *PeerNotifyConfigUpdateRequest) GetProviderEnvironment() bool {
 	if x != nil {
 		return x.ProviderEnvironment
 	}
 	return false
 }
 
-type isPeerConfigUpdateHintRequest_Scope interface {
-	isPeerConfigUpdateHintRequest_Scope()
+type isPeerNotifyConfigUpdateRequest_Scope interface {
+	isPeerNotifyConfigUpdateRequest_Scope()
 }
 
-type PeerConfigUpdateHintRequest_Sandbox struct {
+type PeerNotifyConfigUpdateRequest_Sandbox struct {
 	Sandbox *PeerConfigSandboxTarget `protobuf:"bytes,1,opt,name=sandbox,proto3,oneof"`
 }
 
-type PeerConfigUpdateHintRequest_Workspace struct {
+type PeerNotifyConfigUpdateRequest_Workspace struct {
 	Workspace string `protobuf:"bytes,2,opt,name=workspace,proto3,oneof"`
 }
 
-type PeerConfigUpdateHintRequest_AllConnected struct {
+type PeerNotifyConfigUpdateRequest_AllConnected struct {
 	AllConnected bool `protobuf:"varint,3,opt,name=all_connected,json=allConnected,proto3,oneof"`
 }
 
-type PeerConfigUpdateHintRequest_Provider struct {
+type PeerNotifyConfigUpdateRequest_Provider struct {
 	Provider *PeerConfigProviderTarget `protobuf:"bytes,6,opt,name=provider,proto3,oneof"`
 }
 
-func (*PeerConfigUpdateHintRequest_Sandbox) isPeerConfigUpdateHintRequest_Scope() {}
+func (*PeerNotifyConfigUpdateRequest_Sandbox) isPeerNotifyConfigUpdateRequest_Scope() {}
 
-func (*PeerConfigUpdateHintRequest_Workspace) isPeerConfigUpdateHintRequest_Scope() {}
+func (*PeerNotifyConfigUpdateRequest_Workspace) isPeerNotifyConfigUpdateRequest_Scope() {}
 
-func (*PeerConfigUpdateHintRequest_AllConnected) isPeerConfigUpdateHintRequest_Scope() {}
+func (*PeerNotifyConfigUpdateRequest_AllConnected) isPeerNotifyConfigUpdateRequest_Scope() {}
 
-func (*PeerConfigUpdateHintRequest_Provider) isPeerConfigUpdateHintRequest_Scope() {}
+func (*PeerNotifyConfigUpdateRequest_Provider) isPeerNotifyConfigUpdateRequest_Scope() {}
 
-type PeerConfigUpdateHintResponse struct {
+type PeerNotifyConfigUpdateResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The targeted session moved before the receiving replica accepted the hint.
+	// The targeted session moved before the receiving replica accepted the notification.
 	StaleOwner    bool `protobuf:"varint,1,opt,name=stale_owner,json=staleOwner,proto3" json:"stale_owner,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *PeerConfigUpdateHintResponse) Reset() {
-	*x = PeerConfigUpdateHintResponse{}
+func (x *PeerNotifyConfigUpdateResponse) Reset() {
+	*x = PeerNotifyConfigUpdateResponse{}
 	mi := &file_openshell_proto_msgTypes[198]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PeerConfigUpdateHintResponse) String() string {
+func (x *PeerNotifyConfigUpdateResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PeerConfigUpdateHintResponse) ProtoMessage() {}
+func (*PeerNotifyConfigUpdateResponse) ProtoMessage() {}
 
-func (x *PeerConfigUpdateHintResponse) ProtoReflect() protoreflect.Message {
+func (x *PeerNotifyConfigUpdateResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[198]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -15826,12 +15826,12 @@ func (x *PeerConfigUpdateHintResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PeerConfigUpdateHintResponse.ProtoReflect.Descriptor instead.
-func (*PeerConfigUpdateHintResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use PeerNotifyConfigUpdateResponse.ProtoReflect.Descriptor instead.
+func (*PeerNotifyConfigUpdateResponse) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{198}
 }
 
-func (x *PeerConfigUpdateHintResponse) GetStaleOwner() bool {
+func (x *PeerNotifyConfigUpdateResponse) GetStaleOwner() bool {
 	if x != nil {
 		return x.StaleOwner
 	}
@@ -20565,16 +20565,16 @@ const file_openshell_proto_rawDesc = "" +
 	"session_id\x18\x02 \x01(\tR\tsessionId\"L\n" +
 	"\x18PeerConfigProviderTarget\x12\x1c\n" +
 	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"\xd0\x02\n" +
-	"\x1bPeerConfigUpdateHintRequest\x12A\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"\xd2\x02\n" +
+	"\x1dPeerNotifyConfigUpdateRequest\x12A\n" +
 	"\asandbox\x18\x01 \x01(\v2%.openshell.v1.PeerConfigSandboxTargetH\x00R\asandbox\x12\x1e\n" +
 	"\tworkspace\x18\x02 \x01(\tH\x00R\tworkspace\x12%\n" +
 	"\rall_connected\x18\x03 \x01(\bH\x00R\fallConnected\x12D\n" +
 	"\bprovider\x18\x06 \x01(\v2&.openshell.v1.PeerConfigProviderTargetH\x00R\bprovider\x12%\n" +
 	"\x0esandbox_config\x18\x04 \x01(\bR\rsandboxConfig\x121\n" +
 	"\x14provider_environment\x18\x05 \x01(\bR\x13providerEnvironmentB\a\n" +
-	"\x05scope\"?\n" +
-	"\x1cPeerConfigUpdateHintResponse\x12\x1f\n" +
+	"\x05scope\"A\n" +
+	"\x1ePeerNotifyConfigUpdateResponse\x12\x1f\n" +
 	"\vstale_owner\x18\x01 \x01(\bR\n" +
 	"staleOwner\"`\n" +
 	"\x0fRelayOpenResult\x12\x1d\n" +
@@ -21009,7 +21009,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x18ServiceAuthorizationMode\x12*\n" +
 	"&SERVICE_AUTHORIZATION_MODE_UNSPECIFIED\x10\x00\x12$\n" +
 	" SERVICE_AUTHORIZATION_MODE_STRIP\x10\x01\x121\n" +
-	"-SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH\x10\x022\xacV\n" +
+	"-SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH\x10\x022\xb0V\n" +
 	"\tOpenShell\x12Z\n" +
 	"\x06Health\x12\x1b.openshell.v1.HealthRequest\x1a\x1c.openshell.v1.HealthResponse\"\x15\x82\xb5\x18\x11\n" +
 	"\x0funauthenticated\x12i\n" +
@@ -21143,8 +21143,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04peer\x12\x89\x01\n" +
 	"\x1cPeerGetSandboxProviderStatus\x12-.openshell.v1.GetSandboxProviderStatusRequest\x1a..openshell.v1.GetSandboxProviderStatusResponse\"\n" +
 	"\x82\xb5\x18\x06\n" +
-	"\x04peer\x12{\n" +
-	"\x16PeerNotifyConfigUpdate\x12).openshell.v1.PeerConfigUpdateHintRequest\x1a*.openshell.v1.PeerConfigUpdateHintResponse\"\n" +
+	"\x04peer\x12\x7f\n" +
+	"\x16PeerNotifyConfigUpdate\x12+.openshell.v1.PeerNotifyConfigUpdateRequest\x1a,.openshell.v1.PeerNotifyConfigUpdateResponse\"\n" +
 	"\x82\xb5\x18\x06\n" +
 	"\x04peer\x12w\n" +
 	"\fWatchSandbox\x12!.openshell.v1.WatchSandboxRequest\x1a .openshell.v1.SandboxStreamEvent\" \x82\xb5\x18\x1c\n" +
@@ -21419,8 +21419,8 @@ var file_openshell_proto_goTypes = []any{
 	(*PeerRelayFrame)(nil),                               // 215: openshell.v1.PeerRelayFrame
 	(*PeerConfigSandboxTarget)(nil),                      // 216: openshell.v1.PeerConfigSandboxTarget
 	(*PeerConfigProviderTarget)(nil),                     // 217: openshell.v1.PeerConfigProviderTarget
-	(*PeerConfigUpdateHintRequest)(nil),                  // 218: openshell.v1.PeerConfigUpdateHintRequest
-	(*PeerConfigUpdateHintResponse)(nil),                 // 219: openshell.v1.PeerConfigUpdateHintResponse
+	(*PeerNotifyConfigUpdateRequest)(nil),                // 218: openshell.v1.PeerNotifyConfigUpdateRequest
+	(*PeerNotifyConfigUpdateResponse)(nil),               // 219: openshell.v1.PeerNotifyConfigUpdateResponse
 	(*RelayOpenResult)(nil),                              // 220: openshell.v1.RelayOpenResult
 	(*RelayClose)(nil),                                   // 221: openshell.v1.RelayClose
 	(*L7RequestSample)(nil),                              // 222: openshell.v1.L7RequestSample
@@ -21821,8 +21821,8 @@ var file_openshell_proto_depIdxs = []int32{
 	212, // 299: openshell.v1.RelayFrame.init:type_name -> openshell.v1.RelayInit
 	209, // 300: openshell.v1.PeerRelayInit.relay_open:type_name -> openshell.v1.RelayOpen
 	214, // 301: openshell.v1.PeerRelayFrame.init:type_name -> openshell.v1.PeerRelayInit
-	216, // 302: openshell.v1.PeerConfigUpdateHintRequest.sandbox:type_name -> openshell.v1.PeerConfigSandboxTarget
-	217, // 303: openshell.v1.PeerConfigUpdateHintRequest.provider:type_name -> openshell.v1.PeerConfigProviderTarget
+	216, // 302: openshell.v1.PeerNotifyConfigUpdateRequest.sandbox:type_name -> openshell.v1.PeerConfigSandboxTarget
+	217, // 303: openshell.v1.PeerNotifyConfigUpdateRequest.provider:type_name -> openshell.v1.PeerConfigProviderTarget
 	295, // 304: openshell.v1.DenialSummary.first_seen_time:type_name -> google.protobuf.Timestamp
 	295, // 305: openshell.v1.DenialSummary.last_seen_time:type_name -> google.protobuf.Timestamp
 	222, // 306: openshell.v1.DenialSummary.l7_request_samples:type_name -> openshell.v1.L7RequestSample
@@ -21949,7 +21949,7 @@ var file_openshell_proto_depIdxs = []int32{
 	85,  // 427: openshell.v1.OpenShell.PeerReportProviderReadiness:input_type -> openshell.v1.ReportProviderReadinessRequest
 	265, // 428: openshell.v1.OpenShell.PeerReportEndpointStatus:input_type -> openshell.v1.ReportEndpointStatusRequest
 	83,  // 429: openshell.v1.OpenShell.PeerGetSandboxProviderStatus:input_type -> openshell.v1.GetSandboxProviderStatusRequest
-	218, // 430: openshell.v1.OpenShell.PeerNotifyConfigUpdate:input_type -> openshell.v1.PeerConfigUpdateHintRequest
+	218, // 430: openshell.v1.OpenShell.PeerNotifyConfigUpdate:input_type -> openshell.v1.PeerNotifyConfigUpdateRequest
 	110, // 431: openshell.v1.OpenShell.WatchSandbox:input_type -> openshell.v1.WatchSandboxRequest
 	228, // 432: openshell.v1.OpenShell.SubmitPolicyAnalysis:input_type -> openshell.v1.SubmitPolicyAnalysisRequest
 	230, // 433: openshell.v1.OpenShell.GetDraftPolicy:input_type -> openshell.v1.GetDraftPolicyRequest
@@ -22032,7 +22032,7 @@ var file_openshell_proto_depIdxs = []int32{
 	86,  // 510: openshell.v1.OpenShell.PeerReportProviderReadiness:output_type -> openshell.v1.ReportProviderReadinessResponse
 	266, // 511: openshell.v1.OpenShell.PeerReportEndpointStatus:output_type -> openshell.v1.ReportEndpointStatusResponse
 	84,  // 512: openshell.v1.OpenShell.PeerGetSandboxProviderStatus:output_type -> openshell.v1.GetSandboxProviderStatusResponse
-	219, // 513: openshell.v1.OpenShell.PeerNotifyConfigUpdate:output_type -> openshell.v1.PeerConfigUpdateHintResponse
+	219, // 513: openshell.v1.OpenShell.PeerNotifyConfigUpdate:output_type -> openshell.v1.PeerNotifyConfigUpdateResponse
 	111, // 514: openshell.v1.OpenShell.WatchSandbox:output_type -> openshell.v1.SandboxStreamEvent
 	229, // 515: openshell.v1.OpenShell.SubmitPolicyAnalysis:output_type -> openshell.v1.SubmitPolicyAnalysisResponse
 	231, // 516: openshell.v1.OpenShell.GetDraftPolicy:output_type -> openshell.v1.GetDraftPolicyResponse
@@ -22154,10 +22154,10 @@ func file_openshell_proto_init() {
 		(*PeerRelayFrame_Data)(nil),
 	}
 	file_openshell_proto_msgTypes[197].OneofWrappers = []any{
-		(*PeerConfigUpdateHintRequest_Sandbox)(nil),
-		(*PeerConfigUpdateHintRequest_Workspace)(nil),
-		(*PeerConfigUpdateHintRequest_AllConnected)(nil),
-		(*PeerConfigUpdateHintRequest_Provider)(nil),
+		(*PeerNotifyConfigUpdateRequest_Sandbox)(nil),
+		(*PeerNotifyConfigUpdateRequest_Workspace)(nil),
+		(*PeerNotifyConfigUpdateRequest_AllConnected)(nil),
+		(*PeerNotifyConfigUpdateRequest_Provider)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

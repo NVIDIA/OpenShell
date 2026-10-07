@@ -22,13 +22,13 @@ use openshell_core::proto::ConfigBootstrapResult;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigComponent, ConfigComponentApplyResult,
     ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult, GatewayMessage,
-    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, PeerConfigUpdateHintRequest,
-    PeerConfigUpdateHintResponse, PeerRelayFrame, PeerRelayInit, PolicySource,
-    ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
-    ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox,
-    SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRedirect, SessionRejected,
-    SshRelayTarget, StartupConfigCandidate, SupervisorHello, SupervisorMessage,
+    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame, PeerRelayInit,
+    PolicySource, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
+    ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
+    Sandbox, SandboxConfigurationAdmission, SandboxPhase, SessionAccepted, SessionRedirect,
+    SessionRejected, SshRelayTarget, StartupConfigCandidate, SupervisorHello, SupervisorMessage,
     config_snapshot_revision, config_update, gateway_message, open_shell_client, peer_relay_frame,
     relay_open, startup_config_prepared, supervisor_message,
 };
@@ -41,7 +41,7 @@ use crate::config_delivery::{
     SessionOutbound, SupervisorConfigMessage,
 };
 #[cfg(test)]
-use crate::config_delivery::{LocalSupervisorConfigRouter, SupervisorConfigRouter};
+use crate::config_delivery::{LocalSupervisorConfigTransport, SupervisorConfigTransport};
 use crate::gateway_metrics::{
     self, GaugeSlot, PeerRpc, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
     RoutedRequestTimer,
@@ -1980,11 +1980,11 @@ async fn peer_rpc_client(
     ))
 }
 
-pub(crate) async fn forward_config_hint_to_peer(
+pub(crate) async fn forward_config_notify_to_peer(
     state: &Arc<ServerState>,
     endpoint: &str,
-    request: PeerConfigUpdateHintRequest,
-) -> Result<PeerConfigUpdateHintResponse, Status> {
+    request: PeerNotifyConfigUpdateRequest,
+) -> Result<PeerNotifyConfigUpdateResponse, Status> {
     let mut client = peer_rpc_client(state, endpoint).await?;
     client
         .peer_notify_config_update(request)
@@ -4353,10 +4353,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_reports_missing_session() {
-        let router = LocalSupervisorConfigRouter::new(Arc::new(SupervisorSessionRegistry::new()));
+    async fn config_transport_reports_missing_session() {
+        let transport =
+            LocalSupervisorConfigTransport::new(Arc::new(SupervisorSessionRegistry::new()));
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "missing",
                     "session",
@@ -4368,11 +4369,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_keeps_the_latest_unsent_snapshot_per_component() {
+    async fn config_transport_keeps_the_latest_unsent_snapshot_per_component() {
         use tokio_stream::StreamExt as _;
 
         let registry = Arc::new(SupervisorSessionRegistry::new());
-        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let transport = LocalSupervisorConfigTransport::new(Arc::clone(&registry));
         let (_tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
         for (config_revision, expected) in [
@@ -4380,7 +4381,7 @@ mod tests {
             (2, DeliveryDisposition::Replaced),
         ] {
             assert_eq!(
-                router
+                transport
                     .deliver(
                         "sb-1",
                         "session-1",
@@ -4395,7 +4396,7 @@ mod tests {
         }
         // An identical snapshot is not sent again.
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "session-1",
@@ -4408,7 +4409,7 @@ mod tests {
             DeliveryDisposition::SuppressedUnchanged
         );
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "session-1",
@@ -4427,16 +4428,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_never_crosses_into_a_replacement_session() {
+    async fn config_transport_never_crosses_into_a_replacement_session() {
         use tokio_stream::StreamExt as _;
 
         let registry = Arc::new(SupervisorSessionRegistry::new());
-        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let transport = LocalSupervisorConfigTransport::new(Arc::clone(&registry));
         let (_old_tx, _old_outbound) = register_push_session(&registry, "sb-1", "old-session");
         let (_new_tx, mut new_outbound) = register_push_session(&registry, "sb-1", "new-session");
 
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "old-session",
@@ -4446,7 +4447,7 @@ mod tests {
             DeliveryDisposition::NoActiveSession
         );
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "new-session",
@@ -4460,13 +4461,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_skips_sessions_without_push() {
+    async fn config_transport_skips_sessions_without_push() {
         let registry = Arc::new(SupervisorSessionRegistry::new());
-        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let transport = LocalSupervisorConfigTransport::new(Arc::clone(&registry));
         let (tx, _rx) = mpsc::channel(1);
         registry.register("sb-1".into(), "session-1".into(), tx, make_shutdown());
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "session-1",
@@ -4478,11 +4479,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_router_rejects_oversized_messages() {
+    async fn config_transport_rejects_oversized_messages() {
         use tokio_stream::StreamExt as _;
 
         let registry = Arc::new(SupervisorSessionRegistry::new());
-        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let transport = LocalSupervisorConfigTransport::new(Arc::clone(&registry));
         let (tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
         let snapshot = ProviderEnvironmentSnapshot {
@@ -4494,7 +4495,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            router
+            transport
                 .deliver(
                     "sb-1",
                     "session-1",

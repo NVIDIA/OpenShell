@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Synchronous scheduling policy for supervisor configuration delivery.
+//! Synchronous coalescing queue for supervisor configuration delivery.
 //!
-//! Every publication takes a sequence number. When a build is dispatched, its
+//! Every publication takes a sequence number. When a build starts, its
 //! key records the highest sequence issued so far. Publications are issued
 //! after their commits, so that build observes state at least as new as every
 //! publication it covers, and a key needs work for publication `P` only while
@@ -82,14 +82,14 @@ struct FanoutKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
     Fanout,
-    Direct,
+    Sandbox,
 }
 
 impl Lane {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Fanout => "fanout",
-            Self::Direct => "direct",
+            Self::Sandbox => "sandbox",
         }
     }
 }
@@ -97,19 +97,19 @@ impl Lane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     builds: usize,
-    direct_reserve: usize,
-    routes: usize,
+    sandbox_reserve: usize,
+    peer_notifies: usize,
 }
 
 impl Limits {
-    /// Fanout work may use every build slot except `direct_reserve`, and
+    /// Fanout work may use every build slot except `sandbox_reserve`, and
     /// sandbox-scoped work leaves one slot for waiting fanout work.
-    pub(crate) fn new(builds: usize, routes: usize) -> Self {
+    pub(crate) fn new(builds: usize, peer_notifies: usize) -> Self {
         let builds = builds.max(2);
         Self {
             builds,
-            direct_reserve: (builds / 4).clamp(1, builds - 1),
-            routes: routes.max(1),
+            sandbox_reserve: (builds / 4).clamp(1, builds - 1),
+            peer_notifies: peer_notifies.max(1),
         }
     }
 
@@ -122,14 +122,14 @@ impl Limits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
     Build(BuildTicket),
-    Route(RouteTicket),
+    PeerNotify(PeerNotifyTicket),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildTicket {
     pub key: DeliveryKey,
     pub lane: Lane,
-    /// Session registered when the build was dispatched. Delivery must not
+    /// Session registered when the build started. Delivery must not
     /// cross into a replacement session, which received its own bootstrap.
     pub session_id: String,
     epoch: u64,
@@ -137,16 +137,16 @@ pub struct BuildTicket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RouteTarget {
+pub enum PeerNotifyTarget {
     /// Sandbox without a local push recipient; its owner may be a peer.
     Sandbox(String),
-    /// Scope hint for every peer gateway.
+    /// Scope notification for every peer gateway.
     Peers(FanoutScope),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteTicket {
-    pub target: RouteTarget,
+pub struct PeerNotifyTicket {
+    pub target: PeerNotifyTarget,
     pub components: ConfigComponents,
 }
 
@@ -189,7 +189,7 @@ struct Recipient {
     epoch: u64,
     workspace: String,
     providers: HashSet<String>,
-    /// Dispatch sequence of the build that last refreshed `providers`. Builds
+    /// Start sequence of the build that last refreshed `providers`. Builds
     /// can finish out of order, and an older attachment list must not win.
     providers_seq: u64,
     sandbox_config: KeyState,
@@ -224,7 +224,7 @@ struct Cursor {
 }
 
 #[derive(Debug, Default)]
-struct RouteState {
+struct PeerNotifyState {
     pending: ConfigComponents,
     queued: bool,
     in_flight: bool,
@@ -232,19 +232,19 @@ struct RouteState {
 
 #[derive(Debug, Default)]
 struct Running {
-    direct: usize,
+    sandbox: usize,
     fanout: usize,
-    routes: usize,
+    peer_notifies: usize,
 }
 
 impl Running {
     fn builds(&self) -> usize {
-        self.direct + self.fanout
+        self.sandbox + self.fanout
     }
 
     fn lane_mut(&mut self, lane: Lane) -> &mut usize {
         match lane {
-            Lane::Direct => &mut self.direct,
+            Lane::Sandbox => &mut self.sandbox,
             Lane::Fanout => &mut self.fanout,
         }
     }
@@ -252,7 +252,7 @@ impl Running {
 
 #[derive(Debug, Default)]
 struct QueuedCounts {
-    direct: usize,
+    sandbox: usize,
     fanout: usize,
 }
 
@@ -268,30 +268,30 @@ impl QueuedCounts {
 
     fn lane_mut(&mut self, lane: Lane) -> &mut usize {
         match lane {
-            Lane::Direct => &mut self.direct,
+            Lane::Sandbox => &mut self.sandbox,
             Lane::Fanout => &mut self.fanout,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Scheduler {
+pub struct DeliveryQueue {
     limits: Limits,
     seq: u64,
     next_epoch: u64,
     recipients: BTreeMap<String, Recipient>,
     by_workspace: HashMap<String, BTreeSet<String>>,
-    direct: VecDeque<DeliveryKey>,
+    sandbox_keys: VecDeque<DeliveryKey>,
     fanout_retry: VecDeque<DeliveryKey>,
     queued: QueuedCounts,
     cursors: HashMap<FanoutKey, Cursor>,
     cursor_order: VecDeque<FanoutKey>,
-    routes: HashMap<RouteTarget, RouteState>,
-    route_ready: VecDeque<RouteTarget>,
+    peer_notifies: HashMap<PeerNotifyTarget, PeerNotifyState>,
+    peer_notify_ready: VecDeque<PeerNotifyTarget>,
     running: Running,
 }
 
-impl Scheduler {
+impl DeliveryQueue {
     pub(crate) fn new(limits: Limits) -> Self {
         Self {
             limits,
@@ -299,13 +299,13 @@ impl Scheduler {
             next_epoch: 0,
             recipients: BTreeMap::new(),
             by_workspace: HashMap::new(),
-            direct: VecDeque::new(),
+            sandbox_keys: VecDeque::new(),
             fanout_retry: VecDeque::new(),
             queued: QueuedCounts::default(),
             cursors: HashMap::new(),
             cursor_order: VecDeque::new(),
-            routes: HashMap::new(),
-            route_ready: VecDeque::new(),
+            peer_notifies: HashMap::new(),
+            peer_notify_ready: VecDeque::new(),
             running: Running::default(),
         }
     }
@@ -364,7 +364,7 @@ impl Scheduler {
         );
         if self.seq > captured_seq {
             for component in ConfigComponents::ALL.selected() {
-                self.enqueue_key(&sandbox_id, component, Lane::Direct, now);
+                self.enqueue_key(&sandbox_id, component, Lane::Sandbox, now);
             }
         }
     }
@@ -391,7 +391,7 @@ impl Scheduler {
             return false;
         }
         for component in components.selected() {
-            self.enqueue_key(sandbox_id, component, Lane::Direct, now);
+            self.enqueue_key(sandbox_id, component, Lane::Sandbox, now);
         }
         true
     }
@@ -435,28 +435,31 @@ impl Scheduler {
         let cursors = &self.cursors;
         self.cursor_order.retain(|key| cursors.contains_key(key));
         if notify_peers {
-            self.route(RouteTarget::Peers(scope.clone()), components);
+            self.notify_peer(PeerNotifyTarget::Peers(scope.clone()), components);
         }
     }
 
-    pub(crate) fn route(&mut self, target: RouteTarget, components: ConfigComponents) {
-        let state = self.routes.entry(target.clone()).or_default();
+    pub(crate) fn notify_peer(&mut self, target: PeerNotifyTarget, components: ConfigComponents) {
+        let state = self.peer_notifies.entry(target.clone()).or_default();
         state.pending = state.pending.union(components);
         if !state.queued && !state.in_flight {
             state.queued = true;
-            self.route_ready.push_back(target);
+            self.peer_notify_ready.push_back(target);
         }
     }
 
     pub(crate) fn next_work(&mut self, now: Instant) -> Option<Work> {
-        if self.running.routes < self.limits.routes
-            && let Some(target) = self.route_ready.pop_front()
+        if self.running.peer_notifies < self.limits.peer_notifies
+            && let Some(target) = self.peer_notify_ready.pop_front()
         {
-            let state = self.routes.get_mut(&target).expect("ready route has state");
+            let state = self
+                .peer_notifies
+                .get_mut(&target)
+                .expect("ready peer notification has state");
             state.queued = false;
             state.in_flight = true;
-            self.running.routes += 1;
-            return Some(Work::Route(RouteTicket {
+            self.running.peer_notifies += 1;
+            return Some(Work::PeerNotify(PeerNotifyTicket {
                 target,
                 components: std::mem::take(&mut state.pending),
             }));
@@ -500,31 +503,31 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn complete_route(&mut self, ticket: &RouteTicket) {
-        self.running.routes -= 1;
-        let Some(state) = self.routes.get_mut(&ticket.target) else {
+    pub(crate) fn complete_peer_notify(&mut self, ticket: &PeerNotifyTicket) {
+        self.running.peer_notifies -= 1;
+        let Some(state) = self.peer_notifies.get_mut(&ticket.target) else {
             return;
         };
         state.in_flight = false;
         if state.pending.is_empty() {
-            self.routes.remove(&ticket.target);
+            self.peer_notifies.remove(&ticket.target);
         } else {
             state.queued = true;
-            self.route_ready.push_back(ticket.target.clone());
+            self.peer_notify_ready.push_back(ticket.target.clone());
         }
     }
 
     pub(crate) fn has_running_work(&self) -> bool {
-        self.running.builds() > 0 || self.running.routes > 0
+        self.running.builds() > 0 || self.running.peer_notifies > 0
     }
 
     pub(crate) fn record_gauges(&self) {
-        gauge!("openshell_supervisor_config_pending", "lane" => "direct")
-            .set(u32::try_from(self.queued.direct).unwrap_or(u32::MAX));
+        gauge!("openshell_supervisor_config_pending", "lane" => "sandbox")
+            .set(u32::try_from(self.queued.sandbox).unwrap_or(u32::MAX));
         gauge!("openshell_supervisor_config_pending", "lane" => "fanout")
             .set(u32::try_from(self.queued.fanout).unwrap_or(u32::MAX));
-        gauge!("openshell_supervisor_config_pending", "lane" => "route")
-            .set(u32::try_from(self.route_ready.len()).unwrap_or(u32::MAX));
+        gauge!("openshell_supervisor_config_pending", "lane" => "peer_notify")
+            .set(u32::try_from(self.peer_notify_ready.len()).unwrap_or(u32::MAX));
         gauge!("openshell_supervisor_config_active_fanouts")
             .set(u32::try_from(self.cursors.len()).unwrap_or(u32::MAX));
     }
@@ -533,30 +536,30 @@ impl Scheduler {
         if self.running.builds() >= self.limits.builds {
             return None;
         }
-        // Direct work leaves the last slot to waiting fanout work that has no
+        // Sandbox work leaves the last slot to waiting fanout work that has no
         // build running yet.
         let fanout_waiting = !self.fanout_retry.is_empty() || !self.cursors.is_empty();
         let keeps_fanout_floor = fanout_waiting
             && self.running.fanout == 0
             && self.running.builds() + 1 == self.limits.builds;
-        if !keeps_fanout_floor && let Some(key) = self.pop_queued(Lane::Direct) {
-            return Some(self.dispatch(key, Lane::Direct, now));
+        if !keeps_fanout_floor && let Some(key) = self.pop_queued(Lane::Sandbox) {
+            return Some(self.start_build(key, Lane::Sandbox, now));
         }
-        if self.running.fanout < self.limits.builds - self.limits.direct_reserve
+        if self.running.fanout < self.limits.builds - self.limits.sandbox_reserve
             && let Some(work) = self.next_fanout(now)
         {
             return Some(work);
         }
         // Fanout had nothing to start, so the floor is not needed.
-        if keeps_fanout_floor && let Some(key) = self.pop_queued(Lane::Direct) {
-            return Some(self.dispatch(key, Lane::Direct, now));
+        if keeps_fanout_floor && let Some(key) = self.pop_queued(Lane::Sandbox) {
+            return Some(self.start_build(key, Lane::Sandbox, now));
         }
         None
     }
 
     fn next_fanout(&mut self, now: Instant) -> Option<Work> {
         if let Some(key) = self.pop_queued(Lane::Fanout) {
-            return Some(self.dispatch(key, Lane::Fanout, now));
+            return Some(self.start_build(key, Lane::Fanout, now));
         }
         for _ in 0..self.cursor_order.len() {
             let key = self.cursor_order.pop_front()?;
@@ -567,7 +570,7 @@ impl Scheduler {
                 let component = key.component;
                 self.cursors.insert(key.clone(), cursor);
                 self.cursor_order.push_back(key);
-                return Some(self.dispatch(
+                return Some(self.start_build(
                     DeliveryKey {
                         sandbox_id,
                         component,
@@ -664,7 +667,7 @@ impl Scheduler {
     fn pop_queued(&mut self, lane: Lane) -> Option<DeliveryKey> {
         loop {
             let key = match lane {
-                Lane::Direct => self.direct.pop_front(),
+                Lane::Sandbox => self.sandbox_keys.pop_front(),
                 Lane::Fanout => self.fanout_retry.pop_front(),
             }?;
             if self
@@ -677,12 +680,12 @@ impl Scheduler {
         }
     }
 
-    fn dispatch(&mut self, key: DeliveryKey, lane: Lane, now: Instant) -> Work {
+    fn start_build(&mut self, key: DeliveryKey, lane: Lane, now: Instant) -> Work {
         let seq = self.seq;
         let recipient = self
             .recipients
             .get_mut(&key.sandbox_id)
-            .expect("dispatched key has a recipient");
+            .expect("started key has a recipient");
         let state = recipient.key_mut(key.component);
         self.queued.transition(state.queued, None);
         state.queued = None;
@@ -691,7 +694,7 @@ impl Scheduler {
         state.last_build_seq = seq;
         if let Some(since) = state.waiting_since.take() {
             histogram!(
-                "openshell_supervisor_config_dispatch_wait_seconds",
+                "openshell_supervisor_config_queue_wait_seconds",
                 "lane" => lane.name(),
             )
             .record(now.saturating_duration_since(since).as_secs_f64());
@@ -717,7 +720,7 @@ impl Scheduler {
             return;
         };
         let state = recipient.key_mut(component);
-        if lane == Lane::Direct && state.waiting_since.is_none() {
+        if lane == Lane::Sandbox && state.waiting_since.is_none() {
             state.waiting_since = Some(now);
         }
         if state.in_flight {
@@ -734,7 +737,7 @@ impl Scheduler {
             component,
         };
         match lane {
-            Lane::Direct => self.direct.push_back(key),
+            Lane::Sandbox => self.sandbox_keys.push_back(key),
             Lane::Fanout => self.fanout_retry.push_back(key),
         }
     }
@@ -780,25 +783,25 @@ mod tests {
         }
     }
 
-    fn scheduler(builds: usize) -> Scheduler {
-        Scheduler::new(Limits::new(builds, 2))
+    fn queue(builds: usize) -> DeliveryQueue {
+        DeliveryQueue::new(Limits::new(builds, 2))
     }
 
-    fn with_recipients(builds: usize, count: usize) -> Scheduler {
-        let mut scheduler = scheduler(builds);
+    fn with_recipients(builds: usize, count: usize) -> DeliveryQueue {
+        let mut queue = queue(builds);
         for index in 0..count {
-            scheduler.register(
+            queue.register(
                 registration(&format!("sb-{index:04}"), "ws", &[]),
                 Instant::now(),
             );
         }
-        scheduler
+        queue
     }
 
     fn build(work: Work) -> BuildTicket {
         match work {
             Work::Build(ticket) => ticket,
-            Work::Route(ticket) => panic!("expected a build, got {ticket:?}"),
+            Work::PeerNotify(ticket) => panic!("expected a build, got {ticket:?}"),
         }
     }
 
@@ -807,15 +810,15 @@ mod tests {
     }
 
     /// Run all available work to completion, one ticket at a time.
-    fn drain(scheduler: &mut Scheduler) -> Vec<BuildTicket> {
+    fn drain(queue: &mut DeliveryQueue) -> Vec<BuildTicket> {
         let mut completed = Vec::new();
-        while let Some(work) = scheduler.next_work(Instant::now()) {
+        while let Some(work) = queue.next_work(Instant::now()) {
             match work {
                 Work::Build(ticket) => {
-                    scheduler.complete_build(&ticket, built(), Instant::now());
+                    queue.complete_build(&ticket, built(), Instant::now());
                     completed.push(ticket);
                 }
-                Work::Route(ticket) => scheduler.complete_route(&ticket),
+                Work::PeerNotify(ticket) => queue.complete_peer_notify(&ticket),
             }
         }
         completed
@@ -830,78 +833,74 @@ mod tests {
 
     #[test]
     fn sandbox_update_starts_while_a_fleet_fanout_holds_its_slots() {
-        let mut scheduler = with_recipients(4, 1000);
-        scheduler.publish_fanout(
+        let mut queue = with_recipients(4, 1000);
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
         let mut fanout = Vec::new();
-        while let Some(work) = scheduler.next_work(Instant::now()) {
+        while let Some(work) = queue.next_work(Instant::now()) {
             fanout.push(build(work));
         }
-        assert_eq!(fanout.len(), 3, "fanout leaves the direct reserve free");
+        assert_eq!(fanout.len(), 3, "fanout leaves the sandbox reserve free");
         assert!(fanout.iter().all(|ticket| ticket.lane == Lane::Fanout));
 
-        assert!(scheduler.publish_sandbox(
-            "sb-0999",
-            ConfigComponents::SANDBOX_CONFIG,
-            Instant::now()
-        ));
-        let direct = build(scheduler.next_work(Instant::now()).unwrap());
-        assert_eq!(direct.key.sandbox_id, "sb-0999");
-        assert_eq!(direct.lane, Lane::Direct);
+        assert!(queue.publish_sandbox("sb-0999", ConfigComponents::SANDBOX_CONFIG, Instant::now()));
+        let sandbox_build = build(queue.next_work(Instant::now()).unwrap());
+        assert_eq!(sandbox_build.key.sandbox_id, "sb-0999");
+        assert_eq!(sandbox_build.lane, Lane::Sandbox);
     }
 
     #[test]
     fn sandbox_updates_never_freeze_a_fanout() {
-        let mut scheduler = scheduler(4);
+        let mut queue = queue(4);
         for index in 0..100 {
-            scheduler.register(
+            queue.register(
                 registration(&format!("quiet-{index:03}"), "quiet", &[]),
                 Instant::now(),
             );
-            scheduler.register(
+            queue.register(
                 registration(&format!("busy-{index:03}"), "busy", &[]),
                 Instant::now(),
             );
         }
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Workspace("quiet".into()),
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
         for index in 0..100 {
-            scheduler.publish_sandbox(
+            queue.publish_sandbox(
                 &format!("busy-{index:03}"),
                 ConfigComponents::SANDBOX_CONFIG,
                 Instant::now(),
             );
         }
         let lanes = (0..4)
-            .map(|_| build(scheduler.next_work(Instant::now()).unwrap()).lane)
+            .map(|_| build(queue.next_work(Instant::now()).unwrap()).lane)
             .collect::<Vec<_>>();
         assert_eq!(
             lanes,
-            [Lane::Direct, Lane::Direct, Lane::Direct, Lane::Fanout]
+            [Lane::Sandbox, Lane::Sandbox, Lane::Sandbox, Lane::Fanout]
         );
     }
 
     #[test]
     fn repeated_updates_coalesce_without_rejection() {
-        let mut scheduler = with_recipients(2, 50);
+        let mut queue = with_recipients(2, 50);
         for _ in 0..3 {
             for index in 0..50 {
-                scheduler.publish_sandbox(
+                queue.publish_sandbox(
                     &format!("sb-{index:04}"),
                     ConfigComponents::ALL,
                     Instant::now(),
                 );
             }
         }
-        let completed = drain(&mut scheduler);
+        let completed = drain(&mut queue);
         assert_eq!(completed.len(), 100, "one build per sandbox component");
         let distinct = completed
             .iter()
@@ -914,26 +913,26 @@ mod tests {
     fn publication_during_a_pass_costs_one_circle() {
         const RECIPIENTS: usize = 100;
         const BEFORE: usize = 30;
-        let mut scheduler = with_recipients(2, RECIPIENTS);
+        let mut queue = with_recipients(2, RECIPIENTS);
         let scope = FanoutScope::AllConnected;
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &scope,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
         for _ in 0..BEFORE {
-            let ticket = build(scheduler.next_work(Instant::now()).unwrap());
-            scheduler.complete_build(&ticket, built(), Instant::now());
+            let ticket = build(queue.next_work(Instant::now()).unwrap());
+            queue.complete_build(&ticket, built(), Instant::now());
         }
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &scope,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        let second = scheduler.current_seq();
-        let completed = drain(&mut scheduler);
+        let second = queue.current_seq();
+        let completed = drain(&mut queue);
 
         assert_eq!(completed.len(), RECIPIENTS);
         assert_eq!(
@@ -942,21 +941,21 @@ mod tests {
             "the pass continues from its position"
         );
         assert!(
-            scheduler
+            queue
                 .recipients
                 .values()
                 .all(|recipient| recipient.sandbox_config.last_build_seq >= second)
         );
-        assert!(scheduler.cursors.is_empty());
+        assert!(queue.cursors.is_empty());
     }
 
     #[test]
     fn wider_publication_replaces_narrower_passes() {
-        let mut scheduler = scheduler(4);
+        let mut queue = queue(4);
         for (sandbox_id, workspace) in [("a", "ws-1"), ("b", "ws-1"), ("c", "ws-2")] {
-            scheduler.register(registration(sandbox_id, workspace, &["p"]), Instant::now());
+            queue.register(registration(sandbox_id, workspace, &["p"]), Instant::now());
         }
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Provider {
                 workspace: "ws-1".into(),
                 name: "p".into(),
@@ -965,160 +964,160 @@ mod tests {
             false,
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Workspace("ws-1".into()),
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        assert_eq!(scheduler.cursors.len(), 1);
-        assert_eq!(sandbox_ids(&drain(&mut scheduler)), ["a", "b", "c"]);
+        assert_eq!(queue.cursors.len(), 1);
+        assert_eq!(sandbox_ids(&drain(&mut queue)), ["a", "b", "c"]);
     }
 
     #[test]
     fn overlapping_passes_build_each_sandbox_once() {
-        let mut scheduler = with_recipients(4, 20);
-        scheduler.publish_fanout(
+        let mut queue = with_recipients(4, 20);
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Workspace("ws".into()),
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        assert_eq!(scheduler.cursors.len(), 2);
-        assert_eq!(drain(&mut scheduler).len(), 20);
+        assert_eq!(queue.cursors.len(), 2);
+        assert_eq!(drain(&mut queue).len(), 20);
     }
 
     #[test]
     fn fanout_skips_a_sandbox_rebuilt_after_its_publication() {
-        let mut scheduler = with_recipients(4, 3);
-        scheduler.publish_fanout(
+        let mut queue = with_recipients(4, 3);
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        scheduler.publish_sandbox("sb-0002", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let completed = drain(&mut scheduler);
+        queue.publish_sandbox("sb-0002", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let completed = drain(&mut queue);
         assert_eq!(sandbox_ids(&completed), ["sb-0002", "sb-0000", "sb-0001"]);
     }
 
     #[test]
     fn publication_during_a_build_rebuilds_once_in_its_lane() {
-        let mut scheduler = with_recipients(4, 1);
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let first = build(scheduler.next_work(Instant::now()).unwrap());
-        scheduler.publish_fanout(
+        let mut queue = with_recipients(4, 1);
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let first = build(queue.next_work(Instant::now()).unwrap());
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
         assert!(
-            scheduler.next_work(Instant::now()).is_none(),
+            queue.next_work(Instant::now()).is_none(),
             "an in-flight key is not built twice concurrently"
         );
-        scheduler.complete_build(&first, built(), Instant::now());
-        let second = build(scheduler.next_work(Instant::now()).unwrap());
-        assert_eq!(second.lane, Lane::Direct);
-        scheduler.complete_build(&second, built(), Instant::now());
-        assert!(drain(&mut scheduler).is_empty());
+        queue.complete_build(&first, built(), Instant::now());
+        let second = build(queue.next_work(Instant::now()).unwrap());
+        assert_eq!(second.lane, Lane::Sandbox);
+        queue.complete_build(&second, built(), Instant::now());
+        assert!(drain(&mut queue).is_empty());
     }
 
     #[test]
     fn failed_build_restores_its_sequence() {
-        let mut scheduler = with_recipients(4, 1);
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let ticket = build(scheduler.next_work(Instant::now()).unwrap());
-        scheduler.complete_build(&ticket, BuildOutcome::Failed, Instant::now());
-        assert!(scheduler.next_work(Instant::now()).is_none());
+        let mut queue = with_recipients(4, 1);
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let ticket = build(queue.next_work(Instant::now()).unwrap());
+        queue.complete_build(&ticket, BuildOutcome::Failed, Instant::now());
+        assert!(queue.next_work(Instant::now()).is_none());
 
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        assert_eq!(drain(&mut scheduler).len(), 1);
+        assert_eq!(drain(&mut queue).len(), 1);
     }
 
     #[test]
     fn failed_build_retries_when_a_fanout_skipped_it_as_current() {
-        let mut scheduler = with_recipients(4, 1);
-        scheduler.publish_fanout(
+        let mut queue = with_recipients(4, 1);
+        queue.publish_fanout(
             &FanoutScope::AllConnected,
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let ticket = build(scheduler.next_work(Instant::now()).unwrap());
-        assert_eq!(ticket.lane, Lane::Direct);
-        assert!(scheduler.next_work(Instant::now()).is_none());
-        scheduler.complete_build(&ticket, BuildOutcome::Failed, Instant::now());
-        let retry = build(scheduler.next_work(Instant::now()).unwrap());
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let ticket = build(queue.next_work(Instant::now()).unwrap());
+        assert_eq!(ticket.lane, Lane::Sandbox);
+        assert!(queue.next_work(Instant::now()).is_none());
+        queue.complete_build(&ticket, BuildOutcome::Failed, Instant::now());
+        let retry = build(queue.next_work(Instant::now()).unwrap());
         assert_eq!(retry.lane, Lane::Fanout);
     }
 
     #[test]
     fn bootstrap_covers_registration_until_a_publication_races_it() {
-        let mut scheduler = scheduler(4);
-        let captured = scheduler.current_seq();
-        scheduler.register(
+        let mut queue = queue(4);
+        let captured = queue.current_seq();
+        queue.register(
             Registration {
                 captured_seq: captured,
                 ..registration("fresh", "ws", &[])
             },
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Workspace("other".into()),
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
-        assert!(drain(&mut scheduler).is_empty());
+        assert!(drain(&mut queue).is_empty());
 
-        let captured = scheduler.current_seq();
-        scheduler.publish_sandbox(
+        let captured = queue.current_seq();
+        queue.publish_sandbox(
             "unrelated",
             ConfigComponents::SANDBOX_CONFIG,
             Instant::now(),
         );
-        scheduler.register(
+        queue.register(
             Registration {
                 captured_seq: captured,
                 ..registration("raced", "ws", &[])
             },
             Instant::now(),
         );
-        let completed = drain(&mut scheduler);
+        let completed = drain(&mut queue);
         assert_eq!(completed.len(), 2);
-        assert!(completed.iter().all(|ticket| ticket.lane == Lane::Direct));
+        assert!(completed.iter().all(|ticket| ticket.lane == Lane::Sandbox));
     }
 
     #[test]
     fn provider_pass_builds_only_attached_sandboxes() {
-        let mut scheduler = scheduler(4);
-        scheduler.register(registration("attached", "ws", &["github"]), Instant::now());
-        scheduler.register(registration("other", "ws", &["gitlab"]), Instant::now());
-        scheduler.register(
+        let mut queue = queue(4);
+        queue.register(registration("attached", "ws", &["github"]), Instant::now());
+        queue.register(registration("other", "ws", &["gitlab"]), Instant::now());
+        queue.register(
             registration("elsewhere", "ws-2", &["github"]),
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Provider {
                 workspace: "ws".into(),
                 name: "github".into(),
@@ -1127,7 +1126,7 @@ mod tests {
             false,
             Instant::now(),
         );
-        let completed = drain(&mut scheduler);
+        let completed = drain(&mut queue);
         assert_eq!(completed.len(), 2);
         assert!(
             completed
@@ -1138,11 +1137,11 @@ mod tests {
 
     #[test]
     fn provider_pass_includes_an_attachment_still_being_built() {
-        let mut scheduler = scheduler(4);
-        scheduler.register(registration("sb", "ws", &[]), Instant::now());
-        scheduler.publish_sandbox("sb", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let attach = build(scheduler.next_work(Instant::now()).unwrap());
-        scheduler.publish_fanout(
+        let mut queue = queue(4);
+        queue.register(registration("sb", "ws", &[]), Instant::now());
+        queue.publish_sandbox("sb", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let attach = build(queue.next_work(Instant::now()).unwrap());
+        queue.publish_fanout(
             &FanoutScope::Provider {
                 workspace: "ws".into(),
                 name: "github".into(),
@@ -1151,17 +1150,17 @@ mod tests {
             false,
             Instant::now(),
         );
-        assert!(scheduler.next_work(Instant::now()).is_none());
-        scheduler.complete_build(
+        assert!(queue.next_work(Instant::now()).is_none());
+        queue.complete_build(
             &attach,
             BuildOutcome::Built {
                 providers: Some(HashSet::from(["github".to_string()])),
             },
             Instant::now(),
         );
-        assert_eq!(sandbox_ids(&drain(&mut scheduler)), ["sb"]);
+        assert_eq!(sandbox_ids(&drain(&mut queue)), ["sb"]);
 
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Provider {
                 workspace: "ws".into(),
                 name: "github".into(),
@@ -1171,7 +1170,7 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(
-            sandbox_ids(&drain(&mut scheduler)),
+            sandbox_ids(&drain(&mut queue)),
             ["sb"],
             "the refreshed attachment cache keeps the sandbox in scope"
         );
@@ -1179,31 +1178,31 @@ mod tests {
 
     #[test]
     fn late_build_does_not_roll_back_the_attachment_cache() {
-        let mut scheduler = scheduler(4);
-        scheduler.register(registration("sb", "ws", &[]), Instant::now());
-        scheduler.publish_sandbox("sb", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let before_attach = build(scheduler.next_work(Instant::now()).unwrap());
-        scheduler.publish_sandbox("sb", ConfigComponents::ALL, Instant::now());
-        let after_attach = build(scheduler.next_work(Instant::now()).unwrap());
+        let mut queue = queue(4);
+        queue.register(registration("sb", "ws", &[]), Instant::now());
+        queue.publish_sandbox("sb", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let before_attach = build(queue.next_work(Instant::now()).unwrap());
+        queue.publish_sandbox("sb", ConfigComponents::ALL, Instant::now());
+        let after_attach = build(queue.next_work(Instant::now()).unwrap());
         assert_eq!(
             after_attach.key.component,
             ConfigComponentKind::ProviderEnvironment
         );
-        scheduler.complete_build(
+        queue.complete_build(
             &after_attach,
             BuildOutcome::Built {
                 providers: Some(HashSet::from(["github".to_string()])),
             },
             Instant::now(),
         );
-        scheduler.complete_build(
+        queue.complete_build(
             &before_attach,
             BuildOutcome::Built {
                 providers: Some(HashSet::new()),
             },
             Instant::now(),
         );
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Provider {
                 workspace: "ws".into(),
                 name: "github".into(),
@@ -1212,7 +1211,7 @@ mod tests {
             false,
             Instant::now(),
         );
-        let components = drain(&mut scheduler)
+        let components = drain(&mut queue)
             .into_iter()
             .map(|ticket| ticket.key.component)
             .collect::<HashSet<_>>();
@@ -1224,119 +1223,115 @@ mod tests {
 
     #[test]
     fn fanout_floor_releases_when_fanout_has_nothing_to_start() {
-        let mut scheduler = scheduler(4);
+        let mut queue = queue(4);
         for index in 0..4 {
-            scheduler.register(
+            queue.register(
                 registration(&format!("busy-{index}"), "busy", &[]),
                 Instant::now(),
             );
         }
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &FanoutScope::Workspace("empty".into()),
             ConfigComponents::SANDBOX_CONFIG,
             false,
             Instant::now(),
         );
         for index in 0..4 {
-            scheduler.publish_sandbox(
+            queue.publish_sandbox(
                 &format!("busy-{index}"),
                 ConfigComponents::SANDBOX_CONFIG,
                 Instant::now(),
             );
         }
         let lanes = (0..4)
-            .map(|_| build(scheduler.next_work(Instant::now()).unwrap()).lane)
+            .map(|_| build(queue.next_work(Instant::now()).unwrap()).lane)
             .collect::<Vec<_>>();
-        assert_eq!(lanes, [Lane::Direct; 4]);
+        assert_eq!(lanes, [Lane::Sandbox; 4]);
     }
 
     #[test]
-    fn remote_sandbox_updates_coalesce_into_one_route() {
-        let mut scheduler = scheduler(4);
-        assert!(!scheduler.publish_sandbox(
-            "remote",
-            ConfigComponents::SANDBOX_CONFIG,
-            Instant::now()
-        ));
-        scheduler.route(
-            RouteTarget::Sandbox("remote".into()),
+    fn remote_sandbox_updates_coalesce_into_one_peer_notification() {
+        let mut queue = queue(4);
+        assert!(!queue.publish_sandbox("remote", ConfigComponents::SANDBOX_CONFIG, Instant::now()));
+        queue.notify_peer(
+            PeerNotifyTarget::Sandbox("remote".into()),
             ConfigComponents::SANDBOX_CONFIG,
         );
-        scheduler.route(
-            RouteTarget::Sandbox("remote".into()),
+        queue.notify_peer(
+            PeerNotifyTarget::Sandbox("remote".into()),
             ConfigComponents {
                 sandbox_config: false,
                 provider_environment: true,
             },
         );
-        let Some(Work::Route(ticket)) = scheduler.next_work(Instant::now()) else {
-            panic!("expected a route");
+        let Some(Work::PeerNotify(ticket)) = queue.next_work(Instant::now()) else {
+            panic!("expected a peer notification");
         };
         assert_eq!(ticket.components, ConfigComponents::ALL);
-        assert!(scheduler.next_work(Instant::now()).is_none());
+        assert!(queue.next_work(Instant::now()).is_none());
 
-        scheduler.route(
-            RouteTarget::Sandbox("remote".into()),
+        queue.notify_peer(
+            PeerNotifyTarget::Sandbox("remote".into()),
             ConfigComponents::SANDBOX_CONFIG,
         );
-        assert!(scheduler.next_work(Instant::now()).is_none());
-        scheduler.complete_route(&ticket);
-        let Some(Work::Route(again)) = scheduler.next_work(Instant::now()) else {
-            panic!("an update during routing routes again");
+        assert!(queue.next_work(Instant::now()).is_none());
+        queue.complete_peer_notify(&ticket);
+        let Some(Work::PeerNotify(again)) = queue.next_work(Instant::now()) else {
+            panic!("an update during a peer notification notifies again");
         };
         assert_eq!(again.components, ConfigComponents::SANDBOX_CONFIG);
-        scheduler.complete_route(&again);
-        assert!(scheduler.routes.is_empty());
+        queue.complete_peer_notify(&again);
+        assert!(queue.peer_notifies.is_empty());
     }
 
     #[test]
     fn local_fanout_notifies_peers_once_per_publication() {
-        let mut scheduler = scheduler(4);
+        let mut queue = queue(4);
         let scope = FanoutScope::Workspace("ws".into());
-        scheduler.publish_fanout(
+        queue.publish_fanout(
             &scope,
             ConfigComponents::SANDBOX_CONFIG,
             true,
             Instant::now(),
         );
-        scheduler.publish_fanout(&scope, ConfigComponents::ALL, true, Instant::now());
-        let Some(Work::Route(ticket)) = scheduler.next_work(Instant::now()) else {
-            panic!("expected a peer hint");
+        queue.publish_fanout(&scope, ConfigComponents::ALL, true, Instant::now());
+        let Some(Work::PeerNotify(ticket)) = queue.next_work(Instant::now()) else {
+            panic!("expected a peer notification");
         };
-        assert_eq!(ticket.target, RouteTarget::Peers(scope));
+        assert_eq!(ticket.target, PeerNotifyTarget::Peers(scope));
         assert_eq!(ticket.components, ConfigComponents::ALL);
-        scheduler.complete_route(&ticket);
-        assert!(scheduler.next_work(Instant::now()).is_none());
+        queue.complete_peer_notify(&ticket);
+        assert!(queue.next_work(Instant::now()).is_none());
     }
 
     #[test]
     fn replaced_or_removed_sessions_drop_their_work() {
-        let mut scheduler = with_recipients(4, 1);
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        let stale = build(scheduler.next_work(Instant::now()).unwrap());
-        scheduler.register(registration("sb-0000", "ws", &[]), Instant::now());
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        scheduler.complete_build(&stale, built(), Instant::now());
-        let current = build(scheduler.next_work(Instant::now()).unwrap());
+        let mut queue = with_recipients(4, 1);
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        let stale = build(queue.next_work(Instant::now()).unwrap());
+        queue.register(registration("sb-0000", "ws", &[]), Instant::now());
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        queue.complete_build(&stale, built(), Instant::now());
+        let current = build(queue.next_work(Instant::now()).unwrap());
         assert_ne!(current.epoch, stale.epoch);
 
-        scheduler.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-        scheduler.unregister("sb-0000", "other-session");
-        assert!(scheduler.recipients.contains_key("sb-0000"));
-        scheduler.unregister("sb-0000", "sb-0000-session");
-        scheduler.complete_build(&current, built(), Instant::now());
-        assert!(scheduler.next_work(Instant::now()).is_none());
-        assert!(!scheduler.has_running_work());
-        assert!(scheduler.by_workspace.is_empty());
-        assert_eq!((scheduler.queued.direct, scheduler.queued.fanout), (0, 0));
+        queue.publish_sandbox("sb-0000", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+        queue.unregister("sb-0000", "other-session");
+        assert!(queue.recipients.contains_key("sb-0000"));
+        queue.unregister("sb-0000", "sb-0000-session");
+        queue.complete_build(&current, built(), Instant::now());
+        assert!(queue.next_work(Instant::now()).is_none());
+        assert!(!queue.has_running_work());
+        assert!(queue.by_workspace.is_empty());
+        assert_eq!((queue.queued.sandbox, queue.queued.fanout), (0, 0));
     }
 
     #[test]
     fn limits_keep_both_lanes_schedulable() {
         assert_eq!(Limits::new(0, 0), Limits::new(2, 1));
         let small = Limits::new(2, 1);
-        assert_eq!((small.builds, small.direct_reserve), (2, 1));
+        assert_eq!((small.builds, small.sandbox_reserve), (2, 1));
         let large = Limits::new(20, 8);
-        assert_eq!((large.builds, large.direct_reserve), (20, 5));
+        assert_eq!((large.builds, large.sandbox_reserve), (20, 5));
     }
 }
