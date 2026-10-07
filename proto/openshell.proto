@@ -2141,6 +2141,8 @@ message ListProvidersRequest {
   // Token from a previous ListProviders response. All other request parameters
   // except page_size must match the request that produced it.
   string page_token = 2;
+  // Optional label selector for filtering (format: "key1=value1,key2=value2").
+  string label_selector = 4;
 }
 
 // Update provider request.

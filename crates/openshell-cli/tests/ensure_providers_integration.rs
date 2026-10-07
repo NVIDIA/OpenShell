@@ -42,6 +42,7 @@ use tonic::{Response, Status};
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
+    list_requests: Arc<Mutex<Vec<ListProvidersRequest>>>,
 }
 
 #[derive(Clone, Default)]
@@ -357,8 +358,13 @@ impl OpenShell for TestOpenShell {
 
     async fn list_providers(
         &self,
-        _request: tonic::Request<ListProvidersRequest>,
+        request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
+        self.state
+            .list_requests
+            .lock()
+            .await
+            .push(request.into_inner());
         let providers = self
             .state
             .providers
@@ -859,6 +865,105 @@ async fn run_server() -> TestServer {
 }
 
 // ── tests ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn provider_create_forwards_labels_for_explicit_and_discovered_credentials() {
+    let ts = run_server().await;
+    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-test-key")]);
+    let labels = vec!["env=dev".to_string(), "team=ml".to_string()];
+    let credentials = vec!["NVIDIA_API_KEY=test-explicit".to_string()];
+    for (name, source, credentials) in [
+        (
+            "explicit",
+            run::ProviderCreateCredentialSource::ExplicitCredentials,
+            credentials.as_slice(),
+        ),
+        (
+            "discovered",
+            run::ProviderCreateCredentialSource::Existing,
+            &[],
+        ),
+    ] {
+        run::provider_create_with_options(run::ProviderCreateOptions {
+            server: &ts.endpoint,
+            name,
+            provider_type: "nvidia",
+            labels: &labels,
+            credentials,
+            credential_source: source,
+            config: &[],
+            workspace: "default",
+            profile_workspace: "",
+            tls: &ts.tls,
+        })
+        .await
+        .unwrap();
+        let providers = ts.openshell.state.providers.lock().await;
+        let provider = &providers[name];
+        assert_eq!(
+            provider.metadata.as_ref().unwrap().labels,
+            HashMap::from([("env".into(), "dev".into()), ("team".into(), "ml".into())])
+        );
+        assert!(provider.credentials.contains_key("NVIDIA_API_KEY"));
+    }
+
+    for label in ["no-equals-sign", "=no-key"] {
+        let err = run::provider_create_with_options(run::ProviderCreateOptions {
+            server: &ts.endpoint,
+            name: "invalid",
+            provider_type: "nvidia",
+            labels: &[label.into()],
+            credentials: &credentials,
+            credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+            config: &[],
+            workspace: "default",
+            profile_workspace: "",
+            tls: &ts.tls,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--label"));
+    }
+    assert!(
+        !ts.openshell
+            .state
+            .providers
+            .lock()
+            .await
+            .contains_key("invalid")
+    );
+}
+
+#[tokio::test]
+async fn provider_list_forwards_selector_pagination_and_workspace_scope() {
+    let ts = run_server().await;
+    for all_workspaces in [false, true] {
+        run::provider_list(
+            &ts.endpoint,
+            3,
+            "cursor",
+            "env=dev,team=ml",
+            false,
+            "json",
+            "team-ml",
+            all_workspaces,
+            &ts.tls,
+        )
+        .await
+        .unwrap();
+        let requests = ts.openshell.state.list_requests.lock().await;
+        let request = requests.last().unwrap();
+        assert_eq!(request.page_size, 3);
+        assert_eq!(request.page_token, "cursor");
+        assert_eq!(request.label_selector, "env=dev,team=ml");
+        let expected = if all_workspaces {
+            openshell_core::proto::all_workspaces_selector()
+        } else {
+            openshell_core::proto::workspace_selector("team-ml")
+        };
+        assert_eq!(request.workspace_scope.as_ref(), Some(&expected));
+    }
+}
 
 /// When `--provider nvidia` is passed and a provider named "nvidia" already
 /// exists, `ensure_required_providers` should return it directly without
