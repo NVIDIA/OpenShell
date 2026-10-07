@@ -51,23 +51,6 @@ OpenShell creates an endpoint and returns a URL shaped like:
 https://default--my-sandbox--web.<gateway-base-domain>/
 ```
 
-The shared gateway listener handles requests as follows:
-
-```mermaid
-flowchart TD
-    Client[Connection to gateway:443] --> TLS[TLS: SNI selects certificate; shared client-certificate requirements]
-    TLS --> Dispatch{Content-Type starts with application/grpc?}
-    Dispatch -->|Yes| RPC[Gateway authentication and authorization]
-    RPC --> Control[RPCs, supervisor sessions, or relay streams]
-    Dispatch -->|No| Host{Service hostname?}
-    Host -->|Yes| Proxy[Application HTTP or WebSocket proxy]
-    Proxy --> Relay[Supervisor relay]
-    Relay --> App[Sandbox application at 127.0.0.1:8080]
-    Host -->|No| HTTP[Gateway authentication and discovery endpoints]
-    HTTP --> Tunnel[Optional /_ws_tunnel]
-    Tunnel --> Dispatch
-```
-
 SNI selects the server certificate during TLS. HTTP hostname routing selects the application endpoint after the gRPC/HTTP dispatch decision. All of this runs in the gateway process and deployment.
 
 ### What is missing
@@ -97,13 +80,6 @@ This addresses access restrictions, but does not provide independent scaling.
 ### Option 3: Attach Kubernetes Services to running sandboxes
 
 When a user exposes an application, create a Kubernetes Service for that endpoint. Application ingress routes to the Service, keeping application bytes out of the gateway.
-
-```mermaid
-flowchart LR
-    Ingress[Application ingress] --> Service[Kubernetes Service]
-    Service --> Supervisor[Sandbox supervisor]
-    Supervisor --> App[Application on sandbox loopback]
-```
 
 The Service selects the supervisor pod using sandbox identity and role labels and targets a new application ingress listener. The supervisor forwards traffic to the application's loopback port. The Service cannot directly reach sandbox `127.0.0.1`; adding the listener is necessary. Kubernetes updates the Service's endpoints as matching pods become ready or are replaced.
 
