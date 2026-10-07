@@ -149,6 +149,7 @@ fn shipped_runners_isolate_cli_state_and_gateway_overrides() {
             "OPENSHELL_GATEWAY",
             "OPENSHELL_GATEWAY_ENDPOINT",
             "Remove-Item \"Env:$name\"",
+            "CLI inspection endpoint:",
         ] {
             assert!(runner.contains(required), "{name} is missing {required}");
         }

@@ -26,20 +26,25 @@ fn task_harnesses_isolate_and_restore_gateway_configuration() {
     let script = r#"
 $ErrorActionPreference = "Stop"
 . $env:OPENSHELL_MXC_ENVIRONMENT_HELPER
-$names = @(
-    "APPDATA",
-    "LOCALAPPDATA",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
-    "XDG_DATA_HOME",
-    "OPENSHELL_GATEWAY",
-    "OPENSHELL_GATEWAY_ENDPOINT",
-    "OPENSHELL_GATEWAY_INSECURE",
-    "OPENSHELL_GATEWAY_CONFIG",
-    "OPENSHELL_GATEWAY_NAME"
-)
-foreach ($name in $names) {
-    [System.Environment]::SetEnvironmentVariable($name, "caller-$name", "Process")
+$nonEmptyValues = @{
+    APPDATA = "caller-APPDATA"
+    LOCALAPPDATA = "caller-LOCALAPPDATA"
+    XDG_CONFIG_HOME = "caller-XDG_CONFIG_HOME"
+    XDG_STATE_HOME = "caller-XDG_STATE_HOME"
+    XDG_DATA_HOME = "caller-XDG_DATA_HOME"
+    OPENSHELL_GATEWAY_ENDPOINT = "http://127.0.0.1:1"
+    OPENSHELL_GATEWAY_INSECURE = "caller-OPENSHELL_GATEWAY_INSECURE"
+    OPENSHELL_GATEWAY_CONFIG = "caller-OPENSHELL_GATEWAY_CONFIG"
+}
+foreach ($entry in $nonEmptyValues.GetEnumerator()) {
+    [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+}
+$before = [Environment]::GetEnvironmentVariables("Process")
+if (-not $before.Contains("OPENSHELL_GATEWAY") -or ([string] $before["OPENSHELL_GATEWAY"]).Length -ne 0) {
+    throw "OPENSHELL_GATEWAY did not start as an empty entry"
+}
+if ($before.Contains("OPENSHELL_GATEWAY_NAME")) {
+    throw "OPENSHELL_GATEWAY_NAME did not start absent"
 }
 
 $snapshot = Push-OpenShellMxcE2eEnvironment -StageDir $env:OPENSHELL_MXC_ENVIRONMENT_STAGE
@@ -50,8 +55,9 @@ try {
             throw "$name escaped the staging directory: $value"
         }
     }
+    $isolatedEnvironment = [Environment]::GetEnvironmentVariables("Process")
     foreach ($name in @("OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE", "OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY_NAME")) {
-        if ($null -ne [System.Environment]::GetEnvironmentVariable($name, "Process")) {
+        if ($isolatedEnvironment.Contains($name)) {
             throw "$name was inherited by the isolated harness"
         }
     }
@@ -59,26 +65,43 @@ try {
     Pop-OpenShellMxcE2eEnvironment -Snapshot $snapshot
 }
 
-foreach ($name in $names) {
-    $value = [System.Environment]::GetEnvironmentVariable($name, "Process")
-    if ($value -ne "caller-$name") {
-        throw "$name was not restored: $value"
+foreach ($entry in $nonEmptyValues.GetEnumerator()) {
+    $value = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+    if ($value -ne $entry.Value) {
+        throw "$($entry.Key) was not restored: $value"
     }
+}
+$restored = [Environment]::GetEnvironmentVariables("Process")
+if (-not $restored.Contains("OPENSHELL_GATEWAY") -or ([string] $restored["OPENSHELL_GATEWAY"]).Length -ne 0) {
+    throw "empty OPENSHELL_GATEWAY was not restored exactly"
+}
+if ($restored.Contains("OPENSHELL_GATEWAY_NAME")) {
+    throw "absent OPENSHELL_GATEWAY_NAME was restored"
 }
 "#;
 
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", script])
-        .env("OPENSHELL_MXC_ENVIRONMENT_HELPER", helper)
-        .env("OPENSHELL_MXC_ENVIRONMENT_STAGE", stage)
-        .output()
-        .expect("failed to launch Windows PowerShell");
-    assert!(
-        output.status.success(),
-        "environment isolation check failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for shell in ["powershell.exe", "pwsh.exe"] {
+        let output = std::process::Command::new(shell)
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .env("OPENSHELL_MXC_ENVIRONMENT_HELPER", &helper)
+            .env("OPENSHELL_MXC_ENVIRONMENT_STAGE", &stage)
+            .env("OPENSHELL_GATEWAY", "")
+            .env_remove("OPENSHELL_GATEWAY_NAME")
+            .output()
+            .unwrap_or_else(|error| panic!("failed to launch {shell}: {error}"));
+        assert!(
+            output.status.success(),
+            "environment isolation check failed under {shell}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -94,7 +117,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     [ref]$errors
 )
 if ($errors.Count -gt 0) { throw ($errors.Message -join "; ") }
-foreach ($functionName in @("Enter-IsolatedCliEnvironment", "Exit-IsolatedCliEnvironment")) {
+foreach ($functionName in @("Set-ProcessEnvironmentVariableExact", "Enter-IsolatedCliEnvironment", "Exit-IsolatedCliEnvironment")) {
     $function = $ast.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -112,15 +135,21 @@ $cliEnvironmentNames = @(
     "OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY_NAME"
 )
 $env:OPENSHELL_GATEWAY_ENDPOINT = "http://127.0.0.1:1"
-Remove-Item Env:OPENSHELL_GATEWAY -ErrorAction SilentlyContinue
+$before = [Environment]::GetEnvironmentVariables("Process")
+if (-not $before.Contains("OPENSHELL_GATEWAY") -or ([string] $before["OPENSHELL_GATEWAY"]).Length -ne 0) {
+    throw "OPENSHELL_GATEWAY did not start as an empty entry"
+}
+if ($before.Contains("OPENSHELL_GATEWAY_NAME")) {
+    throw "OPENSHELL_GATEWAY_NAME did not start absent"
+}
 
 Enter-IsolatedCliEnvironment
 try {
-    if (Test-Path Env:OPENSHELL_GATEWAY_ENDPOINT) {
-        throw "OPENSHELL_GATEWAY_ENDPOINT was not removed"
-    }
-    if (Test-Path Env:OPENSHELL_GATEWAY) {
-        throw "OPENSHELL_GATEWAY was not removed"
+    $isolatedEnvironment = [Environment]::GetEnvironmentVariables("Process")
+    foreach ($name in @("OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_NAME")) {
+        if ($isolatedEnvironment.Contains($name)) {
+            throw "$name was not removed"
+        }
     }
 } finally {
     Exit-IsolatedCliEnvironment
@@ -129,16 +158,28 @@ try {
 if ($env:OPENSHELL_GATEWAY_ENDPOINT -ne "http://127.0.0.1:1") {
     throw "OPENSHELL_GATEWAY_ENDPOINT was not restored"
 }
-if (Test-Path Env:OPENSHELL_GATEWAY) {
-    throw "null OPENSHELL_GATEWAY snapshot was restored as an empty variable"
+$restored = [Environment]::GetEnvironmentVariables("Process")
+if (-not $restored.Contains("OPENSHELL_GATEWAY") -or ([string] $restored["OPENSHELL_GATEWAY"]).Length -ne 0) {
+    throw "empty OPENSHELL_GATEWAY snapshot was not restored exactly"
+}
+if ($restored.Contains("OPENSHELL_GATEWAY_NAME")) {
+    throw "absent OPENSHELL_GATEWAY_NAME snapshot was restored"
 }
 "#;
 
     for runner in ["run-mxc-e2e.ps1", "run-ocsf-audit.ps1"] {
         for shell in ["powershell.exe", "pwsh.exe"] {
             let output = std::process::Command::new(shell)
-                .args(["-NoProfile", "-Command", script])
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ])
                 .env("OPENSHELL_MXC_RUNNER", examples.join(runner))
+                .env("OPENSHELL_GATEWAY", "")
+                .env_remove("OPENSHELL_GATEWAY_NAME")
                 .output()
                 .unwrap_or_else(|error| panic!("failed to launch {shell}: {error}"));
             assert!(

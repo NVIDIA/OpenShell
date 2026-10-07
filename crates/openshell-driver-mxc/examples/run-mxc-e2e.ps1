@@ -193,9 +193,55 @@ $cliEnvironmentNames = @(
 
 # --- Helpers ------------------------------------------------------------------
 
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [Parameter(Mandatory = $true)]
+        [bool] $Exists,
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if (-not $Exists) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Value.Length -eq 0) {
+        # Windows PowerShell 5.1 maps an empty value passed through
+        # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+        # so an inherited empty entry remains distinguishable from absence.
+        if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+        }
+        if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+        }
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
 function Enter-IsolatedCliEnvironment {
+    $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
     foreach ($name in $cliEnvironmentNames) {
-        $script:cliEnvironmentSnapshot[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        $exists = $processEnvironment.Contains($name)
+        $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+        }
     }
     $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-e2e-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
     $isolatedPaths = @{
@@ -221,12 +267,8 @@ function Enter-IsolatedCliEnvironment {
 
 function Exit-IsolatedCliEnvironment {
     foreach ($name in $cliEnvironmentNames) {
-        $value = $script:cliEnvironmentSnapshot[$name]
-        if ($null -eq $value) {
-            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
-        } else {
-            [Environment]::SetEnvironmentVariable($name, $value, "Process")
-        }
+        $snapshot = $script:cliEnvironmentSnapshot[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
     }
     if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
         Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -806,7 +848,10 @@ try {
         }
     } finally {
         if ($gw -and -not $KeepRunning) { Stop-Gw $gw }
-        if ($KeepRunning -and $gw) { Info "gateway pid $($gw.Id) left running (-KeepRunning)" }
+        if ($KeepRunning -and $gw) {
+            Info "gateway pid $($gw.Id) left running (-KeepRunning)"
+            Info "CLI inspection endpoint: `$env:OPENSHELL_GATEWAY_ENDPOINT='http://127.0.0.1:$Port'"
+        }
     }
 }
 catch {
