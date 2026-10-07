@@ -157,7 +157,9 @@ device.
 Exact GPU device selection is driver-specific and still requires `--gpu`. For
 Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
 match the active driver; replace `docker` with `podman` when using Podman. CDI
-IDs are treated as opaque strings. The list must not contain duplicate IDs, and
+IDs must be valid CDI qualified names (`<vendor>/<class>=<name>`); host-device
+paths are rejected. Explicit selectors are not restricted to NVIDIA names.
+The list must not contain duplicate IDs, and
 its length must match the effective GPU count:
 
 ```shell

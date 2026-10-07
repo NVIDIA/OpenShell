@@ -18,7 +18,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
-    effective_driver_gpu_count, validate_specific_gpu_device_request,
+    effective_driver_gpu_count, validate_cdi_gpu_device_request,
 };
 use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
@@ -667,7 +667,7 @@ impl PodmanComputeDriver {
         let _ = effective_driver_gpu_count(gpu_requirements)
             .map_err(ComputeDriverError::InvalidArgument)?;
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -693,7 +693,7 @@ impl PodmanComputeDriver {
         ) -> Result<Vec<String>, CdiGpuSelectionError>,
     ) -> Result<Option<Vec<String>>, ComputeDriverError> {
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -2946,6 +2946,32 @@ mod tests {
         let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
 
         assert!(err.to_string().contains("nvidia.com/gpu=all"));
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_host_device_paths() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        });
+        for device in ["/dev/sda", "/dev", "/dev/sda:/dev/sda:rwm"] {
+            let sandbox = DriverSandbox {
+                spec: Some(DriverSandboxSpec {
+                    resource_requirements: Some(gpu_resources(None)),
+                    template: Some(DriverSandboxTemplate {
+                        driver_config: Some(cdi_devices_config(&[device])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+            assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+            assert!(err.to_string().contains("CDI qualified names"));
+        }
     }
 
     #[tokio::test]
