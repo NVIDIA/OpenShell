@@ -9,7 +9,9 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit, sanitize_reason_for_audit,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -668,23 +670,6 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
             status = %other,
             "emit_policy_decision_event called on non-terminal status; no audit event emitted"
         ),
-    }
-}
-
-/// Sanitize a free-form reviewer-typed string before it lands in the OCSF
-/// audit surface. The agent still reads the raw text via the API — this is
-/// audit-side defense only.
-fn sanitize_reason_for_audit(raw: &str) -> String {
-    const MAX_CHARS: usize = 200;
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .take(MAX_CHARS)
-        .collect();
-    if raw.chars().count() > MAX_CHARS {
-        format!("{cleaned}…")
-    } else {
-        cleaned
     }
 }
 
@@ -2303,29 +2288,6 @@ mod tests {
             3,
             "initial, identical replacement, and covering snapshots need one check each"
         );
-    }
-
-    #[test]
-    fn sanitize_reason_for_audit_strips_control_chars_and_caps_length() {
-        // Tabs and newlines are stripped; ordinary printable chars survive;
-        // multi-byte characters count as one char in the cap.
-        let raw = "line one\nline\ttwo\u{0001}\u{0007}";
-        let cleaned = sanitize_reason_for_audit(raw);
-        assert!(!cleaned.contains('\n'));
-        assert!(!cleaned.contains('\t'));
-        assert!(!cleaned.contains('\u{0001}'));
-        assert!(cleaned.contains("line one"));
-        assert!(cleaned.contains("linetwo"));
-
-        // Length cap with ellipsis marker so a downstream reader can tell
-        // the audit string is truncated.
-        let long: String = "x".repeat(500);
-        let capped = sanitize_reason_for_audit(&long);
-        assert!(capped.chars().count() <= 201);
-        assert!(capped.ends_with('…'));
-
-        // Empty input maps to empty output (caller renders "(no guidance)").
-        assert_eq!(sanitize_reason_for_audit(""), "");
     }
 
     #[test]

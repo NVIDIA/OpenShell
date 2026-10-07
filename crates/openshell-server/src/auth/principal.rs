@@ -87,3 +87,16 @@ pub enum SandboxIdentitySource {
         runtime_identity: String,
     },
 }
+
+impl Principal {
+    /// One-line caller label for audit records.
+    #[must_use]
+    pub fn audit_actor(&self) -> String {
+        match self {
+            Self::User(user) => format!("user:{}", user.identity.subject),
+            Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
+            Self::Peer(peer) => format!("peer:{}", peer.replica_id),
+            Self::Anonymous => "anonymous".to_string(),
+        }
+    }
+}
