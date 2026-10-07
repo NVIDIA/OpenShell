@@ -315,4 +315,6 @@ On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in th
 
 MicroVM persists the resolved UID:GID with the writable overlay and retains it across restarts, even if driver defaults change. Explicit policy selectors must match that identity. For example, `run_as_user: "10000"` fails when the overlay owner is `1000:1000`; OpenShell reports both values without changing file ownership. The symbolic selector `sandbox` refers to the guest account for that owner, and each omitted selector accepts its driver default. The `WorkloadIdentity` condition in `openshell sandbox get <name>` shows the resolved pair separately from workload readiness. Canonical and exec processes use this same pair; live policy updates cannot change it.
 
-On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Podman, Kubernetes, and MicroVM always use `/sandbox`.
+On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Kubernetes and MicroVM always use `/sandbox`.
+
+Custom Docker and Podman workspaces use the workload container's writable layer, not a managed named volume. Files survive stop/start of the same container, but removing or replacing that container removes its workspace changes. Export files you need to retain before deleting the sandbox.
