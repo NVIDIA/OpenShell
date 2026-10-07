@@ -833,19 +833,24 @@ mod tests {
     fn restart_reclaims_inactive_attempts_and_preserves_active_shared_and_unknown_data() {
         let temp = tempfile::tempdir().unwrap();
         let cache = super::super::image_cache_root_dir(temp.path());
-        let inactive = Attempt::create(&cache).unwrap();
-        let inactive_directory = inactive.directory.clone();
+        let attempts = cache.join(ATTEMPTS_DIR);
+        fs::create_dir_all(&attempts).unwrap();
+        // Model files left by a terminated driver without opening a live lease.
+        // A dropped lease can remain locked briefly when a concurrent fork has
+        // inherited its descriptor and not yet closed it during exec.
+        let inactive_directory = attempts.join(format!("attempt-{:032x}", 3));
+        fs::create_dir(&inactive_directory).unwrap();
         fs::write(inactive_directory.join("partial.ext4"), b"unfinished").unwrap();
-        drop(inactive);
+        fs::write(inactive_directory.with_extension("lease"), LEASE_MARKER).unwrap();
         let active = Attempt::create(&cache).unwrap();
         let committed = cache.join("shared-image");
         fs::create_dir(&committed).unwrap();
         fs::write(committed.join("rootfs.ext4"), b"valid shared image").unwrap();
         let legacy = cache.join("image.staging-legacy");
         fs::create_dir(&legacy).unwrap();
-        let unmarked = cache.join(ATTEMPTS_DIR).join(format!("attempt-{:032x}", 1));
+        let unmarked = attempts.join(format!("attempt-{:032x}", 1));
         fs::create_dir(&unmarked).unwrap();
-        let link = cache.join(ATTEMPTS_DIR).join(format!("attempt-{:032x}", 2));
+        let link = attempts.join(format!("attempt-{:032x}", 2));
         symlink(&committed, &link).unwrap();
         fs::write(unmarked.with_extension("lease"), b"unrelated lock").unwrap();
 
