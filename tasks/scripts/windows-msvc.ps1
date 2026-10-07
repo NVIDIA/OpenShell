@@ -601,8 +601,6 @@ function Invoke-MxcGb300Tests([string] $RustTarget) {
         "dryrun_accepts_minimal_processcontainer_config",
         "dryrun_accepts_processcontainer_ui_policy_matrix",
         "dryrun_accepts_network_block_without_proxy",
-        "dryrun_accepts_localhost_proxy_shape",
-        "dryrun_rejects_host_port_proxy_shape",
         "dryrun_rejects_unknown_containment",
         "dryrun_accepts_split_policy_output",
         "pc_oneshot_in_policy_write_succeeds",

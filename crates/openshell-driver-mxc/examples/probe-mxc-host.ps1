@@ -98,8 +98,8 @@ try {
     if ($null -ne $ubr) { $osRevision = $ubr }
 } catch {}
 $osBuildFull = "$osBuild.$osRevision"
-$isoSessionMinBuild = 26300
-$isoSessionMinRevision = 8553
+$isoSessionMinBuild = 26340
+$isoSessionMinRevision = 9212
 
 # ── wxc-exec info ─────────────────────────────────────────────────────────────
 
@@ -223,7 +223,7 @@ if ($wxcInfo.exists) {
 
     if ($isoOutputLower -match "backend_unavailable" -or $isoOutputLower -match "0x80040154") {
         $isoTrialResult  = "unavailable"
-        $isoTrialMessage = "backend_unavailable: IsoSessionApp.dll absent or OS build < 26300.8553"
+        $isoTrialMessage = "backend_unavailable: IsoSessionApp.dll absent or OS build < 26340.9212"
     } elseif ($isoResult.ExitCode -eq 0) {
         # Provision succeeded — deprovision immediately to avoid orphaning.
         $isoTrialResult  = "live"

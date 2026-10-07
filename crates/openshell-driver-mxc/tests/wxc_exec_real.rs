@@ -672,7 +672,7 @@ fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
 
     if combined.contains("backend_unavailable") || combined.contains("0x80040154") {
         return Err(
-            "backend_unavailable: IsoSessionApp.dll absent or OS build < 26300.8553".to_string(),
+            "backend_unavailable: IsoSessionApp.dll absent or OS build < 26340.9212".to_string(),
         );
     }
 
