@@ -188,7 +188,7 @@ function Enter-IsolatedCliEnvironment {
       [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
     }
     foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
-      [Environment]::SetEnvironmentVariable($name, $null, "Process")
+      Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
   } catch {
     Exit-IsolatedCliEnvironment
@@ -198,7 +198,12 @@ function Enter-IsolatedCliEnvironment {
 
 function Exit-IsolatedCliEnvironment {
   foreach ($name in $cliEnvironmentNames) {
-    [Environment]::SetEnvironmentVariable($name, $script:cliEnvironmentSnapshot[$name], "Process")
+    $value = $script:cliEnvironmentSnapshot[$name]
+    if ($null -eq $value) {
+      Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    } else {
+      [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
   }
   if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
     Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue

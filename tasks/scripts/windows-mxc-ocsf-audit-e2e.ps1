@@ -95,7 +95,6 @@ try {
 
     $runner = Join-Path $StageDir "run-ocsf-audit.ps1"
     $share = Join-Path $StageDir "share"
-    $port = Get-AvailablePort
     $gatewayName = "openshell-mxc-ocsf-ci"
     $sentinelEndpoint = "http://127.0.0.1:9"
     $inheritedEndpoint = "http://127.0.0.1:1"
@@ -111,27 +110,30 @@ try {
         throw "failed to seed sentinel gateway '$gatewayName': $($sentinelAdd -join [Environment]::NewLine)"
     }
     $env:OPENSHELL_GATEWAY_ENDPOINT = $inheritedEndpoint
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner `
-        -Mock `
-        -GatewayPath $GatewayPath `
-        -CliPath $CliPath `
-        -ShareDir $share `
-        -SandboxCount 1 `
-        -Port $port `
-        -GatewayName $gatewayName 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | ForEach-Object { Write-Host $_ }
-    if ($exitCode -ne 0) {
-        throw "shipped OCSF audit example failed in mock mode (exit $exitCode)"
-    }
+    foreach ($powerShell in @("powershell.exe", "pwsh.exe")) {
+        $port = Get-AvailablePort
+        $output = & $powerShell -NoProfile -ExecutionPolicy Bypass -File $runner `
+            -Mock `
+            -GatewayPath $GatewayPath `
+            -CliPath $CliPath `
+            -ShareDir $share `
+            -SandboxCount 1 `
+            -Port $port `
+            -GatewayName $gatewayName 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object { Write-Host $_ }
+        if ($exitCode -ne 0) {
+            throw "shipped OCSF audit example failed under $powerShell in mock mode (exit $exitCode)"
+        }
 
-    $gateways = & $CliPath gateway list -o json | ConvertFrom-Json
-    $sentinel = $gateways | Where-Object { $_.name -eq $gatewayName } | Select-Object -First 1
-    if ($null -eq $sentinel -or $sentinel.endpoint -ne $sentinelEndpoint -or -not $sentinel.active) {
-        throw "OCSF runner changed the caller's sentinel gateway registration or active selection"
-    }
-    if ($env:OPENSHELL_GATEWAY_ENDPOINT -ne $inheritedEndpoint) {
-        throw "OCSF runner changed the caller's OPENSHELL_GATEWAY_ENDPOINT"
+        $gateways = & $CliPath gateway list -o json | ConvertFrom-Json
+        $sentinel = $gateways | Where-Object { $_.name -eq $gatewayName } | Select-Object -First 1
+        if ($null -eq $sentinel -or $sentinel.endpoint -ne $sentinelEndpoint -or -not $sentinel.active) {
+            throw "OCSF runner changed the caller's sentinel gateway registration or active selection under $powerShell"
+        }
+        if ($env:OPENSHELL_GATEWAY_ENDPOINT -ne $inheritedEndpoint) {
+            throw "OCSF runner changed the caller's OPENSHELL_GATEWAY_ENDPOINT under $powerShell"
+        }
     }
 
     $resultDir = Get-ChildItem -LiteralPath $StageDir -Directory -Filter "results-*" |
