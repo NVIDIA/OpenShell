@@ -77,13 +77,15 @@ This is the approach in [PR #4213](https://github.com/NVIDIA/OpenShell/pull/4213
 
 This addresses access restrictions, but does not provide independent scaling.
 
-### Option 3: Attach Kubernetes Services to running sandboxes
+### Option 3: Expose supervisor application listeners through Kubernetes Services
 
-When a user exposes an application, create a Kubernetes Service for that endpoint. Application ingress routes to the Service, keeping application bytes out of the gateway.
+Use a Kubernetes Service per supervisor or supervisor shard to expose a dedicated application listener. Multiple sandbox service routes share that backend, including when a supervisor manages multiple tenants. Creating an OpenShell service adds a logical route; it does not require another Kubernetes Service. Per-application Kubernetes Services remain an optional integration choice.
 
-The Service selects the supervisor pod using sandbox identity and role labels and targets a new application ingress listener. The supervisor forwards traffic to the application's loopback port. The Service cannot directly reach sandbox `127.0.0.1`; adding the listener is necessary. Kubernetes updates the Service's endpoints as matching pods become ready or are replaced.
+Application ingress routes to the owning supervisor's Service, keeping application bytes out of the gateway. The supervisor resolves the hostname or trusted ingress metadata to a declared service and forwards to its permitted target inside the correct sandbox. The new listener is necessary because a Kubernetes Service cannot directly reach sandbox loopback. It must not expose supervisor management handlers.
 
-This uses standard Kubernetes backends and allows separate ingress scaling, network rules, and authentication policies. It is Kubernetes-specific, requires resource reconciliation, and still shares resources with the sandbox's supervisor. It does not scale the application itself.
+A Kubernetes Service selects pods and ports, not HTTP hostnames. Its backends must be able to serve every route sent to it. A single Service across supervisors that own different sandboxes therefore needs additional routing or forwarding. Separate Services targeting the same shared listener do not themselves isolate tenants: the supervisor must validate sandbox identity and effective policy, with authentication, quotas, and accounting scoped to the service or tenant.
+
+This allows separate ingress scaling and access policies while supporting a future multi-tenant supervisor. It is Kubernetes-specific and requires route and backend reconciliation as sandbox ownership changes. Applications still share supervisor resources; this does not scale the applications themselves.
 
 All options retain gateway-owned service declarations and the existing CLI workflow. Keep gateway routing available for low-volume deployments. The choice between the options remains open.
 
@@ -91,7 +93,7 @@ All options retain gateway-owned service declarations and the existing CLI workf
 
 1. Select the data path and define configuration, supervisor trust, and service lifecycle behavior.
 2. Add the selected mode as opt-in, preserving existing service declarations and URLs where possible; document any DNS, TLS, or endpoint migration.
-3. Test HTTP/WebSockets, authentication boundaries, deletion and restart behavior, and control-plane responsiveness under application load in the relevant E2E lane. Update deployment docs and related skills before release.
+3. Test HTTP/WebSockets, tenant and authentication boundaries, sandbox ownership changes, deletion and restart behavior, and control-plane responsiveness under application load in the relevant E2E lane. Update deployment docs and related skills before release.
 
 ## Risks
 
@@ -114,6 +116,6 @@ Keeping the current gateway path is simplest, but retains resource coupling. Add
 ## Open questions
 
 - Which path should come first: a dedicated proxy, Kubernetes Services, or both? How does the listener split fit?
-- How are service configuration, supervisor connections, and Kubernetes resources reconciled?
+- How are service configuration, supervisor connections, and Kubernetes resources reconciled? For shared supervisors, how does ingress find the owning supervisor and follow sandbox ownership changes?
 - How should declarations map to effective sandbox policy, and where should per-service authentication be configured?
 - What happens to active requests and WebSockets on service deletion, sandbox replacement, or control-plane failure?
