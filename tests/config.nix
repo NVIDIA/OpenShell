@@ -193,9 +193,9 @@ let
           # Match OpenShell's compiled-in default so direct Podman and
           # OpenShell containers resolve the same workload image metadata.
           openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
-          openshell_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
-          openshell_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
-          openshell_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
+          openshell_podman_userns_auto_config = "../e2e/suites/drivers/podman/fixtures/userns-auto.toml";
+          openshell_podman_userns_keep_id_config = "../e2e/suites/drivers/podman/fixtures/userns-keep-id.toml";
+          openshell_podman_userns_private_config = "../e2e/suites/drivers/podman/fixtures/userns-private.toml";
         };
       }
     ];
