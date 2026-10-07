@@ -182,3 +182,8 @@ strip = true
 [profile.dev]
 # Faster compile times for dev builds
 debug = 1
+
+# Executable identity hashes the (100+ MiB) test binary. Unoptimized SHA-256
+# is ~10x slower, which times out broker tests.
+[profile.dev.package.sha2]
+opt-level = 3

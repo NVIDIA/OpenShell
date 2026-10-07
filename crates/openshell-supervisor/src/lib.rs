@@ -764,6 +764,13 @@ async fn run_sandbox_with_backend(
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    let ssh_host_key = if ssh_socket_path.is_some() {
+        Some(openshell_supervisor_process::ssh::parse_host_key(
+            auth_bundle.ssh_host_private_key.as_ref(),
+        )?)
+    } else {
+        None
+    };
     // Startup joins the trace that created the sandbox when the driver passes
     // one, and ends once the access plane is up.
     let startup = tracing::info_span!(
@@ -1419,6 +1426,7 @@ async fn run_sandbox_with_backend(
             Some(supervisor_session_updates),
             prestarted_supervisor_session,
             Some(config_apply_tx),
+            ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
@@ -6409,6 +6417,7 @@ mod tests {
             sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token")
                 .expect("token"),
             sandbox_expires_at: 0,
+            ssh_host_private_key: None,
         };
         let error = run_sandbox(
             vec!["true".to_string()],

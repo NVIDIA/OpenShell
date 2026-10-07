@@ -214,6 +214,7 @@ pub async fn start_boundary_access(
     config_apply_tx: Option<
         tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     >,
+    host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
         prestarted.loopback.install(port_forward.clone()).await;
@@ -245,6 +246,7 @@ pub async fn start_boundary_access(
         .await
         .map_err(|error| miette::miette!(error.to_string()))?;
     let main_session = crate::main_session::MainSession::from_boundary(attachment, agent);
+    let host_key = host_key.ok_or_else(|| miette::miette!("sandbox SSH host key is missing"))?;
 
     let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
     let listen_path = ssh_socket_path.clone();
@@ -259,6 +261,7 @@ pub async fn start_boundary_access(
             ssh_port_forward,
             boundary_exec,
             Some(ssh_main_session),
+            host_key,
         )
         .await
         {

@@ -226,13 +226,17 @@ mod tests {
     // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Sandbox field 6 adds its public SSH fingerprint. Older persisted
+    // sandboxes decode with an empty fingerprint, provisioned at next launch.
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // SessionRedirect and SupervisorHello.redirected are supervisor control
+    // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ae08da01c8ce68c29a5b298555f99721de74a0325134ce01b1be8b6ef5f5516f";
+        "12f3d8ac4785713e195fd3089bdc2941dde40667792ae3f162cac2bc596d1d6e";
     const DURABLE_SCHEMA_SHA256: &str =
-        "8fa5153f96896035f9ffc0b9ef753a74028c81738383fa8b7ab084bd7e978f97";
+        "947396e9e9f73b8e2971e923137eea4b9d5bdc4f67d88db6237c358756ffd8a8";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -715,7 +719,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (329, 29),
+                (330, 29),
                 (94, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

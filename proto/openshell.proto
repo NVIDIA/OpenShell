@@ -1032,6 +1032,10 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only SSH host identity in OpenSSH SHA256:<base64> form. Stable for
+  // this sandbox's lifetime, including runtime restarts. Empty on legacy
+  // runtimes that do not provide a gateway-managed SSH identity.
+  string host_key_fingerprint = 6;
   // Read-only provenance for sandboxes created from a reusable workload template.
   SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
@@ -1779,7 +1783,8 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
+  // Expected sandbox SSH host identity in OpenSSH SHA256:<base64> form.
+  // Stable for the sandbox's lifetime. Empty only for legacy runtimes.
   string host_key_fingerprint = 7;
 
   // Absolute expiry. Absence means no expiry.
@@ -3093,11 +3098,12 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
-    ConfigUpdate config_update = 6;
-    StartupConfigCandidate startup_config_candidate = 7;
+    SessionRedirect session_redirect = 6;
+    ConfigUpdate config_update = 7;
+    StartupConfigCandidate startup_config_candidate = 8;
     // Durable gateway acknowledgement of streamed configuration admission.
     // The supervisor must not launch the workload until this is ACCEPTED.
-    SandboxConfigurationAdmission configuration_admission = 8;
+    SandboxConfigurationAdmission configuration_admission = 9;
   }
 }
 
@@ -3112,17 +3118,25 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Set when this connection is the result of following a SessionRedirect. The
+  // receiving gateway serves a redirected hello locally instead of redirecting
+  // again, so a disagreement about membership cannot bounce the supervisor
+  // between replicas. A gateway that is shutting down may still redirect it.
+  bool redirected = 5;
+  // The supervisor understands SessionRedirect. Gateways never redirect a
+  // supervisor that does not set this.
+  bool supports_session_redirect = 6;
   // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
   // stream. Gateways send configuration payloads only when this is set.
-  bool supports_config_snapshots = 5;
+  bool supports_config_snapshots = 7;
   // Explicit result of inspecting the workload image policy, sent only on the
   // first connection of a supervisor process. The gateway considers it when
   // preparing the first authoritative bootstrap for this process.
-  ImagePolicyDiscovery image_policy_discovery = 6;
+  ImagePolicyDiscovery image_policy_discovery = 8;
   // The supervisor applies streamed configuration, reports apply results and
   // admission, and prepares its startup policy on this stream. Requires
   // supports_config_snapshots.
-  bool supports_config_apply = 7;
+  bool supports_config_apply = 9;
 }
 
 message ImagePolicyDiscovery {
@@ -3239,6 +3253,20 @@ message ConfigBootstrapResult {
 message SessionRejected {
   // Human-readable rejection reason.
   string reason = 1;
+}
+
+// Gateway declines to own this session and names the replica that should.
+//
+// Sent instead of SessionAccepted when the placement ring puts the sandbox on
+// a different live replica, and to established sessions when their gateway
+// shuts down. The supervisor reconnects to peer_endpoint once with
+// SupervisorHello.redirected set, and falls back to its configured gateway
+// address if that fails.
+message SessionRedirect {
+  // Peer endpoint of the replica that should own this sandbox.
+  string peer_endpoint = 1;
+  // Replica ID that should own this sandbox, for logging.
+  string owner_replica_id = 2;
 }
 
 // Supervisor heartbeat.

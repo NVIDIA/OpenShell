@@ -3420,14 +3420,6 @@ async fn run_async() -> Result<()> {
                         })
                         .collect();
 
-                    // Validate all local paths before creating the sandbox so failures are
-                    // fast and have no side effects.
-                    for (local, _, _) in &upload_specs {
-                        if std::fs::symlink_metadata(local).is_err() {
-                            return Err(miette::miette!("local path does not exist: {}", local));
-                        }
-                    }
-
                     let editor = editor.map(Into::into);
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))

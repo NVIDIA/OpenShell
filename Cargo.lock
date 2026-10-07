@@ -4954,6 +4954,7 @@ dependencies = [
  "prost-reflect",
  "prost-types",
  "protoc-bin-vendored",
+ "rand 0.10.2",
  "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
