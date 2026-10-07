@@ -1060,7 +1060,9 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                sandbox_upload_planned(
+                // Boxed so the upload state machine lives on the heap instead of
+                // inflating the `sandbox_create` future (clippy::large_futures).
+                Box::pin(sandbox_upload_planned(
                     upload_plan,
                     &effective_server,
                     &sandbox_name,
@@ -1068,7 +1070,7 @@ pub async fn sandbox_create(
                     dest,
                     &effective_tls,
                     workspace,
-                )
+                ))
                 .await
                 .wrap_err_with(|| {
                     format!(
