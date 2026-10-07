@@ -72,8 +72,52 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification builds and installs
+### Advisory release compatibility review
+
+`Codex Compatibility Review` runs alongside tagged release qualification. It
+reviews the cumulative diff from the previous reachable stable release to the
+exact candidate commit, using the same tag-derived patch/minor policy as the
+protobuf check. It reviews public Rust, Python, Go, and TypeScript SDKs, API
+behavior, CLI contracts, configuration, policy, Helm, and persisted state.
+It does not replace Buf or change the release train's version.
+
+The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
+runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
+`CODEX_SECURITY_API_KEY` as Codex Security. The workflow uses `uv run` from the
+existing Nix devShell; the SDK is not an OpenShell package dependency.
+It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
+repository; candidate-side agent configuration and instructions are not loaded.
+It does not run candidate builds or tests. The review has a 30-minute execution
+limit inside a 40-minute job timeout.
+
+This rollout is report-only: findings and review failures cannot block
+publication. The job is independent of the required qualification dependency
+chain. Its summary distinguishes complete, incomplete, and failed execution
+from the agent's compatibility assessment. Missing credentials, invalid
+baselines, source mismatches, malformed reports, and timeouts are not clean
+reviews. A completed review still does not prove that no breaks exist.
+
+Each run retains `report.json` and `report.md` for 90 days in
+`compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
+revisions, the train, tool/model metadata, coverage gaps, and actionable
+findings. Raw agent transcripts are not published. The qualification summary
+links this separate advisory evidence without waiting for it; compatibility
+review remains missing from the blocking RFC profile during this rollout.
+
+After the workflow is available on the default branch, run a review without
+building or publishing a release:
+
+```shell
+gh workflow run codex-compatibility.yml -f candidate_ref=v0.1.3-pre.1
+```
+
+Use an existing release tag appropriate to the train being reviewed. Inspect
+the report before deciding whether to fix a finding, document an intentional
+minor-release break, or investigate an uncertain result. Enabling a blocking
+agent gate is separate work after calibration.
+
+`Branch E2E Checks` builds binaries and images only when an E2E suite is
+selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev and Release Tag use the same package installers.
@@ -433,8 +477,6 @@ Important: if a PR requires manual admission, every new commit needs another `/o
 GitHub merge queue is required for `main`. Repository administrators must enable **Require merge queue** in the branch ruleset for `main` and keep these required status contexts aligned with the PR gates:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 
@@ -445,7 +487,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -471,7 +513,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -487,6 +529,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
+| `.github/workflows/codex-compatibility.yml` | Reviews cumulative tagged-release compatibility with Codex and retains advisory findings and coverage; it does not gate publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
@@ -507,10 +550,13 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 Require these statuses in the branch ruleset for PR and merge-queue CI:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+
+The following statuses are opt-in and controlled by labels:
+
+- `OpenShell / E2E`: `test:e2e`
+- `OpenShell / GPU E2E`: `test:e2e-gpu`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is

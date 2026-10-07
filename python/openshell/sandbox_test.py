@@ -2728,6 +2728,13 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
 
 
+def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    assert _sandbox_ref(proto).host_key_fingerprint is None
+    proto.host_key_fingerprint = "SHA256:expected"
+    assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
+
+
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0

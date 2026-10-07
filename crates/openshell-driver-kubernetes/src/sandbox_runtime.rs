@@ -275,6 +275,12 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
+    if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
+        environment.push(env_var(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+            &server_name,
+        ));
+    }
     let mut volume_mounts = vec![
         volume_mount("bootstrap", "/.openshell/supervisor", true),
         volume_mount("sa-token", "/var/run/secrets/openshell", true),
@@ -659,6 +665,18 @@ fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String
     labels
 }
 
+/// The gateway may redirect the supervisor to a specific replica by pod
+/// address, which the server certificate does not name. Verifying every dial
+/// against the configured endpoint's host keeps those redirects valid.
+fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
+    let uri = grpc_endpoint.parse::<tonic::transport::Uri>().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn env_var(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -944,6 +962,29 @@ mod tests {
         ));
         assert!(env.is_empty());
         assert!(!volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
+    fn supervisor_verifies_redirected_dials_against_the_configured_host() {
+        let pod = supervisor_pod_with_client_tls(SupervisorClientTls::Disabled);
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let server_name = env
+            .iter()
+            .find(|variable| variable.name == "OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .and_then(|variable| variable.value.as_deref());
+        assert_eq!(server_name, Some("gateway"));
+
+        assert_eq!(
+            gateway_tls_server_name("https://openshell.openshell.svc.cluster.local:8080")
+                .as_deref(),
+            Some("openshell.openshell.svc.cluster.local")
+        );
+        assert_eq!(
+            gateway_tls_server_name("https://[fd00::1]:8080").as_deref(),
+            Some("fd00::1")
+        );
+        assert_eq!(gateway_tls_server_name("http://gateway:8080"), None);
+        assert_eq!(gateway_tls_server_name("not a uri"), None);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use openshell_isolation_interface::linux::seccomp_notify::{Notification, Notific
 use openshell_isolation_interface::linux::task_memory;
 
 const PREFIX: &str = "/run/openshell/providers/";
+const PROC_PREFIX: &str = "/proc/";
 const MAX_FILE_BYTES: usize = 65_536;
 const MAX_TOTAL_BYTES: usize = 262_144;
 const MAX_PATH_BYTES: usize = 4_096;
@@ -75,6 +76,9 @@ impl ProviderFiles {
         } else {
             notification.args[0]
         };
+        if handle_thread_comm_open(listener, notification, path_address)? {
+            return Ok(());
+        }
         // Every workload open reaches the listener. Copy only the reserved
         // prefix for ordinary paths; full path reads are rare.
         let mut prefix = [0_u8; PREFIX.len()];
@@ -160,6 +164,97 @@ fn validate_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Serve a write open of the caller's own thread name file.
+///
+/// `pthread_setname_np` and CUDA's `cuInit` rename threads by writing
+/// `/proc/<pid>/task/<tid>/comm`. Landlock keeps `/proc` read-only, so the
+/// broker opens the caller's own `comm` file and injects the descriptor; no
+/// syscall is continued. The kernel's `comm_write` accepts a write only from
+/// the target's own thread group, so a substituted path or reused thread ID
+/// cannot rename another process's thread through the descriptor. Returns
+/// `false` when the open is not such a request and normal mediation applies.
+fn handle_thread_comm_open(
+    listener: &NotificationListener,
+    notification: Notification,
+    path_address: u64,
+) -> io::Result<bool> {
+    let Ok(flags) = open_flags(&notification) else {
+        return Ok(false);
+    };
+    let access = flags & libc::O_ACCMODE;
+    // Reads are already allowed by the read-only /proc rule.
+    if access == libc::O_RDONLY {
+        return Ok(false);
+    }
+    let mut prefix = [0_u8; PROC_PREFIX.len()];
+    if task_memory::read_exact(notification.tid, path_address, &mut prefix).is_err()
+        || prefix != PROC_PREFIX.as_bytes()
+    {
+        return Ok(false);
+    }
+    let Ok(path) = read_path(notification.tid, path_address) else {
+        return Ok(false);
+    };
+    let Some(caller_group) = thread_group_of(notification.tid) else {
+        return Ok(false);
+    };
+    let Some(target) = comm_target(&path, notification.tid, caller_group) else {
+        return Ok(false);
+    };
+    // Anything else, including another process's thread, is left to
+    // Landlock, which denies the write.
+    if thread_group_of(target) != Some(caller_group) {
+        return Ok(false);
+    }
+    // A shell redirect opens with O_CREAT|O_TRUNC; both are no-ops on an
+    // existing comm file. O_EXCL fails as it would natively.
+    if flags & libc::O_EXCL != 0 {
+        listener.respond_errno(notification.id, libc::EEXIST)?;
+        return Ok(true);
+    }
+    if flags & (libc::O_TMPFILE | libc::O_DIRECTORY | libc::O_PATH) != 0 {
+        listener.respond_errno(notification.id, libc::EINVAL)?;
+        return Ok(true);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(access == libc::O_RDWR)
+        .write(true)
+        .open(format!("/proc/{caller_group}/task/{target}/comm"))?;
+    listener.add_fd_and_send(
+        notification.id,
+        file.as_raw_fd(),
+        flags & libc::O_CLOEXEC != 0,
+    )?;
+    Ok(true)
+}
+
+/// Resolve the thread whose `comm` file `path` names, if it is the caller's
+/// own thread group.
+fn comm_target(path: &str, caller_tid: u32, caller_group: u32) -> Option<u32> {
+    let parts = path
+        .strip_prefix(PROC_PREFIX)?
+        .split('/')
+        .collect::<Vec<_>>();
+    let own_group = |part: &str| part == "self" || part.parse::<u32>().ok() == Some(caller_group);
+    match parts.as_slice() {
+        ["thread-self", "comm"] => Some(caller_tid),
+        [group, "comm"] if own_group(group) => Some(caller_group),
+        [group, "task", tid, "comm"] if own_group(group) => tid.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Thread group (process) ID of a thread, from its procfs status.
+fn thread_group_of(tid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn read_path(tid: u32, mut address: u64) -> io::Result<String> {
     if address == 0 {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
@@ -228,11 +323,31 @@ fn sealed_memfd(content: &[u8]) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderFiles, sealed_memfd};
+    use super::{ProviderFiles, comm_target, sealed_memfd};
     use std::collections::HashMap;
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn comm_target_accepts_only_the_callers_own_thread_names() {
+        let (caller_tid, group) = (4242, 4200);
+        for (path, expected) in [
+            ("/proc/thread-self/comm", Some(caller_tid)),
+            ("/proc/self/comm", Some(group)),
+            ("/proc/4200/comm", Some(group)),
+            ("/proc/self/task/4243/comm", Some(4243)),
+            ("/proc/4200/task/4243/comm", Some(4243)),
+            // Another process's thread, or not a comm file.
+            ("/proc/1/task/1/comm", None),
+            ("/proc/9999/comm", None),
+            ("/proc/self/task/4243/environ", None),
+            ("/proc/self/task/4243/comm/extra", None),
+            ("/proc/self/mem", None),
+        ] {
+            assert_eq!(comm_target(path, caller_tid, group), expected, "{path}");
+        }
+    }
 
     #[test]
     fn paths_cannot_escape_the_managed_tree() {

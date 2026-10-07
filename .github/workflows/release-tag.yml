@@ -239,6 +239,18 @@ jobs:
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
+  compatibility-review:
+    name: Compatibility Review (advisory)
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/codex-compatibility.yml
+    with:
+      candidate_ref: ${{ inputs.tag || github.ref_name }}
+      source_sha: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
   qualification-result:
     name: Release Qualification
     if: always()
@@ -301,6 +313,9 @@ jobs:
             echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
             echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
             echo "| VM E2E | ${VM_E2E_RESULT} |"
+            echo
+            echo "Advisory compatibility review runs independently and does not gate publication."
+            echo "See the Compatibility Review job and compatibility-review-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT} artifact in [this run](${run_url})."
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload qualification result

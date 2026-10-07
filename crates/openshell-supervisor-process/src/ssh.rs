@@ -72,14 +72,27 @@ type SshServerInit = (
     Option<Arc<(PathBuf, PathBuf)>>,
 );
 
+/// A managed SSH server must never silently replace its pinned identity.
+pub fn parse_host_key(key: Option<&openshell_core::jwt::SecretSshHostKey>) -> Result<PrivateKey> {
+    let key = key.ok_or_else(|| {
+        miette::miette!("sandbox SSH host key is missing; restart with a matching gateway release")
+    })?;
+    let key = PrivateKey::from_openssh(key.expose_secret())
+        .map_err(|_| miette::miette!("invalid sandbox SSH host key"))?;
+    if key.algorithm() != Algorithm::Ed25519 || key.is_encrypted() {
+        return Err(miette::miette!(
+            "sandbox SSH host key must be an unencrypted Ed25519 key"
+        ));
+    }
+    Ok(key)
+}
+
 fn ssh_server_init(
     listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
     shared_socket: bool,
+    host_key: PrivateKey,
 ) -> Result<SshServerInit> {
-    let mut rng = rand::rng();
-    let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
-
     let mut config = russh::server::Config {
         server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
@@ -145,9 +158,10 @@ pub async fn run_ssh_server(
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
+    host_key: PrivateKey,
 ) -> Result<()> {
     let (listener, config, _ca_paths) =
-        match ssh_server_init(&listen_path, &ca_file_paths, shared_socket) {
+        match ssh_server_init(&listen_path, &ca_file_paths, shared_socket, host_key) {
             Ok(v) => {
                 // Signal that the SSH server has bound the socket and is ready to
                 // accept connections. The parent task awaits this before spawning
@@ -1319,6 +1333,110 @@ mod tests {
 
     pub(super) struct AcceptAnyServerKey;
 
+    struct PinnedServerKey(String);
+
+    impl russh::client::Handler for PinnedServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(key
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string()
+                == self.0)
+        }
+    }
+
+    #[test]
+    fn managed_host_key_rejects_missing_and_invalid_material() {
+        assert!(parse_host_key(None).is_err());
+        let secret = openshell_core::jwt::SecretSshHostKey::new("secret-invalid-key".to_string());
+        let error = parse_host_key(Some(&secret)).unwrap_err().to_string();
+        assert!(!error.contains(secret.expose_secret()));
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let secret = openshell_core::jwt::SecretSshHostKey::new(
+            key.to_openssh(russh::keys::ssh_key::LineEnding::default())
+                .unwrap()
+                .to_string(),
+        );
+        let decoded = parse_host_key(Some(&secret)).unwrap();
+        assert_eq!(key.public_key(), decoded.public_key());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_identity_matches_direct_and_relayed_ssh_after_listener_restart() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = key
+            .public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        let temp = tempfile::tempdir().unwrap();
+        for relay in [false, true] {
+            let socket = temp.path().join("ssh.sock");
+            let (listener, config, _) =
+                ssh_server_init(&socket, &None, false, key.clone()).unwrap();
+            let server = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                        let handler = SshHandler::new(
+                            Arc::new(TestLoopbackConnector),
+                            Arc::new(RejectingExec),
+                            None,
+                        );
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, handler).await
+                        {
+                            let _ = session.await;
+                        }
+                    });
+                }
+            });
+            let direct = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let stream: openshell_isolation_interface::contract::BoundaryDuplexStream = if relay {
+                let (client, mut tunnel) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let mut direct = direct;
+                    let _ = tokio::io::copy_bidirectional(&mut tunnel, &mut direct).await;
+                });
+                Box::new(client)
+            } else {
+                Box::new(direct)
+            };
+            let mut client = russh::client::connect_stream(
+                Arc::new(russh::client::Config::default()),
+                stream,
+                PinnedServerKey(fingerprint.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                client.authenticate_none("sandbox").await.unwrap(),
+                russh::client::AuthResult::Success
+            ));
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "")
+                .await
+                .unwrap();
+            let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            assert!(
+                russh::client::connect_stream(
+                    Arc::new(russh::client::Config::default()),
+                    stream,
+                    PinnedServerKey("SHA256:wrong".to_string())
+                )
+                .await
+                .is_err()
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     impl russh::client::Handler for AcceptAnyServerKey {
         type Error = russh::Error;
 
@@ -1868,7 +1986,13 @@ mod tests {
         set_file_mode(&parent, 0o775);
         let socket = parent.join("ssh.sock");
 
-        let (listener, _, _) = ssh_server_init(&socket, &None, false).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            false,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         drop(listener);
 
         assert_eq!(file_mode(&parent), 0o700);
@@ -1884,7 +2008,13 @@ mod tests {
         set_file_mode(&parent, 0o775);
         let socket = parent.join("ssh.sock");
 
-        let (listener, _, _) = ssh_server_init(&socket, &None, true).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            true,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         drop(listener);
 
         assert_eq!(file_mode(&parent), 0o775);
@@ -1895,7 +2025,13 @@ mod tests {
     #[tokio::test]
     async fn ssh_server_abstract_socket_cannot_be_replaced_while_bound() {
         let socket = PathBuf::from(format!("@openshell-ssh-test-{}", uuid::Uuid::new_v4()));
-        let (listener, _, _) = ssh_server_init(&socket, &None, true).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            true,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
 
         assert!(
             !socket.exists(),

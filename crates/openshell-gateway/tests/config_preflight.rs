@@ -184,7 +184,7 @@ async fn local_vm_rejects_hanging_tool_with_deadline() {
     let output = fixture.run(&[]).await;
     assert!(!output.status.success());
     assert!(
-        combined(&output).contains("timed out after 5 seconds"),
+        normalized_diagnostic(&output).contains("timed out after 5 seconds"),
         "{}",
         combined(&output)
     );

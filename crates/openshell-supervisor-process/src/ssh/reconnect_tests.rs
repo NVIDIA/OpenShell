@@ -111,7 +111,13 @@ impl Connection {
     async fn with_window(main: Arc<MainSession>, window: Option<u32>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ssh.sock");
-        let (listener, mut config, _) = ssh_server_init(&socket, &None, false).unwrap();
+        let (listener, mut config, _) = ssh_server_init(
+            &socket,
+            &None,
+            false,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         // Preserve whether production enables probes. Only shorten the interval.
         let config_mut = Arc::get_mut(&mut config).unwrap();
         config_mut.keepalive_interval = config_mut.keepalive_interval.map(|_| TEST_INTERVAL);
@@ -407,7 +413,13 @@ async fn waiting_writer_eof_cancels_acquisition() {
 #[tokio::test]
 async fn production_config_probes_before_the_receive_deadline() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, config, _) = ssh_server_init(&dir.path().join("ssh.sock"), &None, false).unwrap();
+    let (_, config, _) = ssh_server_init(
+        &dir.path().join("ssh.sock"),
+        &None,
+        false,
+        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+    )
+    .unwrap();
     assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
     assert_eq!(config.keepalive_max, 3);
     assert_eq!(SSH_PEER_TIMEOUT, Duration::from_mins(1));

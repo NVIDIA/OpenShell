@@ -64,53 +64,6 @@ pub fn read_exact(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<
     }
 }
 
-/// Write exactly all of `source` to `address` in `tid`.
-///
-/// This is used only for syscall outputs such as `getpeername` and
-/// `sendmmsg.msg_len`. Revalidate the notification, task generation, and
-/// destination layout immediately before calling it.
-pub fn write_exact(tid: u32, address: u64, source: &[u8]) -> io::Result<()> {
-    validate_request(tid, address, source.len())?;
-    let pid = libc::pid_t::try_from(tid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "TID does not fit pid_t"))?;
-    let remote_address = usize::try_from(address).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote address does not fit usize",
-        )
-    })?;
-    let local = libc::iovec {
-        iov_base: source.as_ptr().cast_mut().cast(),
-        iov_len: source.len(),
-    };
-    let remote = libc::iovec {
-        iov_base: remote_address as *mut libc::c_void,
-        iov_len: source.len(),
-    };
-
-    // SAFETY: the local iovec spans the caller-provided live buffer. The
-    // remote address is untrusted but bounded; the kernel validates that it is
-    // writable in the target process.
-    let copied = retry_eintr(|| unsafe {
-        libc::process_vm_writev(
-            pid,
-            std::ptr::addr_of!(local),
-            1,
-            std::ptr::addr_of!(remote),
-            1,
-            0,
-        )
-    });
-    match copied {
-        Ok(copied) => require_exact(copied, source.len(), "task-memory write"),
-        Err(error) if syscall_profile_denied(&error) => {
-            write_exact_to_proc_mem(tid, address, source)
-                .map_err(|fallback| fallback_error("write", &error, fallback))
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn syscall_profile_denied(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -145,22 +98,14 @@ fn read_exact_from_proc_mem(tid: u32, address: u64, destination: &mut [u8]) -> i
     require_exact(copied, destination.len(), "proc task-memory read")
 }
 
-fn write_exact_to_proc_mem(tid: u32, address: u64, source: &[u8]) -> io::Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(format!("/proc/{tid}/mem"))?;
-    let copied = file.write_at(source, address)?;
-    require_exact(copied, source.len(), "proc task-memory write")
-}
-
-/// Prove same-UID parent-to-child read and write access under the active Yama,
-/// LSM, and outer seccomp posture.
+/// Prove same-UID parent-to-child read access under the active Yama, LSM, and
+/// outer seccomp posture. The broker only reads workload memory; it never
+/// writes it.
 ///
 /// Call this only from a single-threaded probe process. The child executes
 /// raw, allocation-free syscalls between `fork` and `_exit`.
 pub fn probe_child_access() -> io::Result<()> {
     const INITIAL: u64 = 0x1122_3344_5566_7788;
-    const REPLACEMENT: u64 = 0xaabb_ccdd_eeff_0011;
     // SAFETY: mmap creates one private anonymous page owned by this process.
     let mapping = unsafe {
         libc::mmap(
@@ -216,7 +161,6 @@ pub fn probe_child_access() -> io::Result<()> {
             if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) < 0
                 || write_eventfd(ready.as_raw_fd()).is_err()
                 || read_eventfd(proceed.as_raw_fd()).is_err()
-                || mapping.cast::<u64>().read() != REPLACEMENT
             {
                 libc::_exit(1);
             }
@@ -237,11 +181,6 @@ pub fn probe_child_access() -> io::Result<()> {
                 "cross-child memory read returned wrong data",
             ));
         }
-        write_exact(
-            u32::try_from(child).map_err(|_| io::Error::other("child PID does not fit u32"))?,
-            mapping_address,
-            &REPLACEMENT.to_ne_bytes(),
-        )?;
         write_eventfd(proceed.as_raw_fd())?;
         let mut status = 0;
         // SAFETY: child is a live direct child and status points to storage.
@@ -354,9 +293,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_and_writes_exact_same_process_memory() {
+    fn reads_exact_same_process_memory() {
         let source = 0x1122_3344_5566_7788_u64;
-        let mut destination = 0_u64;
         let mut bytes = [0_u8; size_of::<u64>()];
 
         read_exact(
@@ -366,21 +304,11 @@ mod tests {
         )
         .expect("read source");
         assert_eq!(u64::from_ne_bytes(bytes), source);
-
-        let replacement = 0xaabb_ccdd_eeff_0011_u64;
-        write_exact(
-            std::process::id(),
-            std::ptr::addr_of_mut!(destination) as u64,
-            &replacement.to_ne_bytes(),
-        )
-        .expect("write destination");
-        assert_eq!(destination, replacement);
     }
 
     #[test]
-    fn proc_mem_fallback_reads_and_writes_exact_memory() {
+    fn proc_mem_fallback_reads_exact_memory() {
         let source = 0x0102_0304_0506_0708_u64;
-        let mut destination = 0_u64;
         let mut bytes = [0_u8; size_of::<u64>()];
         read_exact_from_proc_mem(
             std::process::id(),
@@ -389,14 +317,6 @@ mod tests {
         )
         .expect("read through proc mem");
         assert_eq!(u64::from_ne_bytes(bytes), source);
-
-        write_exact_to_proc_mem(
-            std::process::id(),
-            std::ptr::addr_of_mut!(destination) as u64,
-            &source.to_ne_bytes(),
-        )
-        .expect("write through proc mem");
-        assert_eq!(destination, source);
     }
 
     #[test]

@@ -80,6 +80,8 @@ jq -e '.tokens.access_token and .tokens.refresh_token and .tokens.account_id' "$
 
 If this fails, run the local Codex login flow outside the gator launch. If Codex was recently reauthenticated and gateway refresh fails later, relaunch with `--reset-refresh` once.
 
+The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.

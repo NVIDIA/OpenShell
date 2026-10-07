@@ -1,8 +1,6 @@
 name: Branch E2E Checks
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -50,15 +48,6 @@ jobs:
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               ;;
-            merge_group)
-              # Merge groups have no PR labels. When GPU E2E is required as documented
-              # in CI.md, skipping it leaves the gate pending until the queue times out
-              # and ejects the PR. HA stays off until stable.
-              run_core_e2e=true
-              run_gpu_e2e=true
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
-              ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
@@ -82,7 +71,7 @@ jobs:
 
   version:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -228,7 +217,7 @@ jobs:
   build-rpm:
     name: Build RPM packages
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
       contents: read

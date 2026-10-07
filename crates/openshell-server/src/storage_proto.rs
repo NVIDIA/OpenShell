@@ -131,16 +131,20 @@ mod tests {
     // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Sandbox field 6 adds its public SSH fingerprint. Older persisted
+    // sandboxes decode with an empty fingerprint, provisioned at next launch.
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
     // Stable placeholders add a stored credential flag whose absent value is
     // false. Capability negotiation and delivered key lists are public-only;
     // the set of shared message and enum types remains unchanged.
+    // SessionRedirect and SupervisorHello.redirected are supervisor control
+    // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "398d912ae641bcbf67450bd7db7665fff99188cce7dcdeb0a07a3e20034dcd97";
+        "2adec5d69e65dff0fc64ee1efe847b15839d172234a17dcb3910d77f4925da09";
     const DURABLE_SCHEMA_SHA256: &str =
-        "f46476596a7b0407804f9323503e689ba0a92ff6d2833a0a3f1b9236ed398518";
+        "67d74f0304ecfc3dc11135f11deda694dd64e5dde0dd0f6cbc1512bc519fa212";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -610,7 +614,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
+                (307, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
