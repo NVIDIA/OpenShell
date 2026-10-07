@@ -63,9 +63,14 @@ SNI selects the server certificate during TLS. HTTP hostname routing selects the
 
 ### Option 1: Add a dedicated application proxy
 
-Build a small proxy from the gateway's existing application proxy and relay components, or evaluate Envoy with [reverse tunnels](https://www.envoyproxy.io/docs/envoy/latest/configuration/other_features/reverse_tunnel).
+Build a small proxy from the gateway's existing application proxy and relay components, or evaluate an existing proxy such as Envoy. The gateway manages exposure configuration; the dedicated proxy carries application bytes independently of the gateway.
 
-The gateway manages exposure configuration; the dedicated proxy carries application traffic and its supervisor relay connections. Moving both out of the gateway allows independent scaling and network access controls. This adds a deployed component and requires coordination of service configuration and supervisor connections across proxy replicas.
+There are two ways to connect the proxy to supervisors:
+
+- **Direct connections.** The proxy connects to a new, authenticated application-only supervisor listener. It finds the owning supervisor through a Kubernetes Service or endpoint discovery. One listener can serve multiple sandboxes; the proxy must select the correct supervisor and the supervisor must validate the requested service. This can reuse the Kubernetes backends described in option 3.
+- **Reverse tunnels.** The supervisor opens an authenticated outbound connection to the proxy, separate from its gateway management connection. The proxy requests application streams over that connection, and the supervisor bridges them to permitted sandbox targets. No inbound supervisor listener or supervisor Kubernetes Service is needed. Proxy replicas must locate the connection serving each sandbox and handle reconnection and draining. Envoy's [reverse tunnels](https://www.envoyproxy.io/docs/envoy/latest/configuration/other_features/reverse_tunnel) are one candidate to evaluate.
+
+Both variants keep application bytes out of the gateway, allowing independent scaling and network access controls. A multi-tenant supervisor must identify and authorize the sandbox and service for each request or stream. Direct connections require reachable supervisor endpoints; reverse tunnels require coordination of connection ownership across proxy replicas.
 
 ### Option 2: Add separate control-plane and application listeners
 
