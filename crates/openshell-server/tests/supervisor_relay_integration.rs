@@ -52,8 +52,8 @@ struct RelayGateway {
 impl OpenShell for RelayGateway {
     async fn peer_notify_config_update(
         &self,
-        _request: tonic::Request<openshell_core::proto::PeerConfigUpdateHintRequest>,
-    ) -> Result<Response<openshell_core::proto::PeerConfigUpdateHintResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 

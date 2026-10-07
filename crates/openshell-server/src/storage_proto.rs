@@ -124,7 +124,7 @@ mod tests {
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
     // inventories; the provider-environment file map and peer configuration
-    // hint are public-only. The
+    // notification are public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
@@ -140,7 +140,7 @@ mod tests {
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "89ddd9e05870c0ad35e4db70f87471ee81dba8cd30a3e385965e44160048c1ad";
+        "1d8417027267b183576b84f853c7c89b686d8460568b2e92d61faca8266a8e6a";
     const DURABLE_SCHEMA_SHA256: &str =
         "c2d62733c8c4a17d831729ea261373b42e979f00ef5b6f79761f3501f27e6fc5";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -187,7 +187,7 @@ mod tests {
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
-        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerConfigUpdateHintRequest|.openshell.v1.PeerConfigUpdateHintResponse|false|false",
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and route complete supervisor configuration snapshots.
+//! Build and deliver complete supervisor configuration snapshots.
 
-mod scheduler;
+mod queue;
 mod session_slots;
 
 use std::collections::{HashMap, HashSet};
@@ -16,8 +16,8 @@ use metrics::counter;
 use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
     ConfigBootstrap, PeerConfigProviderTarget, PeerConfigSandboxTarget,
-    PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse, ProviderEnvironmentSnapshot,
-    Sandbox, SandboxConfigSnapshot, peer_config_update_hint_request,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot,
+    Sandbox, SandboxConfigSnapshot, peer_notify_config_update_request,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -30,10 +30,10 @@ use crate::grpc::policy::{build_provider_environment_snapshot, build_sandbox_con
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 
-pub use scheduler::Registration;
-use scheduler::{
-    BuildOutcome, BuildTicket, DeliveryKey, FanoutScope, Lane, Limits, RouteTarget, RouteTicket,
-    Scheduler, Work,
+pub use queue::Registration;
+use queue::{
+    BuildOutcome, BuildTicket, DeliveryKey, DeliveryQueue, FanoutScope, Lane, Limits,
+    PeerNotifyTarget, PeerNotifyTicket, Work,
 };
 pub use session_slots::{ConfigSlots, SessionOutbound};
 
@@ -54,8 +54,8 @@ const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
 /// pool busy without stacking every waiter on the acquire timeout.
 const SNAPSHOT_BUILDS_PER_DB_CONNECTION: usize = 2;
 const MIN_CONCURRENT_SNAPSHOT_BUILDS: usize = 4;
-const MAX_CONCURRENT_ROUTES: usize = 8;
-const PEER_HINT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_PEER_NOTIFIES: usize = 8;
+const PEER_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_FANOUT_CONCURRENCY: usize = 8;
 
 /// One complete configuration component awaiting delivery to a supervisor.
@@ -108,7 +108,7 @@ impl DeliveryDisposition {
 
 /// Transport boundary for configuration delivery.
 #[tonic::async_trait]
-pub trait SupervisorConfigRouter: fmt::Debug + Send + Sync {
+pub trait SupervisorConfigTransport: fmt::Debug + Send + Sync {
     async fn deliver(
         &self,
         sandbox_id: &str,
@@ -118,11 +118,11 @@ pub trait SupervisorConfigRouter: fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug)]
-pub struct LocalSupervisorConfigRouter {
+pub struct LocalSupervisorConfigTransport {
     sessions: Arc<SupervisorSessionRegistry>,
 }
 
-impl LocalSupervisorConfigRouter {
+impl LocalSupervisorConfigTransport {
     #[must_use]
     pub fn new(sessions: Arc<SupervisorSessionRegistry>) -> Self {
         Self { sessions }
@@ -130,7 +130,7 @@ impl LocalSupervisorConfigRouter {
 }
 
 #[tonic::async_trait]
-impl SupervisorConfigRouter for LocalSupervisorConfigRouter {
+impl SupervisorConfigTransport for LocalSupervisorConfigTransport {
     async fn deliver(
         &self,
         sandbox_id: &str,
@@ -210,8 +210,8 @@ impl ConfigComponentKind {
     }
 }
 
-/// Coalescing delivery scheduler shared by publications, supervisor sessions,
-/// and one on-demand dispatcher task.
+/// Coalescing delivery queue shared by publications, supervisor sessions,
+/// and one on-demand delivery worker task.
 #[derive(Debug)]
 pub struct ConfigDelivery {
     state: Mutex<DeliveryState>,
@@ -220,8 +220,8 @@ pub struct ConfigDelivery {
 
 #[derive(Debug)]
 struct DeliveryState {
-    scheduler: Scheduler,
-    dispatcher_running: bool,
+    queue: DeliveryQueue,
+    delivery_worker_running: bool,
 }
 
 impl ConfigDelivery {
@@ -234,19 +234,19 @@ impl ConfigDelivery {
             .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
         Self {
             state: Mutex::new(DeliveryState {
-                scheduler: Scheduler::new(Limits::new(builds, MAX_CONCURRENT_ROUTES)),
-                dispatcher_running: false,
+                queue: DeliveryQueue::new(Limits::new(builds, MAX_CONCURRENT_PEER_NOTIFIES)),
+                delivery_worker_running: false,
             }),
             wake: Notify::new(),
         }
     }
 
     pub(crate) fn current_seq(&self) -> u64 {
-        self.lock().scheduler.current_seq()
+        self.lock().queue.current_seq()
     }
 
-    fn with_scheduler<T>(&self, update: impl FnOnce(&mut Scheduler) -> T) -> T {
-        update(&mut self.lock().scheduler)
+    fn with_queue<T>(&self, update: impl FnOnce(&mut DeliveryQueue) -> T) -> T {
+        update(&mut self.lock().queue)
     }
 
     /// Delivery is best effort beside the session lifecycle, so a poisoned
@@ -321,9 +321,12 @@ pub fn publish_sandbox_components(
     // A single-replica gateway owns every session, and registration covers a
     // session that is still connecting.
     let may_be_remote = !state.store.is_single_replica();
-    state.config_delivery.with_scheduler(|scheduler| {
-        if !scheduler.publish_sandbox(sandbox_id, components, now) && may_be_remote {
-            scheduler.route(RouteTarget::Sandbox(sandbox_id.to_string()), components);
+    state.config_delivery.with_queue(|queue| {
+        if !queue.publish_sandbox(sandbox_id, components, now) && may_be_remote {
+            queue.notify_peer(
+                PeerNotifyTarget::Sandbox(sandbox_id.to_string()),
+                components,
+            );
         }
     });
     kick(state);
@@ -367,22 +370,22 @@ fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope, components: Con
         return;
     }
     let notify_peers = !state.store.is_single_replica();
-    state.config_delivery.with_scheduler(|scheduler| {
-        scheduler.publish_fanout(scope, components, notify_peers, Instant::now());
+    state.config_delivery.with_queue(|queue| {
+        queue.publish_fanout(scope, components, notify_peers, Instant::now());
     });
     kick(state);
 }
 
 /// Make a push-capable session visible to fanouts and sandbox updates.
 pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
-    state.config_delivery.with_scheduler(|scheduler| {
+    state.config_delivery.with_queue(|queue| {
         // A concurrent reconnect may already own the registry entry. Checking
-        // under the scheduler lock keeps the newest session registered.
+        // under the queue lock keeps the newest session registered.
         if state
             .supervisor_sessions
             .is_current_session(&registration.sandbox_id, &registration.session_id)
         {
-            scheduler.register(registration, Instant::now());
+            queue.register(registration, Instant::now());
         }
     });
     kick(state);
@@ -391,30 +394,30 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
 pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
     state
         .config_delivery
-        .with_scheduler(|scheduler| scheduler.unregister(sandbox_id, session_id));
+        .with_queue(|queue| queue.unregister(sandbox_id, session_id));
 }
 
 fn kick(state: &Arc<ServerState>) {
     let start = {
         let mut delivery = state.config_delivery.lock();
-        !std::mem::replace(&mut delivery.dispatcher_running, true)
+        !std::mem::replace(&mut delivery.delivery_worker_running, true)
     };
     if start {
-        tokio::spawn(run_dispatcher(Arc::clone(state)));
+        tokio::spawn(run_delivery_worker(Arc::clone(state)));
     } else {
         state.config_delivery.wake.notify_one();
     }
 }
 
-/// Releases outstanding work if the dispatcher unwinds, so a later
+/// Releases outstanding work if the delivery worker unwinds, so a later
 /// publication starts a replacement with consistent slot accounting.
-struct DispatcherGuard {
+struct DeliveryWorkerGuard {
     state: Arc<ServerState>,
     tickets: HashMap<tokio::task::Id, Work>,
     finished: bool,
 }
 
-impl Drop for DispatcherGuard {
+impl Drop for DeliveryWorkerGuard {
     fn drop(&mut self) {
         if self.finished {
             return;
@@ -425,20 +428,20 @@ impl Drop for DispatcherGuard {
             match work {
                 Work::Build(ticket) => {
                     delivery
-                        .scheduler
+                        .queue
                         .complete_build(ticket, BuildOutcome::Failed, now);
                 }
-                Work::Route(ticket) => delivery.scheduler.complete_route(ticket),
+                Work::PeerNotify(ticket) => delivery.queue.complete_peer_notify(ticket),
             }
         }
-        delivery.dispatcher_running = false;
+        delivery.delivery_worker_running = false;
     }
 }
 
-async fn run_dispatcher(state: Arc<ServerState>) {
+async fn run_delivery_worker(state: Arc<ServerState>) {
     let delivery = &state.config_delivery;
     let mut tasks = JoinSet::new();
-    let mut guard = DispatcherGuard {
+    let mut guard = DeliveryWorkerGuard {
         state: Arc::clone(&state),
         tickets: HashMap::new(),
         finished: false,
@@ -448,14 +451,14 @@ async fn run_dispatcher(state: Arc<ServerState>) {
             let mut delivery_state = delivery.lock();
             let now = Instant::now();
             let mut started = Vec::new();
-            while let Some(work) = delivery_state.scheduler.next_work(now) {
+            while let Some(work) = delivery_state.queue.next_work(now) {
                 started.push(work);
             }
-            delivery_state.scheduler.record_gauges();
-            // Clearing the flag under the scheduler lock means a concurrent
-            // publication either sees this dispatcher running or starts one.
-            if started.is_empty() && !delivery_state.scheduler.has_running_work() {
-                delivery_state.dispatcher_running = false;
+            delivery_state.queue.record_gauges();
+            // Clearing the flag under the queue lock means a concurrent
+            // publication either sees this delivery worker running or starts one.
+            if started.is_empty() && !delivery_state.queue.has_running_work() {
+                delivery_state.delivery_worker_running = false;
                 guard.finished = true;
                 return;
             }
@@ -489,25 +492,25 @@ async fn run_dispatcher(state: Arc<ServerState>) {
 
 enum WorkResult {
     Build(BuildResult),
-    Route(RouteResult),
+    PeerNotify(PeerNotifyResult),
 }
 
 struct BuildResult {
     outcome: BuildOutcome,
     /// The session moved to another gateway after the build started.
-    reroute: bool,
+    owner_moved: bool,
 }
 
-enum RouteResult {
+enum PeerNotifyResult {
     Done,
-    /// This gateway owns the current session for the routed sandbox.
+    /// This gateway owns the current session for the notified sandbox.
     Local,
 }
 
 async fn run_work(state: Arc<ServerState>, work: Work) -> WorkResult {
     match work {
         Work::Build(ticket) => WorkResult::Build(run_build(&state, &ticket).await),
-        Work::Route(ticket) => WorkResult::Route(run_route(&state, &ticket).await),
+        Work::PeerNotify(ticket) => WorkResult::PeerNotify(run_peer_notify(&state, &ticket).await),
     }
 }
 
@@ -515,27 +518,27 @@ fn complete_work(state: &ServerState, work: &Work, result: Option<WorkResult>) {
     let now = Instant::now();
     state
         .config_delivery
-        .with_scheduler(|scheduler| match (work, result) {
+        .with_queue(|queue| match (work, result) {
             (Work::Build(ticket), Some(WorkResult::Build(result))) => {
-                scheduler.complete_build(ticket, result.outcome, now);
-                if result.reroute {
-                    scheduler.route(
-                        RouteTarget::Sandbox(ticket.key.sandbox_id.clone()),
+                queue.complete_build(ticket, result.outcome, now);
+                if result.owner_moved {
+                    queue.notify_peer(
+                        PeerNotifyTarget::Sandbox(ticket.key.sandbox_id.clone()),
                         ConfigComponents::only(ticket.key.component),
                     );
                 }
             }
             (Work::Build(ticket), _) => {
-                scheduler.complete_build(ticket, BuildOutcome::Failed, now);
+                queue.complete_build(ticket, BuildOutcome::Failed, now);
             }
-            (Work::Route(ticket), result) => {
-                scheduler.complete_route(ticket);
+            (Work::PeerNotify(ticket), result) => {
+                queue.complete_peer_notify(ticket);
                 if let (
-                    RouteTarget::Sandbox(sandbox_id),
-                    Some(WorkResult::Route(RouteResult::Local)),
+                    PeerNotifyTarget::Sandbox(sandbox_id),
+                    Some(WorkResult::PeerNotify(PeerNotifyResult::Local)),
                 ) = (&ticket.target, result)
                 {
-                    scheduler.publish_sandbox(sandbox_id, ticket.components, now);
+                    queue.publish_sandbox(sandbox_id, ticket.components, now);
                 }
             }
         });
@@ -550,7 +553,7 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
     } = ticket;
     let failed = BuildResult {
         outcome: BuildOutcome::Failed,
-        reroute: false,
+        owner_moved: false,
     };
     let built =
         tokio::time::timeout(build_timeout(key.component), build_component(state, key)).await;
@@ -560,7 +563,7 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
             record_build(key.component, *lane, "ok");
             return BuildResult {
                 outcome: BuildOutcome::Built { providers: None },
-                reroute: false,
+                owner_moved: false,
             };
         }
         Ok(Err(error)) => {
@@ -573,10 +576,10 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
         }
     };
     record_build(key.component, *lane, "ok");
-    let reroute = match owner_check(state, &key.sandbox_id, session_id).await {
+    let owner_moved = match owner_check(state, &key.sandbox_id, session_id).await {
         OwnerCheck::Current => {
             let disposition = state
-                .supervisor_config_router()
+                .supervisor_config_transport()
                 .deliver(&key.sandbox_id, session_id, message)
                 .await;
             record_delivery(key.component, disposition.metric_label());
@@ -599,7 +602,7 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
         outcome: BuildOutcome::Built {
             providers: Some(providers),
         },
-        reroute,
+        owner_moved,
     }
 }
 
@@ -639,7 +642,7 @@ async fn build_component(
 }
 
 enum OwnerCheck {
-    /// This gateway owns the session the build was dispatched for.
+    /// This gateway owns the session the build started for.
     Current,
     Remote,
     Gone,
@@ -666,34 +669,34 @@ async fn owner_check(state: &Arc<ServerState>, sandbox_id: &str, session_id: &st
     }
 }
 
-async fn run_route(state: &Arc<ServerState>, ticket: &RouteTicket) -> RouteResult {
+async fn run_peer_notify(state: &Arc<ServerState>, ticket: &PeerNotifyTicket) -> PeerNotifyResult {
     match &ticket.target {
-        RouteTarget::Sandbox(sandbox_id) => {
-            route_sandbox_hint(state, sandbox_id, ticket.components).await
+        PeerNotifyTarget::Sandbox(sandbox_id) => {
+            notify_sandbox_owner(state, sandbox_id, ticket.components).await
         }
-        RouteTarget::Peers(scope) => {
+        PeerNotifyTarget::Peers(scope) => {
             notify_peers(state, scope, ticket.components).await;
-            RouteResult::Done
+            PeerNotifyResult::Done
         }
     }
 }
 
-/// Send a secret-free hint to the gateway that owns the sandbox session. The
+/// Send a secret-free notification to the gateway that owns the sandbox session. The
 /// owner builds its own snapshot from shared state.
-async fn route_sandbox_hint(
+async fn notify_sandbox_owner(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     components: ConfigComponents,
-) -> RouteResult {
+) -> PeerNotifyResult {
     let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
     let mut final_outcome = "stale_owner";
     for attempt in 0..2 {
         let owner = match owners.read(sandbox_id).await {
             Ok(Some(owner)) if owner.is_fresh(OWNER_TTL) => owner,
-            Ok(_) => return RouteResult::Done,
+            Ok(_) => return PeerNotifyResult::Done,
             Err(error) => {
                 warn!(sandbox_id, error = %error, "configuration owner lookup failed");
-                return RouteResult::Done;
+                return PeerNotifyResult::Done;
             }
         };
         if owner.owner_replica_id == state.replica_id {
@@ -701,17 +704,17 @@ async fn route_sandbox_hint(
                 .supervisor_sessions
                 .is_current_session(sandbox_id, &owner.session_id)
             {
-                RouteResult::Local
+                PeerNotifyResult::Local
             } else {
-                RouteResult::Done
+                PeerNotifyResult::Done
             };
         }
         if !is_peer_endpoint(&owner.owner_peer_endpoint) {
             warn!(sandbox_id, owner = %owner.owner_replica_id, "configuration owner has no reachable peer endpoint");
-            return RouteResult::Done;
+            return PeerNotifyResult::Done;
         }
-        let request = PeerConfigUpdateHintRequest {
-            scope: Some(peer_config_update_hint_request::Scope::Sandbox(
+        let request = PeerNotifyConfigUpdateRequest {
+            scope: Some(peer_notify_config_update_request::Scope::Sandbox(
                 PeerConfigSandboxTarget {
                     sandbox_id: sandbox_id.to_string(),
                     session_id: owner.session_id,
@@ -720,20 +723,20 @@ async fn route_sandbox_hint(
             sandbox_config: components.sandbox_config,
             provider_environment: components.provider_environment,
         };
-        match send_peer_hint(state, &owner.owner_peer_endpoint, request).await {
-            HintOutcome::StaleOwner => final_outcome = "stale_owner",
-            HintOutcome::Failed(outcome) => {
+        match send_peer_notify(state, &owner.owner_peer_endpoint, request).await {
+            PeerNotifyOutcome::StaleOwner => final_outcome = "stale_owner",
+            PeerNotifyOutcome::Failed(outcome) => {
                 final_outcome = outcome;
-                warn!(sandbox_id, owner = %owner.owner_replica_id, attempt, outcome, "configuration peer hint failed");
+                warn!(sandbox_id, owner = %owner.owner_replica_id, attempt, outcome, "configuration peer notification failed");
             }
             outcome => {
-                record_peer_hint(outcome.label());
-                return RouteResult::Done;
+                record_peer_notify(outcome.label());
+                return PeerNotifyResult::Done;
             }
         }
     }
-    record_peer_hint(final_outcome);
-    RouteResult::Done
+    record_peer_notify(final_outcome);
+    PeerNotifyResult::Done
 }
 
 async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope, components: ConfigComponents) {
@@ -748,30 +751,30 @@ async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope, components:
     let scope = peer_scope(scope);
     futures::stream::iter(endpoints)
         .for_each_concurrent(PEER_FANOUT_CONCURRENCY, |endpoint| {
-            let request = PeerConfigUpdateHintRequest {
+            let request = PeerNotifyConfigUpdateRequest {
                 scope: Some(scope.clone()),
                 sandbox_config: components.sandbox_config,
                 provider_environment: components.provider_environment,
             };
             async move {
-                let outcome = send_peer_hint(state, &endpoint, request).await;
-                if let HintOutcome::Failed(outcome) = outcome {
-                    warn!(endpoint = %endpoint, outcome, "configuration peer fanout hint failed");
+                let outcome = send_peer_notify(state, &endpoint, request).await;
+                if let PeerNotifyOutcome::Failed(outcome) = outcome {
+                    warn!(endpoint = %endpoint, outcome, "configuration peer fanout notification failed");
                 }
-                record_peer_hint(outcome.label());
+                record_peer_notify(outcome.label());
             }
         })
         .await;
 }
 
-fn peer_scope(scope: &FanoutScope) -> peer_config_update_hint_request::Scope {
+fn peer_scope(scope: &FanoutScope) -> peer_notify_config_update_request::Scope {
     match scope {
-        FanoutScope::AllConnected => peer_config_update_hint_request::Scope::AllConnected(true),
+        FanoutScope::AllConnected => peer_notify_config_update_request::Scope::AllConnected(true),
         FanoutScope::Workspace(workspace) => {
-            peer_config_update_hint_request::Scope::Workspace(workspace.clone())
+            peer_notify_config_update_request::Scope::Workspace(workspace.clone())
         }
         FanoutScope::Provider { workspace, name } => {
-            peer_config_update_hint_request::Scope::Provider(PeerConfigProviderTarget {
+            peer_notify_config_update_request::Scope::Provider(PeerConfigProviderTarget {
                 workspace: workspace.clone(),
                 name: name.clone(),
             })
@@ -783,14 +786,14 @@ fn is_peer_endpoint(endpoint: &str) -> bool {
     endpoint.starts_with("http://") || endpoint.starts_with("https://")
 }
 
-enum HintOutcome {
+enum PeerNotifyOutcome {
     Accepted,
     StaleOwner,
     UnsupportedPeer,
     Failed(&'static str),
 }
 
-impl HintOutcome {
+impl PeerNotifyOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -801,29 +804,29 @@ impl HintOutcome {
     }
 }
 
-async fn send_peer_hint(
+async fn send_peer_notify(
     state: &Arc<ServerState>,
     endpoint: &str,
-    request: PeerConfigUpdateHintRequest,
-) -> HintOutcome {
+    request: PeerNotifyConfigUpdateRequest,
+) -> PeerNotifyOutcome {
     match tokio::time::timeout(
-        PEER_HINT_TIMEOUT,
-        crate::supervisor_session::forward_config_hint_to_peer(state, endpoint, request),
+        PEER_NOTIFY_TIMEOUT,
+        crate::supervisor_session::forward_config_notify_to_peer(state, endpoint, request),
     )
     .await
     {
-        Ok(Ok(response)) if response.stale_owner => HintOutcome::StaleOwner,
-        Ok(Ok(_)) => HintOutcome::Accepted,
-        Ok(Err(error)) if error.code() == Code::Unimplemented => HintOutcome::UnsupportedPeer,
-        Ok(Err(_)) => HintOutcome::Failed("peer_error"),
-        Err(_) => HintOutcome::Failed("timeout"),
+        Ok(Ok(response)) if response.stale_owner => PeerNotifyOutcome::StaleOwner,
+        Ok(Ok(_)) => PeerNotifyOutcome::Accepted,
+        Ok(Err(error)) if error.code() == Code::Unimplemented => PeerNotifyOutcome::UnsupportedPeer,
+        Ok(Err(_)) => PeerNotifyOutcome::Failed("peer_error"),
+        Err(_) => PeerNotifyOutcome::Failed("timeout"),
     }
 }
 
-pub fn handle_peer_config_update_hint(
+pub fn handle_peer_notify_config_update(
     state: &Arc<ServerState>,
-    request: Request<PeerConfigUpdateHintRequest>,
-) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
+    request: Request<PeerNotifyConfigUpdateRequest>,
+) -> Result<Response<PeerNotifyConfigUpdateResponse>, Status> {
     if !matches!(
         request.extensions().get::<Principal>(),
         Some(Principal::Peer(_))
@@ -835,20 +838,20 @@ pub fn handle_peer_config_update_hint(
             "configuration push is disabled",
         ));
     }
-    let hint = request.into_inner();
+    let notification = request.into_inner();
     let components = ConfigComponents {
-        sandbox_config: hint.sandbox_config,
-        provider_environment: hint.provider_environment,
+        sandbox_config: notification.sandbox_config,
+        provider_environment: notification.provider_environment,
     };
     if components.is_empty() {
         return Err(Status::invalid_argument(
             "at least one configuration component is required",
         ));
     }
-    let mut response = PeerConfigUpdateHintResponse::default();
-    // Hints from peers never fan out to peers again.
-    let scope = match hint.scope {
-        Some(peer_config_update_hint_request::Scope::Sandbox(target)) => {
+    let mut response = PeerNotifyConfigUpdateResponse::default();
+    // Notifications from peers never fan out to peers again.
+    let scope = match notification.scope {
+        Some(peer_notify_config_update_request::Scope::Sandbox(target)) => {
             if target.sandbox_id.is_empty() || target.session_id.is_empty() {
                 return Err(Status::invalid_argument(
                     "sandbox and session IDs are required",
@@ -860,8 +863,8 @@ pub fn handle_peer_config_update_hint(
                 .supervisor_sessions
                 .is_current_session(&target.sandbox_id, &target.session_id)
             {
-                state.config_delivery.with_scheduler(|scheduler| {
-                    scheduler.publish_sandbox(&target.sandbox_id, components, Instant::now())
+                state.config_delivery.with_queue(|queue| {
+                    queue.publish_sandbox(&target.sandbox_id, components, Instant::now())
                 });
                 kick(state);
             } else {
@@ -869,13 +872,13 @@ pub fn handle_peer_config_update_hint(
             }
             return Ok(Response::new(response));
         }
-        Some(peer_config_update_hint_request::Scope::Workspace(workspace)) => {
+        Some(peer_notify_config_update_request::Scope::Workspace(workspace)) => {
             if workspace.is_empty() {
                 return Err(Status::invalid_argument("workspace is required"));
             }
             FanoutScope::Workspace(workspace)
         }
-        Some(peer_config_update_hint_request::Scope::Provider(target)) => {
+        Some(peer_notify_config_update_request::Scope::Provider(target)) => {
             if target.workspace.is_empty() || target.name.is_empty() {
                 return Err(Status::invalid_argument(
                     "provider workspace and name are required",
@@ -886,17 +889,17 @@ pub fn handle_peer_config_update_hint(
                 name: target.name,
             }
         }
-        Some(peer_config_update_hint_request::Scope::AllConnected(true)) => {
+        Some(peer_notify_config_update_request::Scope::AllConnected(true)) => {
             FanoutScope::AllConnected
         }
         _ => {
             return Err(Status::invalid_argument(
-                "configuration hint scope is required",
+                "configuration notification scope is required",
             ));
         }
     };
-    state.config_delivery.with_scheduler(|scheduler| {
-        scheduler.publish_fanout(&scope, components, false, Instant::now());
+    state.config_delivery.with_queue(|queue| {
+        queue.publish_fanout(&scope, components, false, Instant::now());
     });
     kick(state);
     Ok(Response::new(response))
@@ -977,8 +980,9 @@ fn record_delivery(component: ConfigComponentKind, outcome: &'static str) {
     .increment(1);
 }
 
-fn record_peer_hint(outcome: &'static str) {
-    counter!("openshell_supervisor_config_peer_hints_total", "outcome" => outcome).increment(1);
+fn record_peer_notify(outcome: &'static str) {
+    counter!("openshell_supervisor_config_peer_notifications_total", "outcome" => outcome)
+        .increment(1);
 }
 
 #[cfg(test)]
@@ -992,9 +996,9 @@ mod tests {
     };
 
     fn peer_request(
-        scope: peer_config_update_hint_request::Scope,
-    ) -> Request<PeerConfigUpdateHintRequest> {
-        let mut request = Request::new(PeerConfigUpdateHintRequest {
+        scope: peer_notify_config_update_request::Scope,
+    ) -> Request<PeerNotifyConfigUpdateRequest> {
+        let mut request = Request::new(PeerNotifyConfigUpdateRequest {
             scope: Some(scope),
             sandbox_config: true,
             provider_environment: false,
@@ -1008,8 +1012,8 @@ mod tests {
         request
     }
 
-    fn peer_hint(sandbox_id: &str, session_id: &str) -> Request<PeerConfigUpdateHintRequest> {
-        peer_request(peer_config_update_hint_request::Scope::Sandbox(
+    fn peer_notify(sandbox_id: &str, session_id: &str) -> Request<PeerNotifyConfigUpdateRequest> {
+        peer_request(peer_notify_config_update_request::Scope::Sandbox(
             PeerConfigSandboxTarget {
                 sandbox_id: sandbox_id.into(),
                 session_id: session_id.into(),
@@ -1099,28 +1103,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_hint_requires_push_and_current_session() {
+    async fn peer_notify_requires_push_and_current_session() {
         let state = test_server_state().await;
-        let error = handle_peer_config_update_hint(&state, peer_hint("sandbox", "old-session"))
+        let error = handle_peer_notify_config_update(&state, peer_notify("sandbox", "old-session"))
             .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
 
         let state = push_state().await;
-        let response = handle_peer_config_update_hint(&state, peer_hint("sandbox", "old-session"))
-            .unwrap()
-            .into_inner();
+        let response =
+            handle_peer_notify_config_update(&state, peer_notify("sandbox", "old-session"))
+                .unwrap()
+                .into_inner();
         assert!(response.stale_owner);
 
-        let error = handle_peer_config_update_hint(
+        let error = handle_peer_notify_config_update(
             &state,
-            Request::new(PeerConfigUpdateHintRequest::default()),
+            Request::new(PeerNotifyConfigUpdateRequest::default()),
         )
         .unwrap_err();
         assert_eq!(error.code(), Code::PermissionDenied);
 
-        let error = handle_peer_config_update_hint(
+        let error = handle_peer_notify_config_update(
             &state,
-            peer_request(peer_config_update_hint_request::Scope::Provider(
+            peer_request(peer_notify_config_update_request::Scope::Provider(
                 PeerConfigProviderTarget {
                     workspace: "default".into(),
                     name: String::new(),
@@ -1132,13 +1137,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_hint_rebuilds_snapshot_on_the_session_owner() {
+    async fn peer_notify_rebuilds_snapshot_on_the_session_owner() {
         let state = push_state().await;
         put_sandbox(&state, "owned-sandbox", &[]).await;
         let (mut harness, session_id) = accepted_session(&state, "owned-sandbox").await;
 
         let response =
-            handle_peer_config_update_hint(&state, peer_hint("owned-sandbox", &session_id))
+            handle_peer_notify_config_update(&state, peer_notify("owned-sandbox", &session_id))
                 .unwrap()
                 .into_inner();
         assert!(!response.stale_owner);
@@ -1182,7 +1187,7 @@ mod tests {
     fn has_recipient(state: &ServerState, sandbox_id: &str) -> bool {
         state
             .config_delivery
-            .with_scheduler(|scheduler| scheduler.has_recipient(sandbox_id))
+            .with_queue(|queue| queue.has_recipient(sandbox_id))
     }
 
     #[tokio::test]
@@ -1199,7 +1204,7 @@ mod tests {
         publish_all_connected(&state, ConfigComponents::ALL);
 
         assert_eq!(state.config_delivery.current_seq(), 0);
-        assert!(!state.config_delivery.lock().dispatcher_running);
+        assert!(!state.config_delivery.lock().delivery_worker_running);
         assert!(
             next_update(&mut harness, Duration::from_millis(100))
                 .await
@@ -1234,7 +1239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnected_sessions_leave_the_scheduler() {
+    async fn disconnected_sessions_leave_the_queue() {
         let state = push_state().await;
         put_sandbox(&state, "sandbox", &[]).await;
         let (_harness, _) = accepted_session(&state, "sandbox").await;
@@ -1251,10 +1256,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_for_a_moved_session_routes_to_the_new_owner() {
+    async fn build_for_a_moved_session_notifies_the_new_owner() {
         let state = push_state().await;
-        let work = state.config_delivery.with_scheduler(|scheduler| {
-            scheduler.register(
+        let work = state.config_delivery.with_queue(|queue| {
+            queue.register(
                 Registration {
                     sandbox_id: "moved".into(),
                     session_id: "session".into(),
@@ -1265,8 +1270,8 @@ mod tests {
                 },
                 Instant::now(),
             );
-            scheduler.publish_sandbox("moved", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-            scheduler.next_work(Instant::now()).unwrap()
+            queue.publish_sandbox("moved", ConfigComponents::SANDBOX_CONFIG, Instant::now());
+            queue.next_work(Instant::now()).unwrap()
         });
 
         complete_work(
@@ -1274,16 +1279,16 @@ mod tests {
             &work,
             Some(WorkResult::Build(BuildResult {
                 outcome: BuildOutcome::Built { providers: None },
-                reroute: true,
+                owner_moved: true,
             })),
         );
         let next = state
             .config_delivery
-            .with_scheduler(|scheduler| scheduler.next_work(Instant::now()));
+            .with_queue(|queue| queue.next_work(Instant::now()));
         assert_eq!(
             next,
-            Some(Work::Route(RouteTicket {
-                target: RouteTarget::Sandbox("moved".into()),
+            Some(Work::PeerNotify(PeerNotifyTicket {
+                target: PeerNotifyTarget::Sandbox("moved".into()),
                 components: ConfigComponents::SANDBOX_CONFIG,
             }))
         );
@@ -1293,7 +1298,7 @@ mod tests {
     fn build_slots_are_sized_from_the_database_pool() {
         let builds = |connections| {
             ConfigDelivery::for_db_connections(connections)
-                .with_scheduler(|scheduler| scheduler.limits().builds())
+                .with_queue(|queue| queue.limits().builds())
         };
         assert_eq!(builds(10), 20);
         assert_eq!(builds(1), MIN_CONCURRENT_SNAPSHOT_BUILDS);
