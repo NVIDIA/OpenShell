@@ -272,10 +272,11 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 /// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
 ///
 /// The sandbox runtime sets it in every workload process to
-/// [`OTLP_RELAY_ENDPOINT`], after the environment from the sandbox creation
-/// request, so agent SDKs export to the supervisor's relay and a value in the
-/// creation request never wins. A per-exec environment is a developer's
-/// explicit instruction and still overrides it for that exec only.
+/// [`OTLP_RELAY_ENDPOINT`] so agent SDKs export to the supervisor's relay,
+/// unless the sandbox creation request already names an OTLP endpoint
+/// (generic or traces-specific), in which case the caller's variables are
+/// left untouched. A per-exec environment is a developer's explicit
+/// instruction and still overrides it for that exec only.
 pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
 /// Standard OpenTelemetry environment variable for the OTLP exporter protocol.

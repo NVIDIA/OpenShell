@@ -185,10 +185,15 @@ impl LocalBoundaryExec {
         crate::process::strip_proxy_env_std(&mut command);
         // Point OTel SDKs at the supervisor's trace relay, after the creation
         // request's environment and the provider variables, matching the main
-        // process. A per-exec `spec.env` value applied below still wins for
+        // process, and only when the creation request named no endpoint of
+        // its own. A per-exec `spec.env` value applied below still wins for
         // that exec only.
-        for (key, value) in crate::child_env::otlp_relay_env_vars() {
-            command.env(key, value);
+        if let Some(relay_env) =
+            crate::child_env::otlp_relay_env_vars_unless_configured(&self.user_environment)
+        {
+            for (key, value) in relay_env {
+                command.env(key, value);
+            }
         }
         for (key, value) in &spec.env {
             if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {

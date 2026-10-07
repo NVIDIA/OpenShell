@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::Path;
 
 use openshell_core::sandbox_env::{
@@ -9,17 +11,16 @@ use openshell_core::sandbox_env::{
     OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
 };
 
-/// OpenTelemetry exporter variables every workload process receives.
+/// OpenTelemetry exporter variables a workload process receives when the
+/// sandbox creation request names no OTLP endpoint of its own.
 ///
-/// They point agent SDKs at the supervisor's OTLP relay and are applied after
-/// the environment from the sandbox creation request, so an endpoint named
-/// there never wins: it would either point into the fenced network and fail
-/// or bypass attribution. The signal-specific traces variables are set as
-/// well because SDKs give them precedence over the generic ones, and
-/// compression is disabled because the relay refuses compressed bodies. The
-/// values are the same whether or not a collector is configured; without one
-/// the relay address refuses connections immediately. A per-exec environment
-/// still overrides them for that exec only.
+/// They point agent SDKs at the supervisor's OTLP relay. The signal-specific
+/// traces variables are set as well because SDKs give them precedence over
+/// the generic ones, and compression is disabled because the relay refuses
+/// compressed bodies. The values are the same whether or not a collector is
+/// configured; without one the relay address refuses connections
+/// immediately. Use [`otlp_relay_env_vars_unless_configured`] to respect a
+/// caller who deliberately exports elsewhere.
 pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 6] {
     [
         (OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT),
@@ -32,6 +33,29 @@ pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 6] {
         (OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
         (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, "none"),
     ]
+}
+
+/// Whether a sandbox creation environment names an OTLP endpoint, generic or
+/// traces-specific. A caller who does has chosen where the agent exports.
+pub fn names_otlp_endpoint<S: BuildHasher>(user_environment: &HashMap<String, String, S>) -> bool {
+    [
+        OTEL_EXPORTER_OTLP_ENDPOINT,
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+    ]
+    .iter()
+    .any(|key| user_environment.contains_key(*key))
+}
+
+/// [`otlp_relay_env_vars`] unless the creation request named an endpoint.
+///
+/// Returns `None` when the caller named one, and then none of the caller's
+/// `OTEL_EXPORTER_OTLP_*` values are touched: the agent exports where it was
+/// told to, subject to the sandbox's network policy and outside relay
+/// attribution, instead of being redirected to the relay.
+pub fn otlp_relay_env_vars_unless_configured<S: BuildHasher>(
+    user_environment: &HashMap<String, String, S>,
+) -> Option<[(&'static str, &'static str); 6]> {
+    (!names_otlp_endpoint(user_environment)).then(otlp_relay_env_vars)
 }
 
 pub fn tls_env_vars(
@@ -98,5 +122,29 @@ mod tests {
                 ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none"),
             ]
         );
+    }
+
+    #[test]
+    fn a_caller_named_endpoint_disables_relay_injection() {
+        let none = HashMap::new();
+        assert!(otlp_relay_env_vars_unless_configured(&none).is_some());
+
+        // Protocol or compression alone do not name a destination.
+        let protocol_only = HashMap::from([(
+            "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+            "grpc".to_string(),
+        )]);
+        assert!(otlp_relay_env_vars_unless_configured(&protocol_only).is_some());
+
+        for key in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        ] {
+            let named = HashMap::from([(key.to_string(), "http://collector.example:4318".into())]);
+            assert!(
+                otlp_relay_env_vars_unless_configured(&named).is_none(),
+                "{key} names a destination"
+            );
+        }
     }
 }

@@ -260,7 +260,8 @@ fn configured_user_environment() -> HashMap<String, String> {
 /// sandbox environment minus the reserved `OPENSHELL_` namespace, the
 /// declared user environment, supervisor-only and proxy variables stripped,
 /// provider placeholders, TLS trust paths, and finally the OTLP relay
-/// endpoint, applied last so a caller-supplied endpoint never wins.
+/// variables, applied last so a provider cannot redirect traces, and only
+/// when the declared environment names no OTLP endpoint of its own.
 fn compose_canonical_process_environment(
     cmd: &mut Command,
     policy: &SandboxPolicy,
@@ -280,8 +281,10 @@ fn compose_canonical_process_environment(
             cmd.env(key, value);
         }
     }
-    for (key, value) in child_env::otlp_relay_env_vars() {
-        cmd.env(key, value);
+    if let Some(relay_env) = child_env::otlp_relay_env_vars_unless_configured(user_environment) {
+        for (key, value) in relay_env {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -1302,11 +1305,13 @@ mod tests {
         }
     }
 
-    /// The production composition applies the relay endpoint after the
-    /// declared environment and strips the collector address. Runs in a
-    /// re-executed copy of the test binary so the collector address can sit
-    /// in the inherited environment, where `OPENSHELL_OTLP_ENDPOINT` lives
-    /// for a real supervisor, without touching the harness environment.
+    /// The production composition injects the relay variables when the
+    /// declared environment names no OTLP endpoint, leaves a caller's own
+    /// endpoint alone otherwise, and strips the collector address in both
+    /// cases. Runs in a re-executed copy of the test binary so the collector
+    /// address can sit in the inherited environment, where
+    /// `OPENSHELL_OTLP_ENDPOINT` lives for a real supervisor, without touching
+    /// the harness environment.
     #[cfg(unix)]
     #[test]
     fn canonical_process_sees_relay_endpoint_and_never_the_collector() {
@@ -1326,86 +1331,140 @@ mod tests {
             run_as_user: Some(current_user.name),
             run_as_group: None,
         });
-        // Mirror production: inherit the sandbox environment, no env_clear.
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.stdout(StdStdio::piped());
-        let declared = HashMap::from([
-            (
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.into(),
-                "http://example.invalid".into(),
-            ),
-            (
+        let workspace = ResolvedWorkspace::default();
+        let probe = |declared: HashMap<String, String>, provider_env: HashMap<String, String>| {
+            // Mirror production: inherit the sandbox environment, no env_clear.
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.stdout(StdStdio::piped());
+            compose_canonical_process_environment(
+                &mut cmd,
+                &policy,
+                &workspace,
+                false,
+                &declared,
+                &provider_env,
+                None,
+            );
+            let variables = probe_environment(cmd);
+            assert!(
+                !variables.contains_key(openshell_core::sandbox_env::OTLP_ENDPOINT),
+                "the collector variable reached the workload: {variables:?}"
+            );
+            assert!(
+                !variables
+                    .values()
+                    .any(|value| value.contains(COLLECTOR_HOST)),
+                "the collector address reached the workload: {variables:?}"
+            );
+            variables
+        };
+        let get = |variables: &HashMap<String, String>, key: &str| variables.get(key).cloned();
+
+        // No endpoint in the creation request: the relay variables are set,
+        // and a provider cannot redirect traces either.
+        let variables = probe(
+            HashMap::from([(
                 openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL.into(),
                 "grpc".into(),
-            ),
-            // SDKs prefer the signal-specific variables; a declared one must
-            // not redirect traces around the relay either.
-            (
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.into(),
-                "http://example.invalid/v1/traces".into(),
-            ),
-            (
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(),
-                "gzip".into(),
-            ),
-        ]);
-        // A provider could also try to name an endpoint; the relay must win
-        // over that layer too.
-        let provider_env = HashMap::from([(
-            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
-            "http://provider.invalid".to_string(),
-        )]);
-        compose_canonical_process_environment(
-            &mut cmd,
-            &policy,
-            &ResolvedWorkspace::default(),
-            false,
-            &declared,
-            &provider_env,
-            None,
+            )]),
+            HashMap::from([(
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                "http://provider.invalid".to_string(),
+            )]),
         );
-        let variables = probe_environment(cmd);
         assert_eq!(
-            variables
-                .get(openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT)
-                .map(String::as_str),
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
             Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT),
-            "the relay endpoint wins over the declared one: {variables:?}"
+            "the relay endpoint wins over a provider's: {variables:?}"
         );
         assert_eq!(
-            variables
-                .get(openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL)
-                .map(String::as_str),
-            Some("http/protobuf")
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            )
+            .as_deref(),
+            Some("http/protobuf"),
+            "a declared protocol without an endpoint is replaced: {variables:?}"
         );
         assert_eq!(
-            variables
-                .get(openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            )
+            .as_deref(),
             Some(openshell_core::sandbox_env::OTLP_RELAY_TRACES_ENDPOINT),
-            "the traces-specific endpoint is forced too: {variables:?}"
+            "the traces-specific endpoint is set too: {variables:?}"
         );
         assert_eq!(
-            variables
-                .get(openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION)
-                .map(String::as_str),
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION
+            )
+            .as_deref(),
             Some("none")
-        );
-        assert!(
-            !variables.contains_key(openshell_core::sandbox_env::OTLP_ENDPOINT),
-            "the collector variable reached the workload: {variables:?}"
-        );
-        assert!(
-            !variables
-                .values()
-                .any(|value| value.contains(COLLECTOR_HOST)),
-            "the collector address reached the workload: {variables:?}"
         );
         assert!(
             !variables
                 .values()
                 .any(|value| value.contains("provider.invalid")),
             "a provider endpoint overrode the relay: {variables:?}"
+        );
+
+        // The creation request names its own endpoint: every caller value
+        // stays as declared and nothing points at the relay.
+        let variables = probe(
+            HashMap::from([
+                (
+                    openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.into(),
+                    "http://own-backend.invalid/v1/traces".into(),
+                ),
+                (
+                    openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL.into(),
+                    "grpc".into(),
+                ),
+                (
+                    openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(),
+                    "gzip".into(),
+                ),
+            ]),
+            HashMap::new(),
+        );
+        assert_eq!(
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            )
+            .as_deref(),
+            Some("http://own-backend.invalid/v1/traces"),
+            "a caller's endpoint is left alone: {variables:?}"
+        );
+        assert_eq!(
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            )
+            .as_deref(),
+            Some("grpc")
+        );
+        assert_eq!(
+            get(
+                &variables,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION
+            )
+            .as_deref(),
+            Some("gzip")
+        );
+        assert!(
+            !variables.contains_key(openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT),
+            "nothing is injected when the caller named an endpoint: {variables:?}"
+        );
+        assert!(
+            !variables.values().any(|value| value.contains("192.0.0.8")),
+            "the relay address must not appear: {variables:?}"
         );
     }
 
