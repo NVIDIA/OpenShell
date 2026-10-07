@@ -596,6 +596,7 @@ fn main() -> Result<()> {
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                    otlp_endpoint: args.otlp_endpoint.clone(),
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.
