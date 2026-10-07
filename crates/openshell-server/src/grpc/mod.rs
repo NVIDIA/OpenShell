@@ -1011,6 +1011,8 @@ pub mod test_support {
                     supports_config_snapshots,
                     connection_epoch: 0,
                     supports_provider_readiness: false,
+                    redirected: false,
+                    supports_session_redirect: false,
                 })),
             })
             .await

@@ -78,6 +78,14 @@ jq -n \
       url: $run_url
     },
     generated_at: $generated_at,
+    advisory_reviews: {
+      compatibility: {
+        required: false,
+        status: "reported_separately",
+        artifact_name: ("compatibility-review-run-" + $run_id + "-attempt-" + $run_attempt),
+        run_url: $run_url
+      }
+    },
     suites: {
       protobuf_compatibility: $protobuf_compatibility,
       security: $security,

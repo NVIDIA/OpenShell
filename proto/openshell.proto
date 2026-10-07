@@ -3050,7 +3050,8 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
-    ConfigUpdate config_update = 6;
+    SessionRedirect session_redirect = 6;
+    ConfigUpdate config_update = 7;
   }
 }
 
@@ -3065,9 +3066,17 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Set when this connection is the result of following a SessionRedirect. The
+  // receiving gateway serves a redirected hello locally instead of redirecting
+  // again, so a disagreement about membership cannot bounce the supervisor
+  // between replicas. A gateway that is shutting down may still redirect it.
+  bool redirected = 5;
+  // The supervisor understands SessionRedirect. Gateways never redirect a
+  // supervisor that does not set this.
+  bool supports_session_redirect = 6;
   // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
   // stream. Gateways send configuration payloads only when this is set.
-  bool supports_config_snapshots = 5;
+  bool supports_config_snapshots = 7;
 }
 
 // Gateway accepts the supervisor session.
@@ -3141,6 +3150,20 @@ message ConfigBootstrapResult {
 message SessionRejected {
   // Human-readable rejection reason.
   string reason = 1;
+}
+
+// Gateway declines to own this session and names the replica that should.
+//
+// Sent instead of SessionAccepted when the placement ring puts the sandbox on
+// a different live replica, and to established sessions when their gateway
+// shuts down. The supervisor reconnects to peer_endpoint once with
+// SupervisorHello.redirected set, and falls back to its configured gateway
+// address if that fails.
+message SessionRedirect {
+  // Peer endpoint of the replica that should own this sandbox.
+  string peer_endpoint = 1;
+  // Replica ID that should own this sandbox, for logging.
+  string owner_replica_id = 2;
 }
 
 // Supervisor heartbeat.
