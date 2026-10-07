@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -18,9 +19,15 @@ from pathlib import Path
 def read_document(path: Path) -> tuple[dict, str]:
     # Never echo parser errors, paths, or arbitrary scanner-generated text.
     try:
-        if path.is_symlink():
+        if not stat.S_ISREG(path.lstat().st_mode):
             return {}, "invalid"
-        with path.open("rb") as stream:
+        # Check the opened file too: the path may change after lstat().
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return {}, "invalid"
             data = stream.read(4 * 1024 * 1024 + 1)
         if len(data) > 4 * 1024 * 1024:
             return {}, "oversized"

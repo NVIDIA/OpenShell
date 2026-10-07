@@ -128,6 +128,43 @@ def test_missing_invalid_and_symlinked_reports_do_not_echo_contents(tmp_path):
     assert coverage_summary(tmp_path)["coverage_document"] == "invalid"
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+@pytest.mark.parametrize(
+    ("filename", "field"),
+    [
+        ("coverage.json", "coverage_document"),
+        ("scan-manifest.json", "manifest_document"),
+    ],
+)
+def test_fifo_report_does_not_block_diagnostics(tmp_path, filename, field):
+    scan = tmp_path / "scan"
+    scan.mkdir()
+    os.mkfifo(scan / filename)
+    output = tmp_path / "diagnostics.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--scan-dir",
+            str(scan),
+            "--output",
+            str(output),
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(2)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 2
+    report = json.loads(output.read_text())
+    assert report["exit_code"] == 2
+    assert report[field] == "invalid"
+
+
 def test_scan_output_directory_stays_empty_until_scanner_writes(tmp_path):
     scan = tmp_path / "scan"
     output = tmp_path / "diagnostics.json"
