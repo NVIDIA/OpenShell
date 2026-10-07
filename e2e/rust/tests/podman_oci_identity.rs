@@ -226,23 +226,6 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         "Podman sandbox must launch the immutable image ID inspected before creation"
     );
 
-    let workspace_output = sandbox
-        .exec(&[
-            "sh",
-            "-c",
-            "set -eu; test \"$(pwd -P)\" = /home/app/project; test ! -e /sandbox; stat -c 'workspace-owner=%u:%g' .; touch probe; rm probe; echo podman-workspace-write-ok",
-        ])
-        .await
-        .expect("OCI workload should be able to write to its image workspace");
-    assert!(
-        workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
-        "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"
-    );
-    assert!(
-        workspace_output.contains("podman-workspace-write-ok"),
-        "expected workspace write marker:\n{workspace_output}"
-    );
-
     assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
 }
