@@ -382,6 +382,7 @@ pub async fn ensure_required_providers(
         loop {
             let response = client
                 .list_providers(ListProvidersRequest {
+                    label_selector: String::new(),
                     page_size: 100,
                     page_token,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1046,6 +1047,7 @@ pub async fn provider_create(
         server,
         name,
         provider_type,
+        labels: &[],
         credentials,
         credential_source,
         config,
@@ -1060,6 +1062,7 @@ pub struct ProviderCreateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
     pub provider_type: &'a str,
+    pub labels: &'a [String],
     pub credentials: &'a [String],
     pub credential_source: ProviderCreateCredentialSource,
     pub config: &'a [String],
@@ -1082,6 +1085,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         server,
         name,
         provider_type,
+        labels,
         credentials,
         credential_source,
         config,
@@ -1089,6 +1093,8 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         profile_workspace,
         tls,
     } = options;
+
+    let labels = parse_key_value_pairs(labels, "--label")?;
 
     let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
     let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
@@ -1209,7 +1215,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     id: String::new(),
                     name: name.to_string(),
                     created_time: None,
-                    labels: HashMap::new(),
+                    labels,
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
@@ -1346,6 +1352,21 @@ pub async fn provider_get(
     println!("  {} {}", "Id:".dimmed(), provider.object_id());
     println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    if let Some(meta) = &provider.metadata
+        && !meta.labels.is_empty()
+    {
+        let mut labels: Vec<_> = meta.labels.iter().collect();
+        labels.sort_unstable_by_key(|(key, _)| *key);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            labels
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -1455,6 +1476,7 @@ pub async fn provider_list(
     server: &str,
     page_size: i32,
     page_token: &str,
+    label_selector: &str,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -1466,6 +1488,7 @@ pub async fn provider_list(
         .list_providers(ListProvidersRequest {
             page_size,
             page_token: page_token.to_string(),
+            label_selector: label_selector.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {

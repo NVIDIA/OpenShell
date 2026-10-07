@@ -3432,6 +3432,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "table",
         "default",
@@ -3744,6 +3745,7 @@ async fn provider_list_json_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "json",
         "default",
@@ -3787,6 +3789,7 @@ async fn provider_list_yaml_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "yaml",
         "default",
@@ -3814,6 +3817,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
+        "",
         "",
         false,
         "json",
@@ -4061,6 +4065,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     );
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &["team=ml".into()],
         server: &ts.endpoint,
         name: "custom-refresh-provider",
         provider_type: "custom-refresh",
@@ -4077,6 +4082,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let stored = ts.state.providers.lock().await;
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
+    assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
     assert!(provider.credentials.is_empty());
 }
 
@@ -5377,6 +5383,7 @@ async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "openai-inline",
         provider_type: "openai",
@@ -5413,6 +5420,7 @@ async fn provider_create_prefers_exact_imported_alias_profile() {
     install_test_profile(&ts, "gh", "GITHUB_TOKEN").await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "enterprise-github",
         provider_type: "gh",
@@ -5607,17 +5615,18 @@ async fn provider_create_from_gcloud_adc_happy_path() {
 
     Environment::from_pairs(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)])
         .run_async(async {
-            run::provider_create(
-                &ts.endpoint,
-                "my-vertex",
-                "google-vertex-ai",
-                false,
-                &[],  // no explicit credentials; refresh bootstrap covers it
-                true, // from_gcloud_adc
-                &[],
-                "default",
-                &ts.tls,
-            )
+            run::provider_create_with_options(run::ProviderCreateOptions {
+                server: &ts.endpoint,
+                name: "my-vertex",
+                provider_type: "google-vertex-ai",
+                labels: &["team=ml".into()],
+                credentials: &[],
+                credential_source: run::ProviderCreateCredentialSource::GcloudAdc,
+                config: &[],
+                workspace: "default",
+                profile_workspace: "default",
+                tls: &ts.tls,
+            })
             .await
             .expect("provider_create with --from-gcloud-adc should succeed");
 
@@ -5627,6 +5636,7 @@ async fn provider_create_from_gcloud_adc_happy_path() {
                 .get("my-vertex")
                 .expect("provider should be stored after create");
             assert_eq!(provider.r#type, "google-vertex-ai");
+            assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
             assert_eq!(
                 provider
                     .credentials

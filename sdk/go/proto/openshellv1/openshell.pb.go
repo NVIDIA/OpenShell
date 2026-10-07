@@ -8423,7 +8423,9 @@ type ListProvidersRequest struct {
 	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Token from a previous ListProviders response. All other request parameters
 	// except page_size must match the request that produced it.
-	PageToken     string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	// Optional label selector for filtering (format: "key1=value1,key2=value2").
+	LabelSelector string `protobuf:"bytes,4,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8475,6 +8477,13 @@ func (x *ListProvidersRequest) GetPageSize() int32 {
 func (x *ListProvidersRequest) GetPageToken() string {
 	if x != nil {
 		return x.PageToken
+	}
+	return ""
+}
+
+func (x *ListProvidersRequest) GetLabelSelector() string {
+	if x != nil {
+		return x.LabelSelector
 	}
 	return ""
 }
@@ -18798,12 +18807,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\vcredentials\x18\x01 \x03(\v2=.openshell.v1.GetProviderCredentialsResponse.CredentialsEntryR\vcredentials\x1ae\n" +
 	"\x10CredentialsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12;\n" +
-	"\x05value\x18\x02 \x01(\v2%.openshell.v1.ProviderCredentialValueR\x05value:\x028\x01\"\xa6\x01\n" +
+	"\x05value\x18\x02 \x01(\v2%.openshell.v1.ProviderCredentialValueR\x05value:\x028\x01\"\xcd\x01\n" +
 	"\x14ListProvidersRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
-	"page_token\x18\x02 \x01(\tR\tpageToken\"\xa0\x04\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
+	"\x0elabel_selector\x18\x04 \x01(\tR\rlabelSelector\"\xa0\x04\n" +
 	"\x15UpdateProviderRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12<\n" +
 	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12\x82\x01\n" +
