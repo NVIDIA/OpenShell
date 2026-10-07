@@ -22,7 +22,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
@@ -61,6 +60,9 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
+| `e2e/suites/` | Behavioral E2E suites | Conformance scenarios, feature tests, and driver tests |
+| `e2e/support/rust/` | Shared Rust test tooling | CLI runner, binary resolution, output parsing, and port utilities |
+| `tests/` | Test provisioning | Target configuration, artifact construction, and Ansible setup |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |

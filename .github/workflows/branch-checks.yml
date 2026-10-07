@@ -141,6 +141,9 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo fmt --all -- --check
+          cargo fmt --manifest-path e2e/support/rust/Cargo.toml --all -- --check
+          cargo fmt --manifest-path e2e/suites/conformance/Cargo.toml --all -- --check
+          cargo fmt --manifest-path e2e/suites/drivers/Cargo.toml --all -- --check
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
@@ -196,6 +199,9 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/support/rust/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/suites/conformance/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/suites/drivers/Cargo.toml --workspace --all-targets -- -D warnings
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
@@ -235,6 +241,9 @@ jobs:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path e2e/support/rust/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path e2e/suites/conformance/Cargo.toml --package openshell-test-conformance-cli -E 'binary(policy_advisor) & test(draft_assertion::tests::)'
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path e2e/suites/drivers/Cargo.toml --package openshell-test-suite-podman -E 'test(::tests::)'
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
   rust-build-modes:

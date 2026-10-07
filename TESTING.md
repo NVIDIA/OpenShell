@@ -8,6 +8,22 @@ mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
 mise run ci            # Everything: lint, compile checks, and tests
 ```
 
+## Test Families
+
+- Lint checks formatting, style, and static rules.
+- Unit tests verify a component in isolation.
+- Integration tests verify interactions between components.
+- End-to-end tests exercise a configured OpenShell target through a client.
+- Benchmarks measure performance or scale separately from behavioral correctness.
+
+End-to-end suites under `e2e/suites/` are grouped by intent: conformance verifies
+required public behavior, feature suites need a named external service or special
+gateway configuration, and driver suites verify driver or host integration.
+The [conformance guide](e2e/suites/conformance/README.md) owns conformance
+requirements, authoring, and execution guidance. Existing mixed suites remain
+under `e2e/rust/` while their behavior is migrated. `tests/` supplies provisioning
+and artifact construction independently of the suite layout.
+
 ## Test Layout
 
 ```text
@@ -15,7 +31,9 @@ crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
-e2e/rust/              # Rust CLI E2E tests
+e2e/rust/              # Legacy Rust CLI E2E tests awaiting migration
+e2e/suites/            # Conformance, feature, and driver E2E suites
+tests/                 # Target provisioning and artifact construction
 ```
 
 ## Rust Tests
@@ -210,10 +228,15 @@ When more than one test needs this behavior, put the transport in the shared
 Rust e2e harness and require callers to use it instead of duplicating DNS,
 HTTP `Host`, TLS SNI, and mTLS handling.
 
+Shared Rust test tooling lives under `e2e/support/rust`, including the CLI runner,
+binary resolution, output parsing, and port utilities. Conformance scenarios live
+under `e2e/suites/conformance/cli/tests`. `mise run test:rust` includes the tooling
+and scenario unit tests without requiring a gateway.
+
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
+- CLI conformance (`e2e/suites/conformance`) - portable Cargo tests for
   lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
   including agent-authored permission requests. Driver E2E runs the complete
   Cargo test package. The installed-artifact conformance suite runs the same
@@ -251,7 +274,7 @@ cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
   cargo test \
     --locked \
-    --manifest-path tests/suites/conformance/Cargo.toml \
+    --manifest-path e2e/suites/conformance/Cargo.toml \
     --package openshell-test-conformance-cli \
     --no-fail-fast \
     -- \
@@ -313,7 +336,14 @@ The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
-profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+profiles. Each profile is a named Rust test. The suite runs serially against
+the shared gateway; a guest-side file lock also protects separate invocations.
+The Rust fixture restores the original gateway configuration, restarts and
+checks gateway health, and verifies sandbox cleanup after each test, including
+assertion failures. A dirty marker stops later tests after interruption or failed
+restoration; start a fresh tmachine invocation to recover.
+
+The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, host fixtures, missing guest tools, or nondeterministic relay
 setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
 binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses

@@ -234,6 +234,7 @@ path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
 [dependencies]
+openshell-e2e-support = { path = "../support/rust" }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
