@@ -47,7 +47,10 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Gateway delivery path for supervisor configuration.
-/// `Push` is a shadow stream until supervisors support applying snapshots.
+///
+/// `Push` sends configuration over the supervisor session. Supervisors that
+/// apply streamed configuration stop polling; others keep polling and treat the
+/// stream as a shadow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigDeliveryMode {
@@ -233,7 +236,7 @@ pub struct Config {
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
 
-    /// Optional shadow push of complete supervisor configuration snapshots.
+    /// Whether supervisors poll for configuration or receive it over their session.
     pub config_delivery_mode: ConfigDeliveryMode,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
