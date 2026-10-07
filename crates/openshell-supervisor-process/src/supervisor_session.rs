@@ -386,6 +386,7 @@ async fn run_session_loop(config: SessionConfig) {
             }) => {
                 if config.ready_tx.send_replace(false) {
                     backoff_skipped = false;
+                    backoff = INITIAL_BACKOFF;
                 }
                 info!(
                     sandbox_id = %config.sandbox_id,
@@ -412,6 +413,7 @@ async fn run_session_loop(config: SessionConfig) {
                 if accepted {
                     backoff_skipped = false;
                 }
+                backoff = backoff_after_failure(backoff, accepted);
                 target.clone_from(&config.endpoint);
                 redirected = redirect_survives_failure(redirected, accepted);
                 if skip_backoff(failed_redirect_target, backoff_skipped) {
@@ -423,6 +425,14 @@ async fn run_session_loop(config: SessionConfig) {
             }
         }
     }
+}
+
+/// A session the gateway accepted proves the path works again, so its loss
+/// starts backoff over. Without the reset, every gateway restart over the
+/// sandbox's lifetime doubles the delay until each reconnect waits the full
+/// maximum.
+fn backoff_after_failure(backoff: Duration, accepted: bool) -> Duration {
+    if accepted { INITIAL_BACKOFF } else { backoff }
 }
 
 /// Keep asking not to be redirected when a redirected attempt never got a
@@ -1313,6 +1323,12 @@ mod ocsf_event_tests {
         assert!(!redirect_survives_failure(true, true));
         assert!(!redirect_survives_failure(false, false));
         assert!(!redirect_survives_failure(false, true));
+    }
+
+    #[test]
+    fn backoff_resets_after_accepted_session() {
+        assert_eq!(backoff_after_failure(MAX_BACKOFF, true), INITIAL_BACKOFF);
+        assert_eq!(backoff_after_failure(MAX_BACKOFF, false), MAX_BACKOFF);
     }
 
     #[test]

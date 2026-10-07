@@ -340,6 +340,9 @@ async fn wait_for_startup(
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Interval between replacement-session checks during a shutdown handoff.
+const SUPERVISOR_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Restart intents live in sandbox rows. A lightweight holder-only scan makes
 /// cross-replica writes and lost wakeups recover without changing the general
 /// backend reconciliation cadence.
@@ -4758,6 +4761,41 @@ impl ComputeRuntime {
             .await?;
         }
         Ok(())
+    }
+
+    /// Wait up to `timeout` for a replacement supervisor session after this
+    /// replica handed the sandbox off during shutdown.
+    ///
+    /// Call before [`Self::supervisor_session_disconnected`], which keeps the
+    /// sandbox Ready when a replacement exists. Without the wait, the stopping
+    /// replica demotes the sandbox before the redirected supervisor publishes
+    /// its new ownership, and requests fail with `sandbox is not ready` for the
+    /// length of the handoff. Returns whether a replacement became ready.
+    pub async fn wait_for_supervisor_session_handoff(
+        &self,
+        sandbox_id: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match self.supervisor_session_ready(sandbox_id).await {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        sandbox_id,
+                        error = %error,
+                        "Failed to check for a replacement supervisor session during handoff"
+                    );
+                    return false;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SUPERVISOR_HANDOFF_POLL_INTERVAL.min(deadline - now)).await;
+        }
     }
 
     async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -14287,6 +14325,81 @@ mod tests {
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_handoff_keeps_ready_when_replacement_publishes_during_wait() {
+        let runtime = Arc::new(test_runtime(Arc::new(TestDriver::default())).await);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let store = runtime.store.clone();
+        let publish = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            SupervisorOwnerIndex::new(store, OWNER_TTL)
+                .publish(
+                    "sb-1",
+                    "replacement-session",
+                    "supervisor-instance",
+                    2,
+                    "gateway-b",
+                    "http://gateway-b:8080",
+                )
+                .await
+                .unwrap();
+        });
+
+        assert!(
+            runtime
+                .wait_for_supervisor_session_handoff("sb-1", Duration::from_secs(5))
+                .await
+        );
+        publish.await.unwrap();
+        runtime
+            .supervisor_session_disconnected("sb-1", false)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_handoff_demotes_when_no_replacement_arrives() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        assert!(
+            !runtime
+                .wait_for_supervisor_session_handoff("sb-1", Duration::from_millis(200))
+                .await
+        );
+        runtime
+            .supervisor_session_disconnected("sb-1", false)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
         );
     }
 

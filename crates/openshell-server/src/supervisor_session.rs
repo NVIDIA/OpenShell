@@ -41,6 +41,10 @@ use crate::supervisor_owner::{
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a stopping replica waits for a redirected supervisor to publish its
+/// replacement session before marking the sandbox not ready. Must stay below
+/// the gateway's supervisor session cleanup timeout at shutdown.
+const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
@@ -2317,7 +2321,7 @@ async fn establish_supervisor_session(
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
-        run_session_loop(
+        let exit = run_session_loop(
             &state_clone,
             &sandbox_id_clone,
             &session_id,
@@ -2348,6 +2352,18 @@ async fn establish_supervisor_session(
                     sandbox_id_clone.clone(),
                 ),
             );
+            // A gateway shutdown hands the supervisor to another replica.
+            // Give it time to publish the replacement session so the sandbox
+            // stays Ready through the handoff instead of flapping.
+            if exit == SessionLoopExit::GatewayShutdown
+                && !terminal_finalized
+                && state_clone
+                    .compute
+                    .wait_for_supervisor_session_handoff(&sandbox_id_clone, SHUTDOWN_HANDOFF_GRACE)
+                    .await
+            {
+                info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: handed off to replacement session");
+            }
             if let Err(err) = state_clone
                 .compute
                 .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
@@ -2438,6 +2454,15 @@ pub async fn handle_finalize_main_process_exit(
     ))
 }
 
+/// Why a supervisor session loop ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLoopExit {
+    /// This gateway is shutting down and handed the session off.
+    GatewayShutdown,
+    /// The session ended for any other reason.
+    Other,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session_loop(
     state: &Arc<ServerState>,
@@ -2448,7 +2473,7 @@ async fn run_session_loop(
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
-) {
+) -> SessionLoopExit {
     let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
@@ -2466,7 +2491,7 @@ async fn run_session_loop(
                         payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
                     });
                 }
-                break;
+                return SessionLoopExit::GatewayShutdown;
             }
             _ = &mut shutdown_rx => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
@@ -2518,6 +2543,7 @@ async fn run_session_loop(
             }
         }
     }
+    SessionLoopExit::Other
 }
 
 async fn handle_supervisor_message(

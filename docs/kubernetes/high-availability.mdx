@@ -184,6 +184,12 @@ reconnect through the gateway Service. Either way, they publish new ownership. O
 while waiting to relay a request. A request fails if no fresh, reachable owner
 appears before its normal deadline.
 
+A stopping owner waits up to five seconds for a redirected supervisor to
+publish its new session before it marks the sandbox not ready, so a sandbox
+stays `Ready` through a graceful handoff. Supervisors reconnect with
+exponential backoff that restarts after each accepted session, so repeated
+gateway restarts do not lengthen later reconnects.
+
 Established streams do not move between gateway replicas. An interrupted exec,
 forwarding, or service stream must reconnect. File sync retries with a new SSH
 session instead of resuming the interrupted byte stream. Rolling updates can
