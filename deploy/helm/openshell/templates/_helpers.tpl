@@ -246,15 +246,16 @@ into per-generation Secrets in workspace namespaces, as a JSON array. Empty in
 shared workspace mode.
 */}}
 {{- define "openshell.workspaceSecretSourceNames" -}}
-{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $names := list -}}
 {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}
 {{- $names = append $names .Values.server.tls.clientTlsSecretName -}}
 {{- end -}}
 {{- if eq $workspaceMode "managed" -}}
-{{- range .Values.server.sandboxImagePullSecrets -}}
-{{- if .name -}}
-{{- $names = append $names .name -}}
+{{- range (get $kubernetesConfig "image_pull_secrets" | default list) -}}
+{{- if . -}}
+{{- $names = append $names . -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -505,11 +506,12 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- if and (get $legacyServer "enableUserNamespaces") (not (hasKey $kubernetes "enable_user_namespaces")) -}}{{- $_ := set $kubernetes "enable_user_namespaces" true -}}{{- end -}}
 {{- if and (get $legacyServer "hostGatewayIP") (not (hasKey $kubernetes "host_gateway_ip")) -}}{{- $_ := set $kubernetes "host_gateway_ip" (get $legacyServer "hostGatewayIP") -}}{{- end -}}
-{{- if not (hasKey $kubernetes "namespace") -}}{{- $_ := set $kubernetes "namespace" (include "openshell.sandboxNamespace" .) -}}{{- end -}}
+{{/* Namespace and ServiceAccount refer to chart-created resources. */}}
+{{- $_ := set $kubernetes "namespace" (include "openshell.sandboxNamespace" .) -}}
 {{- if not (hasKey $kubernetes "default_image") -}}{{- $_ := set $kubernetes "default_image" (include "openshell.sandboxImage" .) -}}{{- end -}}
 {{- if not (hasKey $kubernetes "gateway_id") -}}{{- $_ := set $kubernetes "gateway_id" (get (.Values.server.sandboxJwt | default dict) "gatewayId" | default (include "openshell.fullname" .)) -}}{{- end -}}
 {{- if not (hasKey $kubernetes "grpc_endpoint") -}}{{- $_ := set $kubernetes "grpc_endpoint" (include "openshell.grpcEndpoint" .) -}}{{- end -}}
-{{- if not (hasKey $kubernetes "service_account_name") -}}{{- $_ := set $kubernetes "service_account_name" (include "openshell.sandboxServiceAccountName" .) -}}{{- end -}}
+{{- $_ := set $kubernetes "service_account_name" (include "openshell.sandboxServiceAccountName" .) -}}
 {{- if not (hasKey $kubernetes "sa_token_ttl_secs") -}}{{- $_ := set $kubernetes "sa_token_ttl_secs" (get (.Values.server.sandboxJwt | default dict) "k8sSaTokenTtlSecs" | default 3600) -}}{{- end -}}
 {{- if not (hasKey $kubernetes "image_pull_secrets") -}}
 {{- $imagePullSecrets := list -}}{{- range (get $legacyServer "sandboxImagePullSecrets" | default list) }}{{- if .name }}{{- $imagePullSecrets = append $imagePullSecrets .name }}{{- end }}{{- end -}}

@@ -74,4 +74,5 @@ For Vault, set `openshell.gateway.credential_drivers: [vault]` and configure
 for a private Vault CA. For a proxy, use the Kubernetes-driver fields in
 `gatewayConfig`. TLS remains Secret-backed; set `server.disableTls: true` only for
 trusted external termination. A null map field omits it; null array elements
-are invalid. Strings evaluate Helm `tpl`; other values do not.
+are invalid. Strings are serialized literally; Helm template expressions inside
+them are not evaluated.

@@ -972,6 +972,17 @@ tests:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
 
+  - it: preserves pkiInitJob serverDnsNames as the runtime SAN fallback
+    set:
+      certManager.enabled: false
+      pkiInitJob.serverDnsNames:
+        - "*.apps.example.com"
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'server_sans\s*=\s*\["\*\.apps\.example\.com"\]'
+
   - it: passes sqlite db-url via --db-url arg by default
     template: templates/statefulset.yaml
     asserts:

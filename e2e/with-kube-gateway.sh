@@ -99,7 +99,6 @@ EXTERNAL_PG_FIXTURE_SECRET=""
 EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
 EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
-EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
 ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
 ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
@@ -178,10 +177,6 @@ verify_gateway_config_rollout() {
     --reuse-values \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
@@ -207,6 +202,7 @@ verify_gateway_config_rollout() {
 
 deploy_postgres_fixture() {
   local secret_name="$1"
+  local pg_password
   local pg_uri
 
   echo "Deploying external PostgreSQL fixture ${EXTERNAL_PG_FIXTURE_SERVICE}..."
@@ -228,9 +224,16 @@ deploy_postgres_fixture() {
   EXTERNAL_PG_FIXTURE_DEPLOYED=1
   EXTERNAL_PG_FIXTURE_SECRET="${secret_name}"
 
+  pg_password="$(kctl -n "${NAMESPACE}" get secret openshell-e2e-postgres-credentials \
+    -o jsonpath='{.data.password}' | base64 -d)"
+  if [[ -z "${pg_password}" ]]; then
+    echo "ERROR: external PostgreSQL fixture password is empty" >&2
+    return 1
+  fi
+
   kctl -n "${NAMESPACE}" rollout status "deployment/${EXTERNAL_PG_FIXTURE_SERVICE}" --timeout=120s
 
-  pg_uri="postgresql://${EXTERNAL_PG_FIXTURE_USER}:${EXTERNAL_PG_FIXTURE_PASSWORD}@${EXTERNAL_PG_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_FIXTURE_DATABASE}"
+  pg_uri="postgresql://${EXTERNAL_PG_FIXTURE_USER}:${pg_password}@${EXTERNAL_PG_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_FIXTURE_DATABASE}"
   kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
     --ignore-not-found >/dev/null 2>&1 || true
   kctl -n "${NAMESPACE}" create secret generic "${secret_name}" \
@@ -1220,10 +1223,6 @@ helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
-# `supervisor.image` is the chart-owned input and is derived into the runtime
-# TOML. Keep it aligned with the locally built/imported image and CI overrides.
-helm_extra_args+=(--set-string "supervisor.image.repository=${REGISTRY_VALUE}/supervisor")
-helm_extra_args+=(--set-string "supervisor.image.tag=${IMAGE_TAG_VALUE}")
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2

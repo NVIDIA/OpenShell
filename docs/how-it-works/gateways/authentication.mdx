@@ -116,9 +116,9 @@ gatewayConfig:
 
 The gateway requires HTTPS for OIDC discovery and JWKS retrieval, rejects
 redirects, and trusts the issuer origin for JWKS by default. Add a
-`jwksAllowedOrigins` entry only when the identity provider intentionally serves
+`jwks_allowed_origins` entry only when the identity provider intentionally serves
 keys from another trusted origin. For local tests, numeric-loopback HTTP also
-requires `dangerouslyAllowInsecureHttp: true`; this setting never permits an
+requires `dangerously_allow_insecure_http: true`; this setting never permits an
 HTTP hostname or non-loopback address.
 
 Register an OIDC gateway with the CLI:

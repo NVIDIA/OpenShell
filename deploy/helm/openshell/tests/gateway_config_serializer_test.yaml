@@ -23,6 +23,44 @@ tests:
           path: data["gateway.toml"]
           pattern: legacy-proxy
 
+  - it: derives runtime listener ports from chart-owned Service ports
+    set:
+      service.port: 19080
+      service.healthPort: 19081
+      service.metricsPort: 19090
+      gatewayConfig:
+        openshell.gateway:
+          bind_address: 0.0.0.0:8080
+          health_bind_address: 0.0.0.0:8081
+          metrics_bind_address: 0.0.0.0:9090
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address = "0\.0\.0\.0:19080"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address = "0\.0\.0\.0:19081"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:19090"$'
+
+  - it: aligns runtime namespace and ServiceAccount with chart-owned resources
+    set:
+      server.sandboxNamespace: chart-sandboxes
+      sandboxServiceAccount.create: false
+      sandboxServiceAccount.name: chart-sandbox
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          namespace: unrelated-namespace
+          service_account_name: unrelated-service-account
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^namespace = "chart-sandboxes"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_account_name = "chart-sandbox"$'
+
   - it: gives gatewayConfig precedence over deprecated image, runtime, and CA aliases
     set:
       sandboxRuntime.image.repository: legacy.example/sandbox
@@ -127,6 +165,114 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.oidc\].*?user_role = "platform-user"'
 
+  - it: fills absent schema-v2 OIDC fields from legacy values without overwriting schema-v2 fields
+    set:
+      server.oidc.issuer: https://legacy.example/realms/openshell
+      server.oidc.rolesClaim: legacy.roles
+      server.oidc.adminRole: legacy-admin
+      server.oidc.userRole: legacy-user
+      server.oidc.scopesClaim: legacy.scopes
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://schema-v2.example/realms/openshell
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://schema-v2\.example/realms/openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim = "legacy\.roles"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role = "legacy-admin"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role = "legacy-user"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^scopes_claim = "legacy\.scopes"$'
+
+  - it: fills an absent schema-v2 OTLP endpoint from legacy values
+    set:
+      server.otlp.endpoint: https://legacy-otlp.example:4317
+      server.otlp.serviceName: legacy-service
+      gatewayConfig:
+        openshell.gateway.otlp:
+          service_name: schema-v2-service
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^endpoint = "https://legacy-otlp\.example:4317"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_name = "schema-v2-service"$'
+
+  - it: fills an absent schema-v2 OCSF path from legacy values
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/log/openshell/legacy.jsonl
+      gatewayConfig:
+        openshell.gateway.ocsf_log:
+          rotation: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^path = "/var/log/openshell/legacy\.jsonl"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^rotation = "never"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^max_files ='
+
+  - it: omits empty optional OIDC role fields translated from legacy values
+    set:
+      server.oidc.issuer: https://issuer.example/realms/openshell
+      server.oidc.audience: openshell-cli
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://issuer\.example/realms/openshell"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^scopes_claim ='
+
+  - it: preserves explicit empty schema-v2 OIDC role fields
+    set:
+      server.oidc.issuer: https://legacy.example/realms/openshell
+      server.oidc.adminRole: legacy-admin
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://schema-v2.example/realms/openshell
+          roles_claim: ""
+          admin_role: ""
+          user_role: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://schema-v2\.example/realms/openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim = ""$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role = ""$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role = ""$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy-admin
+
   - it: translates legacy resource admission labels into snake_case
     set:
       server.drivers.kubernetes.resourceAdmission.requiredLabels:
@@ -212,16 +358,34 @@ tests:
       - failedTemplate:
           errorMessage: 'gatewayConfig array-of-tables "example.entries" entry 1 must be a map, got string'
 
-  - it: evaluates templates only in string values
+  - it: rejects a nested map that collides with a dotted top-level table
+    set:
+      gatewayConfig:
+        openshell:
+          gateway:
+            log_level: debug
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig defines "openshell.gateway" both as a nested map and a dotted top-level table; use only the dotted top-level key'
+
+  - it: serializes strings literally without evaluating Helm expressions
     set:
       gatewayConfig:
         example:
-          rendered_string: '{{ .Release.Namespace }}/{{ .Release.Name }}'
+          release_template: '{{ .Release.Namespace }}/{{ .Release.Name }}'
+          helm_function: '{{ randAlphaNum 8 }}'
+          lookup_expression: '{{ lookup "v1" "Secret" "default" "example" }}'
           boolean_value: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^rendered_string = "serializer-namespace/serializer-test"$'
+          pattern: '(?m)^release_template = "\{\{ \.Release\.Namespace \}\}/\{\{ \.Release\.Name \}\}"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^helm_function = "\{\{ randAlphaNum 8 \}\}"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^lookup_expression = "\{\{ lookup \\"v1\\" \\"Secret\\" \\"default\\" \\"example\\" \}\}"$'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?m)^boolean_value = true$'

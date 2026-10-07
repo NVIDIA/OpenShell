@@ -44,11 +44,11 @@ extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
 # Exercise all serializer shapes through a raw driver table and prove that
-# string-only tpl expansion, TOML escaping, and null omission survive parsing.
+# literal strings, TOML escaping, and null omission survive parsing.
 render "${work_dir}/shapes.yaml" --values "${fixture}"
 extract_toml "${work_dir}/shapes.yaml" "${work_dir}/shapes.toml"
 preflight "${work_dir}/shapes.toml"
-grep -F 'rendered_name = "parser-namespace/parser-validation' "${work_dir}/shapes.toml" >/dev/null
+grep -F 'rendered_name = "{{ .Release.Namespace }}/{{ .Release.Name }}"' "${work_dir}/shapes.toml" >/dev/null
 grep -F 'empty_value = ""' "${work_dir}/shapes.toml" >/dev/null
 if grep -Fq 'omitted_value' "${work_dir}/shapes.toml"; then
   echo "null gatewayConfig values must be omitted from gateway.toml" >&2

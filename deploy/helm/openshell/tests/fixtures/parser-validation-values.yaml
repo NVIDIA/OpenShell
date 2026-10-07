@@ -6,7 +6,7 @@
 # exercise every TOML shape supported by the chart serializer.
 gatewayConfig:
   openshell.drivers.parser-validation:
-    rendered_name: '{{ .Release.Namespace }}/{{ .Release.Name }} "quoted" \\ path'
+    rendered_name: '{{ .Release.Namespace }}/{{ .Release.Name }}'
     boolean_value: true
     integer_value: 42
     float_value: 1.5

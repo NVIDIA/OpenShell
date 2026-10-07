@@ -45,11 +45,11 @@ arrays of inline tables. A top-level `gatewayConfig` list instead renders an
 ordered TOML array of tables: each list item must be a map and emits one
 `[[table]]` block. Keys are ordered alphabetically within each table, while
 array-of-tables item order follows the YAML list, so equivalent input produces
-the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
-string values, never in keys or YAML structure.
+the same ConfigMap checksum. String values are serialized literally; Helm
+template expressions inside them are not evaluated.
 
 The implementation intentionally uses only long-standing Helm 3 template and
-Sprig functions (`tpl`, `kindIs`, `keys`, `sortAlpha`, `splitList`, `quote`, and
+Sprig functions (`kindIs`, `keys`, `sortAlpha`, `splitList`, `quote`, and
 `toJson`); it does not rely on a Helm-specific TOML encoder. This preserves the
 chart's documented Helm 3 compatibility while making the serialization rules
 explicit in the chart itself.

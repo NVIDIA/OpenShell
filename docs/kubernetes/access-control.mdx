@@ -70,7 +70,7 @@ The `audience` value must match the client ID configured in your identity provid
 
 The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
 limits response sizes, requires a JSON media type, and rejects a `jwks_uri` on
-a different origin unless that origin appears in `jwksAllowedOrigins`. Use
+a different origin unless that origin appears in `jwks_allowed_origins`. Use
 `server.oidc.caConfigMapName` for issuers signed by a private CA.
 
 ### Auth-only mode vs. RBAC mode
@@ -134,9 +134,7 @@ gatewayConfig:
     allow_unauthenticated_users: true
 ```
 
-The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
-
-To disable client-certificate verification entirely, set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
+The gateway listens on plaintext HTTP behind the trusted proxy, while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
 
 <Warning>
 Only enable unauthenticated users when the gateway is not reachable from outside a trusted local development environment or the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network.

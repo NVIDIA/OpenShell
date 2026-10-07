@@ -19,19 +19,17 @@ field must not require a Helm template change.
 {{- end -}}
 {{- end -}}
 
-{{/* Render a scalar. Strings alone are Helm-templated. */}}
+{{/* Render a scalar. Strings are serialized literally. */}}
 {{- define "openshell.toml.scalar" -}}
-{{- $root := index . 0 -}}
 {{- $value := index . 1 -}}
 {{- if kindIs "string" $value -}}
-{{- $rendered := tpl $value $root -}}
-{{- if regexMatch "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" $rendered -}}
+{{- if regexMatch "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" $value -}}
 {{- fail "gatewayConfig must not contain an inline private key; provide it through a Secret-backed file mount" -}}
 {{- end -}}
-{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]*@" $rendered -}}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]*@" $value -}}
 {{- fail "gatewayConfig must not contain inline URL credentials; provide them through a Secret-backed environment variable, file, or volume" -}}
 {{- end -}}
-{{- $rendered | quote -}}
+{{- $value | quote -}}
 {{- else if or
     (kindIs "bool" $value)
     (kindIs "int" $value)
@@ -105,15 +103,18 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $legacyServer := .Values.server | default dict -}}
 {{- $gateway := get $config "openshell.gateway" | default dict -}}
 {{- if not (hasKey $gateway "name") -}}{{- $_ := set $gateway "name" (get $legacyServer "name" | default (include "openshell.fullname" .)) -}}{{- end -}}
-{{- if not (hasKey $gateway "bind_address") -}}{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}{{- end -}}
-{{- if and .Values.service.healthPort (not (hasKey $gateway "health_bind_address")) -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- end -}}
-{{- if and .Values.service.metricsPort (not (hasKey $gateway "metrics_bind_address")) -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- end -}}
+{{/* The Service and probes own listener ports, so keep runtime listeners aligned. */}}
+{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}
+{{- if .Values.service.healthPort -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- else -}}{{- $_ := unset $gateway "health_bind_address" -}}{{- end -}}
+{{- if .Values.service.metricsPort -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- else -}}{{- $_ := unset $gateway "metrics_bind_address" -}}{{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
-{{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames (not (hasKey $gateway "server_sans")) -}}
-{{- $_ := set $gateway "server_sans" (deepCopy .Values.certManager.serverDnsNames) -}}
+{{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
+{{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}
+{{- if and $serverDnsNames (not (hasKey $gateway "server_sans")) -}}
+{{- $_ := set $gateway "server_sans" (deepCopy $serverDnsNames) -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway" $gateway -}}
 {{- $gatewayJwt := get $config "openshell.gateway.gateway_jwt" | default dict -}}
@@ -143,26 +144,43 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
 {{- end -}}
 {{- $legacyOidc := get $legacyServer "oidc" | default dict -}}
-{{- if and (get $legacyOidc "issuer") (not (hasKey $config "openshell.gateway.oidc")) -}}
-{{- $_ := set $config "openshell.gateway.oidc" (dict "issuer" (get $legacyOidc "issuer") "dangerously_allow_insecure_http" (get $legacyOidc "dangerouslyAllowInsecureHttp") "jwks_allowed_origins" (get $legacyOidc "jwksAllowedOrigins") "audience" (get $legacyOidc "audience") "jwks_ttl_secs" (get $legacyOidc "jwksTtl") "roles_claim" (get $legacyOidc "rolesClaim") "admin_role" (get $legacyOidc "adminRole") "user_role" (get $legacyOidc "userRole") "scopes_claim" (get $legacyOidc "scopesClaim")) -}}
+{{- $oidcConfig := get $config "openshell.gateway.oidc" | default dict -}}
+{{- if or (hasKey $config "openshell.gateway.oidc") (get $legacyOidc "issuer") -}}
+{{- if get $legacyOidc "issuer" -}}
+{{- if not (hasKey $oidcConfig "issuer") -}}{{- $_ := set $oidcConfig "issuer" (get $legacyOidc "issuer") -}}{{- end -}}
+{{- if not (hasKey $oidcConfig "dangerously_allow_insecure_http") -}}{{- $_ := set $oidcConfig "dangerously_allow_insecure_http" (get $legacyOidc "dangerouslyAllowInsecureHttp") -}}{{- end -}}
+{{- if not (hasKey $oidcConfig "jwks_allowed_origins") -}}{{- $_ := set $oidcConfig "jwks_allowed_origins" (get $legacyOidc "jwksAllowedOrigins") -}}{{- end -}}
+{{- if not (hasKey $oidcConfig "audience") -}}{{- $_ := set $oidcConfig "audience" (get $legacyOidc "audience") -}}{{- end -}}
+{{- if not (hasKey $oidcConfig "jwks_ttl_secs") -}}{{- $_ := set $oidcConfig "jwks_ttl_secs" (get $legacyOidc "jwksTtl") -}}{{- end -}}
+{{- if and (get $legacyOidc "rolesClaim") (not (hasKey $oidcConfig "roles_claim")) -}}{{- $_ := set $oidcConfig "roles_claim" (get $legacyOidc "rolesClaim") -}}{{- end -}}
+{{- if and (get $legacyOidc "adminRole") (not (hasKey $oidcConfig "admin_role")) -}}{{- $_ := set $oidcConfig "admin_role" (get $legacyOidc "adminRole") -}}{{- end -}}
+{{- if and (get $legacyOidc "userRole") (not (hasKey $oidcConfig "user_role")) -}}{{- $_ := set $oidcConfig "user_role" (get $legacyOidc "userRole") -}}{{- end -}}
+{{- if and (get $legacyOidc "scopesClaim") (not (hasKey $oidcConfig "scopes_claim")) -}}{{- $_ := set $oidcConfig "scopes_claim" (get $legacyOidc "scopesClaim") -}}{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.gateway.oidc" $oidcConfig -}}
 {{- end -}}
 {{- $legacyOtlp := get $legacyServer "otlp" | default dict -}}
-{{- if and (get $legacyOtlp "endpoint") (not (hasKey $config "openshell.gateway.otlp")) -}}{{- $_ := set $config "openshell.gateway.otlp" (dict "endpoint" (get $legacyOtlp "endpoint") "service_name" (get $legacyOtlp "serviceName")) -}}{{- end -}}
+{{- $otlpConfig := get $config "openshell.gateway.otlp" | default dict -}}
+{{- if or (hasKey $config "openshell.gateway.otlp") (get $legacyOtlp "endpoint") -}}
+{{- if get $legacyOtlp "endpoint" -}}
+{{- if not (hasKey $otlpConfig "endpoint") -}}{{- $_ := set $otlpConfig "endpoint" (get $legacyOtlp "endpoint") -}}{{- end -}}
+{{- if not (hasKey $otlpConfig "service_name") -}}{{- $_ := set $otlpConfig "service_name" (get $legacyOtlp "serviceName") -}}{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.gateway.otlp" $otlpConfig -}}
+{{- end -}}
 {{- $legacyAuth := get $legacyServer "auth" | default dict -}}
 {{- if and (get $legacyAuth "allowUnauthenticatedUsers") (not (hasKey $config "openshell.gateway.auth")) -}}{{- $_ := set $config "openshell.gateway.auth" (dict "allow_unauthenticated_users" true) -}}{{- end -}}
 {{- $legacyOcsf := get $legacyServer "ocsfLog" | default dict -}}
-{{- if and (get $legacyOcsf "enabled") (not (hasKey $config "openshell.gateway.ocsf_log")) -}}
-{{- $rotation := get $legacyOcsf "rotation" | default "daily" -}}
-{{- if not (has $rotation (list "daily" "never")) -}}{{- fail "server.ocsfLog.rotation must be daily or never" -}}{{- end -}}
-{{- $path := get $legacyOcsf "path" -}}{{- if not $path -}}{{- fail "server.ocsfLog.path must be set when server.ocsfLog.enabled is true" -}}{{- end -}}
-{{- $queueCapacity := 10000 -}}{{- if and (hasKey $legacyOcsf "queueCapacity") (ne (get $legacyOcsf "queueCapacity") nil) -}}{{- $queueCapacity = get $legacyOcsf "queueCapacity" -}}{{- end -}}
-{{- $queueMaxBytes := 16777216 -}}{{- if and (hasKey $legacyOcsf "queueMaxBytes") (ne (get $legacyOcsf "queueMaxBytes") nil) -}}{{- $queueMaxBytes = get $legacyOcsf "queueMaxBytes" -}}{{- end -}}
-{{- if or (lt (int $queueCapacity) 1) (lt (int $queueMaxBytes) 1) -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}
-{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}
-{{- if not (has $schemaVersion (list "" "1.1" "1.3")) -}}{{- fail "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3" -}}{{- end -}}
-{{- $ocsfConfig := dict "path" $path "rotation" $rotation "queue_capacity" (int $queueCapacity) "queue_max_bytes" (int $queueMaxBytes) -}}
-{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" $schemaVersion -}}{{- end -}}
-{{- if eq $rotation "daily" -}}{{- $maxFiles := 7 -}}{{- if and (hasKey $legacyOcsf "maxFiles") (ne (get $legacyOcsf "maxFiles") nil) -}}{{- $maxFiles = get $legacyOcsf "maxFiles" -}}{{- end -}}{{- if lt (int $maxFiles) 1 -}}{{- fail "server.ocsfLog.maxFiles must be positive when rotation is daily" -}}{{- end -}}{{- $_ := set $ocsfConfig "max_files" (int $maxFiles) -}}{{- end -}}
+{{- $ocsfConfig := get $config "openshell.gateway.ocsf_log" | default dict -}}
+{{- if or (hasKey $config "openshell.gateway.ocsf_log") (get $legacyOcsf "enabled") -}}
+{{- if get $legacyOcsf "enabled" -}}
+{{- if not (hasKey $ocsfConfig "path") -}}{{- $path := get $legacyOcsf "path" -}}{{- if not $path -}}{{- fail "server.ocsfLog.path must be set when server.ocsfLog.enabled is true" -}}{{- end -}}{{- $_ := set $ocsfConfig "path" $path -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "rotation") -}}{{- $rotation := get $legacyOcsf "rotation" | default "daily" -}}{{- if not (has $rotation (list "daily" "never")) -}}{{- fail "server.ocsfLog.rotation must be daily or never" -}}{{- end -}}{{- $_ := set $ocsfConfig "rotation" $rotation -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "queue_capacity") -}}{{- $queueCapacity := 10000 -}}{{- if and (hasKey $legacyOcsf "queueCapacity") (ne (get $legacyOcsf "queueCapacity") nil) -}}{{- $queueCapacity = get $legacyOcsf "queueCapacity" -}}{{- end -}}{{- if lt (int $queueCapacity) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_capacity" (int $queueCapacity) -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "queue_max_bytes") -}}{{- $queueMaxBytes := 16777216 -}}{{- if and (hasKey $legacyOcsf "queueMaxBytes") (ne (get $legacyOcsf "queueMaxBytes") nil) -}}{{- $queueMaxBytes = get $legacyOcsf "queueMaxBytes" -}}{{- end -}}{{- if lt (int $queueMaxBytes) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_max_bytes" (int $queueMaxBytes) -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "schema_version") -}}{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}{{- if not (has $schemaVersion (list "" "1.1" "1.3")) -}}{{- fail "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3" -}}{{- end -}}{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" $schemaVersion -}}{{- end -}}{{- end -}}
+{{- if and (eq (get $ocsfConfig "rotation") "daily") (not (hasKey $ocsfConfig "max_files")) -}}{{- $maxFiles := 7 -}}{{- if and (hasKey $legacyOcsf "maxFiles") (ne (get $legacyOcsf "maxFiles") nil) -}}{{- $maxFiles = get $legacyOcsf "maxFiles" -}}{{- end -}}{{- if lt (int $maxFiles) 1 -}}{{- fail "server.ocsfLog.maxFiles must be positive when rotation is daily" -}}{{- end -}}{{- $_ := set $ocsfConfig "max_files" (int $maxFiles) -}}{{- end -}}
+{{- end -}}
 {{- $_ := set $config "openshell.gateway.ocsf_log" $ocsfConfig -}}
 {{- end -}}
 {{- $legacyRateLimit := get $legacyServer "grpcRateLimit" | default dict -}}
@@ -196,14 +214,27 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := set $config "openshell.credential_drivers.kubernetes-secrets" (dict "namespace" (default .Release.Namespace $legacyKubernetesSecrets.namespace)) -}}
 {{- else if $legacyVault.enabled -}}
 {{- $_ := set $gatewayForCredentials "credential_drivers" (list "vault") -}}
-{{- $vaultConfig := dict "address" $legacyVault.address "auth_method" $legacyVault.authMethod "role" $legacyVault.role -}}
-{{- range $legacyKey, $runtimeKey := dict "mount" "mount" "kvVersion" "kv_version" "kubernetesAuthMount" "kubernetes_auth_mount" "serviceAccountTokenPath" "service_account_token_path" "tokenPath" "token_path" "timeoutSecs" "timeout_secs" -}}
-{{- if get $legacyVault $legacyKey -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
-{{- end -}}
-{{- $_ := set $config "openshell.credential_drivers.vault" $vaultConfig -}}
 {{- end -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway" $gatewayForCredentials -}}
+{{- $effectiveCredentialDrivers := get $gatewayForCredentials "credential_drivers" | default list -}}
+{{- if has "kubernetes-secrets" $effectiveCredentialDrivers -}}
+{{- $kubernetesSecretsConfig := get $config "openshell.credential_drivers.kubernetes-secrets" | default dict -}}
+{{- if not (hasKey $kubernetesSecretsConfig "namespace") -}}
+{{- $_ := set $kubernetesSecretsConfig "namespace" (include "openshell.credentialKubernetesSecretsNamespace" .) -}}
+{{- end -}}
+{{- $_ := set $config "openshell.credential_drivers.kubernetes-secrets" $kubernetesSecretsConfig -}}
+{{- end -}}
+{{- if and $legacyVault.enabled (has "vault" $effectiveCredentialDrivers) -}}
+{{- $vaultConfig := get $config "openshell.credential_drivers.vault" | default dict -}}
+{{- range $legacyKey, $runtimeKey := dict "address" "address" "authMethod" "auth_method" "role" "role" -}}
+{{- if not (hasKey $vaultConfig $runtimeKey) -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- range $legacyKey, $runtimeKey := dict "mount" "mount" "kvVersion" "kv_version" "kubernetesAuthMount" "kubernetes_auth_mount" "serviceAccountTokenPath" "service_account_token_path" "tokenPath" "token_path" "timeoutSecs" "timeout_secs" -}}
+{{- if and (get $legacyVault $legacyKey) (not (hasKey $vaultConfig $runtimeKey)) -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.credential_drivers.vault" $vaultConfig -}}
+{{- end -}}
 {{/* External credential drivers own their storage. Do not configure the
 chart-managed encrypted database store when any driver is selected: its KEK
 environment variable is intentionally not mounted in that mode. */}}
@@ -273,6 +304,19 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- $_ := unset $gatewayTls "external_server_names" -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
+{{- end -}}
+{{/* A nested YAML map and its dotted top-level table would serialize to
+conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}
+{{- range $tableName := keys $config | sortAlpha -}}
+{{- $fields := get $config $tableName -}}
+{{- if kindIs "map" $fields -}}
+{{- range $fieldName := keys $fields -}}
+{{- $nestedTableName := printf "%s.%s" $tableName $fieldName -}}
+{{- if hasKey $config $nestedTableName -}}
+{{- fail (printf "gatewayConfig defines %q both as a nested map and a dotted top-level table; use only the dotted top-level key" $nestedTableName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- range $tableName := keys $config | sortAlpha -}}
 {{- $fields := get $config $tableName -}}
