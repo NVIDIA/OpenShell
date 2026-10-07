@@ -12,7 +12,7 @@ use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-use crate::format::downgrade::downgrade_event;
+use crate::format::downgrade::{DowngradeOutcome, downgrade_event, record_kept_native};
 use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
@@ -27,8 +27,8 @@ use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 ///
 /// An optional target schema version can be set via
 /// [`with_target_version`](Self::with_target_version). When set, events are
-/// downgraded to the target version before writing (stripping fields and
-/// profiles that don't exist in older schema versions).
+/// downgraded to the target version before writing; events that cannot
+/// conform to it are written at the native version and tallied.
 pub struct OcsfJsonlLayer<W: Write + Send + 'static> {
     writer: Mutex<W>,
     enabled: Option<Arc<AtomicBool>>,
@@ -94,7 +94,11 @@ where
                 let Ok(mut json) = serde_json::to_value(&ocsf_event) else {
                     return;
                 };
-                downgrade_event(&mut json, &version);
+                if let DowngradeOutcome::KeptNative { reason } =
+                    downgrade_event(&mut json, &version)
+                {
+                    record_kept_native(&reason);
+                }
                 match serde_json::to_string(&json) {
                     Ok(mut s) => {
                         s.push('\n');
@@ -121,5 +125,65 @@ mod tests {
     fn test_jsonl_layer_creation() {
         let buffer: Vec<u8> = Vec::new();
         let _layer = OcsfJsonlLayer::new(buffer);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn written_event(target: &str, event: crate::OcsfEvent) -> serde_json::Value {
+        use tracing_subscriber::layer::SubscriberExt;
+        let buffer = SharedBuffer::default();
+        let layer = OcsfJsonlLayer::new(buffer.clone())
+            .with_target_version(Arc::new(Mutex::new(target.to_string())));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || crate::ocsf_emit!(event));
+        let bytes = buffer.0.lock().unwrap().clone();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn http(response: bool) -> crate::OcsfEvent {
+        let ctx = crate::builders::test_sandbox_context();
+        let builder = crate::HttpActivityBuilder::new(&ctx)
+            .action(crate::ActionId::Denied)
+            .http_request(crate::HttpRequest::new(
+                "GET",
+                crate::Url::new("https", "api.example.com", "/v1", 443),
+            ))
+            .src_endpoint(crate::Endpoint::from_ip("10.0.0.5".parse().unwrap(), 51234))
+            .dst_endpoint(crate::Endpoint::from_domain("api.example.com", 443));
+        if response {
+            builder
+                .http_response(crate::HttpResponse { code: 403 })
+                .build()
+        } else {
+            builder.build()
+        }
+    }
+
+    #[test]
+    fn convertible_events_are_written_at_the_target_version() {
+        let json = written_event("1.3", http(true));
+        assert_eq!(json["metadata"]["version"], "1.3.0");
+    }
+
+    #[test]
+    fn events_kept_native_are_written_unchanged_and_tallied() {
+        let before = crate::format::downgrade::kept_native_tally().0;
+        let json = written_event("1.1", http(false));
+        assert_eq!(json["metadata"]["version"], crate::OCSF_VERSION);
+        assert!(json.pointer("/unmapped/downgraded_from").is_none());
+        let (after, latest) = crate::format::downgrade::kept_native_tally();
+        assert!(after > before);
+        assert!(latest.is_some_and(|reason| reason.contains("http_response")));
     }
 }

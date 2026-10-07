@@ -42,7 +42,7 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     /// be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, HttpActivityBuilder};
+    /// use openshell_ocsf::{EventContext, EventOrigin, HttpActivityBuilder};
     ///
     /// let ctx = EventContext {
     ///     sandbox_id: String::new(),
@@ -52,6 +52,7 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     ///     product_version: String::new(),
     ///     proxy_ip: "127.0.0.1".parse().unwrap(),
     ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
     /// };
     /// HttpActivityBuilder::new(&ctx).build();
     /// ```
@@ -254,7 +255,6 @@ impl HttpActivityBuilder<'_, HasHttpContext> {
             action: self.action,
             disposition: self.disposition,
             observation_point_id: Some(2),
-            is_src_dst_assignment_known: Some(true),
         })
     }
 }
@@ -286,6 +286,8 @@ mod tests {
         assert_eq!(json["activity_name"], "Get");
         assert_eq!(json["http_request"]["http_method"], "GET");
         assert_eq!(json["actor"]["process"]["name"], "curl");
+        // HTTP Activity does not define this attribute in any OCSF version.
+        assert!(json.get("is_src_dst_assignment_known").is_none());
     }
 
     #[test]

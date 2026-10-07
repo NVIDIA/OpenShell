@@ -132,6 +132,7 @@ pub async fn spawn_workload(
             .status(StatusId::Success)
             .launch_type(LaunchTypeId::Spawn)
             .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .actor_process(crate::process::ocsf_launcher_process())
             .message(format!("Process started: pid={}", handle.pid()))
             .build()
     );

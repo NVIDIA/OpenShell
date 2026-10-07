@@ -27,6 +27,15 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
 
+/// The socket the SSH server listens on, once bound.
+static SSH_LISTEN_SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// OCSF destination endpoint for events about this supervisor's SSH server,
+/// which listens on a Unix socket rather than a network address.
+fn ssh_server_endpoint() -> openshell_ocsf::Endpoint {
+    openshell_ocsf::Endpoint::local_service("ssh", SSH_LISTEN_SOCKET.get().map(String::as_str))
+}
+
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
@@ -126,6 +135,7 @@ fn ssh_server_init(
     }
     let runtime_path = crate::unix_socket::runtime_path(listen_path);
     let listener = UnixListener::bind(runtime_path.as_ref()).into_diagnostic()?;
+    let _ = SSH_LISTEN_SOCKET.set(listen_path.display().to_string());
 
     // Tighten filesystem-socket permissions. Abstract sockets have no inode;
     // local relay connections authenticate the listener with SO_PEERCRED.
@@ -139,6 +149,7 @@ fn ssh_server_init(
 
     ocsf_emit!(
         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint(ssh_server_endpoint())
             .activity(ActivityId::Listen)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
@@ -201,6 +212,7 @@ pub async fn run_ssh_server(
                     {
                         ocsf_emit!(
                             SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .dst_endpoint(ssh_server_endpoint())
                                 .activity(ActivityId::Fail)
                                 .severity(SeverityId::Low)
                                 .status(StatusId::Failure)
@@ -221,6 +233,7 @@ pub async fn run_ssh_server(
                 SshAcceptAction::Retry { backoff, severity } => {
                     ocsf_emit!(
                         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .dst_endpoint(ssh_server_endpoint())
                             .activity(ActivityId::Fail)
                             .severity(severity)
                             .status(StatusId::Failure)
@@ -343,6 +356,7 @@ async fn handle_connection(
     // gateway's RelayStream directly into this socket.
     ocsf_emit!(
         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint(ssh_server_endpoint())
             .activity(ActivityId::Open)
             .action(ActionId::Allowed)
             .disposition(DispositionId::Allowed)
@@ -526,6 +540,7 @@ impl russh::server::Handler for SshHandler {
         // check, port 65537 truncates to port 1 (privileged).
         if port_to_connect > u32::from(u16::MAX) {
             ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .dst_endpoint(ssh_server_endpoint())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -543,6 +558,7 @@ impl russh::server::Handler for SshHandler {
         let target = direct_tcpip_target(host_to_connect, port_to_connect);
         if target.is_none() {
             ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .dst_endpoint(ssh_server_endpoint())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -571,6 +587,7 @@ impl russh::server::Handler for SshHandler {
                 Err(err) => {
                     ocsf_emit!(
                         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .dst_endpoint(ssh_server_endpoint())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -823,6 +840,7 @@ impl russh::server::Handler for SshHandler {
         } else {
             ocsf_emit!(
                 SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .dst_endpoint(ssh_server_endpoint())
                     .activity(ActivityId::Refuse)
                     .action(ActionId::Denied)
                     .disposition(DispositionId::Rejected)
@@ -1330,6 +1348,21 @@ fn direct_tcpip_target(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn ssh_events_name_the_server_endpoint_and_conform_to_ocsf() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let event = SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .dst_endpoint(ssh_server_endpoint())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .message("SSH connection accepted on supervisor Unix socket")
+            .build();
+        let json = event.to_json().unwrap();
+        assert_eq!(json["dst_endpoint"]["svc_name"], "ssh");
+        validate_required_fields(&json, &load_class_schema("ssh_activity"));
+    }
 
     pub(super) struct AcceptAnyServerKey;
 

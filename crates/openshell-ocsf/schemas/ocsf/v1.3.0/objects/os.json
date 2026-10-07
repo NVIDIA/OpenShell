@@ -1,0 +1,171 @@
+{
+    "attributes": [
+        {
+            "name": {
+                "type": "string_t",
+                "description": "The operating system name.",
+                "requirement": "required",
+                "caption": "Name",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "type": {
+                "type": "string_t",
+                "description": "The type of the operating system.",
+                "requirement": "optional",
+                "caption": "Type",
+                "type_name": "String",
+                "_source": "os",
+                "_sibling_of": "type_id"
+            }
+        },
+        {
+            "version": {
+                "type": "string_t",
+                "description": "The version of the OS running on the device that originated the event. For example: \"Windows 10\", \"OS X 10.7\", or \"iOS 9\".",
+                "requirement": "optional",
+                "caption": "Version",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "build": {
+                "type": "string_t",
+                "description": "The operating system build number.",
+                "requirement": "optional",
+                "caption": "OS Build",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "country": {
+                "type": "string_t",
+                "description": "The operating system country code, as defined by the ISO 3166-1 standard (Alpha-2 code). For the complete list of country codes, see <a target='_blank' href='https://www.iso.org/obp/ui/#iso:pub:PUB500001:en'>ISO 3166-1 alpha-2 codes</a>.",
+                "requirement": "optional",
+                "caption": "Country",
+                "type_name": "String",
+                "observable": 14,
+                "_source": "os"
+            }
+        },
+        {
+            "type_id": {
+                "type": "integer_t",
+                "enum": {
+                    "0": {
+                        "description": "The type is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "99": {
+                        "description": "The type is not mapped. See the <code>type</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "101": {
+                        "caption": "Windows Mobile"
+                    },
+                    "100": {
+                        "caption": "Windows"
+                    },
+                    "200": {
+                        "caption": "Linux"
+                    },
+                    "201": {
+                        "caption": "Android"
+                    },
+                    "300": {
+                        "caption": "macOS"
+                    },
+                    "301": {
+                        "caption": "iOS"
+                    },
+                    "302": {
+                        "caption": "iPadOS"
+                    },
+                    "400": {
+                        "caption": "Solaris"
+                    },
+                    "401": {
+                        "caption": "AIX"
+                    },
+                    "402": {
+                        "caption": "HP-UX"
+                    }
+                },
+                "description": "The type identifier of the operating system.",
+                "requirement": "required",
+                "caption": "Type ID",
+                "type_name": "Integer",
+                "sibling": "type",
+                "_source": "os"
+            }
+        },
+        {
+            "lang": {
+                "type": "string_t",
+                "description": "The two letter lower case language codes, as defined by <a target='_blank' href='https://en.wikipedia.org/wiki/ISO_639-1'>ISO 639-1</a>. For example: <code>en</code> (English), <code>de</code> (German), or <code>fr</code> (French).",
+                "requirement": "optional",
+                "caption": "Language",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "cpe_name": {
+                "type": "string_t",
+                "description": "The Common Platform Enumeration (CPE) name as described by (<a target='_blank' href='https://nvd.nist.gov/products/cpe'>NIST</a>) For example: <code>cpe:/a:apple:safari:16.2</code>.",
+                "requirement": "optional",
+                "caption": "The product CPE identifier",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "cpu_bits": {
+                "type": "integer_t",
+                "description": "The cpu architecture, the number of bits used for addressing in memory. For example: <code>32</code> or <code>64</code>.",
+                "requirement": "optional",
+                "caption": "CPU Bits",
+                "type_name": "Integer",
+                "_source": "os"
+            }
+        },
+        {
+            "edition": {
+                "type": "string_t",
+                "description": "The operating system edition. For example: <code>Professional</code>.",
+                "requirement": "optional",
+                "caption": "OS Edition",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "sp_name": {
+                "type": "string_t",
+                "description": "The name of the latest Service Pack.",
+                "requirement": "optional",
+                "caption": "OS Service Pack",
+                "type_name": "String",
+                "_source": "os"
+            }
+        },
+        {
+            "sp_ver": {
+                "type": "integer_t",
+                "description": "The version number of the latest Service Pack.",
+                "requirement": "optional",
+                "caption": "OS Service Pack Version",
+                "type_name": "Integer",
+                "_source": "os"
+            }
+        }
+    ],
+    "name": "os",
+    "description": "The Operating System (OS) object describes characteristics of an OS, such as Linux or Windows. Defined by D3FEND <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:OperatingSystem/'>d3f:OperatingSystem</a>.",
+    "extends": "object",
+    "caption": "Operating System (OS)"
+}

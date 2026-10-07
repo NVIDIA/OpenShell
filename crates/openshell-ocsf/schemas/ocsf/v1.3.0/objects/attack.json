@@ -1,0 +1,74 @@
+{
+    "attributes": [
+        {
+            "version": {
+                "type": "string_t",
+                "description": "The <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a> version.",
+                "requirement": "recommended",
+                "caption": "Version",
+                "type_name": "String",
+                "_source": "attack"
+            }
+        },
+        {
+            "tactics": {
+                "type": "object_t",
+                "description": "The Tactic object describes the tactic ID and/or tactic name that are associated with the attack technique, as defined by <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a>.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Tactics",
+                "object_name": "MITRE ATT&CK\u00ae Tactic",
+                "object_type": "tactic",
+                "@deprecated": {
+                    "message": "Use the <code> tactic </code> attribute instead.",
+                    "since": "1.1.0"
+                },
+                "_source": "attack"
+            }
+        },
+        {
+            "technique": {
+                "type": "object_t",
+                "description": "The Technique object describes the technique ID and/or name associated to an attack, as defined by <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a>.",
+                "requirement": "optional",
+                "caption": "Technique",
+                "object_name": "MITRE ATT&CK\u00ae Technique",
+                "object_type": "technique",
+                "_source": "attack"
+            }
+        },
+        {
+            "sub_technique": {
+                "type": "object_t",
+                "description": "The Sub Technique object describes the sub technique ID and/or name associated to an attack, as defined by <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a>.",
+                "requirement": "optional",
+                "caption": "Sub Technique",
+                "object_name": "MITRE ATT&CK\u00ae Sub Technique",
+                "object_type": "sub_technique",
+                "_source": "attack"
+            }
+        },
+        {
+            "tactic": {
+                "type": "object_t",
+                "description": "The Tactic object describes the tactic ID and/or name that is associated to an attack, as defined by <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a>.",
+                "requirement": "optional",
+                "caption": "Tactic",
+                "object_name": "MITRE ATT&CK\u00ae Tactic",
+                "object_type": "tactic",
+                "_source": "attack"
+            }
+        }
+    ],
+    "name": "attack",
+    "description": "The <a target='_blank' href='https://attack.mitre.org'>MITRE ATT&CK\u00ae</a> object describes the tactic, technique & sub-technique associated to an attack as defined in <a target='_blank' href='https://attack.mitre.org/wiki/ATT&CK_Matrix'>ATT&CK\u00ae Matrix</a>.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "tactic",
+            "technique",
+            "sub_technique"
+        ]
+    },
+    "caption": "MITRE ATT&CK\u00ae"
+}

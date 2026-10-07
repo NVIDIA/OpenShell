@@ -91,49 +91,6 @@ macro_rules! impl_action_disposition_setters {
     };
 }
 
-/// Generate the `actor_process` setter shared by network, HTTP, SSH, and
-/// process-activity builders.
-macro_rules! impl_actor_process_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the acting process.
-            #[must_use]
-            pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
-                self
-            }
-        }
-    };
-}
-
-/// Generate the `dst_endpoint` setter shared by network, HTTP, and SSH builders.
-macro_rules! impl_dst_endpoint_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the destination endpoint.
-            #[must_use]
-            pub fn dst_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
-                self.dst_endpoint = Some(endpoint);
-                self
-            }
-        }
-    };
-}
-
-/// Generate the `src_endpoint_addr` setter shared by network and SSH builders.
-macro_rules! impl_src_endpoint_addr_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the source endpoint from a raw IP address and port.
-            #[must_use]
-            pub fn src_endpoint_addr(mut self, ip: std::net::IpAddr, port: u16) -> Self {
-                self.src_endpoint = Some($crate::objects::Endpoint::from_ip(ip, port));
-                self
-            }
-        }
-    };
-}
-
 mod api_activity;
 mod base;
 mod config;
@@ -280,6 +237,92 @@ pub(crate) fn test_sandbox_context() -> EventContext {
     }
 }
 
+/// One event per builder, as production emits them, for schema conformance tests.
+#[cfg(test)]
+pub(crate) fn sample_events(ctx: &EventContext) -> Vec<(&'static str, crate::OcsfEvent)> {
+    use crate::{
+        ActionId, ActivityId, AiModel, ConnectionInfo, DispositionId, Endpoint, FindingInfo,
+        HttpRequest, HttpResponse, Process, SeverityId, StateId, Url,
+    };
+
+    let peer = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
+    vec![
+        (
+            "network_activity",
+            NetworkActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .src_endpoint_addr(peer, 51234)
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .connection_info(ConnectionInfo::new("tcp"))
+                .actor_process(Process::new("curl", 42))
+                .firewall_rule("default", "opa")
+                .build(),
+        ),
+        (
+            "http_activity",
+            HttpActivityBuilder::new(ctx)
+                .activity(ActivityId::Reset)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .http_request(HttpRequest::new(
+                    "GET",
+                    Url::new("https", "api.example.com", "/v1", 443),
+                ))
+                .http_response(HttpResponse { code: 403 })
+                .src_endpoint(Endpoint::from_ip(peer, 51234))
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .actor_process(Process::new("curl", 42))
+                .build(),
+        ),
+        (
+            "ssh_activity",
+            SshActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .src_endpoint_addr(peer, 44321)
+                .dst_endpoint(Endpoint::from_domain("sandbox.local", 22))
+                .build(),
+        ),
+        (
+            "process_activity",
+            ProcessActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .process(Process::new("python3", 4713))
+                .actor_process(Process::new("openshell-sandbox", 1))
+                .build(),
+        ),
+        (
+            "detection_finding",
+            DetectionFindingBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .severity(SeverityId::High)
+                .finding_info(FindingInfo::new("finding-1", "Nonce replay"))
+                .build(),
+        ),
+        (
+            "application_lifecycle",
+            AppLifecycleBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .build(),
+        ),
+        (
+            "device_config_state_change",
+            ConfigStateChangeBuilder::new(ctx)
+                .state(StateId::Enabled, "loaded")
+                .build(),
+        ),
+        ("base_event", BaseEventBuilder::new(ctx).build()),
+        (
+            "api_activity",
+            ApiActivityBuilder::new(ctx, "chat.completions")
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .ai_model(AiModel::new("model", "provider"))
+                .build(),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +349,20 @@ mod tests {
         let schema = load_object_schema("device");
         validate_required_fields(&device, &schema);
         validate_enum_value(&device, "type_id", &schema);
+    }
+
+    /// One event per builder, built with a production-like sandbox context
+    /// (container image set), must validate against the vendored 1.8.0 schemas.
+    #[test]
+    fn every_builder_emits_schema_conformant_events() {
+        use crate::validation::schema::{load_class_schema, validate_required_fields};
+
+        let ctx = test_sandbox_context();
+        let events = sample_events(&ctx);
+        for (class, event) in &events {
+            let json = event.to_json().unwrap();
+            validate_required_fields(&json, &load_class_schema(class));
+        }
     }
 
     #[test]

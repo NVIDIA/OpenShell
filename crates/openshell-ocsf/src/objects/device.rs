@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::enums::DeviceTypeId;
+use crate::enums::{DeviceTypeId, OsTypeId};
 
 /// OCSF Device object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,9 +38,27 @@ pub struct Device {
 pub struct OsInfo {
     /// OS name (e.g., "Linux").
     pub name: String,
+
+    /// OS type id. Required by the OCSF schema.
+    pub type_id: OsTypeId,
+
+    /// Sibling label for `type_id`.
+    #[serde(rename = "type")]
+    pub type_label: String,
 }
 
 impl OsInfo {
+    /// OS info for a `std::env::consts::OS` value.
+    #[must_use]
+    pub fn for_os(os: &str) -> Self {
+        let type_id = OsTypeId::from_os(os);
+        Self {
+            name: Self::pretty_name(os).to_string(),
+            type_id,
+            type_label: type_id.to_string(),
+        }
+    }
+
     /// Display name for a `std::env::consts::OS` value.
     #[must_use]
     pub fn pretty_name(os: &str) -> &str {
@@ -63,9 +81,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Linux".to_string(),
-            }),
+            os: Some(OsInfo::for_os("linux")),
         }
     }
 
@@ -78,9 +94,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Windows".to_string(),
-            }),
+            os: Some(OsInfo::for_os("windows")),
         }
     }
 
@@ -111,9 +125,7 @@ impl Device {
             name: Some(name.to_string()),
             // Operators assign a unique name per installation; replicas share this UID.
             uid: Some(name.to_string()),
-            os: Some(OsInfo {
-                name: OsInfo::pretty_name(std::env::consts::OS).to_string(),
-            }),
+            os: Some(OsInfo::for_os(std::env::consts::OS)),
         }
     }
 }
@@ -128,6 +140,8 @@ mod tests {
         let json = serde_json::to_value(&device).unwrap();
         assert_eq!(json["hostname"], "sandbox-abc123");
         assert_eq!(json["os"]["name"], "Linux");
+        assert_eq!(json["os"]["type_id"], 200);
+        assert_eq!(json["os"]["type"], "Linux");
     }
 
     #[test]
@@ -136,6 +150,8 @@ mod tests {
         let json = serde_json::to_value(&device).unwrap();
         assert_eq!(json["hostname"], "gateway-host");
         assert_eq!(json["os"]["name"], "Windows");
+        assert_eq!(json["os"]["type_id"], 100);
+        assert_eq!(json["os"]["type"], "Windows");
         assert_eq!(json["type_id"], DeviceTypeId::Other.as_u8());
         assert_eq!(json["type"], "Sandbox");
         let decoded: Device = serde_json::from_value(json).unwrap();
@@ -188,6 +204,13 @@ mod tests {
 
         assert_eq!(json["type_id"], 1);
         assert_eq!(json["type"], "Server");
+        let expected_os_type = match std::env::consts::OS {
+            "linux" => 200,
+            "windows" => 100,
+            "macos" => 300,
+            _ => 99,
+        };
+        assert_eq!(json["os"]["type_id"], expected_os_type);
     }
 
     #[test]

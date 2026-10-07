@@ -1,0 +1,577 @@
+{
+    "attributes": [
+        {
+            "interface_name": {
+                "type": "string_t",
+                "description": "The name of the network interface (e.g. eth2).",
+                "requirement": "recommended",
+                "caption": "Network Interface Name",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "type_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:LaptopComputer/'>laptop computer</a>.",
+                        "caption": "Laptop"
+                    },
+                    "6": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:VirtualizationSoftware/'>virtual machine</a>.",
+                        "caption": "Virtual"
+                    },
+                    "99": {
+                        "description": "The type is not mapped. See the <code>type</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "0": {
+                        "description": "The type is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Server/'>server</a>.",
+                        "caption": "Server"
+                    },
+                    "2": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:DesktopComputer/'>desktop computer</a>.",
+                        "caption": "Desktop"
+                    },
+                    "10": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Switch/'>networking switch</a>.",
+                        "caption": "Switch"
+                    },
+                    "4": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:TabletComputer/'>tablet computer</a>.",
+                        "caption": "Tablet"
+                    },
+                    "5": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:MobilePhone/'>mobile phone</a>.",
+                        "caption": "Mobile"
+                    },
+                    "7": {
+                        "description": "A <a target='_blank' href='https://www.techtarget.com/iotagenda/definition/IoT-device'>IOT (Internet of Things) device</a>.",
+                        "caption": "IOT"
+                    },
+                    "8": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Browser/'>web browser</a>.",
+                        "caption": "Browser"
+                    },
+                    "9": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Firewall/'>networking firewall</a>.",
+                        "caption": "Firewall"
+                    },
+                    "11": {
+                        "description": "A <a target='_blank' href='https://en.wikipedia.org/wiki/Ethernet_hub'>networking hub</a>.",
+                        "caption": "Hub"
+                    }
+                },
+                "description": "The device type ID.",
+                "requirement": "required",
+                "caption": "Type ID",
+                "type_name": "Integer",
+                "sibling": "type",
+                "_source": "device"
+            }
+        },
+        {
+            "hypervisor": {
+                "type": "string_t",
+                "description": "The name of the hypervisor running on the device. For example, <code>Xen</code>, <code>VMware</code>, <code>Hyper-V</code>, <code>VirtualBox</code>, etc.",
+                "requirement": "optional",
+                "caption": "Hypervisor",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "modified_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The time when the device was last known to have been modified.",
+                "requirement": "optional",
+                "caption": "Modified Time",
+                "type_name": "Datetime",
+                "_source": "device"
+            }
+        },
+        {
+            "type": {
+                "type": "string_t",
+                "description": "The device type. For example: <code>unknown</code>, <code>server</code>, <code>desktop</code>, <code>laptop</code>, <code>tablet</code>, <code>mobile</code>, <code>virtual</code>, <code>browser</code>, or <code>other</code>.",
+                "requirement": "optional",
+                "caption": "Type",
+                "type_name": "String",
+                "_source": "device",
+                "_sibling_of": "type_id"
+            }
+        },
+        {
+            "risk_level": {
+                "type": "string_t",
+                "description": "The risk level, normalized to the caption of the risk_level_id value. In the case of 'Other', it is defined by the event source.",
+                "requirement": "optional",
+                "caption": "Risk Level",
+                "type_name": "String",
+                "_source": "device",
+                "_sibling_of": "risk_level_id"
+            }
+        },
+        {
+            "is_managed": {
+                "type": "boolean_t",
+                "description": "The event occurred on a managed device.",
+                "requirement": "optional",
+                "caption": "Managed Device",
+                "type_name": "Boolean",
+                "_source": "device"
+            }
+        },
+        {
+            "namespace_pid": {
+                "profile": "container",
+                "type": "integer_t",
+                "description": "If running under a process namespace (such as in a container), the process identifier within that process namespace.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Namespace PID",
+                "type_name": "Integer",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "created_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The time when the device was known to have been created.",
+                "requirement": "optional",
+                "caption": "Created Time",
+                "type_name": "Datetime",
+                "_source": "device"
+            }
+        },
+        {
+            "location": {
+                "type": "object_t",
+                "description": "The geographical location of the device.",
+                "requirement": "optional",
+                "caption": "Geo Location",
+                "object_name": "Geo Location",
+                "object_type": "location",
+                "_source": "device"
+            }
+        },
+        {
+            "name": {
+                "type": "string_t",
+                "description": "The alternate device name, ordinarily as assigned by an administrator. <p><b>Note:</b> The <b>Name</b> could be any other string that helps to identify the device, such as a phone number; for example <code>310-555-1234</code>.</p>",
+                "requirement": "recommended",
+                "caption": "Name",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "first_seen_time": {
+                "type": "timestamp_t",
+                "description": "The initial discovery time of the device.",
+                "requirement": "optional",
+                "caption": "First Seen",
+                "type_name": "Timestamp",
+                "_source": "device"
+            }
+        },
+        {
+            "interface_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the network interface.",
+                "requirement": "recommended",
+                "caption": "Network Interface ID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "network_interfaces": {
+                "type": "object_t",
+                "description": "The network interfaces that are associated with the device, one for each unique MAC address/IP address/hostname/name combination.<p><b>Note:</b> The first element of the array is the network information that pertains to the event.</p>",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Network Interfaces",
+                "object_name": "Network Interface",
+                "object_type": "network_interface",
+                "_source": "device"
+            }
+        },
+        {
+            "uid_alt": {
+                "type": "string_t",
+                "description": "An alternate unique identifier of the device if any. For example the ActiveDirectory DN.",
+                "requirement": "optional",
+                "caption": "Alternate ID",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "first_seen_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The initial discovery time of the device.",
+                "requirement": "optional",
+                "caption": "First Seen",
+                "type_name": "Datetime",
+                "_source": "device"
+            }
+        },
+        {
+            "imei": {
+                "type": "string_t",
+                "description": "The International Mobile Station Equipment Identifier that is associated with the device.",
+                "requirement": "optional",
+                "caption": "IMEI",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "subnet_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of a virtual subnet.",
+                "requirement": "optional",
+                "caption": "Subnet UID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "instance_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of a VM instance.",
+                "requirement": "recommended",
+                "caption": "Instance ID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "domain": {
+                "type": "string_t",
+                "description": "The network domain where the device resides. For example: <code>work.example.com</code>.",
+                "requirement": "optional",
+                "caption": "Domain",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "zone": {
+                "type": "string_t",
+                "description": "The network zone or LAN segment.",
+                "requirement": "optional",
+                "caption": "Network Zone",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "last_seen_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The most recent discovery time of the device.",
+                "requirement": "optional",
+                "caption": "Last Seen",
+                "type_name": "Datetime",
+                "_source": "device"
+            }
+        },
+        {
+            "hw_info": {
+                "type": "object_t",
+                "description": "The endpoint hardware information.",
+                "requirement": "optional",
+                "caption": "Hardware Info",
+                "object_name": "Device Hardware Info",
+                "object_type": "device_hw_info",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "region": {
+                "type": "string_t",
+                "description": "The region where the virtual machine is located. For example, an AWS Region.",
+                "requirement": "recommended",
+                "caption": "Region",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "modified_time": {
+                "type": "timestamp_t",
+                "description": "The time when the device was last known to have been modified.",
+                "requirement": "optional",
+                "caption": "Modified Time",
+                "type_name": "Timestamp",
+                "_source": "device"
+            }
+        },
+        {
+            "risk_score": {
+                "type": "integer_t",
+                "description": "The risk score as reported by the event source.",
+                "requirement": "optional",
+                "caption": "Risk Score",
+                "type_name": "Integer",
+                "_source": "device"
+            }
+        },
+        {
+            "ip": {
+                "type": "ip_t",
+                "description": "The device IP address, in either IPv4 or IPv6 format.",
+                "requirement": "recommended",
+                "caption": "IP Address",
+                "type_name": "IP Address",
+                "_source": "device"
+            }
+        },
+        {
+            "vlan_uid": {
+                "type": "string_t",
+                "description": "The Virtual LAN identifier.",
+                "requirement": "optional",
+                "caption": "VLAN",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "os": {
+                "type": "object_t",
+                "description": "The endpoint operating system.",
+                "requirement": "optional",
+                "caption": "OS",
+                "object_name": "Operating System (OS)",
+                "object_type": "os",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "image": {
+                "type": "object_t",
+                "description": "The image used as a template to run the virtual machine.",
+                "requirement": "optional",
+                "caption": "Image",
+                "object_name": "Image",
+                "object_type": "image",
+                "_source": "device"
+            }
+        },
+        {
+            "last_seen_time": {
+                "type": "timestamp_t",
+                "description": "The most recent discovery time of the device.",
+                "requirement": "optional",
+                "caption": "Last Seen",
+                "type_name": "Timestamp",
+                "_source": "device"
+            }
+        },
+        {
+            "subnet": {
+                "type": "subnet_t",
+                "description": "The subnet mask.",
+                "requirement": "optional",
+                "caption": "Subnet",
+                "type_name": "Subnet",
+                "_source": "device"
+            }
+        },
+        {
+            "container": {
+                "profile": "container",
+                "type": "object_t",
+                "description": "The information describing an instance of a container. A container is a prepackaged, portable system image that runs isolated on an existing system using a container runtime like containerd.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Container",
+                "object_name": "Container",
+                "object_type": "container",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "mac": {
+                "type": "mac_t",
+                "description": "The Media Access Control (MAC) address of the endpoint.",
+                "requirement": "optional",
+                "caption": "MAC Address",
+                "type_name": "MAC Address",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "hostname": {
+                "type": "hostname_t",
+                "description": "The device hostname.",
+                "requirement": "recommended",
+                "caption": "Hostname",
+                "type_name": "Hostname",
+                "_source": "device"
+            }
+        },
+        {
+            "is_personal": {
+                "type": "boolean_t",
+                "description": "The event occurred on a personal device.",
+                "requirement": "optional",
+                "caption": "Personal Device",
+                "type_name": "Boolean",
+                "_source": "device"
+            }
+        },
+        {
+            "is_compliant": {
+                "type": "boolean_t",
+                "description": "The event occurred on a compliant device.",
+                "requirement": "optional",
+                "caption": "Compliant Device",
+                "type_name": "Boolean",
+                "_source": "device"
+            }
+        },
+        {
+            "risk_level_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "caption": "High"
+                    },
+                    "0": {
+                        "caption": "Info"
+                    },
+                    "1": {
+                        "caption": "Low"
+                    },
+                    "2": {
+                        "caption": "Medium"
+                    },
+                    "4": {
+                        "caption": "Critical"
+                    }
+                },
+                "description": "The normalized risk level id.",
+                "requirement": "optional",
+                "caption": "Risk Level ID",
+                "type_name": "Integer",
+                "sibling": "risk_level",
+                "_source": "device"
+            }
+        },
+        {
+            "created_time": {
+                "type": "timestamp_t",
+                "description": "The time when the device was known to have been created.",
+                "requirement": "optional",
+                "caption": "Created Time",
+                "type_name": "Timestamp",
+                "_source": "device"
+            }
+        },
+        {
+            "groups": {
+                "type": "object_t",
+                "description": "The group names to which the device belongs. For example: <code>[\"Windows Laptops\", \"Engineering\"]<code/>.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Groups",
+                "object_name": "Group",
+                "object_type": "group",
+                "_source": "device"
+            }
+        },
+        {
+            "vpc_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the Virtual Private Cloud (VPC).",
+                "requirement": "optional",
+                "caption": "VPC UID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "org": {
+                "type": "object_t",
+                "description": "Organization and org unit related to the device.",
+                "requirement": "optional",
+                "caption": "Organization",
+                "object_name": "Organization",
+                "object_type": "organization",
+                "_source": "device"
+            }
+        },
+        {
+            "is_trusted": {
+                "type": "boolean_t",
+                "description": "The event occurred on a trusted device.",
+                "requirement": "optional",
+                "caption": "Trusted Device",
+                "type_name": "Boolean",
+                "_source": "device"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the device. For example the Windows TargetSID or AWS EC2 ARN.",
+                "requirement": "recommended",
+                "caption": "Unique ID",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "desc": {
+                "type": "string_t",
+                "description": "The description of the device, ordinarily as reported by the operating system.",
+                "requirement": "optional",
+                "caption": "Description",
+                "type_name": "String",
+                "_source": "device"
+            }
+        },
+        {
+            "autoscale_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the cloud autoscale configuration.",
+                "requirement": "optional",
+                "caption": "Autoscale UID",
+                "type_name": "String",
+                "_source": "device"
+            }
+        }
+    ],
+    "name": "device",
+    "description": "The Device object represents an addressable computer system or host, which is typically connected to a computer network and participates in the transmission or processing of data within the computer network. Defined by D3FEND <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Host/'>d3f:Host</a>.",
+    "extends": "endpoint",
+    "constraints": {
+        "at_least_one": [
+            "ip",
+            "uid",
+            "name",
+            "hostname",
+            "instance_uid",
+            "interface_uid",
+            "interface_name"
+        ]
+    },
+    "profiles": [
+        "container",
+        "datetime"
+    ],
+    "caption": "Device",
+    "observable": 20
+}

@@ -1,0 +1,256 @@
+{
+    "attributes": [
+        {
+            "version": {
+                "type": "string_t",
+                "description": "The version of the OCSF schema, using Semantic Versioning Specification (<a target='_blank' href='https://semver.org'>SemVer</a>). For example: 1.0.0. Event consumers use the version to determine the available event attributes.",
+                "requirement": "required",
+                "caption": "Version",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "extension": {
+                "type": "object_t",
+                "description": "The schema extension used to create the event.",
+                "requirement": "optional",
+                "caption": "Schema Extension",
+                "object_name": "Schema Extension",
+                "object_type": "extension",
+                "@deprecated": {
+                    "message": "Use the <code> extensions </code> attribute instead.",
+                    "since": "1.1.0"
+                },
+                "_source": "metadata"
+            }
+        },
+        {
+            "product": {
+                "type": "object_t",
+                "description": "The product that reported the event.",
+                "requirement": "required",
+                "caption": "Product",
+                "object_name": "Product",
+                "object_type": "product",
+                "_source": "metadata"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The logging system-assigned unique identifier of an event instance.",
+                "requirement": "optional",
+                "caption": "Event UID",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "extensions": {
+                "type": "object_t",
+                "description": "The schema extensions used to create the event.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Schema Extensions",
+                "object_name": "Schema Extension",
+                "object_type": "extension",
+                "_source": "metadata"
+            }
+        },
+        {
+            "labels": {
+                "type": "string_t",
+                "description": "<p>The list of category labels attached to the event or specific attributes. Labels are user defined tags or aliases added at normalization time.</p>For example: <code>[\"network\", \"connection.ip:destination\", \"device.ip:source\"]</code>",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Labels",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "log_level": {
+                "type": "string_t",
+                "description": "The audit level at which an event was generated.",
+                "requirement": "optional",
+                "caption": "Log Level",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "sequence": {
+                "type": "integer_t",
+                "description": "Sequence number of the event. The sequence number is a value available in some events, to make the exact ordering of events unambiguous, regardless of the event time precision.",
+                "requirement": "optional",
+                "caption": "Sequence Number",
+                "type_name": "Integer",
+                "_source": "metadata"
+            }
+        },
+        {
+            "profiles": {
+                "type": "string_t",
+                "description": "The list of profiles used to create the event.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Profiles",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "correlation_uid": {
+                "type": "string_t",
+                "description": "The unique identifier used to correlate events.",
+                "requirement": "optional",
+                "caption": "Correlation UID",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "event_code": {
+                "type": "string_t",
+                "description": "The Event ID or Code that the product uses to describe the event.",
+                "requirement": "optional",
+                "caption": "Event Code",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "log_name": {
+                "type": "string_t",
+                "description": "The event log name. For example, syslog file name or Windows logging subsystem: Security.",
+                "requirement": "recommended",
+                "caption": "Log Name",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "log_provider": {
+                "type": "string_t",
+                "description": "The logging provider or logging service that logged the event. For example, Microsoft-Windows-Security-Auditing.",
+                "requirement": "recommended",
+                "caption": "Log Provider",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "log_version": {
+                "type": "string_t",
+                "description": "The event log schema version that specifies the format of the original event. For example syslog version or Cisco Log Schema Version.",
+                "requirement": "optional",
+                "caption": "Log Version",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "logged_time": {
+                "type": "timestamp_t",
+                "description": "<p>The time when the logging system collected and logged the event.</p>This attribute is distinct from the event time in that event time typically contain the time extracted from the original event. Most of the time, these two times will be different.",
+                "requirement": "optional",
+                "caption": "Logged Time",
+                "type_name": "Timestamp",
+                "_source": "metadata"
+            }
+        },
+        {
+            "loggers": {
+                "type": "object_t",
+                "description": "An array of Logger objects that describe the devices and logging products between the event source and its eventual destination. Note, this attribute can be used when there is a complex end-to-end path of event flow.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Loggers",
+                "object_name": "Logger",
+                "object_type": "logger",
+                "_source": "metadata"
+            }
+        },
+        {
+            "modified_time": {
+                "type": "timestamp_t",
+                "description": "The time when the event was last modified or enriched.",
+                "requirement": "optional",
+                "caption": "Modified Time",
+                "type_name": "Timestamp",
+                "_source": "metadata"
+            }
+        },
+        {
+            "original_time": {
+                "type": "string_t",
+                "description": "The original event time as reported by the event source. For example, the time in the original format from system event log such as Syslog on Unix/Linux and the System event file on Windows. Omit if event is generated instead of collected via logs.",
+                "requirement": "recommended",
+                "caption": "Original Time",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "processed_time": {
+                "type": "timestamp_t",
+                "description": "The event processed time, such as an ETL operation.",
+                "requirement": "optional",
+                "caption": "Processed Time",
+                "type_name": "Timestamp",
+                "_source": "metadata"
+            }
+        },
+        {
+            "tenant_uid": {
+                "type": "string_t",
+                "description": "The unique tenant identifier.",
+                "requirement": "recommended",
+                "caption": "Tenant UID",
+                "type_name": "String",
+                "_source": "metadata"
+            }
+        },
+        {
+            "logged_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "<p>The time when the logging system collected and logged the event.</p>This attribute is distinct from the event time in that event time typically contain the time extracted from the original event. Most of the time, these two times will be different.",
+                "requirement": "optional",
+                "caption": "Logged Time",
+                "type_name": "Datetime",
+                "_source": "metadata"
+            }
+        },
+        {
+            "modified_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The time when the event was last modified or enriched.",
+                "requirement": "optional",
+                "caption": "Modified Time",
+                "type_name": "Datetime",
+                "_source": "metadata"
+            }
+        },
+        {
+            "processed_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The event processed time, such as an ETL operation.",
+                "requirement": "optional",
+                "caption": "Processed Time",
+                "type_name": "Datetime",
+                "_source": "metadata"
+            }
+        }
+    ],
+    "name": "metadata",
+    "description": "The Metadata object describes the metadata associated with the event. Defined by D3FEND <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Metadata/'>d3f:Metadata</a>.",
+    "extends": "object",
+    "profiles": [
+        "datetime"
+    ],
+    "caption": "Metadata"
+}

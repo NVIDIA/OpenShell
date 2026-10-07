@@ -1,0 +1,123 @@
+{
+    "attributes": [
+        {
+            "data": {
+                "type": "json_t",
+                "description": "Additional evidence data that is not accounted for in the specific evidence attributes.<code> Use only when absolutely necessary.</code>",
+                "requirement": "optional",
+                "caption": "Data",
+                "type_name": "JSON",
+                "_source": "evidences"
+            }
+        },
+        {
+            "process": {
+                "type": "object_t",
+                "description": "Describes details about the process associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Process",
+                "object_name": "Process",
+                "object_type": "process",
+                "_source": "evidences"
+            }
+        },
+        {
+            "file": {
+                "type": "object_t",
+                "description": "Describes details about the file associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "File",
+                "object_name": "File",
+                "object_type": "file",
+                "_source": "evidences"
+            }
+        },
+        {
+            "query": {
+                "type": "object_t",
+                "description": "Describes details about the DNS query associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "DNS Query",
+                "object_name": "DNS Query",
+                "object_type": "dns_query",
+                "_source": "evidences"
+            }
+        },
+        {
+            "connection_info": {
+                "type": "object_t",
+                "description": "Describes details about the network connection associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Connection Info",
+                "object_name": "Network Connection Information",
+                "object_type": "network_connection_info",
+                "_source": "evidences"
+            }
+        },
+        {
+            "api": {
+                "type": "object_t",
+                "description": "Describes details about the API call associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "API Details",
+                "object_name": "API",
+                "object_type": "api",
+                "_source": "evidences"
+            }
+        },
+        {
+            "actor": {
+                "type": "object_t",
+                "description": "Describes details about the user/role/process that was the source of the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Actor",
+                "object_name": "Actor",
+                "object_type": "actor",
+                "_source": "evidences"
+            }
+        },
+        {
+            "dst_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the destination of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Destination Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "src_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the source of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Source Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        }
+    ],
+    "name": "evidences",
+    "description": "A collection of evidence artifacts associated to the activity/activities that triggered a security detection.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "actor",
+            "api",
+            "connection_info",
+            "data",
+            "dst_endpoint",
+            "file",
+            "process",
+            "query",
+            "src_endpoint"
+        ]
+    },
+    "profiles": [
+        "container",
+        "linux/linux_users"
+    ],
+    "caption": "Evidence Artifacts"
+}

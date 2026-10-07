@@ -61,10 +61,6 @@ pub struct HttpActivityEvent {
     /// Observation point ID (v1.6.0+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation_point_id: Option<u8>,
-
-    /// Whether src/dst assignment is known (v1.6.0+).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_src_dst_assignment_known: Option<bool>,
 }
 
 impl Serialize for HttpActivityEvent {
@@ -86,11 +82,6 @@ impl Serialize for HttpActivityEvent {
         insert_enum_pair!(obj, "action", self.action);
         insert_enum_pair!(obj, "disposition", self.disposition);
         insert_optional!(obj, "observation_point_id", self.observation_point_id);
-        insert_optional!(
-            obj,
-            "is_src_dst_assignment_known",
-            self.is_src_dst_assignment_known
-        );
 
         base_val.serialize(serializer)
     }
@@ -134,7 +125,6 @@ mod tests {
             action: Some(ActionId::Allowed),
             disposition: Some(DispositionId::Allowed),
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         };
 
         let json = serde_json::to_value(&event).unwrap();
