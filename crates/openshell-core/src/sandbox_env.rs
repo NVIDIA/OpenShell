@@ -269,10 +269,94 @@ pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
+///
+/// The sandbox runtime sets it in every workload process to
+/// [`OTLP_RELAY_ENDPOINT`] so agent SDKs export to the supervisor's relay,
+/// unless the sandbox creation request already names an OTLP endpoint
+/// (generic or traces-specific), in which case the caller's variables are
+/// left untouched. A per-exec environment is a developer's explicit
+/// instruction and still overrides it for that exec only.
+pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the OTLP exporter protocol.
+///
+/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+/// Signal-specific endpoint variable. SDKs give it precedence over the
+/// generic endpoint, so it is set too (to the full traces URL) or an image
+/// that ships one would silently bypass the relay.
+pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+/// Signal-specific protocol variable, set alongside
+/// [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`] for the same reason.
+pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
+
+/// Standard OTLP compression variable. The relay refuses compressed bodies,
+/// so both this and the traces-specific variant are set to `none`.
+pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION";
+
+/// Signal-specific compression variable, see
+/// [`OTEL_EXPORTER_OTLP_COMPRESSION`].
+pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
+
+/// Reserved destination agent processes export OTLP to.
+///
+/// This address is never routed. A workload `connect()` to any non-loopback
+/// address is intercepted by the sandbox seccomp broker and staged for the
+/// supervisor, which recognises this destination and serves the OTLP
+/// receiver on the staged stream itself instead of dialing upstream. So the
+/// value is a label the supervisor switches on, and it must stay outside
+/// loopback (loopback connects complete locally without mediation) and
+/// outside `198.18.0.0/15`, which the policy DNS runtime uses for synthetic
+/// answers. `192.0.0.8` is the IPv4 dummy address (RFC 7600): reserved,
+/// unroutable, and never assigned to a real service.
+pub const OTLP_RELAY_ADDR: &str = "192.0.0.8:4318";
+
+/// [`OTLP_RELAY_ADDR`] as the URL injected through
+/// [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
+
+/// The traces URL injected through [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`],
+/// which unlike the generic endpoint names the full path.
+pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
+
+#[cfg(test)]
+mod otlp_relay_address_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT};
+
+    #[test]
+    fn relay_address_is_an_unroutable_non_loopback_label() {
+        let addr: SocketAddr = OTLP_RELAY_ADDR.parse().expect("relay address parses");
+        assert_eq!(addr.port(), 4318, "OTLP HTTP default port");
+        let IpAddr::V4(ip) = addr.ip() else {
+            panic!("relay address must be IPv4");
+        };
+        assert!(
+            !ip.is_loopback(),
+            "loopback would bypass seccomp mediation and never reach the supervisor"
+        );
+        assert_eq!(ip, Ipv4Addr::new(192, 0, 0, 8), "RFC 7600 dummy address");
+        let [a, b, ..] = ip.octets();
+        assert!(
+            !(a == 198 && (b == 18 || b == 19)),
+            "198.18.0.0/15 is the policy DNS synthetic answer pool"
+        );
+        assert_eq!(OTLP_RELAY_ENDPOINT, format!("http://{OTLP_RELAY_ADDR}"));
+        assert_eq!(
+            OTLP_RELAY_TRACES_ENDPOINT,
+            format!("{OTLP_RELAY_ENDPOINT}/v1/traces")
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

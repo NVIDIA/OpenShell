@@ -183,6 +183,18 @@ impl LocalBoundaryExec {
             }
         }
         crate::process::strip_proxy_env_std(&mut command);
+        // Point OTel SDKs at the supervisor's trace relay, after the creation
+        // request's environment and the provider variables, matching the main
+        // process, and only when the creation request named no endpoint of
+        // its own. A per-exec `spec.env` value applied below still wins for
+        // that exec only.
+        if let Some(relay_env) =
+            crate::child_env::otlp_relay_env_vars_unless_configured(&self.user_environment)
+        {
+            for (key, value) in relay_env {
+                command.env(key, value);
+            }
+        }
         for (key, value) in &spec.env {
             if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
@@ -772,6 +784,63 @@ mod tests {
             .expect("resolve interactive workload shell");
 
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["-i"]);
+    }
+
+    fn env_of(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .filter(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .last()
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn exec_children_see_the_relay_endpoint_unless_the_exec_overrides_it() {
+        let executor = executor();
+        let spec = |env: Vec<(String, String)>| ExecSpec {
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            shell: None,
+            runtime_helper: None,
+            env,
+            workdir: None,
+            pty: false,
+        };
+
+        let command = executor.command(&spec(Vec::new())).expect("resolve exec");
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
+            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+        );
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            )
+            .as_deref(),
+            Some("http/protobuf")
+        );
+
+        // A per-exec environment is a developer's explicit instruction and
+        // is applied last (contracts/sandbox-environment.md).
+        let command = executor
+            .command(&spec(vec![(
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                "http://127.0.0.1:4318".to_string(),
+            )]))
+            .expect("resolve exec");
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
     }
 
     #[tokio::test]

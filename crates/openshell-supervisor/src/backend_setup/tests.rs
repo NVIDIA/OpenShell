@@ -698,6 +698,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 auth_bundle: setup.auth.clone(),
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),
                 main_exit_marker: Some(marker.clone()),
+                otlp_endpoint: None,
             },
         ))
     };
