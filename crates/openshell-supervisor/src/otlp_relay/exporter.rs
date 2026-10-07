@@ -95,10 +95,19 @@ impl Exporter {
             .http2_keep_alive_interval(HTTP2_PING_INTERVAL)
             .keep_alive_timeout(HTTP2_PING_TIMEOUT)
             .connect_lazy();
-        Ok(Self {
+        Ok(Self::with_channel(channel, endpoint))
+    }
+
+    /// Forwards over a channel prepared elsewhere. This is the seam for a
+    /// shared collector transport (TLS, compression, headers) built once in
+    /// `openshell-otel` for the gateway, the supervisor's own spans, and this
+    /// relay; `endpoint` is only used for log messages.
+    #[must_use]
+    pub fn with_channel(channel: Channel, endpoint: &str) -> Self {
+        Self {
             client: Grpc::new(channel),
             endpoint: endpoint.to_string(),
-        })
+        }
     }
 
     /// The collector URI this exporter targets.
@@ -224,6 +233,22 @@ mod tests {
     #[test]
     fn new_rejects_an_invalid_uri() {
         assert!(Exporter::new("not a uri").is_err());
+    }
+
+    #[tokio::test]
+    async fn exports_over_a_channel_prepared_by_the_caller() {
+        let collector = OtlpTestServer::start().await;
+        let channel = Endpoint::from_shared(collector.endpoint().to_string())
+            .unwrap()
+            .connect_lazy();
+        let exporter = Exporter::with_channel(channel, collector.endpoint());
+        exporter
+            .export(Bytes::from(encoded_request("via-channel", &[])))
+            .await
+            .expect("export over the supplied channel");
+        collector.wait_for_export().await;
+        let received = collector.shutdown().await;
+        assert!(received.spans.iter().any(|span| span.name == "via-channel"));
     }
 
     #[tokio::test]
