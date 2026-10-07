@@ -10,11 +10,12 @@ use std::sync::atomic::AtomicBool;
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
-use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+mod logging;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -315,17 +316,6 @@ fn main() -> Result<()> {
         None
     };
 
-    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openshell")
-        .filename_suffix("log")
-        .max_log_files(3)
-        .build("/var/log")
-        .ok()
-        .map(|roller| {
-            let (writer, guard) = tracing_appender::non_blocking(roller);
-            (writer, guard)
-        });
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -369,62 +359,26 @@ fn main() -> Result<()> {
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
         let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
-        let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer)
-                        .with_enabled_flag(ocsf_enabled.clone())
-                        .with_target_version(ocsf_schema_version.clone());
-                    (layer, guard)
-                });
-            let (jsonl_layer, jsonl_guard) =
-                jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(
-                    OcsfShorthandLayer::new(file_writer)
-                        .with_non_ocsf(true)
-                        .with_filter(EnvFilter::new("info")),
-                )
-                .with(jsonl_layer.with_filter(LevelFilter::INFO))
-                .with(push_layer.clone())
-                .with(
-                    otlp_layer_provider
-                        .as_ref()
-                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                        .with_filter(otlp_span_filter(&args.log_level)),
-                )
-                .init();
-            (Some(file_guard), jsonl_guard)
-        } else {
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(push_layer)
-                .with(
-                    otlp_layer_provider
-                        .as_ref()
-                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                        .with_filter(otlp_span_filter(&args.log_level)),
-                )
-                .init();
+        let (logging_layers, _logging_guards, file_available) = logging::layers(
+            std::io::stderr(),
+            Path::new("/var/log"),
+            console_filter,
+            ocsf_enabled.clone(),
+            ocsf_schema_version.clone(),
+        );
+        tracing_subscriber::registry()
+            .with(logging_layers)
+            .with(push_layer)
+            .with(
+                otlp_layer_provider
+                    .as_ref()
+                    .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
+                    .with_filter(otlp_span_filter(&args.log_level)),
+            )
+            .init();
+        if !file_available {
             warn!("Could not open /var/log for log rotation; using stderr-only logging");
-            (None, None)
-        };
+        }
         if let Some(error) = otlp_setup_error {
             warn!(%error, "OTLP exporting could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_endpoint {

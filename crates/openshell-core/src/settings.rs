@@ -115,9 +115,9 @@ pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 pub const OCSF_SCHEMA_VERSION_VALUES: &[&str] = &["", "1.1", "1.3"];
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    // When true the sandbox writes OCSF v1.8.0 JSONL records to
-    // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
-    // to the human-readable shorthand log. Defaults to false (no JSONL written).
+    // When true the supervisor emits OCSF-JSON records to stderr and writes
+    // JSONL to `/var/log/openshell-ocsf*.log` when file logging is available.
+    // Defaults to false; shorthand output remains unchanged.
     RegisteredSetting {
         key: "ocsf_json_enabled",
         kind: SettingValueKind::Bool,

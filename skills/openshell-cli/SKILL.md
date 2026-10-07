@@ -870,6 +870,8 @@ openshell settings set --global --key ocsf_json_enabled --value true
 openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
+
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 
 `policy_validation_failure_mode` is gateway startup configuration, not a
