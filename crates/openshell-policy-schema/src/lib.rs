@@ -518,7 +518,12 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    // Some YAML deserializers treat null as an empty, defaulted struct.
+    // Decode the outer option explicitly so present null never becomes an
+    // authored empty value; omitted fields still use serde's field default.
+    Option::<T>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("explicit null is not allowed"))
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
@@ -1458,6 +1463,30 @@ network_policies:
                 tiny,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn typed_yaml_deserialization_enforces_scalar_budget() {
+        // Exercise the streaming typed path independently from the policy
+        // parser's Value-first path (RUSTSEC-2026-0333).
+        #[derive(Debug, serde::Deserialize)]
+        struct Document {
+            value: String,
+        }
+
+        let mut config = serde_yml::ParserConfig::new();
+        config.max_total_scalar_bytes = 16;
+        let valid: Document = serde_yml::from_str_with_config("value: ok", &config)
+            .expect("small typed document fits the budget");
+        assert_eq!(valid.value, "ok");
+        assert!(
+            serde_yml::from_str_with_config::<Document>(
+                "value: this scalar exceeds the configured budget",
+                &config,
+            )
+            .is_err(),
+            "typed deserialization must enforce the scalar budget",
         );
     }
 
