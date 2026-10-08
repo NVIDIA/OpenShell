@@ -975,6 +975,9 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+    state
+        .provider_profile_sources
+        .spawn_refreshers(&shutdown_rx);
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");

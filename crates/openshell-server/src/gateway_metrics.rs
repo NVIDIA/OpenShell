@@ -32,6 +32,7 @@ pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const CONFIG_BUILD_DURATION_SECONDS: &str = "openshell_server_config_build_duration_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -39,6 +40,8 @@ const LABEL_OUTCOME: &str = "outcome";
 const LABEL_GRPC_CODE: &str = "grpc_code";
 const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
+const LABEL_PART: &str = "part";
+const LABEL_TRIGGER: &str = "trigger";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
 /// claim timeout and the 15 s routed-relay wait.
@@ -48,8 +51,11 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 2] =
-    [RELAY_CLAIM_DURATION_SECONDS, PEER_REQUEST_DURATION_SECONDS];
+const BUCKETED_HISTOGRAMS: [&str; 3] = [
+    RELAY_CLAIM_DURATION_SECONDS,
+    PEER_REQUEST_DURATION_SECONDS,
+    CONFIG_BUILD_DURATION_SECONDS,
+];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +135,39 @@ impl PeerRpc {
             Self::ReportProviderReadiness => "report_provider_readiness",
             Self::ReportEndpointStatus => "report_endpoint_status",
             Self::GetSandboxProviderStatus => "get_sandbox_provider_status",
+        }
+    }
+}
+
+/// One independently built and versioned part of a sandbox's configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConfigPart {
+    /// Policy and settings (`GetSandboxConfigResponse`).
+    SandboxConfig,
+    /// Provider credentials and files (`GetSandboxProviderEnvironmentResponse`).
+    ProviderEnvironment,
+}
+
+impl ConfigPart {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SandboxConfig => "sandbox_config",
+            Self::ProviderEnvironment => "provider_environment",
+        }
+    }
+}
+
+/// Why a configuration part was built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTrigger {
+    /// An RPC asked for it: a supervisor poll, or a status or readiness query.
+    Request,
+}
+
+impl BuildTrigger {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
         }
     }
 }
@@ -250,6 +289,11 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
     );
+    describe_histogram!(
+        CONFIG_BUILD_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time to build one sandbox configuration part, including its store reads and credential resolution."
+    );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
@@ -322,6 +366,17 @@ impl Drop for GaugeSlot {
     fn drop(&mut self) {
         self.0.decrement(1.0);
     }
+}
+
+/// One configuration part build, including the store reads it needed.
+pub fn record_config_build(part: ConfigPart, trigger: BuildTrigger, ok: bool, elapsed: Duration) {
+    histogram!(
+        CONFIG_BUILD_DURATION_SECONDS,
+        LABEL_PART => part.label(),
+        LABEL_TRIGGER => trigger.label(),
+        LABEL_OUTCOME => if ok { "ok" } else { "error" }
+    )
+    .record(elapsed);
 }
 
 pub fn record_relay_rejected(reason: RelayRejection) {
@@ -573,6 +628,12 @@ mod tests {
         let metrics = MetricsCapture::install();
         let sample = Duration::from_millis(3);
         histogram!(RELAY_CLAIM_DURATION_SECONDS).record(sample);
+        record_config_build(
+            ConfigPart::SandboxConfig,
+            BuildTrigger::Request,
+            true,
+            sample,
+        );
         histogram!(
             PEER_REQUEST_DURATION_SECONDS,
             LABEL_OPERATION => "relay",

@@ -138,9 +138,10 @@ curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessi
 
 ## Histograms and Summaries
 
-The multi-replica latency metrics are Prometheus histograms with `_bucket`,
-`_sum`, and `_count` series and buckets from 1 millisecond to 15 seconds, so
-`histogram_quantile` can aggregate them across replicas. The older
+The multi-replica latency metrics and the configuration build metric are
+Prometheus histograms with `_bucket`, `_sum`, and `_count` series and buckets
+from 1 millisecond to 15 seconds, so `histogram_quantile` can aggregate them
+across replicas. The older
 `*_duration_seconds` metrics and the interceptor latency metric are summaries
 with `quantile` labels that each replica computes on its own. Do not average
 summary quantiles across pods.
@@ -230,6 +231,26 @@ The gateway also records every API request and its background database check:
 | `openshell_server_http_request_duration_seconds` | Summary | `path`, `status` | Duration of those HTTP requests. |
 | `openshell_server_readiness_database_healthy` | Gauge | None | `1` when the last background database check succeeded, otherwise `0`. |
 | `openshell_server_readiness_database_probe_duration_seconds` | Summary | `outcome` | Duration of the background database check. `outcome` is `success`, `db_error`, or `timeout`. |
+
+## Sandbox Configuration Metrics
+
+The gateway builds each sandbox's configuration in two parts: policy and
+settings, and the provider environment. These metrics measure that work:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_config_build_duration_seconds` | Histogram | `part`, `trigger`, `outcome` | Time to build one configuration part, including its database reads and credential resolution. |
+
+The labels take these values:
+
+- `part` is `sandbox_config` for policy and settings, or `provider_environment`
+  for provider credentials and files.
+- `trigger` is `request` when an API call asked for the part, such as a
+  supervisor's configuration poll or a provider status query.
+- `outcome` is `ok` or `error`.
+
+Use the rate of `openshell_server_config_build_duration_seconds_count` to see
+how many builds the gateway runs.
 
 ## Gateway Interceptor Metrics
 

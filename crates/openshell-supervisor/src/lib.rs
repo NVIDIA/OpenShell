@@ -4150,13 +4150,896 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     run_policy_poll_loop_with_client(ctx, client).await
 }
 
+/// Outcome of applying one configuration snapshot through [`ConfigApplier`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// The snapshot was already in effect.
+    Unchanged,
+    /// The snapshot is in effect.
+    Applied,
+    /// An explicit local policy is in effect; only settings were tracked.
+    LocalOverride,
+    /// The configuration was rejected and the runtime is quarantined.
+    FailedClosed,
+    /// The configuration was rejected and the last valid one stays active.
+    FailedRetained,
+    /// Supervisor middleware is unavailable; the last working runtime stays
+    /// active and the apply is retried.
+    Degraded,
+    /// The matching provider environment could not be installed. Static
+    /// credentials were revoked; dynamic grants that remain bound stay active.
+    ProviderFailed,
+    /// The snapshot needs a provider environment that has not arrived yet.
+    /// Nothing was changed.
+    AwaitingProvider,
+    /// The admission report failed; the same snapshot must be applied again.
+    ReportFailed,
+}
+
+impl ApplyOutcome {
+    fn rejected(disposition: &PolicyValidationFailureDisposition) -> Self {
+        if disposition.previous_policy_active {
+            Self::FailedRetained
+        } else {
+            Self::FailedClosed
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApplyReport {
+    outcome: ApplyOutcome,
+    /// The provider environment the apply fetched or received was installed.
+    provider_installed: bool,
+}
+
+impl ApplyReport {
+    const fn new(outcome: ApplyOutcome) -> Self {
+        Self {
+            outcome,
+            provider_installed: false,
+        }
+    }
+}
+
+/// Result of asking for the provider environment a snapshot needs.
+enum ProviderFetch {
+    Fetched(Box<Result<openshell_core::grpc_client::ProviderEnvironmentResult>>),
+    /// Not available yet. The caller holds the snapshot and retries when it
+    /// arrives.
+    #[allow(dead_code, reason = "constructed by pushed delivery")]
+    Awaiting,
+}
+
+/// Where [`ConfigApplier`] gets the provider environment matching a snapshot.
+#[tonic::async_trait]
+trait ProviderEnvironmentSource: Send + Sync {
+    async fn provider_environment(&self, desired: &EnvironmentIdentity) -> ProviderFetch;
+}
+
+/// Polling fetches the provider environment from the gateway on demand.
+struct FetchedProviderEnvironment<'a, C> {
+    client: &'a C,
+    endpoint: &'a str,
+    sandbox_id: &'a str,
+}
+
+#[tonic::async_trait]
+impl<C: PolicyGatewayClient> ProviderEnvironmentSource for FetchedProviderEnvironment<'_, C> {
+    async fn provider_environment(&self, _desired: &EnvironmentIdentity) -> ProviderFetch {
+        ProviderFetch::Fetched(Box::new(
+            self.client
+                .fetch_provider_environment(self.endpoint, self.sandbox_id)
+                .await,
+        ))
+    }
+}
+
+/// Where [`ConfigApplier`] reports configuration admission.
+#[tonic::async_trait]
+trait AdmissionReporter: Send + Sync {
+    /// Returns false when the report did not reach the gateway; the caller
+    /// must not treat the snapshot as applied.
+    async fn report(
+        &self,
+        ctx: &PolicyPollLoopContext,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+        accepted: bool,
+        error: &str,
+    ) -> bool;
+}
+
+/// Polling reports admission with `ReportSandboxConfiguration`.
+struct RpcAdmissionReporter;
+
+#[tonic::async_trait]
+impl AdmissionReporter for RpcAdmissionReporter {
+    async fn report(
+        &self,
+        ctx: &PolicyPollLoopContext,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+        accepted: bool,
+        error: &str,
+    ) -> bool {
+        report_runtime_configuration(ctx, snapshot, accepted, error).await
+    }
+}
+
+/// Applies gateway configuration snapshots to the running sandbox.
+///
+/// Polling and pushed delivery share this state machine. They differ only in
+/// where snapshots and provider environments come from and how admission is
+/// reported. Callers must not apply concurrently: provider credential
+/// installation is serialized through this type.
+struct ConfigApplier {
+    ctx: PolicyPollLoopContext,
+    status_sender: UnboundedSender<PolicyStatusUpdate>,
+    /// Policy generation installed by startup, captured before the first
+    /// gateway request and consumed by [`ConfigApplier::initial`].
+    initial_generation: Option<PolicyGenerationGuard>,
+    current_config_revision: u64,
+    current_provider_env_revision: u64,
+    current_policy_version: u32,
+    current_policy_hash: String,
+    current_policy_generation: Option<PolicyGenerationGuard>,
+    current_endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
+    current_middleware_services: Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    current_extension_authentication_enabled: bool,
+    middleware_registry_status: MiddlewareRegistryStatus,
+    current_settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    reloads_gateway_policy: bool,
+    last_failed_runtime_revision: Option<FailedRuntimeRevision>,
+    /// Outcome of the last runtime reload failure, repeated while the same
+    /// failure is deduplicated.
+    last_runtime_failure_outcome: ApplyOutcome,
+    rejected_policy_generation: Option<RejectedPolicyGeneration>,
+    has_last_valid_policy: bool,
+}
+
+impl ConfigApplier {
+    fn new(ctx: PolicyPollLoopContext, status_sender: UnboundedSender<PolicyStatusUpdate>) -> Self {
+        // Bind startup evidence before awaiting the gateway. A generation changed
+        // during that request no longer proves which policy startup installed.
+        let initial_generation = ctx
+            .opa_engine
+            .generation_guard(ctx.opa_engine.current_generation())
+            .ok();
+        Self {
+            current_provider_env_revision: ctx.provider_credentials.snapshot().revision,
+            current_endpoint_policy: ctx.endpoint_policy.clone(),
+            current_extension_authentication_enabled: ctx.extension_authentication_enabled,
+            middleware_registry_status: ctx.middleware_registry_status,
+            reloads_gateway_policy: ctx.loaded_policy_origin.allows_gateway_policy_reload(),
+            has_last_valid_policy: ctx.loaded_policy_origin.has_last_valid_policy(),
+            initial_generation,
+            ctx,
+            status_sender,
+            current_config_revision: 0,
+            current_policy_version: 0,
+            current_policy_hash: String::new(),
+            current_policy_generation: None,
+            current_middleware_services: Vec::new(),
+            current_settings: std::collections::HashMap::new(),
+            last_failed_runtime_revision: None,
+            last_runtime_failure_outcome: ApplyOutcome::FailedRetained,
+            rejected_policy_generation: None,
+        }
+    }
+
+    /// Handle the first snapshot after startup and acknowledge the initial
+    /// policy revision the supervisor actually loaded.
+    ///
+    /// Returns the snapshot when it does not match what startup loaded. It
+    /// must then go through [`ConfigApplier::apply`] immediately, and must
+    /// never seed the applied-state trackers before OPA actually loads it.
+    async fn initial(
+        &mut self,
+        result: openshell_core::grpc_client::SettingsPollResult,
+    ) -> Option<openshell_core::grpc_client::SettingsPollResult> {
+        match (
+            initial_poll_disposition(&self.ctx.loaded_policy_origin, &result),
+            self.initial_generation.take().as_ref(),
+        ) {
+            (InitialPollDisposition::Acknowledge(candidate), Some(generation))
+                if self.middleware_registry_status == MiddlewareRegistryStatus::Synchronized
+                    && !generation.is_stale() =>
+            {
+                self.ctx.provider_readiness.policy_activated(
+                    &EnvironmentIdentity::from_settings(&result),
+                    result.config_revision,
+                    generation.clone(),
+                );
+                self.current_policy_generation = Some(generation.clone());
+                apply_ocsf_json_setting(&self.ctx.ocsf_enabled, &result.settings);
+                apply_ocsf_schema_version_setting(&self.ctx.ocsf_schema_version, &result.settings);
+                apply_agent_proposals_enabled(
+                    &self.ctx.agent_proposals,
+                    agent_proposals_enabled_from_settings(&result.settings),
+                    "initial settings poll",
+                    Some(candidate.config_revision),
+                    skills::install_static_skills,
+                );
+                self.current_config_revision = candidate.config_revision;
+                self.current_policy_version = candidate.version;
+                self.current_policy_hash.clone_from(&candidate.policy_hash);
+                self.current_endpoint_policy.clone_from(&result.policy);
+                endpoint_status::reset(
+                    self.ctx.endpoint_observation_tx.as_ref(),
+                    self.current_endpoint_policy.as_ref(),
+                    &self.current_policy_hash,
+                    self.ctx.provider_credentials.snapshot().revision,
+                )
+                .await;
+                self.current_middleware_services = result.supervisor_middleware_services;
+                self.current_extension_authentication_enabled =
+                    result.extension_authentication_enabled;
+                self.current_settings = result.settings;
+                enqueue_policy_status(
+                    &self.status_sender,
+                    PolicyStatusUpdate::initial_loaded(&candidate),
+                );
+                debug!(
+                    config_revision = self.current_config_revision,
+                    "Settings poll: initial policy matches loaded revision"
+                );
+            }
+            (InitialPollDisposition::Acknowledge(_) | InitialPollDisposition::Reconcile, _) => {
+                // Matching policy bytes cannot prove an unavailable registry
+                // or a replaced generation. Install this snapshot immediately.
+                return Some(result);
+            }
+            (InitialPollDisposition::TrackOnly, _) => {
+                apply_ocsf_json_setting(&self.ctx.ocsf_enabled, &result.settings);
+                apply_ocsf_schema_version_setting(&self.ctx.ocsf_schema_version, &result.settings);
+                apply_agent_proposals_enabled(
+                    &self.ctx.agent_proposals,
+                    agent_proposals_enabled_from_settings(&result.settings),
+                    "initial settings poll",
+                    Some(result.config_revision),
+                    skills::install_static_skills,
+                );
+                self.current_config_revision = result.config_revision;
+                self.current_policy_hash.clone_from(&result.policy_hash);
+                self.current_middleware_services = result.supervisor_middleware_services;
+                self.current_extension_authentication_enabled =
+                    result.extension_authentication_enabled;
+                self.current_settings = result.settings;
+                debug!(
+                    config_revision = self.current_config_revision,
+                    "Settings poll: tracking gateway config while preserving local policy override"
+                );
+            }
+        }
+        None
+    }
+
+    /// Apply one snapshot, fetching or awaiting the provider environment it
+    /// needs from `provider_source`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One reconciliation pass shared by polling and pushed delivery"
+    )]
+    async fn apply(
+        &mut self,
+        result: openshell_core::grpc_client::SettingsPollResult,
+        middleware_credentials: std::collections::HashMap<
+            String,
+            openshell_extension_core::BearerTokenSlot,
+        >,
+        provider_source: &impl ProviderEnvironmentSource,
+        admission: &impl AdmissionReporter,
+    ) -> Result<ApplyReport> {
+        use openshell_core::proto::PolicySource;
+        use std::sync::atomic::Ordering;
+
+        if self.reloads_gateway_policy && !result.configuration_admitted {
+            let disposition = apply_policy_validation_failure(
+                &self.ctx.opa_engine,
+                result.policy_validation_failure_mode,
+                self.has_last_valid_policy,
+                result.version,
+                &result.configuration_error,
+            )?;
+            emit_policy_validation_failure(
+                &disposition,
+                result.version,
+                &result.policy_hash,
+                &result.configuration_error,
+            );
+            self.rejected_policy_generation = Some(RejectedPolicyGeneration {
+                version: result.version,
+                policy_hash: result.policy_hash.clone(),
+                validation_error: result.configuration_error.clone(),
+                configured_mode: result.policy_validation_failure_mode,
+            });
+            admission
+                .report(&self.ctx, &result, false, &result.configuration_error)
+                .await;
+            return Ok(ApplyReport::new(ApplyOutcome::rejected(&disposition)));
+        }
+
+        let config_changed = result.config_revision != self.current_config_revision;
+        let desired_identity = EnvironmentIdentity::from_settings(&result);
+        let provider_env_changed = result.provider_env_revision
+            != self.current_provider_env_revision
+            || self
+                .ctx
+                .provider_readiness
+                .needs_environment(&desired_identity);
+        let policy_changed = result.policy_hash != self.current_policy_hash;
+        let extension_authentication_changed = self.current_extension_authentication_enabled
+            != result.extension_authentication_enabled;
+        let middleware_registry_changed = extension_authentication_changed
+            || middleware_registry_needs_rebuild(
+                self.middleware_registry_status,
+                &self.current_middleware_services,
+                &result.supervisor_middleware_services,
+            );
+        // A valid candidate may intentionally restore byte-for-byte policy
+        // content that was active before a rejected update. Its hash then
+        // equals `self.current_policy_hash`, but the runtime is still quarantined
+        // and must reload (or it would remain deny-all indefinitely).
+        let recovering_rejected_policy = self.reloads_gateway_policy
+            && self.rejected_policy_generation.is_some()
+            && result.configuration_admitted;
+        let policy_runtime_changed = (self.reloads_gateway_policy
+            && (provider_env_changed
+                || self
+                    .current_policy_generation
+                    .as_ref()
+                    .is_some_and(PolicyGenerationGuard::is_stale)))
+            || recovering_rejected_policy
+            || extension_authentication_changed
+            || gateway_policy_runtime_needs_reconciliation(
+                self.reloads_gateway_policy,
+                &self.current_policy_hash,
+                &result.policy_hash,
+                &self.current_middleware_services,
+                &result.supervisor_middleware_services,
+                self.middleware_registry_status,
+            );
+        // Recovery already has its own acknowledgement path below. Giving it
+        // precedence here prevents a restored last-known-good policy from
+        // also being acknowledged as an ordinary same-hash revision.
+        let unchanged_policy_revision = unchanged_policy_revision_candidate(
+            self.reloads_gateway_policy,
+            recovering_rejected_policy,
+            self.current_policy_version,
+            &self.current_policy_hash,
+            &result,
+        );
+        let mut policy_runtime_reconciled = false;
+
+        // A local policy override is not coupled to the gateway policy
+        // snapshot, so its service registry can still be reconciled alone.
+        // Gateway policy snapshots, however, must install policy and registry
+        // as one generation below.
+        if !self.reloads_gateway_policy {
+            reconcile_middleware_registry(
+                &self.ctx.opa_engine,
+                &self.ctx.middleware_connector,
+                MiddlewareRegistryReconciliation {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    extension_credentials: &self.ctx.extension_credentials,
+                    current_services: &mut self.current_middleware_services,
+                    status: &mut self.middleware_registry_status,
+                },
+            )
+            .await;
+            if self.middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
+                self.current_extension_authentication_enabled =
+                    result.extension_authentication_enabled;
+            }
+        }
+
+        if !config_changed
+            && !provider_env_changed
+            && !policy_runtime_changed
+            && unchanged_policy_revision.is_none()
+        {
+            return Ok(ApplyReport::new(ApplyOutcome::Unchanged));
+        }
+
+        if config_changed || provider_env_changed {
+            // Log which settings changed.
+            log_setting_changes(&self.current_settings, &result.settings);
+
+            // A posture change after a rejected update takes effect immediately.
+            // The compiled last-known-good engine remains available beneath a
+            // fail-closed quarantine, so an explicit retain_last_valid selection
+            // can reactivate it without accepting any part of the invalid policy.
+            if !policy_changed && let Some(rejected) = self.rejected_policy_generation.as_mut() {
+                let mode = result.policy_validation_failure_mode;
+                if mode != rejected.configured_mode {
+                    let disposition = apply_policy_validation_failure(
+                        &self.ctx.opa_engine,
+                        mode,
+                        self.has_last_valid_policy,
+                        rejected.version,
+                        &rejected.validation_error,
+                    )?;
+                    emit_policy_validation_failure(
+                        &disposition,
+                        rejected.version,
+                        &rejected.policy_hash,
+                        &rejected.validation_error,
+                    );
+                    rejected.configured_mode = mode;
+                }
+            }
+
+            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Other, "detected")
+                .unmapped("old_config_revision", serde_json::json!(self.current_config_revision))
+                .unmapped("new_config_revision", serde_json::json!(result.config_revision))
+                .unmapped("policy_changed", serde_json::json!(policy_changed))
+                .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
+                .message(format!(
+                    "Settings poll: config change detected [old_revision:{old_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
+                    result.config_revision,
+                    old_revision = self.current_config_revision,
+                ))
+                .build());
+        }
+
+        // Prepare the matching environment before activation. Failed refreshes
+        // revoke static credentials while preserving independently bound dynamic grants.
+        let mut prepared_identity = None;
+        let prepared_provider = if provider_env_changed {
+            self.ctx.provider_readiness.credentials_failed(
+                desired_identity.clone(),
+                ProviderReadinessReason::WaitingForCredentials,
+            );
+            let fetched = match provider_source
+                .provider_environment(&desired_identity)
+                .await
+            {
+                ProviderFetch::Fetched(fetched) => *fetched,
+                ProviderFetch::Awaiting => {
+                    return Ok(ApplyReport::new(ApplyOutcome::AwaitingProvider));
+                }
+            };
+            let provider = match fetched {
+                Ok(provider)
+                    if EnvironmentIdentity::from_environment(&provider) == desired_identity
+                        && provider_environment_is_installable(provider.readiness_reason) =>
+                {
+                    provider
+                }
+                failed => {
+                    let reason = match failed {
+                        Ok(provider)
+                            if provider.readiness_reason
+                                != ProviderReadinessReason::Unspecified =>
+                        {
+                            provider.readiness_reason
+                        }
+                        Ok(_) => ProviderReadinessReason::SnapshotMismatch,
+                        Err(_) => ProviderReadinessReason::CredentialInstallFailed,
+                    };
+                    self.ctx
+                        .provider_readiness
+                        .credentials_failed(desired_identity.clone(), reason);
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "fail_closed")
+                        .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
+                        .build());
+                    self.ctx
+                        .provider_credentials
+                        .revoke_static_provider_environment(result.provider_env_revision);
+                    endpoint_status::reset(
+                        self.ctx.endpoint_observation_tx.as_ref(),
+                        self.current_endpoint_policy.as_ref(),
+                        &self.current_policy_hash,
+                        result.provider_env_revision,
+                    )
+                    .await;
+                    admission
+                        .report(
+                            &self.ctx,
+                            &result,
+                            false,
+                            "Provider environment is unavailable or changed during preparation",
+                        )
+                        .await;
+                    return Ok(ApplyReport::new(ApplyOutcome::ProviderFailed));
+                }
+            };
+            if let Ok(prepared) = prepare_provider_environment(&provider) {
+                prepared_identity = Some((
+                    EnvironmentIdentity::from_environment(&provider),
+                    provider
+                        .credential_expires_at_ms
+                        .values()
+                        .copied()
+                        .filter(|expiry| *expiry > 0)
+                        .min(),
+                ));
+                Some(prepared)
+            } else {
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "fail_closed")
+                    .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
+                    .build());
+                self.ctx.provider_readiness.credentials_failed(
+                    desired_identity.clone(),
+                    ProviderReadinessReason::CredentialInstallFailed,
+                );
+                // Repeat the rejected binding validation on the live state to
+                // revoke static material and retain the fetched dynamic grants.
+                let _ = self.ctx.provider_credentials.install_bound_environment(
+                    provider.provider_env_revision,
+                    provider.environment,
+                    provider.credential_expires_at_ms,
+                    provider.dynamic_credentials,
+                    provider.static_credential_bindings,
+                    provider.non_secret_environment_keys,
+                );
+                endpoint_status::reset(
+                    self.ctx.endpoint_observation_tx.as_ref(),
+                    self.current_endpoint_policy.as_ref(),
+                    &self.current_policy_hash,
+                    result.provider_env_revision,
+                )
+                .await;
+                admission
+                    .report(
+                        &self.ctx,
+                        &result,
+                        false,
+                        "Provider environment bindings failed validation",
+                    )
+                    .await;
+                return Ok(ApplyReport::new(ApplyOutcome::ProviderFailed));
+            }
+        } else {
+            None
+        };
+
+        if policy_runtime_changed {
+            let pid = self.ctx.entrypoint_pid.load(Ordering::Acquire);
+            let runtime_result = reload_gateway_configuration_runtime(
+                &self.ctx.opa_engine,
+                result.policy.as_ref(),
+                pid,
+                MiddlewareReloadContext {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: &MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    connector: &self.ctx.middleware_connector,
+                },
+                self.ctx.transparent_tcp,
+                self.ctx.vm_identity,
+                || {
+                    if let Some(prepared) = prepared_provider.as_ref() {
+                        self.ctx.provider_credentials.install_prepared(prepared);
+                    }
+                },
+            )
+            .await;
+
+            match runtime_result {
+                Ok(generation) => {
+                    policy_runtime_reconciled = true;
+                    if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
+                        self.ctx.provider_readiness.credentials_installed(
+                            identity.clone(),
+                            &self.ctx.provider_credentials,
+                            *expires_at_ms,
+                        );
+                    }
+                    self.ctx.provider_readiness.policy_activated(
+                        &desired_identity,
+                        result.config_revision,
+                        generation.clone(),
+                    );
+                    self.current_policy_generation = Some(generation);
+                    let policy = result
+                        .policy
+                        .as_ref()
+                        .expect("successful runtime reload requires a policy payload");
+                    self.has_last_valid_policy = true;
+                    self.rejected_policy_generation = None;
+                    if policy_changed {
+                        if let Some(policy_local_ctx) = self.ctx.policy_local_ctx.as_ref() {
+                            policy_local_ctx.set_current_policy(policy.clone()).await;
+                        }
+                        if result.global_policy_version > 0 {
+                            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .unmapped("global_version", serde_json::json!(result.global_policy_version))
+                                .message(format!(
+                                    "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
+                                    result.policy_hash,
+                                    result.global_policy_version
+                                ))
+                                .build());
+                        } else {
+                            ocsf_emit!(
+                                ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Informational)
+                                    .status(StatusId::Success)
+                                    .state(StateId::Enabled, "loaded")
+                                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                    .message(format!(
+                                        "Policy reloaded successfully [policy_hash:{}]",
+                                        result.policy_hash
+                                    ))
+                                    .build()
+                            );
+                        }
+                        if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                            enqueue_policy_status(
+                                &self.status_sender,
+                                PolicyStatusUpdate::loaded(result.version),
+                            );
+                            self.current_policy_version = result.version;
+                        }
+                    } else if recovering_rejected_policy
+                        && result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                    {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .message(format!(
+                                    "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
+                                    result.policy_hash
+                                ))
+                                .build()
+                        );
+                        enqueue_policy_status(
+                            &self.status_sender,
+                            PolicyStatusUpdate::loaded(result.version),
+                        );
+                        self.current_policy_version = result.version;
+                    }
+
+                    if middleware_registry_changed {
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "supervisor_middleware_service_count",
+                                serde_json::json!(result.supervisor_middleware_services.len())
+                            )
+                            .message(format!(
+                                "Supervisor policy runtime reloaded atomically [service_count:{}]",
+                                result.supervisor_middleware_services.len()
+                            ))
+                            .build());
+                    }
+
+                    self.current_policy_hash.clone_from(&result.policy_hash);
+                    self.current_endpoint_policy.clone_from(&result.policy);
+                    self.current_middleware_services
+                        .clone_from(&result.supervisor_middleware_services);
+                    self.current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
+                    retain_extension_credentials(
+                        &self.ctx.extension_credentials,
+                        &result.supervisor_middleware_services,
+                        result.extension_authentication_enabled,
+                    );
+                    self.middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
+                    self.last_failed_runtime_revision = None;
+                }
+                Err(failure) => {
+                    self.ctx
+                        .provider_readiness
+                        .policy_install_failed(desired_identity.clone(), result.config_revision);
+                    let failed_revision = FailedRuntimeRevision::new(
+                        result.config_revision,
+                        &result.policy_hash,
+                        &failure,
+                    );
+                    if self.last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
+                        let failure_mode = result.policy_validation_failure_mode;
+                        match apply_gateway_runtime_reload_failure(
+                            &self.ctx.opa_engine,
+                            failure,
+                            failure_mode,
+                            self.has_last_valid_policy,
+                            result.version,
+                        )? {
+                            GatewayRuntimeFailureDisposition::PolicyRejected {
+                                error,
+                                disposition,
+                            } => {
+                                self.last_runtime_failure_outcome =
+                                    ApplyOutcome::rejected(&disposition);
+                                emit_policy_validation_failure(
+                                    &disposition,
+                                    result.version,
+                                    &result.policy_hash,
+                                    &error,
+                                );
+                                self.rejected_policy_generation = Some(RejectedPolicyGeneration {
+                                    version: result.version,
+                                    policy_hash: result.policy_hash.clone(),
+                                    validation_error: error.clone(),
+                                    configured_mode: failure_mode,
+                                });
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &self.status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
+                            }
+                            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error } => {
+                                self.last_runtime_failure_outcome = ApplyOutcome::Degraded;
+                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Medium)
+                                    .status(StatusId::Failure)
+                                    .state(StateId::Other, "failed")
+                                    .unmapped("version", serde_json::json!(result.version))
+                                    .unmapped("error", serde_json::json!(&error))
+                                    .unmapped("previous_policy_active", serde_json::json!(true))
+                                    .message(format!(
+                                        "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
+                                        result.version
+                                    ))
+                                    .build());
+                            }
+                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                                error,
+                                active_generation,
+                            } => {
+                                self.last_runtime_failure_outcome = ApplyOutcome::FailedRetained;
+                                emit_transparent_tcp_expansion_rejection(
+                                    result.version,
+                                    &result.policy_hash,
+                                    active_generation,
+                                    &error,
+                                );
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &self.status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.last_failed_runtime_revision = Some(failed_revision);
+                    // Nothing was installed, so the registry status still
+                    // describes the live registry. The retry is driven by the
+                    // persisting hash/service-set mismatch (or an existing
+                    // NeedsReconciliation), not by degrading the status here.
+                }
+            }
+        }
+
+        if policy_runtime_changed && !policy_runtime_reconciled {
+            admission.report(&self.ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed").await;
+            return Ok(ApplyReport::new(self.last_runtime_failure_outcome));
+        }
+        if !self.reloads_gateway_policy
+            && let Some(prepared) = prepared_provider.as_ref()
+        {
+            self.ctx.provider_credentials.install_prepared(prepared);
+            if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
+                self.ctx.provider_readiness.credentials_installed(
+                    identity.clone(),
+                    &self.ctx.provider_credentials,
+                    *expires_at_ms,
+                );
+            }
+        }
+        if provider_env_changed || policy_runtime_reconciled {
+            self.current_provider_env_revision = result.provider_env_revision;
+        }
+
+        if let Some(version) = unchanged_policy_revision_ready_to_ack(
+            unchanged_policy_revision,
+            policy_runtime_changed,
+            policy_runtime_reconciled,
+        ) {
+            enqueue_policy_status(
+                &self.status_sender,
+                PolicyStatusUpdate::unchanged_loaded(version, result.policy_hash.clone()),
+            );
+            self.current_policy_version = version;
+        }
+
+        if self.reloads_gateway_policy
+            && !policy_runtime_changed
+            && let Some(generation) = self
+                .current_policy_generation
+                .as_ref()
+                .filter(|generation| !generation.is_stale())
+        {
+            // The same installed policy may serve a new attachment/configuration
+            // identity. Its generation is retained, never inferred from a cursor.
+            self.ctx.provider_readiness.policy_activated(
+                &desired_identity,
+                result.config_revision,
+                generation.clone(),
+            );
+        }
+
+        if policy_runtime_reconciled || provider_env_changed {
+            endpoint_status::reset(
+                self.ctx.endpoint_observation_tx.as_ref(),
+                self.current_endpoint_policy.as_ref(),
+                &self.current_policy_hash,
+                self.ctx.provider_credentials.snapshot().revision,
+            )
+            .await;
+        }
+
+        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
+        apply_ocsf_json_setting(&self.ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&self.ctx.ocsf_schema_version, &result.settings);
+
+        // Apply the agent-proposals feature toggle. On a false→true transition
+        // we lazily install the skill so a sandbox that started with the flag
+        // off picks up the surface without a recreate. We never uninstall on
+        // a true→false transition: stale skill content on disk is harmless
+        // because route_request and agent_next_steps both gate on the live
+        // shared flag, so the agent that reads the skill will see 404s and an
+        // empty `next_steps` array regardless.
+        apply_agent_proposals_enabled(
+            &self.ctx.agent_proposals,
+            agent_proposals_enabled_from_settings(&result.settings),
+            "settings poll",
+            Some(result.config_revision),
+            skills::install_static_skills,
+        );
+
+        if !admission.report(&self.ctx, &result, true, "").await {
+            // Retry the exact status tuple on the next poll before advancing
+            // the observed revision; an old instance cannot claim readiness.
+            return Ok(ApplyReport::new(ApplyOutcome::ReportFailed));
+        }
+        self.current_config_revision = result.config_revision;
+        if !self.reloads_gateway_policy {
+            self.current_policy_hash = result.policy_hash;
+        }
+        self.current_settings = result.settings;
+        Ok(ApplyReport {
+            outcome: if self.reloads_gateway_policy {
+                ApplyOutcome::Applied
+            } else {
+                ApplyOutcome::LocalOverride
+            },
+            provider_installed: prepared_provider.is_some(),
+        })
+    }
+}
+
 async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     mut ctx: PolicyPollLoopContext,
     client: C,
 ) -> Result<()> {
-    use openshell_core::proto::PolicySource;
-    use std::sync::atomic::Ordering;
-
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
         client.clone(),
@@ -4171,136 +5054,45 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             ctx.supervisor_session_id.clone(),
         ));
     }
+    let endpoint = ctx.endpoint.clone();
+    let sandbox_id = ctx.sandbox_id.clone();
+    let sandbox = ctx.sandbox.clone();
+    let interval = Duration::from_secs(ctx.interval_secs);
+    let mut applier = ConfigApplier::new(ctx, status_sender);
+    let provider_source = FetchedProviderEnvironment {
+        client: &client,
+        endpoint: &endpoint,
+        sandbox_id: &sandbox_id,
+    };
 
-    let mut current_config_revision: u64 = 0;
-    let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
-    let mut current_policy_version: u32 = 0;
-    let mut current_policy_hash = String::new();
-    let mut current_policy_generation = None;
-    let mut current_endpoint_policy = ctx.endpoint_policy.clone();
-    let mut current_middleware_services = Vec::new();
-    let mut current_extension_authentication_enabled = ctx.extension_authentication_enabled;
-    let mut middleware_registry_status = ctx.middleware_registry_status;
-    let mut current_settings: std::collections::HashMap<
-        String,
-        openshell_core::proto::EffectiveSetting,
-    > = std::collections::HashMap::new();
-    let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
-    let mut last_failed_runtime_revision: Option<FailedRuntimeRevision> = None;
-    let mut rejected_policy_generation: Option<RejectedPolicyGeneration> = None;
-    let mut has_last_valid_policy = ctx.loaded_policy_origin.has_last_valid_policy();
-
-    // A first poll that does not match the policy already loaded into OPA must
-    // pass through the normal reconciliation path immediately. It must never
-    // seed the applied-state trackers before OPA actually loads it.
-    let mut pending_result = None;
-    // Bind startup evidence before awaiting the gateway. A generation changed
-    // during that request no longer proves which policy startup installed.
-    let initial_generation = ctx
-        .opa_engine
-        .generation_guard(ctx.opa_engine.current_generation())
-        .ok();
-
-    // Initialize revision from the first poll and acknowledge the initial
-    // policy revision the supervisor actually loaded. A mismatched result is
-    // reconciled below instead of being recorded as already applied.
-    match client.poll_settings(&ctx.sandbox).await {
+    let mut pending_result = match client.poll_settings(&sandbox).await {
         Ok(result) => {
-            let _ = ctx.workspace_tx.send(client.workspace());
-            match (
-                initial_poll_disposition(&ctx.loaded_policy_origin, &result),
-                initial_generation.as_ref(),
-            ) {
-                (InitialPollDisposition::Acknowledge(candidate), Some(generation))
-                    if middleware_registry_status == MiddlewareRegistryStatus::Synchronized
-                        && !generation.is_stale() =>
-                {
-                    ctx.provider_readiness.policy_activated(
-                        &EnvironmentIdentity::from_settings(&result),
-                        result.config_revision,
-                        generation.clone(),
-                    );
-                    current_policy_generation = Some(generation.clone());
-                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
-                    apply_agent_proposals_enabled(
-                        &ctx.agent_proposals,
-                        agent_proposals_enabled_from_settings(&result.settings),
-                        "initial settings poll",
-                        Some(candidate.config_revision),
-                        skills::install_static_skills,
-                    );
-                    current_config_revision = candidate.config_revision;
-                    current_policy_version = candidate.version;
-                    current_policy_hash.clone_from(&candidate.policy_hash);
-                    current_endpoint_policy.clone_from(&result.policy);
-                    endpoint_status::reset(
-                        ctx.endpoint_observation_tx.as_ref(),
-                        current_endpoint_policy.as_ref(),
-                        &current_policy_hash,
-                        ctx.provider_credentials.snapshot().revision,
-                    )
-                    .await;
-                    current_middleware_services = result.supervisor_middleware_services;
-                    current_extension_authentication_enabled =
-                        result.extension_authentication_enabled;
-                    current_settings = result.settings;
-                    enqueue_policy_status(
-                        &status_sender,
-                        PolicyStatusUpdate::initial_loaded(&candidate),
-                    );
-                    debug!(
-                        config_revision = current_config_revision,
-                        "Settings poll: initial policy matches loaded revision"
-                    );
-                }
-                (InitialPollDisposition::Acknowledge(_) | InitialPollDisposition::Reconcile, _) => {
-                    // Matching policy bytes cannot prove an unavailable registry
-                    // or a replaced generation. Install this snapshot immediately.
-                    pending_result = Some(result);
-                }
-                (InitialPollDisposition::TrackOnly, _) => {
-                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
-                    apply_agent_proposals_enabled(
-                        &ctx.agent_proposals,
-                        agent_proposals_enabled_from_settings(&result.settings),
-                        "initial settings poll",
-                        Some(result.config_revision),
-                        skills::install_static_skills,
-                    );
-                    current_config_revision = result.config_revision;
-                    current_policy_hash = result.policy_hash.clone();
-                    current_middleware_services = result.supervisor_middleware_services;
-                    current_extension_authentication_enabled =
-                        result.extension_authentication_enabled;
-                    current_settings = result.settings;
-                    debug!(
-                        config_revision = current_config_revision,
-                        "Settings poll: tracking gateway config while preserving local policy override"
-                    );
-                }
-            }
+            let _ = applier.ctx.workspace_tx.send(client.workspace());
+            applier.initial(result).await
         }
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
+            None
         }
-    }
+    };
 
-    let interval = Duration::from_secs(ctx.interval_secs);
     loop {
         let result = if let Some(result) = pending_result.take() {
             result
         } else {
-            tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
-            match client.poll_settings(&ctx.sandbox).await {
+            tokio::time::sleep(next_poll_delay(
+                &applier.ctx.extension_credentials,
+                interval,
+            ))
+            .await;
+            match client.poll_settings(&sandbox).await {
                 Ok(result) => {
-                    let _ = ctx.workspace_tx.send(client.workspace());
+                    let _ = applier.ctx.workspace_tx.send(client.workspace());
                     result
                 }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
-                    if current_extension_authentication_enabled
+                    if applier.current_extension_authentication_enabled
                         && let Err(refresh_error) =
                             client.refresh_installed_extension_credentials().await
                     {
@@ -4333,571 +5125,14 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             std::collections::HashMap::new()
         };
 
-        if reloads_gateway_policy && !result.configuration_admitted {
-            let disposition = apply_policy_validation_failure(
-                &ctx.opa_engine,
-                result.policy_validation_failure_mode,
-                has_last_valid_policy,
-                result.version,
-                &result.configuration_error,
-            )?;
-            emit_policy_validation_failure(
-                &disposition,
-                result.version,
-                &result.policy_hash,
-                &result.configuration_error,
-            );
-            rejected_policy_generation = Some(RejectedPolicyGeneration {
-                version: result.version,
-                policy_hash: result.policy_hash.clone(),
-                validation_error: result.configuration_error.clone(),
-                configured_mode: result.policy_validation_failure_mode,
-            });
-            report_runtime_configuration(&ctx, &result, false, &result.configuration_error).await;
-            continue;
-        }
-
-        let config_changed = result.config_revision != current_config_revision;
-        let desired_identity = EnvironmentIdentity::from_settings(&result);
-        let provider_env_changed = result.provider_env_revision != current_provider_env_revision
-            || ctx.provider_readiness.needs_environment(&desired_identity);
-        let policy_changed = result.policy_hash != current_policy_hash;
-        let extension_authentication_changed =
-            current_extension_authentication_enabled != result.extension_authentication_enabled;
-        let middleware_registry_changed = extension_authentication_changed
-            || middleware_registry_needs_rebuild(
-                middleware_registry_status,
-                &current_middleware_services,
-                &result.supervisor_middleware_services,
-            );
-        // A valid candidate may intentionally restore byte-for-byte policy
-        // content that was active before a rejected update. Its hash then
-        // equals `current_policy_hash`, but the runtime is still quarantined
-        // and must reload (or it would remain deny-all indefinitely).
-        let recovering_rejected_policy = reloads_gateway_policy
-            && rejected_policy_generation.is_some()
-            && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy
-            && (provider_env_changed
-                || current_policy_generation
-                    .as_ref()
-                    .is_some_and(PolicyGenerationGuard::is_stale)))
-            || recovering_rejected_policy
-            || extension_authentication_changed
-            || gateway_policy_runtime_needs_reconciliation(
-                reloads_gateway_policy,
-                &current_policy_hash,
-                &result.policy_hash,
-                &current_middleware_services,
-                &result.supervisor_middleware_services,
-                middleware_registry_status,
-            );
-        // Recovery already has its own acknowledgement path below. Giving it
-        // precedence here prevents a restored last-known-good policy from
-        // also being acknowledged as an ordinary same-hash revision.
-        let unchanged_policy_revision = unchanged_policy_revision_candidate(
-            reloads_gateway_policy,
-            recovering_rejected_policy,
-            current_policy_version,
-            &current_policy_hash,
-            &result,
-        );
-        let mut policy_runtime_reconciled = false;
-
-        // A local policy override is not coupled to the gateway policy
-        // snapshot, so its service registry can still be reconciled alone.
-        // Gateway policy snapshots, however, must install policy and registry
-        // as one generation below.
-        if !reloads_gateway_policy {
-            reconcile_middleware_registry(
-                &ctx.opa_engine,
-                &ctx.middleware_connector,
-                MiddlewareRegistryReconciliation {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    extension_credentials: &ctx.extension_credentials,
-                    current_services: &mut current_middleware_services,
-                    status: &mut middleware_registry_status,
-                },
+        applier
+            .apply(
+                result,
+                middleware_credentials,
+                &provider_source,
+                &RpcAdmissionReporter,
             )
-            .await;
-            if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
-                current_extension_authentication_enabled = result.extension_authentication_enabled;
-            }
-        }
-
-        if !config_changed
-            && !provider_env_changed
-            && !policy_runtime_changed
-            && unchanged_policy_revision.is_none()
-        {
-            continue;
-        }
-
-        if config_changed || provider_env_changed {
-            // Log which settings changed.
-            log_setting_changes(&current_settings, &result.settings);
-
-            // A posture change after a rejected update takes effect immediately.
-            // The compiled last-known-good engine remains available beneath a
-            // fail-closed quarantine, so an explicit retain_last_valid selection
-            // can reactivate it without accepting any part of the invalid policy.
-            if !policy_changed && let Some(rejected) = rejected_policy_generation.as_mut() {
-                let mode = result.policy_validation_failure_mode;
-                if mode != rejected.configured_mode {
-                    let disposition = apply_policy_validation_failure(
-                        &ctx.opa_engine,
-                        mode,
-                        has_last_valid_policy,
-                        rejected.version,
-                        &rejected.validation_error,
-                    )?;
-                    emit_policy_validation_failure(
-                        &disposition,
-                        rejected.version,
-                        &rejected.policy_hash,
-                        &rejected.validation_error,
-                    );
-                    rejected.configured_mode = mode;
-                }
-            }
-
-            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Other, "detected")
-                .unmapped("old_config_revision", serde_json::json!(current_config_revision))
-                .unmapped("new_config_revision", serde_json::json!(result.config_revision))
-                .unmapped("policy_changed", serde_json::json!(policy_changed))
-                .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
-                .message(format!(
-                    "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
-                    result.config_revision
-                ))
-                .build());
-        }
-
-        // Prepare the matching environment before activation. Failed refreshes
-        // revoke static credentials while preserving independently bound dynamic grants.
-        let mut prepared_identity = None;
-        let prepared_provider = if provider_env_changed {
-            ctx.provider_readiness.credentials_failed(
-                desired_identity.clone(),
-                ProviderReadinessReason::WaitingForCredentials,
-            );
-            let provider = match client
-                .fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id)
-                .await
-            {
-                Ok(provider)
-                    if EnvironmentIdentity::from_environment(&provider) == desired_identity
-                        && provider_environment_is_installable(provider.readiness_reason) =>
-                {
-                    provider
-                }
-                failed => {
-                    let reason = match failed {
-                        Ok(provider)
-                            if provider.readiness_reason
-                                != ProviderReadinessReason::Unspecified =>
-                        {
-                            provider.readiness_reason
-                        }
-                        Ok(_) => ProviderReadinessReason::SnapshotMismatch,
-                        Err(_) => ProviderReadinessReason::CredentialInstallFailed,
-                    };
-                    ctx.provider_readiness
-                        .credentials_failed(desired_identity.clone(), reason);
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::High)
-                        .status(StatusId::Failure)
-                        .state(StateId::Disabled, "fail_closed")
-                        .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
-                        .build());
-                    ctx.provider_credentials
-                        .revoke_static_provider_environment(result.provider_env_revision);
-                    endpoint_status::reset(
-                        ctx.endpoint_observation_tx.as_ref(),
-                        current_endpoint_policy.as_ref(),
-                        &current_policy_hash,
-                        result.provider_env_revision,
-                    )
-                    .await;
-                    report_runtime_configuration(
-                        &ctx,
-                        &result,
-                        false,
-                        "Provider environment is unavailable or changed during preparation",
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            if let Ok(prepared) = prepare_provider_environment(&provider) {
-                prepared_identity = Some((
-                    EnvironmentIdentity::from_environment(&provider),
-                    provider
-                        .credential_expires_at_ms
-                        .values()
-                        .copied()
-                        .filter(|expiry| *expiry > 0)
-                        .min(),
-                ));
-                Some(prepared)
-            } else {
-                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::High)
-                    .status(StatusId::Failure)
-                    .state(StateId::Disabled, "fail_closed")
-                    .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
-                    .build());
-                ctx.provider_readiness.credentials_failed(
-                    desired_identity.clone(),
-                    ProviderReadinessReason::CredentialInstallFailed,
-                );
-                // Repeat the rejected binding validation on the live state to
-                // revoke static material and retain the fetched dynamic grants.
-                let _ = ctx.provider_credentials.install_bound_environment(
-                    provider.provider_env_revision,
-                    provider.environment,
-                    provider.credential_expires_at_ms,
-                    provider.dynamic_credentials,
-                    provider.static_credential_bindings,
-                    provider.non_secret_environment_keys,
-                );
-                endpoint_status::reset(
-                    ctx.endpoint_observation_tx.as_ref(),
-                    current_endpoint_policy.as_ref(),
-                    &current_policy_hash,
-                    result.provider_env_revision,
-                )
-                .await;
-                report_runtime_configuration(
-                    &ctx,
-                    &result,
-                    false,
-                    "Provider environment bindings failed validation",
-                )
-                .await;
-                continue;
-            }
-        } else {
-            None
-        };
-
-        if policy_runtime_changed {
-            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
-                result.policy.as_ref(),
-                pid,
-                MiddlewareReloadContext {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    connector: &ctx.middleware_connector,
-                },
-                ctx.transparent_tcp,
-                ctx.vm_identity,
-                || {
-                    if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials.install_prepared(prepared);
-                    }
-                },
-            )
-            .await;
-
-            match runtime_result {
-                Ok(generation) => {
-                    policy_runtime_reconciled = true;
-                    if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
-                        ctx.provider_readiness.credentials_installed(
-                            identity.clone(),
-                            &ctx.provider_credentials,
-                            *expires_at_ms,
-                        );
-                    }
-                    ctx.provider_readiness.policy_activated(
-                        &desired_identity,
-                        result.config_revision,
-                        generation.clone(),
-                    );
-                    current_policy_generation = Some(generation);
-                    let policy = result
-                        .policy
-                        .as_ref()
-                        .expect("successful runtime reload requires a policy payload");
-                    has_last_valid_policy = true;
-                    rejected_policy_generation = None;
-                    if policy_changed {
-                        if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
-                            policy_local_ctx.set_current_policy(policy.clone()).await;
-                        }
-                        if result.global_policy_version > 0 {
-                            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                .unmapped("global_version", serde_json::json!(result.global_policy_version))
-                                .message(format!(
-                                    "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
-                                    result.policy_hash,
-                                    result.global_policy_version
-                                ))
-                                .build());
-                        } else {
-                            ocsf_emit!(
-                                ConfigStateChangeBuilder::new(ocsf_ctx())
-                                    .severity(SeverityId::Informational)
-                                    .status(StatusId::Success)
-                                    .state(StateId::Enabled, "loaded")
-                                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                    .message(format!(
-                                        "Policy reloaded successfully [policy_hash:{}]",
-                                        result.policy_hash
-                                    ))
-                                    .build()
-                            );
-                        }
-                        if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                            enqueue_policy_status(
-                                &status_sender,
-                                PolicyStatusUpdate::loaded(result.version),
-                            );
-                            current_policy_version = result.version;
-                        }
-                    } else if recovering_rejected_policy
-                        && result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                    {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                .message(format!(
-                                    "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
-                                    result.policy_hash
-                                ))
-                                .build()
-                        );
-                        enqueue_policy_status(
-                            &status_sender,
-                            PolicyStatusUpdate::loaded(result.version),
-                        );
-                        current_policy_version = result.version;
-                    }
-
-                    if middleware_registry_changed {
-                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "supervisor_middleware_service_count",
-                                serde_json::json!(result.supervisor_middleware_services.len())
-                            )
-                            .message(format!(
-                                "Supervisor policy runtime reloaded atomically [service_count:{}]",
-                                result.supervisor_middleware_services.len()
-                            ))
-                            .build());
-                    }
-
-                    current_policy_hash.clone_from(&result.policy_hash);
-                    current_endpoint_policy.clone_from(&result.policy);
-                    current_middleware_services.clone_from(&result.supervisor_middleware_services);
-                    current_extension_authentication_enabled =
-                        result.extension_authentication_enabled;
-                    retain_extension_credentials(
-                        &ctx.extension_credentials,
-                        &result.supervisor_middleware_services,
-                        result.extension_authentication_enabled,
-                    );
-                    middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-                    last_failed_runtime_revision = None;
-                }
-                Err(failure) => {
-                    ctx.provider_readiness
-                        .policy_install_failed(desired_identity.clone(), result.config_revision);
-                    let failed_revision = FailedRuntimeRevision::new(
-                        result.config_revision,
-                        &result.policy_hash,
-                        &failure,
-                    );
-                    if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
-                        let failure_mode = result.policy_validation_failure_mode;
-                        match apply_gateway_runtime_reload_failure(
-                            &ctx.opa_engine,
-                            failure,
-                            failure_mode,
-                            has_last_valid_policy,
-                            result.version,
-                        )? {
-                            GatewayRuntimeFailureDisposition::PolicyRejected {
-                                error,
-                                disposition,
-                            } => {
-                                emit_policy_validation_failure(
-                                    &disposition,
-                                    result.version,
-                                    &result.policy_hash,
-                                    &error,
-                                );
-                                rejected_policy_generation = Some(RejectedPolicyGeneration {
-                                    version: result.version,
-                                    policy_hash: result.policy_hash.clone(),
-                                    validation_error: error.clone(),
-                                    configured_mode: failure_mode,
-                                });
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    enqueue_policy_status(
-                                        &status_sender,
-                                        PolicyStatusUpdate::failed(result.version, error),
-                                    );
-                                }
-                            }
-                            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error } => {
-                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                                    .severity(SeverityId::Medium)
-                                    .status(StatusId::Failure)
-                                    .state(StateId::Other, "failed")
-                                    .unmapped("version", serde_json::json!(result.version))
-                                    .unmapped("error", serde_json::json!(&error))
-                                    .unmapped("previous_policy_active", serde_json::json!(true))
-                                    .message(format!(
-                                        "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
-                                        result.version
-                                    ))
-                                    .build());
-                            }
-                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                                error,
-                                active_generation,
-                            } => {
-                                emit_transparent_tcp_expansion_rejection(
-                                    result.version,
-                                    &result.policy_hash,
-                                    active_generation,
-                                    &error,
-                                );
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    enqueue_policy_status(
-                                        &status_sender,
-                                        PolicyStatusUpdate::failed(result.version, error),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    last_failed_runtime_revision = Some(failed_revision);
-                    // Nothing was installed, so the registry status still
-                    // describes the live registry. The retry is driven by the
-                    // persisting hash/service-set mismatch (or an existing
-                    // NeedsReconciliation), not by degrading the status here.
-                }
-            }
-        }
-
-        if policy_runtime_changed && !policy_runtime_reconciled {
-            report_runtime_configuration(&ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed").await;
-            continue;
-        }
-        if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
-            ctx.provider_credentials.install_prepared(prepared);
-            if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
-                ctx.provider_readiness.credentials_installed(
-                    identity.clone(),
-                    &ctx.provider_credentials,
-                    *expires_at_ms,
-                );
-            }
-        }
-        if provider_env_changed || policy_runtime_reconciled {
-            current_provider_env_revision = result.provider_env_revision;
-        }
-
-        if let Some(version) = unchanged_policy_revision_ready_to_ack(
-            unchanged_policy_revision,
-            policy_runtime_changed,
-            policy_runtime_reconciled,
-        ) {
-            enqueue_policy_status(
-                &status_sender,
-                PolicyStatusUpdate::unchanged_loaded(version, result.policy_hash.clone()),
-            );
-            current_policy_version = version;
-        }
-
-        if reloads_gateway_policy
-            && !policy_runtime_changed
-            && let Some(generation) = current_policy_generation
-                .as_ref()
-                .filter(|generation| !generation.is_stale())
-        {
-            // The same installed policy may serve a new attachment/configuration
-            // identity. Its generation is retained, never inferred from a cursor.
-            ctx.provider_readiness.policy_activated(
-                &desired_identity,
-                result.config_revision,
-                generation.clone(),
-            );
-        }
-
-        if policy_runtime_reconciled || provider_env_changed {
-            endpoint_status::reset(
-                ctx.endpoint_observation_tx.as_ref(),
-                current_endpoint_policy.as_ref(),
-                &current_policy_hash,
-                ctx.provider_credentials.snapshot().revision,
-            )
-            .await;
-        }
-
-        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
-        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
-
-        // Apply the agent-proposals feature toggle. On a false→true transition
-        // we lazily install the skill so a sandbox that started with the flag
-        // off picks up the surface without a recreate. We never uninstall on
-        // a true→false transition: stale skill content on disk is harmless
-        // because route_request and agent_next_steps both gate on the live
-        // shared flag, so the agent that reads the skill will see 404s and an
-        // empty `next_steps` array regardless.
-        apply_agent_proposals_enabled(
-            &ctx.agent_proposals,
-            agent_proposals_enabled_from_settings(&result.settings),
-            "settings poll",
-            Some(result.config_revision),
-            skills::install_static_skills,
-        );
-
-        if !report_runtime_configuration(&ctx, &result, true, "").await {
-            // Retry the exact status tuple on the next poll before advancing
-            // the observed revision; an old instance cannot claim readiness.
-            continue;
-        }
-        current_config_revision = result.config_revision;
-        if !reloads_gateway_policy {
-            current_policy_hash = result.policy_hash;
-        }
-        current_settings = result.settings;
+            .await?;
     }
 }
 

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
@@ -20,8 +21,10 @@ use openshell_providers::{
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::persistence::{ObjectListQuery, ObjectType, Store};
 use crate::storage_proto::StoredProviderProfile;
@@ -140,10 +143,164 @@ impl ProviderProfileSource for UserProviderProfileSource {
     }
 }
 
+/// A remote profile catalog that does not depend on the store or workspace.
 #[async_trait]
-impl ProviderProfileSource for GatewayInterceptorProfileSource {
+trait RemoteProfileFetch: Send + Sync + std::fmt::Debug {
+    fn source_id(&self) -> &str;
+    async fn fetch(&self) -> Result<ProviderProfileSnapshot, Status>;
+}
+
+/// How often a remote catalog is refreshed in the background.
+const REMOTE_PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a cached remote catalog may be served without a successful
+/// refresh. Past this, builds that need the catalog fail closed: a stale
+/// catalog could keep injecting credentials for an endpoint the source
+/// withdrew.
+const REMOTE_PROFILE_MAX_STALENESS: Duration = Duration::from_mins(1);
+/// Requests that find a stale cache within this long of a failed fetch fail
+/// with that fetch's error instead of fetching again.
+const REMOTE_PROFILE_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
+struct CachedProfileSnapshot {
+    snapshot: ProviderProfileSnapshot,
+    fetched_at: Instant,
+}
+
+/// Caches a remote, global profile catalog.
+///
+/// Requests are served from the cache. A background task refreshes it and
+/// reports revision changes. A request finding no cache (cold start) or a
+/// cache older than the staleness bound fetches synchronously and fails if
+/// that fetch fails.
+#[derive(Debug)]
+struct CachedRemoteProfileSource {
+    remote: Arc<dyn RemoteProfileFetch>,
+    refresh_interval: Duration,
+    max_staleness: Duration,
+    cache: std::sync::Mutex<Option<CachedProfileSnapshot>>,
+    /// Single flight for remote fetches, holding the last failed attempt.
+    fetch_lock: tokio::sync::Mutex<Option<(Instant, Status)>>,
+    changes: Arc<watch::Sender<u64>>,
+}
+
+impl CachedRemoteProfileSource {
+    fn new(
+        remote: Arc<dyn RemoteProfileFetch>,
+        refresh_interval: Duration,
+        max_staleness: Duration,
+        changes: Arc<watch::Sender<u64>>,
+    ) -> Self {
+        Self {
+            remote,
+            refresh_interval,
+            max_staleness,
+            cache: std::sync::Mutex::new(None),
+            fetch_lock: tokio::sync::Mutex::new(None),
+            changes,
+        }
+    }
+
+    fn cached_within(&self, age: Duration) -> Option<ProviderProfileSnapshot> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= age)
+            .map(|cached| cached.snapshot.clone())
+    }
+
+    /// Fetch from the remote and replace the cache, reporting a revision
+    /// change to subscribers. A failed fetch leaves the cache unchanged.
+    async fn refresh(&self) -> Result<ProviderProfileSnapshot, Status> {
+        let mut flight = self.fetch_lock.lock().await;
+        self.fetch_in_flight(&mut flight).await
+    }
+
+    /// Fetch while holding the single-flight lock. Requests that queued
+    /// behind a failed fetch reuse its error instead of fetching again, so an
+    /// unreachable source fails every waiting request after one timeout.
+    async fn fetch_in_flight(
+        &self,
+        last_failure: &mut Option<(Instant, Status)>,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let snapshot = match self.remote.fetch().await {
+            Ok(snapshot) => {
+                *last_failure = None;
+                snapshot
+            }
+            Err(error) => {
+                *last_failure = Some((Instant::now(), error.clone()));
+                return Err(error);
+            }
+        };
+        let changed = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = cache
+                .as_ref()
+                .is_some_and(|cached| cached.snapshot.revision != snapshot.revision);
+            *cache = Some(CachedProfileSnapshot {
+                snapshot: snapshot.clone(),
+                fetched_at: Instant::now(),
+            });
+            changed
+        };
+        if changed {
+            debug!(
+                source_id = %self.remote.source_id(),
+                revision = %snapshot.revision,
+                "remote provider profile catalog changed"
+            );
+            self.changes.send_modify(|generation| *generation += 1);
+        }
+        Ok(snapshot)
+    }
+
+    async fn get(&self) -> Result<ProviderProfileSnapshot, Status> {
+        if let Some(snapshot) = self.cached_within(self.max_staleness) {
+            return Ok(snapshot);
+        }
+        let mut flight = self.fetch_lock.lock().await;
+        // Another request may have fetched while this one waited.
+        if let Some(snapshot) = self.cached_within(self.max_staleness) {
+            return Ok(snapshot);
+        }
+        if let Some((failed_at, error)) = flight.as_ref()
+            && failed_at.elapsed() < REMOTE_PROFILE_RETRY_FLOOR
+        {
+            return Err(error.clone());
+        }
+        self.fetch_in_flight(&mut flight).await
+    }
+
+    async fn run_refresher(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        let mut ticker = tokio::time::interval(self.refresh_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if let Err(error) = self.refresh().await {
+                warn!(
+                    source_id = %self.remote.source_id(),
+                    error = %error.message(),
+                    "provider profile source refresh failed; serving the cached catalog until it is stale"
+                );
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderProfileSource for CachedRemoteProfileSource {
     fn source_id(&self) -> &str {
-        Self::source_id(self)
+        self.remote.source_id()
     }
 
     fn user_managed(&self) -> bool {
@@ -159,6 +316,17 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
         _store: &Store,
         _workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status> {
+        self.get().await
+    }
+}
+
+#[async_trait]
+impl RemoteProfileFetch for GatewayInterceptorProfileSource {
+    fn source_id(&self) -> &str {
+        Self::source_id(self)
+    }
+
+    async fn fetch(&self) -> Result<ProviderProfileSnapshot, Status> {
         let InterceptorProfileSnapshot { revision, profiles } =
             Self::snapshot(self).await.map_err(|err| {
                 openshell_core::rpc_error::unavailable(
@@ -167,7 +335,7 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
                         "provider profile source '{}' snapshot failed: {err}",
                         self.source_id()
                     ),
-                    std::time::Duration::from_secs(1),
+                    Duration::from_secs(1),
                 )
             })?;
         let profiles = profiles
@@ -184,6 +352,10 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSources {
     sources: Vec<Arc<dyn ProviderProfileSource>>,
+    /// Remote sources whose caches need a background refresher.
+    cached: Vec<Arc<CachedRemoteProfileSource>>,
+    /// Bumped whenever a cached remote catalog changes revision.
+    changes: Arc<watch::Sender<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,8 +396,14 @@ impl ProviderProfileSources {
     /// A gateway with nothing imported serves an empty catalog, which is a
     /// valid state, not a startup failure.
     pub fn with_default_sources() -> Self {
+        Self::from_sources(vec![Arc::new(UserProviderProfileSource)])
+    }
+
+    fn from_sources(sources: Vec<Arc<dyn ProviderProfileSource>>) -> Self {
         Self {
-            sources: vec![Arc::new(UserProviderProfileSource)],
+            sources,
+            cached: Vec::new(),
+            changes: Arc::new(watch::channel(0).0),
         }
     }
 
@@ -239,6 +417,8 @@ impl ProviderProfileSources {
 
         let mut source_ids = BTreeSet::new();
         let mut sources: Vec<Arc<dyn ProviderProfileSource>> = Vec::with_capacity(configured.len());
+        let mut cached = Vec::new();
+        let changes = Arc::new(watch::channel(0).0);
         for source in configured {
             let source: Arc<dyn ProviderProfileSource> = match source {
                 GatewayProviderProfileSourceConfig::User => Arc::new(UserProviderProfileSource),
@@ -254,7 +434,14 @@ impl ProviderProfileSources {
                                 "provider profile source interceptor '{name}' is not configured or does not advertise provider_profiles"
                             )
                         })?;
-                    Arc::new(source)
+                    let source = Arc::new(CachedRemoteProfileSource::new(
+                        Arc::new(source),
+                        REMOTE_PROFILE_REFRESH_INTERVAL,
+                        REMOTE_PROFILE_MAX_STALENESS,
+                        changes.clone(),
+                    ));
+                    cached.push(source.clone());
+                    source
                 }
             };
             let source_id = source.source_id().to_string();
@@ -265,7 +452,25 @@ impl ProviderProfileSources {
             }
             sources.push(source);
         }
-        Ok(Self { sources })
+        Ok(Self {
+            sources,
+            cached,
+            changes,
+        })
+    }
+
+    /// Keep remote catalogs refreshed until `shutdown` fires. Without this,
+    /// a remote catalog is fetched again once its cache goes stale.
+    pub fn spawn_refreshers(&self, shutdown: &watch::Receiver<bool>) {
+        for source in &self.cached {
+            tokio::spawn(source.clone().run_refresher(shutdown.clone()));
+        }
+    }
+
+    /// Changes whenever a cached remote catalog changes revision.
+    #[allow(dead_code, reason = "consumed by configuration push publication")]
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     pub fn source_ids(&self) -> Vec<&str> {
@@ -285,14 +490,12 @@ impl ProviderProfileSources {
                 profile,
             })
             .collect();
-        Self {
-            sources: vec![Arc::new(StaticProviderProfileSource {
-                snapshot: ProviderProfileSnapshot {
-                    revision,
-                    profiles: scoped,
-                },
-            })],
-        }
+        Self::from_sources(vec![Arc::new(StaticProviderProfileSource {
+            snapshot: ProviderProfileSnapshot {
+                revision,
+                profiles: scoped,
+            },
+        })])
     }
 
     /// A source-managed catalog composed with the user-managed source.
@@ -304,7 +507,7 @@ impl ProviderProfileSources {
     pub(crate) fn from_test_profiles_with_user_source(profiles: Vec<ProviderProfile>) -> Self {
         let mut sources = Self::from_test_profiles(profiles).sources;
         sources.push(Arc::new(UserProviderProfileSource));
-        Self { sources }
+        Self::from_sources(sources)
     }
 
     #[cfg(test)]
@@ -316,24 +519,22 @@ impl ProviderProfileSources {
             !snapshots.is_empty(),
             "test snapshot sequence must not be empty"
         );
-        Self {
-            sources: vec![Arc::new(SequencedProviderProfileSource {
-                snapshots: snapshots
-                    .into_iter()
-                    .map(|(revision, profiles)| ProviderProfileSnapshot {
-                        revision,
-                        profiles: profiles
-                            .into_iter()
-                            .map(|profile| ScopedSnapshotProfile {
-                                scope: ProfileScope::Static,
-                                profile,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                fetch_count,
-            })],
-        }
+        Self::from_sources(vec![Arc::new(SequencedProviderProfileSource {
+            snapshots: snapshots
+                .into_iter()
+                .map(|(revision, profiles)| ProviderProfileSnapshot {
+                    revision,
+                    profiles: profiles
+                        .into_iter()
+                        .map(|profile| ScopedSnapshotProfile {
+                            scope: ProfileScope::Static,
+                            profile,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            fetch_count,
+        })])
     }
 
     pub(crate) async fn snapshot_catalog(
@@ -2209,5 +2410,210 @@ mod tests {
             .expect("custom profile reusing unloaded default ID");
         assert_eq!(resolved.id, "github");
         assert_eq!(resolved.display_name, "Private GitHub");
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeRemote {
+        revision: std::sync::Mutex<String>,
+        failing: std::sync::atomic::AtomicBool,
+        fetches: AtomicUsize,
+    }
+
+    impl FakeRemote {
+        fn serving(revision: &str) -> Arc<Self> {
+            let remote = Arc::new(Self::default());
+            remote.set_revision(revision);
+            remote
+        }
+
+        fn set_revision(&self, revision: &str) {
+            *self.revision.lock().unwrap() = revision.to_string();
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.failing.store(failing, Ordering::SeqCst);
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RemoteProfileFetch for FakeRemote {
+        fn source_id(&self) -> &'static str {
+            "fake-remote"
+        }
+
+        async fn fetch(&self) -> Result<ProviderProfileSnapshot, Status> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(Status::unavailable("remote down"));
+            }
+            Ok(ProviderProfileSnapshot {
+                revision: self.revision.lock().unwrap().clone(),
+                profiles: Vec::new(),
+            })
+        }
+    }
+
+    fn cached_source(
+        remote: &Arc<FakeRemote>,
+    ) -> (CachedRemoteProfileSource, watch::Receiver<u64>) {
+        let changes = Arc::new(watch::channel(0).0);
+        let receiver = changes.subscribe();
+        (
+            CachedRemoteProfileSource::new(
+                remote.clone(),
+                Duration::from_secs(10),
+                Duration::from_mins(1),
+                changes,
+            ),
+            receiver,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_remote_source_fetches_once_on_cold_start_then_serves_cache() {
+        let remote = FakeRemote::serving("r1");
+        let (source, _changes) = cached_source(&remote);
+
+        assert_eq!(source.get().await.unwrap().revision, "r1");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(source.get().await.unwrap().revision, "r1");
+        assert_eq!(
+            remote.fetches(),
+            1,
+            "requests inside the staleness bound hit the cache"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_remote_source_cold_start_fails_closed_when_remote_is_down() {
+        let remote = FakeRemote::serving("r1");
+        remote.set_failing(true);
+        let (source, _changes) = cached_source(&remote);
+
+        assert_eq!(
+            source.get().await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        remote.set_failing(false);
+        tokio::time::advance(REMOTE_PROFILE_RETRY_FLOOR).await;
+        assert_eq!(source.get().await.unwrap().revision, "r1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_remote_source_reports_revision_changes_only() {
+        let remote = FakeRemote::serving("r1");
+        let (source, mut changes) = cached_source(&remote);
+        source.get().await.unwrap();
+        assert!(
+            !changes.has_changed().unwrap(),
+            "cold start is not a change"
+        );
+
+        source.refresh().await.unwrap();
+        assert!(
+            !changes.has_changed().unwrap(),
+            "same revision is not a change"
+        );
+
+        remote.set_revision("r2");
+        source.refresh().await.unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        assert_eq!(source.get().await.unwrap().revision, "r2");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_remote_source_serves_stale_cache_only_within_bound() {
+        let remote = FakeRemote::serving("r1");
+        let (source, _changes) = cached_source(&remote);
+        source.get().await.unwrap();
+        remote.set_failing(true);
+
+        // A failed background refresh keeps serving the cached catalog.
+        assert!(source.refresh().await.is_err());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert_eq!(source.get().await.unwrap().revision, "r1");
+
+        // Past the staleness bound the request fetches and fails closed.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            source.get().await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+
+        remote.set_failing(false);
+        tokio::time::advance(REMOTE_PROFILE_RETRY_FLOOR).await;
+        assert_eq!(source.get().await.unwrap().revision, "r1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_remote_source_refresher_runs_on_interval_until_shutdown() {
+        let remote = FakeRemote::serving("r1");
+        let (source, mut changes) = cached_source(&remote);
+        let source = Arc::new(source);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(source.clone().run_refresher(shutdown_rx));
+
+        // The first tick fires immediately and fills the cache.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(remote.fetches(), 1);
+        remote.set_revision("r2");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(remote.fetches(), 2);
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(remote.fetches(), 2);
+        assert_eq!(source.get().await.unwrap().revision, "r2");
+    }
+
+    #[derive(Debug)]
+    struct SlowFailingRemote {
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RemoteProfileFetch for SlowFailingRemote {
+        fn source_id(&self) -> &'static str {
+            "slow-failing-remote"
+        }
+
+        async fn fetch(&self) -> Result<ProviderProfileSnapshot, Status> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(Status::unavailable("remote down"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_remote_fails_concurrent_requests_after_one_timeout() {
+        let remote = Arc::new(SlowFailingRemote {
+            fetches: AtomicUsize::new(0),
+        });
+        let source = Arc::new(CachedRemoteProfileSource::new(
+            remote.clone(),
+            Duration::from_secs(10),
+            Duration::from_mins(1),
+            Arc::new(watch::channel(0).0),
+        ));
+        let started = Instant::now();
+        let requests: Vec<_> = (0..10)
+            .map(|_| {
+                let source = source.clone();
+                tokio::spawn(async move { source.get().await })
+            })
+            .collect();
+        for request in requests {
+            assert!(request.await.unwrap().is_err());
+        }
+        assert_eq!(remote.fetches.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

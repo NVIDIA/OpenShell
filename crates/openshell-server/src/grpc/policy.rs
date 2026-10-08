@@ -10,6 +10,7 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+pub mod config_snapshot;
 mod endpoint_status;
 mod provisioning_clock;
 #[cfg(test)]
@@ -54,12 +55,11 @@ use openshell_core::proto::{
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderReadinessReason,
-    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse,
+    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision,
+    SettingScope, SettingValue, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -2777,253 +2777,12 @@ pub(super) async fn load_sandbox_config(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<GetSandboxConfigResponse, Status> {
-    let sandbox_id = sandbox.object_id().to_string();
-    let workspace = sandbox.object_workspace().to_string();
-    let sandbox_provider_names = sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.providers.clone())
-        .unwrap_or_default();
-    let provider_profile_catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await?;
-
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let global_policy = decode_policy_from_global_settings(&global_settings)?;
-    let mut global_policy_version: u32 = 0;
-
-    // Try to get the latest policy from the policy history table. Under a
-    // global override, only the sandbox version metadata is observed; the
-    // dormant payload is neither decoded nor validated.
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
-
-    let (mut policy, version, mut policy_hash, policy_source) = if let Some(global_policy) =
-        global_policy
-    {
-        let version = latest
-            .as_ref()
-            .map(|record| u32::try_from(record.version).unwrap_or(0))
-            .filter(|version| *version > 0)
-            .unwrap_or(1);
-        let hash = deterministic_policy_hash(&global_policy);
-        (Some(global_policy), version, hash, PolicySource::Global)
-    } else if let Some(record) = latest {
-        let (policy, hash) = canonical_policy_record_identity(&record)?;
-        debug!(
-            sandbox_id = %sandbox_id,
-            version = record.version,
-            "GetSandboxConfig served from policy history"
-        );
-        (
-            Some(policy),
-            u32::try_from(record.version).unwrap_or(0),
-            hash,
-            PolicySource::Sandbox,
-        )
-    } else {
-        // Lazy backfill: no policy history exists yet.
-        let spec = sandbox
-            .spec
-            .as_ref()
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
-        match spec.policy.clone() {
-            None => {
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig: no policy configured, returning empty response"
-                );
-                (None, 0, String::new(), PolicySource::Sandbox)
-            }
-            Some(spec_policy) => {
-                // Stored specs may predate the current schema. Validate before
-                // creating policy history so malformed state is never copied or
-                // marked loaded, and hash the canonical representation.
-                let spec_policy = validate_and_canonicalize_stored_policy(
-                    spec_policy,
-                    STORED_POLICY_SOURCE_SPEC,
-                )?;
-                let hash = deterministic_policy_hash(&spec_policy);
-                let payload = spec_policy.encode_to_vec();
-                let policy_id = uuid::Uuid::new_v4().to_string();
-
-                if let Err(e) = state
-                    .store
-                    .put_policy_revision(&policy_id, &sandbox_id, &workspace, 1, &payload, &hash)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to backfill policy version 1"
-                    );
-                } else if let Err(e) = state
-                    .store
-                    .update_policy_status(&sandbox_id, 1, "loaded", None, None)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to mark backfilled policy as loaded"
-                    );
-                }
-
-                info!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig served from spec (backfilled version 1)"
-                );
-
-                (Some(spec_policy), 1, hash, PolicySource::Sandbox)
-            }
-        }
-    };
-
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let sandbox_settings =
-        load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let provider_records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        &workspace,
-        &sandbox_provider_names,
+    config_snapshot::load_and_build_sandbox_config(
+        state,
+        sandbox,
+        crate::gateway_metrics::BuildTrigger::Request,
     )
-    .await?;
-    let mut provider_policy_context =
-        provider_policy_context_from_records(&provider_profile_catalog, &provider_records);
-
-    if matches!(policy_source, PolicySource::Global)
-        && let Ok(Some(global_rev)) = state
-            .store
-            .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
-            .await
-    {
-        global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
-    }
-
-    if let Some(source_policy) = policy.as_mut() {
-        // Never trust provenance supplied by a persisted/user-authored policy.
-        // The gateway derives it from the attached provider catalog below.
-        clear_provider_credentialed_markers(source_policy);
-    }
-
-    if !matches!(policy_source, PolicySource::Global)
-        && let Some(source_policy) = policy.as_ref()
-        && !provider_policy_context.layers.is_empty()
-    {
-        let effective_policy =
-            compose_effective_policy(source_policy, &provider_policy_context.layers);
-        let effective_policy =
-            validate_and_canonicalize_policy(effective_policy).map_err(|error| {
-                Status::failed_precondition(format!(
-                    "provider composition produced an invalid effective policy: {}",
-                    error.message()
-                ))
-            })?;
-        validate_policy_safety(&effective_policy).map_err(|error| {
-            Status::failed_precondition(format!(
-                "provider composition produced an invalid effective policy: {}",
-                error.message()
-            ))
-        })?;
-        policy_hash = deterministic_policy_hash(&effective_policy);
-        policy = Some(effective_policy);
-    }
-
-    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
-    extend_credentialed_scopes_from_policy_bindings(
-        &mut provider_policy_context.credentialed_scopes,
-        &policy_credential_bindings,
-        &provider_policy_context.endpointless_provider_names,
-    );
-    let mut configuration_error = String::new();
-    if let Some(effective_policy) = policy.as_mut() {
-        stamp_provider_credentialed_endpoints(
-            effective_policy,
-            &provider_policy_context.credentialed_scopes,
-        );
-        if matches!(policy_source, PolicySource::Global) {
-            openshell_core::policy_identity::stamp_global_token_grant_owners(effective_policy);
-        }
-        if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
-            configuration_error = bounded_configuration_diagnostic(error.message());
-        }
-        policy_hash = deterministic_policy_hash(effective_policy);
-    }
-
-    if let Some(policy) = policy.as_ref() {
-        state
-            .middleware_registry
-            .ensure_policy_middlewares_registered(policy)
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "effective policy middleware registration is invalid: {error}"
-                ))
-            })?;
-    }
-
-    let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
-    let supervisor_middleware_services =
-        state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision_with_validation_mode(
-        policy.as_ref(),
-        &settings,
-        policy_source,
-        &supervisor_middleware_services,
-        state.config.policy_validation_failure_mode,
-        state.extension_jwt_issuer.is_some(),
-    );
-    if let Some(policy) = policy.as_ref() {
-        validate_policy_credential_binding_context(
-            &provider_profile_catalog,
-            &provider_records,
-            policy,
-            &policy_credential_bindings,
-        )?;
-    }
-    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
-        &provider_profile_catalog,
-        &provider_records,
-        &policy_credential_bindings,
-        policy
-            .as_ref()
-            .filter(|_| matches!(policy_source, PolicySource::Global)),
-    )?;
-
-    Ok(GetSandboxConfigResponse {
-        configuration_instance_id: sandbox
-            .status
-            .as_ref()
-            .and_then(|status| status.configuration_admission.as_ref())
-            .map_or_else(String::new, |admission| admission.instance_id.clone()),
-        configuration_admitted: policy.is_some() && configuration_error.is_empty(),
-        configuration_error,
-        policy,
-        version,
-        policy_hash,
-        settings,
-        config_revision,
-        policy_source: policy_source.into(),
-        global_policy_version,
-        provider_env_revision,
-        supervisor_middleware_services,
-        workspace,
-        policy_validation_failure_mode: state
-            .config
-            .policy_validation_failure_mode
-            .as_str()
-            .to_string(),
-        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
-        provider_attachment_epoch: sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.provider_attachment_epoch.clone())
-            .unwrap_or_default(),
-    })
+    .await
 }
 
 #[cfg(test)]
@@ -3560,153 +3319,13 @@ pub(super) async fn load_sandbox_provider_environment(
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
 ) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
-    let sandbox_id = sandbox.object_id().to_string();
-    let workspace = sandbox.object_workspace().to_string();
-
-    let spec = sandbox
-        .spec
-        .as_ref()
-        .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
-    let provider_names = spec.providers.clone();
-    let provider_profile_catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await?;
-    let provider_records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        &workspace,
-        &provider_names,
-    )
-    .await?;
-    let (effective_policy, policy_source) = current_effective_policy_from_records(
-        state.as_ref(),
-        &provider_profile_catalog,
+    config_snapshot::load_and_build_provider_environment(
+        state,
         sandbox,
-        &sandbox_id,
-        &provider_records,
+        supports_static_credential_bindings,
+        crate::gateway_metrics::BuildTrigger::Request,
     )
-    .await?;
-    let policy_credential_bindings =
-        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
-    validate_policy_credential_binding_context(
-        &provider_profile_catalog,
-        &provider_records,
-        &effective_policy,
-        &policy_credential_bindings,
-    )?;
-    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
-        &provider_profile_catalog,
-        &provider_records,
-        &policy_credential_bindings,
-        matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
-    )?;
-    let mut provider_environment =
-        super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            state.store.as_ref(),
-            &provider_profile_catalog,
-            &provider_records,
-            &policy_credential_bindings,
-            &state.credentials,
-            Some(&sandbox_id),
-        )
-        .await?;
-
-    if matches!(policy_source, PolicySource::Global) {
-        // A global policy replaces provider ACLs. Grants retain their profile
-        // destination selectors, but only the selected global endpoint may
-        // authorize their use. Keeping every global owner avoids reimplementing
-        // host/path intersection here; the relay checks both selectors.
-        let mut owners: Vec<_> = effective_policy
-            .network_policies
-            .values()
-            .flat_map(|rule| &rule.endpoints)
-            .map(|endpoint| endpoint.token_grant_owner.clone())
-            .filter(|owner| !owner.is_empty())
-            .collect();
-        owners.sort();
-        owners.dedup();
-        for credential in provider_environment.dynamic_credentials.values_mut() {
-            credential.token_grant_owners.clone_from(&owners);
-        }
-    }
-
-    let mut readiness_reason = provider_environment.readiness_reason;
-
-    if supports_static_credential_bindings {
-        let unbound_static_keys = provider_environment
-            .static_credential_keys
-            .iter()
-            .filter(|key| {
-                !provider_environment
-                    .static_credential_bindings
-                    .contains_key(*key)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unbound_static_keys.is_empty() {
-            readiness_reason = ProviderReadinessReason::CredentialsWithheld;
-        }
-        for key in unbound_static_keys {
-            warn!(
-                sandbox_id = %sandbox_id,
-                key = %key,
-                "withholding unbound static provider credential from binding-capable supervisor"
-            );
-            provider_environment.environment.remove(&key);
-            provider_environment
-                .credential_expiration_times
-                .remove(&key);
-            provider_environment.static_credential_keys.remove(&key);
-        }
-    } else {
-        if !provider_environment.static_credential_keys.is_empty() {
-            readiness_reason = ProviderReadinessReason::UnsupportedSupervisor;
-        }
-        for key in &provider_environment.static_credential_keys {
-            provider_environment.environment.remove(key);
-            provider_environment.credential_expiration_times.remove(key);
-        }
-        provider_environment.static_credential_bindings.clear();
-    }
-
-    info!(
-        sandbox_id = %sandbox_id,
-        provider_count = provider_names.len(),
-        env_count = provider_environment.environment.len(),
-        provider_env_revision,
-        "GetSandboxProviderEnvironment request completed successfully"
-    );
-
-    let non_secret_environment_keys = provider_environment
-        .environment
-        .keys()
-        .filter(|key| !provider_environment.static_credential_keys.contains(*key))
-        .cloned()
-        .collect();
-
-    let credential_expiration_times = provider_environment
-        .credential_expiration_times
-        .into_iter()
-        .filter_map(|(key, value)| {
-            openshell_core::time::optional_timestamp_from_legacy_millis(value)
-                .ok()
-                .flatten()
-                .map(|timestamp| (key, timestamp))
-        })
-        .collect();
-    Ok(GetSandboxProviderEnvironmentResponse {
-        environment: provider_environment.environment,
-        files: provider_environment.files,
-        provider_env_revision,
-        credential_expiration_times,
-        dynamic_credentials: provider_environment.dynamic_credentials,
-        static_credential_bindings: provider_environment.static_credential_bindings,
-        non_secret_environment_keys,
-        provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
-        policy_hash: deterministic_policy_hash(&effective_policy),
-        readiness_reason: readiness_reason.into(),
-    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -7723,6 +7342,7 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::{authed_request, test_server_state};
+    use openshell_core::proto::ProviderReadinessReason;
 
     /// An in-memory store with the example profiles imported at platform scope.
     ///
@@ -14128,7 +13748,6 @@ mod tests {
         state.store.put_message(&replacement).await.unwrap();
 
         let first_environment = crate::grpc::provider::resolve_provider_environment_from_records(
-            state.store.as_ref(),
             &catalog,
             &first_records,
         )
@@ -14169,7 +13788,6 @@ mod tests {
             compute_provider_env_revision_from_records(&catalog, &replacement_records).unwrap();
         let replacement_environment =
             crate::grpc::provider::resolve_provider_environment_from_records(
-                state.store.as_ref(),
                 &catalog,
                 &replacement_records,
             )
