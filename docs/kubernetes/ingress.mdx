@@ -226,6 +226,8 @@ If the release uses `workload.kind=deployment`, this upgrade replaces the Deploy
 
 Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm SSH host or port values are required.
 
+When a Gateway terminates TLS, register its externally reachable `https://` endpoint with the CLI. OpenShell uses that registered endpoint for `sandbox connect`, `sandbox exec`, and port forwarding, even when the gateway pod reports an internal plaintext endpoint.
+
 ## Next Steps
 
 Return to [Setup](/kubernetes/setup) to complete the installation.
