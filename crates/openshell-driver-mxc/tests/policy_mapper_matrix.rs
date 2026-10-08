@@ -953,12 +953,12 @@ fn b_run_as_group_warning() {
     assert_single_loss(&r.loss, "run_as_group", "warning", "process.run_as_group");
 }
 
-/// Seam-level: EmbeddedPolicyMapper.map over a policy with one error-class field
-/// (a port) via MapCtx{egress: None} returns Err(MapError::Unsupported(_)).
+/// Seam-level: EmbeddedPolicyMapper.map over a policy with unsupported fields
+/// via MapCtx{egress: None} returns Err(MapError::Unsupported(_)).
 #[test]
 fn b_seam_returns_unsupported_on_error_field() {
     let mapper = EmbeddedPolicyMapper;
-    // isolation_session containment + network policy → error loss from add_backend_specific_config.
+    // isolation_session containment cannot enforce filesystem or network policy.
     let mut policy = SandboxPolicy {
         filesystem: Some(FilesystemPolicy {
             read_write: vec!["C:/work".into()],
@@ -987,6 +987,30 @@ fn b_seam_returns_unsupported_on_error_field() {
     assert!(
         matches!(err, MapError::Unsupported(_)),
         "seam must return MapError::Unsupported for error-class losses; got: {err:?}"
+    );
+}
+
+#[test]
+fn b_isolation_session_reports_filesystem_grants_as_error() {
+    let policy = SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            read_write: vec!["C:/work".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(
+        &policy,
+        &MxcMappingOptions {
+            containment: "isolation_session".into(),
+            ..Default::default()
+        },
+    );
+    assert_single_loss(
+        &result.loss,
+        "filesystem_policy.grants",
+        "error",
+        "isolation_session filesystem grants",
     );
 }
 

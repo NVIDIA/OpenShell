@@ -506,9 +506,18 @@ impl WxcExecInvoker {
 
     /// Run the provision phase and return the `sandboxId` from the response.
     pub async fn provision(&self, filesystem: MxcFilesystem) -> Result<String, InvokerError> {
+        if !filesystem.readwrite_paths.is_empty()
+            || !filesystem.readonly_paths.is_empty()
+            || !filesystem.denied_paths.is_empty()
+        {
+            return Err(InvokerError::Mxc {
+                code: "policy_validation".into(),
+                message: "MXC 1.0 isolation_session cannot enforce filesystem grants".into(),
+            });
+        }
         if self.mock {
-            // Mock provision: mint a synthetic `iso:` id and record the granted
-            // read-write paths so the mock exec can enforce the policy.
+            // Mock provision: mint a synthetic `iso:` id. IsolationSession has
+            // no filesystem grants in MXC 1.0, so the recorded grant set is empty.
             let id = format!("iso:mock-{}", uuid::Uuid::new_v4());
             let grants: Vec<String> = filesystem
                 .readwrite_paths
@@ -1037,6 +1046,25 @@ mod tests {
         assert_eq!(config["version"], "1.0.0");
         assert!(config.get("phase").is_none());
         assert!(config.get("sandboxId").is_none());
+    }
+
+    #[tokio::test]
+    async fn isolation_provision_rejects_filesystem_grants() {
+        let invoker = WxcExecInvoker::mocked("unused");
+        let error = invoker
+            .provision(MxcFilesystem {
+                readwrite_paths: vec![r"C:\work\demo".into()],
+                ..Default::default()
+            })
+            .await
+            .expect_err("isolation_session must not silently drop filesystem grants");
+        match error {
+            InvokerError::Mxc { code, message } => {
+                assert_eq!(code, "policy_validation");
+                assert!(message.contains("cannot enforce filesystem grants"));
+            }
+            other => panic!("expected MXC policy validation error, got {other}"),
+        }
     }
 
     #[test]

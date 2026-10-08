@@ -4150,6 +4150,24 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn isolation_session_rejects_filesystem_before_lifecycle_side_effects() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::IsolationSession,
+            ..Default::default()
+        });
+        let policy = fs_policy(&["C:/work/demo"]);
+        let sandbox = with_policy(driver_sandbox("sb-iso-filesystem"), policy);
+        let error = backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("isolation filesystem grants must be rejected synchronously");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("filesystem_policy"));
+        assert!(backend.list_sandboxes().await.is_empty());
+        assert!(crate::mxc::mock_recorded_config("sb-iso-filesystem").is_none());
+    }
+
+    #[tokio::test]
     async fn negative_out_of_policy_write_is_denied_with_event() {
         let share_tmp = tempfile::tempdir().unwrap();
         let out_tmp = tempfile::tempdir().unwrap();

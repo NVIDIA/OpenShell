@@ -410,11 +410,19 @@ fn split_policy_rejects_proxy_redirect_on_isolation_session() {
         .collect();
     assert_eq!(
         errors.len(),
-        1,
-        "expected one containment error: {errors:?}"
+        2,
+        "expected filesystem and containment errors: {errors:?}"
     );
-    assert_eq!(errors[0].path, "containment");
-    assert!(errors[0].message.contains("processcontainer"));
+    let filesystem = errors
+        .iter()
+        .find(|item| item.path == "filesystem_policy.grants")
+        .expect("isolation_session filesystem error");
+    assert!(filesystem.message.contains("cannot enforce"));
+    let containment = errors
+        .iter()
+        .find(|item| item.path == "containment")
+        .expect("isolation_session proxy-containment error");
+    assert!(containment.message.contains("processcontainer"));
     assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 

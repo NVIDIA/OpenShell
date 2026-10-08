@@ -104,3 +104,29 @@ pub fn add_backend_network_loss(
         _ => {}
     }
 }
+
+/// Reject filesystem grants on stable-schema backends that cannot enforce
+/// them. Empty filesystem lists remain valid because they do not claim a grant.
+pub fn add_backend_filesystem_loss(
+    policy: &SandboxPolicy,
+    containment: &str,
+    items: &mut Vec<LossItem>,
+) {
+    let Some(filesystem) = &policy.filesystem else {
+        return;
+    };
+    if containment == "isolation_session"
+        && (filesystem.include_workdir
+            || !filesystem.read_only.is_empty()
+            || !filesystem.read_write.is_empty())
+    {
+        add_loss(
+            items,
+            "filesystem_policy.grants",
+            "error",
+            "MXC 1.0 isolation_session cannot enforce OpenShell filesystem grants.",
+            "filesystem path grants",
+            "The caller must reject the mapping instead of silently dropping the grants.",
+        );
+    }
+}

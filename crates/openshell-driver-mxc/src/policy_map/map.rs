@@ -17,8 +17,8 @@ use openshell_core::proto::{
 use serde_json::{Value, json};
 
 use super::config::{
-    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, add_backend_network_loss,
-    add_backend_specific_config, filesystem_default_deny_message,
+    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, add_backend_filesystem_loss,
+    add_backend_network_loss, add_backend_specific_config, filesystem_default_deny_message,
 };
 use super::loss::{LossItem, add_loss};
 
@@ -137,6 +137,7 @@ fn build_split_mxc_config(
     }
 
     let filesystem = map_filesystem(policy, opts, items);
+    add_backend_filesystem_loss(policy, &opts.containment, items);
 
     let proxy_supported = matches!(opts.containment.as_str(), "processcontainer" | "process");
     if !proxy_supported {
@@ -245,6 +246,7 @@ fn build_mxc_config(
     }
 
     let filesystem = map_filesystem(policy, opts, items);
+    add_backend_filesystem_loss(policy, &opts.containment, items);
     let allow_rules = map_network(policy, opts, items);
     let has_direct_egress = !allow_rules.is_empty();
     let mut egress = json!({ "default": "deny" });
