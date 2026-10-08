@@ -31,9 +31,13 @@ use openshell_ocsf::{
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
+
+#[cfg(test)]
+mod token_grant_ownership_tests;
 
 const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
@@ -67,6 +71,10 @@ pub struct L7EvalContext {
     /// resolver. Used to reject a request if credentials change again before
     /// its first upstream write.
     pub(crate) provider_credential_revision: Option<u64>,
+    /// Installation that supplied an inspected request's dynamic credentials.
+    /// Repairs may retain the revision, so keep this identity across the grant
+    /// await and the final static-credential scoping before the upstream write.
+    pub(crate) provider_credential_installation_id: Option<String>,
     pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
@@ -106,7 +114,11 @@ fn scoped_context_for_request(
         // signing attempt fail closed before an upstream write.
         scoped.secret_resolver = None;
         scoped.body_classifier = None;
-        scoped.provider_credential_revision = None;
+        // A dynamic grant may already be installed on this request. Keep its
+        // generation pin across body buffering even without static authority.
+        if scoped.provider_credential_installation_id.is_none() {
+            scoped.provider_credential_revision = None;
+        }
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
@@ -121,10 +133,88 @@ fn scoped_context_for_request(
 fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
-    Some(crate::l7::rest::CredentialGenerationGuard::new(
-        ctx.provider_credentials.as_ref()?,
-        ctx.provider_credential_revision?,
-    ))
+    Some(
+        crate::l7::rest::CredentialGenerationGuard::new(
+            ctx.provider_credentials.as_ref()?,
+            ctx.provider_credential_revision?,
+        )
+        .with_installation_id(ctx.provider_credential_installation_id.as_deref()),
+    )
+}
+
+/// Resolve a grant from the provider installation and policy owners admitted
+/// for this request. Provider refresh is independent of tunnel lifetime: the
+/// connection's original dynamic map cannot authorize a later request.
+pub(crate) async fn prepare_inspected_request(
+    req: crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    engine: &TunnelPolicyEngine,
+    config: &L7EndpointConfig,
+    request_info: &L7RequestInfo,
+) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
+    let mut scoped = ctx.clone();
+    let snapshot = ctx
+        .provider_credentials
+        .as_ref()
+        .map(openshell_core::provider_credentials::ProviderCredentialState::snapshot);
+    if let Some(snapshot) = &snapshot {
+        scoped.provider_credential_revision = Some(snapshot.revision);
+        scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+    }
+    // Admission-gated injection reads credentials only from the pinned snapshot,
+    // so a context without one never acquires a grant.
+    let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
+        snapshot
+            .dynamic_credentials
+            .values()
+            .any(|credential| credential.token_grant.is_some())
+    });
+    let req = if let Some(snapshot) = grant_snapshot {
+        // Middleware can replace an inspected body. Recompute owner admission for
+        // the body that will be sent, even when another endpoint allowed both the
+        // original and transformed requests. Request method/path/query are immutable.
+        let mut current_info = request_info.clone();
+        match config.protocol {
+            L7Protocol::Graphql => {
+                let body = req
+                    .raw_header
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .and_then(|end| req.raw_header.get(end + 4..))
+                    .unwrap_or_default();
+                current_info.graphql = Some(crate::l7::graphql::classify_request(&req, body));
+            }
+            L7Protocol::JsonRpc | L7Protocol::Mcp => {
+                let mut options = crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+                if let Some(revision) = request_info
+                    .jsonrpc
+                    .as_ref()
+                    .and_then(|info| info.mcp_revision)
+                {
+                    options = options.with_mcp_revision(revision);
+                }
+                current_info.jsonrpc = Some(
+                    crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(&req, options)?,
+                );
+            }
+            L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
+        }
+        let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+        crate::l7::token_grant_injection::inject_for_admitted_owners(
+            req, &scoped, snapshot, &owners,
+        )
+        .await?
+    } else {
+        req
+    };
+    if engine.is_stale() {
+        return Err(miette!("policy changed during token grant resolution"));
+    }
+    if let Some(guard) = credential_generation_guard(&scoped) {
+        guard.ensure_current()?;
+    }
+    let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
+    Ok((req, scoped))
 }
 
 fn request_authority_matches_endpoint(
@@ -534,6 +624,98 @@ pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
         .await
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()
+}
+
+struct InspectedForwarding<'a> {
+    config: &'a L7EndpointConfig,
+    engine: &'a TunnelPolicyEngine,
+    request_info: &'a L7RequestInfo,
+    request_id: &'a str,
+    response_chain: &'a [openshell_supervisor_middleware::ChainEntry],
+    websocket_middleware: bool,
+    observation_context: Option<&'a openshell_core::endpoint_status::EndpointObservationContext>,
+}
+
+// Every inspected HTTP relay enters here after policy and request middleware.
+// Keep credential preparation and the guarded upstream write together so new
+// protocol relays cannot accidentally forward without required authentication.
+async fn forward_inspected_request<C, U>(
+    request: crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &mut L7EvalContext,
+    forwarding: InspectedForwarding<'_>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let InspectedForwarding {
+        config,
+        engine,
+        request_info,
+        request_id,
+        response_chain,
+        websocket_middleware,
+        observation_context,
+    } = forwarding;
+    let (request, grant_ctx) =
+        match prepare_inspected_request(request, ctx, engine, config, request_info).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(error = %error, "Token grant failed before forwarding");
+                write_bad_gateway_response(client).await?;
+                return Ok(None);
+            }
+        };
+    *ctx = grant_ctx;
+    let observer = EndpointObserver::begin_captured(
+        ctx.endpoint_observation_tx.as_ref(),
+        config,
+        observation_context,
+        ctx.provider_credential_revision,
+        Some(engine.generation_guard()),
+    );
+    relay_http_request_with_credential_rejection_observed(
+        &request,
+        client,
+        upstream,
+        crate::l7::rest::RelayRequestOptions {
+            resolver: ctx.secret_resolver.as_deref(),
+            body_classifier: ctx.body_classifier.as_deref(),
+            mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
+                crate::l7::rest::McpRequestValidation {
+                    config,
+                    ctx,
+                    redacted_target: &request_info.target,
+                },
+            ),
+            credential_generation: credential_generation_guard(ctx),
+            generation_guard: Some(engine.generation_guard()),
+            websocket_extensions: websocket_extension_mode(config, websocket_middleware),
+            request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                && config.request_body_credential_rewrite,
+            deny_uninspected_credentials: config
+                .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+            credential_signing: config.credential_signing,
+            signing_service: &config.signing_service,
+            signing_region: &config.signing_region,
+            host: &ctx.host,
+            port: ctx.port,
+        },
+        ctx,
+        Some(http_response_middleware_relay(
+            &request,
+            ctx,
+            "https",
+            request_id,
+            response_chain,
+            engine.middleware_runner(),
+            Some(engine.generation_guard()),
+        )),
+        observer.as_ref(),
+    )
+    .await
 }
 
 async fn relay_http_request_with_credential_rejection<C, U>(
@@ -1257,18 +1439,6 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            // Credential scoping can acquire a newer revision after middleware.
-            // Bind its actual snapshot to the original authority, never a fresh
-            // epoch; the earlier handle served only pre-forward local decisions.
-            let observer = EndpointObserver::begin_captured(
-                ctx.endpoint_observation_tx.as_ref(),
-                config,
-                observation_context.as_ref(),
-                ctx.provider_credential_revision,
-                Some(engine.generation_guard()),
-            );
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -1302,49 +1472,25 @@ where
             } else {
                 None
             };
-            let outcome_result = relay_http_request_with_credential_rejection_observed(
-                &req,
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
-                        crate::l7::rest::McpRequestValidation {
-                            config,
-                            ctx,
-                            redacted_target: &redacted_target,
-                        },
-                    ),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine: &engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
-                observer.as_ref(),
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
@@ -1413,7 +1559,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req.query_params,
+                        &query_params,
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -2068,60 +2214,25 @@ where
             } else {
                 None
             };
-            let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
-            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-
-            // Forward request to upstream and relay response
-            let outcome_result = relay_http_request_with_credential_rejection(
-                &req_with_auth,
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: None,
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: None,
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req_with_auth,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
@@ -2174,7 +2285,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req_with_auth.query_params,
+                        &query_params,
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -2502,49 +2613,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            // The outgoing resolver and revision are one snapshot. Rebind using
-            // the original authority so a newly scoped provider revision cannot
-            // publish its result under the earlier inventory.
-            let observer = EndpointObserver::begin_captured(
-                ctx.endpoint_observation_tx.as_ref(),
-                config,
-                observation_context.as_ref(),
-                ctx.provider_credential_revision,
-                Some(engine.generation_guard()),
-            );
-            // Policy inspects client request bodies. Response bodies and SSE
-            // messages remain opaque and are relayed without MCP inspection.
-            let Some(outcome) = relay_http_request_with_credential_rejection_observed(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
-                        crate::l7::rest::McpRequestValidation {
-                            config,
-                            ctx,
-                            redacted_target: &redacted_target,
-                        },
-                    ),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
-                observer.as_ref(),
             )
             .await?
             else {
@@ -2804,29 +2887,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            let Some(outcome) = relay_http_request_with_credential_rejection(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: None,
                 },
-                ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
             )
             .await?
             else {
@@ -3248,6 +3323,85 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
     })
 }
 
+/// A batch may be allowed by several endpoints, but one credential owner must
+/// admit every member before its token can authenticate the combined request.
+fn admitted_token_grant_owners(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if let Some(jsonrpc) = &request.jsonrpc
+        && jsonrpc.is_batch
+        && !jsonrpc.calls.is_empty()
+    {
+        let mut owners = if jsonrpc.has_response {
+            Some(admitted_token_grant_owners_once(engine, ctx, request)?)
+        } else {
+            None
+        };
+        for call in &jsonrpc.calls {
+            let admitted = admitted_token_grant_owners_once(
+                engine,
+                ctx,
+                &jsonrpc_request_for_call(request, call),
+            )?;
+            if let Some(owners) = &mut owners {
+                owners.retain(|owner| admitted.contains(owner));
+            } else {
+                owners = Some(admitted);
+            }
+        }
+        return Ok(owners.unwrap_or_default());
+    }
+    admitted_token_grant_owners_once(engine, ctx, request)
+}
+
+fn admitted_token_grant_owners_once(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if engine.is_stale() {
+        return Err(miette!("policy changed before token grant selection"));
+    }
+    let mut engine = engine
+        .engine()
+        .lock()
+        .map_err(|_| miette!("OPA engine lock poisoned"))?;
+    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    let owners = engine
+        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+        .map_err(|error| miette!("{error}"))?;
+    let regorus::Value::Array(owners) = owners else {
+        return Err(miette!("invalid credential owner admission result"));
+    };
+    owners
+        .iter()
+        .map(|owner| match owner {
+            regorus::Value::String(owner) => Ok(owner.to_string()),
+            _ => Err(miette!("invalid credential owner identity")),
+        })
+        .collect()
+}
+
+fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+    serde_json::json!({
+        "network": { "host": ctx.host, "port": ctx.port },
+        "exec": {
+            "path": ctx.binary_path,
+            "ancestors": ctx.ancestors,
+            "cmdline_paths": ctx.cmdline_paths,
+        },
+        "request": {
+            "method": request.action,
+            "path": request.target,
+            "query_params": request.query_params.clone(),
+            "graphql": request.graphql.clone(),
+            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
+        }
+    })
+}
+
 fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -3261,24 +3415,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = serde_json::json!({
-        "network": {
-            "host": ctx.host,
-            "port": ctx.port,
-        },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    });
+    let input = l7_request_policy_input(ctx, request);
 
     let mut engine = engine
         .engine()
@@ -4189,6 +4326,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
@@ -4236,6 +4374,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -4269,6 +4408,7 @@ network_policies:
             }
         };
         ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         ctx.token_grant_resolver = Some(fixture.resolver());
 
         (config, tunnel_engine, ctx, fixture)
@@ -4564,6 +4704,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
@@ -4603,6 +4744,7 @@ network_policies:
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -5064,7 +5206,7 @@ network_policies:
     }
 
     async fn assert_multiple_grants_tls_relay(identity_result: std::result::Result<&str, &str>) {
-        let (config, tunnel_engine, ctx, fixture) =
+        let (config, tunnel_engine, mut ctx, fixture) =
             rest_token_grant_relay_context(Ok("service-token"));
         let service_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
         let identity_key = "api.example.test\t8080\t/v1/**\tprovider:identity";
@@ -5073,6 +5215,8 @@ network_policies:
         identity.auth_style = "header".into();
         identity.header_name = "X-Workload-Jwt".into();
         fixture.add_credential(identity_key, identity, identity_result);
+        // The context's snapshot predates the second credential; pin a new one.
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         // Both sides verify a synthetic certificate: the test exercises encrypted
         // application traffic, inspection and credential injection, then upstream TLS.
         let (mut app, mut relay_client) = token_grant_tls_pair().await;

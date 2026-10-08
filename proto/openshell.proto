@@ -2317,12 +2317,18 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Output-only gateway-derived endpoint authorities for resolved token grants.
+  // For inspected L7 requests, empty means no endpoint may obtain this grant.
+  // L4 injection uses selectors without checking these authorities.
+  // Profile-authored values are ignored; normal policies name the originating
+  // provider endpoint, while a global policy uses its own endpoint authorities.
+  repeated string token_grant_owners = 11;
   // Opt in to an opaque identity-bound environment placeholder for every env
   // var declared by this credential. Use this only when an external credential
   // updater requires one placeholder across value-only provider revisions.
   // Gateway-managed refresh and token-grant credentials cannot opt in because
   // they require identity-bearing handles for authorization-epoch revocation.
-  bool stable_placeholder = 11;
+  bool stable_placeholder = 12;
 }
 
 enum ProviderCredentialRefreshStrategy {

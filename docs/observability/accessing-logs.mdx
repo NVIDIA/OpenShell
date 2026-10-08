@@ -96,7 +96,7 @@ podman cp <supervisor-container>:/var/log/. ./supervisor-logs/
 
 Docker's `docker cp` cannot copy the live contents of the supervisor's tmpfs log mount. Retrieving those files requires operator-managed access to the live mount on the Docker daemon host. The default supervisor image has no shell or `tar`, so shell-based `docker exec` collection is not an alternative.
 
-For live shorthand output, read the supervisor's stderr through the platform log interface:
+For live console output, read the supervisor's stderr through the platform log interface:
 
 ```shell
 kubectl -n <sandbox-namespace> logs <supervisor-pod> -c supervisor --follow
@@ -104,7 +104,7 @@ docker logs --follow <supervisor-container>
 podman logs --follow <supervisor-container>
 ```
 
-This console output follows the supervisor's diagnostic log filter and does not include full OCSF JSON records. A cluster or container log collector can ship it for retention. Collect workload container logs separately for main process output and sandbox-runtime events.
+Shorthand and diagnostics follow the supervisor's diagnostic log filter. With `ocsf_json_enabled=true`, stderr also includes compact `OCSF-JSON` records independently of that filter and file storage. See [OCSF JSON collection](/observability/ocsf-json-export#output-location) for the collector format and delivery limits. A cluster or container log collector can ship this output for retention. Collect workload container logs separately for main process output and sandbox-runtime events.
 
 The default supervisor image has no shell or `tar`, so shell-based `kubectl exec` and `kubectl cp` examples do not work with that image. Reading Kubernetes supervisor files requires operator-managed access to its log volume, such as cluster debugging tooling. OpenShell does not configure a file collector for you.
 

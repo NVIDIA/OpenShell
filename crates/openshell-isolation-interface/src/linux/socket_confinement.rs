@@ -15,7 +15,7 @@
 use std::io;
 use std::os::fd::AsFd;
 
-use socket2::{Domain, SockFilter, SockRef, Socket, Type};
+use socket2::{Domain, SockRef, Socket, Type};
 
 const LOOPBACK_DEVICE: &[u8] = b"lo";
 
@@ -36,50 +36,6 @@ pub fn confine_to_loopback(fd: impl AsFd) -> io::Result<()> {
 /// Returns the kernel error from `getsockopt(SO_BINDTODEVICE)`.
 pub fn bound_device(fd: impl AsFd) -> io::Result<Option<Vec<u8>>> {
     SockRef::from(&fd).device()
-}
-
-/// Drop TCP/UDP ingress that arrives on the loopback interface.
-///
-/// Attach this to a trusted listener whose legitimate clients are never in the
-/// same network namespace. Matching the ingress interface rather than the
-/// source address also rejects connections to the host's own non-loopback
-/// address, which the kernel delivers through loopback. The filter is not
-/// locked: the listener descriptor never leaves the trusted sandbox process,
-/// which marks every descriptor above stdio close-on-exec before running
-/// workload code.
-///
-/// # Errors
-///
-/// Returns the kernel error when the interface index cannot be resolved or
-/// the filter cannot be attached.
-pub fn reject_loopback_ingress(fd: impl AsFd) -> io::Result<()> {
-    let index = rustix::net::netdevice::name_to_index(&fd, "lo")?;
-    reject_ingress_interface(fd, index)
-}
-
-fn reject_ingress_interface(fd: impl AsFd, index: u32) -> io::Result<()> {
-    // Ancillary loads use the documented negative offset encoding.
-    let ifindex_offset = (libc::SKF_AD_OFF + libc::SKF_AD_IFINDEX).cast_unsigned();
-    let program = [
-        filter(
-            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
-            0,
-            0,
-            ifindex_offset,
-        ),
-        filter(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, index),
-        filter(libc::BPF_RET | libc::BPF_K, 0, 0, 0),
-        filter(libc::BPF_RET | libc::BPF_K, 0, 0, u32::MAX),
-    ];
-    SockRef::from(&fd).attach_filter(&program)
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "classic BPF opcodes are 16-bit by definition"
-)]
-const fn filter(code: u32, jt: u8, jf: u8, k: u32) -> SockFilter {
-    SockFilter::new(code as u16, jt, jf, k)
 }
 
 /// Actively prove loopback confinement under the current runtime profile.
@@ -178,8 +134,7 @@ fn probe_error(context: &str, error: &io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::time::Duration;
 
     fn new_socket(domain: Domain, kind: Type) -> Socket {
@@ -210,38 +165,6 @@ mod tests {
         confine_to_loopback(&socket).unwrap();
         assert!(confine_to_loopback(&socket).is_err());
         assert_eq!(bound_device(&socket).unwrap().as_deref(), Some(&b"lo"[..]));
-    }
-
-    fn connect_with_timeout(address: SocketAddr) -> io::Result<TcpStream> {
-        TcpStream::connect_timeout(&address, Duration::from_millis(300))
-    }
-
-    #[test]
-    fn loopback_ingress_filter_rejects_loopback_connections() {
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        reject_loopback_ingress(&listener).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        // Dropped SYNs never complete the handshake.
-        assert!(connect_with_timeout(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_err());
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-    }
-
-    #[test]
-    fn ingress_filter_admits_other_interfaces() {
-        // Positive control: the same program keyed to an absent interface
-        // index must leave loopback traffic untouched.
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        reject_ingress_interface(&listener, u32::MAX).unwrap();
-        let mut client = connect_with_timeout(listener.local_addr().unwrap()).unwrap();
-        let (mut accepted, _) = listener.accept().unwrap();
-        client.write_all(b"ping").unwrap();
-        let mut buffer = [0_u8; 4];
-        accepted.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, b"ping");
     }
 
     /// Return a local non-loopback address, if this namespace has one.

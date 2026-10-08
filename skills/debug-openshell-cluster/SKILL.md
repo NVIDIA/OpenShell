@@ -249,7 +249,13 @@ errors as connectivity, authorization, or lifecycle failures.
 
 The sandbox container's log holds the sandbox runtime's warnings and the
 main process's stdout and stderr when it runs without a TTY. The supervisor
-container's log holds supervisor diagnostics.
+container's log holds supervisor diagnostics and OCSF shorthand. With
+`ocsf_json_enabled=true`, it also contains compact `OCSF-JSON` records for
+log collectors. Read these through `docker logs <supervisor-container>`;
+`docker cp` does not expose the live `/var/log` tmpfs, and workload exec
+accesses a separate filesystem. See the published
+[OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export)
+for the marker format and delivery limits.
 
 ```bash
 docker info
@@ -293,7 +299,8 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
-- Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Docker and Podman also reject an image `VOLUME` or driver mount that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Custom Docker and Podman workspace changes live in the workload container's writable layer, not a managed named volume. Stop/start of the same container retains them; removing or replacing that container does not. Export files you need before deleting the sandbox.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Local Docker gateway setup cannot copy `openshell-sandbox` after exporting a supervisor image: the sandbox runtime and supervisor are separate artifacts. The runtime image must provide `/openshell-sandbox`; the supervisor image provides `/openshell-supervisor`.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.

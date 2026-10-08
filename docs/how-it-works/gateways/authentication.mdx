@@ -215,7 +215,7 @@ The gateway validates OIDC access tokens against the issuer's JWKS endpoint. It 
 
 For EC and OKP keys, `crv` fully determines the algorithm. For RSA keys, the algorithm is selected from the JWK's declared `alg` field when it names one of the six RSA algorithms above; if `alg` is absent (as with Microsoft Entra ID, which omits it entirely), the gateway defaults to RS256. If `alg` names a non-RSA algorithm, the key is treated as contradictory and skipped (see below) rather than falling back to RS256.
 
-The gateway rejects tokens when the JWT header `alg` does not match the algorithm pinned from the JWK. Tokens must include `iss`, `aud`, `exp`, and `sub` claims. The `iss` and `aud` values must match the configured issuer and audience.
+The gateway accepts the `Bearer` scheme in the `Authorization` header in any letter case. It rejects tokens when the JWT header `alg` does not match the algorithm pinned from the JWK. Tokens must include `iss`, `aud`, `exp`, and `sub` claims. The `iss` and `aud` values must match the configured issuer and audience.
 
 JWKs with `use: enc`, an `alg` that genuinely contradicts the derived algorithm (for example an RSA key declaring `ES256`), or `key_ops` that excludes `verify` are skipped. The gateway refreshes the JWKS cache when it encounters an unknown key ID, throttled to at most once per second to bound how much an unknown-`kid` lookup can amplify requests against the issuer. If a refresh yields zero usable keys, the gateway keeps serving the previous key set rather than dropping all signing keys and failing every request, but only for up to three times the configured TTL. If the JWKS is still empty after that grace period, the cached keys are evicted and all tokens are rejected until the issuer recovers.
 

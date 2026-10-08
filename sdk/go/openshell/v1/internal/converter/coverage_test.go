@@ -229,7 +229,12 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"credential_binding":              true,
 	}
 
-	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway derives this authority from the effective policy. It is
+	// available through the raw API, not authored SDK endpoint settings.
+	skipped := fieldSet{
+		"token_grant_owner": true,
+	}
+	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_L7Allow(t *testing.T) {
@@ -337,7 +342,12 @@ func TestConverterCoversAllProtoFields_ProviderProfileCredential(t *testing.T) {
 		"stable_placeholder": true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, nil)
+	// Resolved grant authorities belong to gateway-to-supervisor delivery,
+	// not authored provider profiles. They remain available in the raw API.
+	skipped := fieldSet{
+		"token_grant_owners": true,
+	}
+	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T) {

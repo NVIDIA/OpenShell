@@ -801,6 +801,7 @@ pub(crate) struct McpRequestValidation<'a> {
 pub(crate) struct CredentialGenerationGuard<'a> {
     state: &'a openshell_core::provider_credentials::ProviderCredentialState,
     revision: u64,
+    installation_id: Option<&'a str>,
 }
 
 /// Typed marker for provider credential material that cannot be used.
@@ -833,11 +834,28 @@ impl<'a> CredentialGenerationGuard<'a> {
         state: &'a openshell_core::provider_credentials::ProviderCredentialState,
         revision: u64,
     ) -> Self {
-        Self { state, revision }
+        Self {
+            state,
+            revision,
+            installation_id: None,
+        }
+    }
+
+    /// Bind dynamic material to its exact installation, including a repair
+    /// that retains the provider revision. Static-only callers retain their
+    /// existing revision guard.
+    pub(crate) fn with_installation_id(mut self, installation_id: Option<&'a str>) -> Self {
+        self.installation_id = installation_id;
+        self
     }
 
     pub(crate) fn ensure_current(self) -> Result<()> {
-        if self.state.revision() == self.revision {
+        let snapshot = self.state.snapshot();
+        if snapshot.revision == self.revision
+            && self
+                .installation_id
+                .is_none_or(|id| id == snapshot.installation_id)
+        {
             Ok(())
         } else {
             Err(miette::Report::new(CredentialUnavailableError::new(

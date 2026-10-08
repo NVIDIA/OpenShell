@@ -145,12 +145,13 @@ jobs:
           sparse-checkout: tasks/scripts
           persist-credentials: false
 
-      - name: Stage the range resolver
+      - name: Stage trusted scan helpers
         run: |
           set -euo pipefail
           install -d -m 700 "$RUNNER_TEMP/range-resolver"
           cp workflow-revision/tasks/scripts/release.py \
             workflow-revision/tasks/scripts/codex_security_range.py \
+            workflow-revision/tasks/scripts/codex_security_diagnostics.py \
             "$RUNNER_TEMP/range-resolver/"
           rm -rf workflow-revision
 
@@ -185,6 +186,7 @@ jobs:
           python3 "$RUNNER_TEMP/range-resolver/codex_security_range.py" "${args[@]}"
 
       - name: Scan changes since the previous stable
+        id: scan
         env:
           BASE_SHA: ${{ steps.range.outputs.base_sha }}
           CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
@@ -206,7 +208,10 @@ jobs:
             exit 2
           fi
 
-          "$CODEX_SECURITY_BIN" scan . \
+          python3 "$RUNNER_TEMP/range-resolver/codex_security_diagnostics.py" \
+            --scan-dir "$SCAN_DIR" \
+            --output "$RUNNER_TEMP/codex-security-diagnostics.json" \
+            -- "$CODEX_SECURITY_BIN" scan . \
             "${target_args[@]}" \
             --auth api-key \
             --model "$NVIDIA_INFERENCE_MODEL" \
@@ -220,7 +225,18 @@ jobs:
             --codex "features.multi_agent_v2.max_concurrent_threads_per_session=$CODEX_SECURITY_MAX_CONCURRENT_THREADS" \
             --codex 'approval_policy="never"' \
             --output-dir "$SCAN_DIR" \
-            --headless > /dev/null
+            --headless
+
+      # Actions artifacts in this public repository are publicly downloadable.
+      # Publish only the helper's allowlisted projection, never SCAN_DIR or state.
+      - name: Upload public execution diagnostics on failure
+        if: ${{ failure() && steps.scan.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-security-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-security-diagnostics.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Export SARIF
         env:

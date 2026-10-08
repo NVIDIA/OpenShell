@@ -125,6 +125,22 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
+scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
+the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+scan failure. It contains fixed status values, aggregate coverage counts, and
+disk space before, after, and the minimum sampled every five seconds. Missing
+coverage or manifest documents indicate no readable final report was available;
+deferred items or surfaces needing follow-up can explain partial coverage.
+Sampling cannot rule out a disk spike between samples.
+
+Artifacts and logs in this public repository are public. Never upload the raw
+scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
+logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
+The public diagnostic intentionally omits them; detailed review needs an
+approved private destination. Helpers must come from the workflow revision,
+not from the candidate under scan.
+
 `setup-nix` retries development-shell preparation once when `prepare-shell`
 is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
 shell has already been prepared. Cargo, lint, and test commands are not retried.

@@ -4760,7 +4760,7 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
+    pub(crate) async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
         if self.supervisor_sessions.has_session(sandbox_id) {
             return Ok(true);
         }

@@ -141,10 +141,14 @@ mod tests {
     // the set of shared message and enum types remains unchanged.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
+    // Token-grant owner fields add gateway-derived metadata to endpoints and
+    // profile credentials reachable from stored policies and provider profiles.
+    // Legacy payloads decode empty owners; the gateway rebuilds their authority
+    // from effective policy rather than trusting persisted owner stamps.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2adec5d69e65dff0fc64ee1efe847b15839d172234a17dcb3910d77f4925da09";
+        "e2c1a8b73eed91cfed798faa22aa9cb54a8f9b7009295260f39e1417a75d7d9b";
     const DURABLE_SCHEMA_SHA256: &str =
-        "67d74f0304ecfc3dc11135f11deda694dd64e5dde0dd0f6cbc1512bc519fa212";
+        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // Encoded with the schema that omitted stable_placeholder. Keep these

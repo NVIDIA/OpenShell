@@ -679,14 +679,13 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
         .ok()
         .and_then(|v| v.to_str().ok().map(str::to_string))
         .unwrap_or_default();
-    let bearer = token.strip_prefix("Bearer ").unwrap_or(&token);
     let now_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(i64::MAX);
-    let expires_at = parse_jwt_exp_ms(bearer);
+    let expires_at = parse_jwt_exp_ms(&token);
     if expires_at == Some(0) {
         return None;
     }

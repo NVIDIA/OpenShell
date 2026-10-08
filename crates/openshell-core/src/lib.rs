@@ -16,6 +16,7 @@ pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
+pub mod dynamic_credential_key;
 pub mod dynamic_string_allowlist;
 #[cfg(unix)]
 pub mod e2fsprogs;

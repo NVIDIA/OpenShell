@@ -10,7 +10,7 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{Authenticator, bearer_credential};
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
@@ -891,11 +891,7 @@ impl Authenticator for OidcAuthenticator {
         headers: &http::HeaderMap,
         _path: &str,
     ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
+        let Some(token) = bearer_credential(headers) else {
             return Ok(None);
         };
 
