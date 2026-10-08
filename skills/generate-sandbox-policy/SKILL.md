@@ -219,9 +219,10 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
+- `on_uninspectable` controls selected traffic no middleware can inspect, such as `tls: skip`, h2c, and non-HTTP connections. Omit it (`deny`) unless the user explicitly accepts relaying that traffic uninspected; then set `on_uninspectable: allow`. Never rely on the deprecated fallback where `on_error: fail_open` without `on_uninspectable` allows it.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
-- Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.
+- Do not select middleware with `on_uninspectable: deny` (the default) for `tls: skip` endpoints because the supervisor cannot inspect that traffic. If the user accepts uninspected `tls: skip` traffic, set `on_uninspectable: allow`, plus `on_error: fail_open` while sandboxes may run supervisors older than `on_uninspectable`.
 
 ### Mapping Paths to Glob Patterns (when building explicit rules)
 
@@ -385,7 +386,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] `rules` list is not empty when present
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
-- [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
+- [ ] No middleware selector with `on_uninspectable: deny` (the default) can cover a `tls: skip` endpoint
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
 - [ ] Any required response control advertises `HTTP_RESPONSE/PRE_RETURN`
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
@@ -422,6 +423,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Hostless `allowed_ips`** (no `host` field and no `protocol: tcp`) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted through the legacy proxy. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
+| **`on_uninspectable: allow`**, or `on_error: fail_open` without `on_uninspectable` | "Traffic this middleware cannot inspect, such as `tls: skip`, h2c, or non-HTTP connections to the selected hosts, passes without inspection. Keep the default `deny` unless that traffic is required." |
 | **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
 | **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 

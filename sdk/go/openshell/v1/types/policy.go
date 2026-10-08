@@ -140,8 +140,12 @@ type NetworkMiddlewareConfig struct {
 	Middleware string
 	Config     map[string]any
 	OnError    string
-	Endpoints  *MiddlewareEndpointSelector
-	Order      int32
+	// OnUninspectable is "deny" or "allow" for selected traffic that no
+	// middleware can inspect, such as tls: skip endpoints. Empty means "deny",
+	// or "allow" through a deprecated fallback when OnError is "fail_open".
+	OnUninspectable string
+	Endpoints       *MiddlewareEndpointSelector
+	Order           int32
 }
 
 // MiddlewareEndpointSelector controls which admitted destinations use a

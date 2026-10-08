@@ -634,9 +634,13 @@ type NetworkMiddlewareConfig struct {
 	// Host selector controlling which admitted destinations use this config.
 	Endpoints *MiddlewareEndpointSelector `protobuf:"bytes,5,opt,name=endpoints,proto3" json:"endpoints,omitempty"`
 	// Execution order. Values must be unique within a policy; lower values run first.
-	Order         int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Order int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
+	// Handling for selected traffic that no middleware can inspect, such as
+	// `tls: skip` endpoints: "deny" (default) or "allow". When unset,
+	// `on_error: "fail_open"` selects "allow"; that fallback is deprecated.
+	OnUninspectable string `protobuf:"bytes,7,opt,name=on_uninspectable,json=onUninspectable,proto3" json:"on_uninspectable,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *NetworkMiddlewareConfig) Reset() {
@@ -709,6 +713,13 @@ func (x *NetworkMiddlewareConfig) GetOrder() int32 {
 		return x.Order
 	}
 	return 0
+}
+
+func (x *NetworkMiddlewareConfig) GetOnUninspectable() string {
+	if x != nil {
+		return x.OnUninspectable
+	}
+	return ""
 }
 
 // Host selector controlling which admitted destinations use a middleware config.
@@ -2316,7 +2327,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +
-	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xff\x01\n" +
+	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xaa\x02\n" +
 	"\x17NetworkMiddlewareConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1e\n" +
 	"\n" +
@@ -2325,7 +2336,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x06config\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x06config\x12\x19\n" +
 	"\bon_error\x18\x04 \x01(\tR\aonError\x12N\n" +
 	"\tendpoints\x18\x05 \x01(\v20.openshell.sandbox.v1.MiddlewareEndpointSelectorR\tendpoints\x12\x14\n" +
-	"\x05order\x18\x06 \x01(\x05R\x05order\"P\n" +
+	"\x05order\x18\x06 \x01(\x05R\x05order\x12)\n" +
+	"\x10on_uninspectable\x18\a \x01(\tR\x0fonUninspectable\"P\n" +
 	"\x1aMiddlewareEndpointSelector\x12\x18\n" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +

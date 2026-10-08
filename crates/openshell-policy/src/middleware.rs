@@ -22,7 +22,7 @@ use openshell_core::host_pattern::{HostPattern, HostSelector};
 
 use openshell_policy_schema::{
     MiddlewareEndpointSelector as MiddlewareEndpointSelectorDef,
-    NetworkMiddleware as NetworkMiddlewareConfigDef,
+    NetworkMiddleware as NetworkMiddlewareConfigDef, OnUninspectable,
 };
 
 /// Middleware-relevant projection of the runtime policy JSON accepted by the
@@ -72,6 +72,7 @@ pub fn into_proto(
                         definition.config.into_iter().collect(),
                     )?),
                     on_error: definition.on_error,
+                    on_uninspectable: definition.on_uninspectable,
                     endpoints: definition
                         .endpoints
                         .map(|selector| MiddlewareEndpointSelector {
@@ -104,6 +105,7 @@ pub fn from_proto(
                         .into_iter()
                         .collect(),
                     on_error: middleware.on_error.clone(),
+                    on_uninspectable: middleware.on_uninspectable.clone(),
                     endpoints: middleware.endpoints.as_ref().map(|selector| {
                         MiddlewareEndpointSelectorDef {
                             include: selector.include.clone(),
@@ -223,6 +225,18 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             });
         }
 
+        let on_uninspectable =
+            OnUninspectable::effective(&middleware.on_uninspectable, &middleware.on_error);
+        if on_uninspectable.is_none() {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: name.clone(),
+                reason: format!(
+                    "invalid on_uninspectable '{}'; expected 'deny' or 'allow'",
+                    middleware.on_uninspectable
+                ),
+            });
+        }
+
         let Some(selector) = &middleware.endpoints else {
             violations.push(PolicyViolation::InvalidMiddlewareConfig {
                 name: name.clone(),
@@ -263,7 +277,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             None
         };
 
-        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed");
+        let requires_inspection = on_uninspectable == Some(OnUninspectable::Deny);
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {
                 key

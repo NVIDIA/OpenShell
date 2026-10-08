@@ -41,6 +41,7 @@ fn middleware_config() -> NetworkMiddlewareConfig {
         middleware: "openshell/regex".into(),
         config: None,
         on_error: "fail_closed".into(),
+        on_uninspectable: String::new(),
         endpoints: Some(MiddlewareEndpointSelector {
             include: vec!["api.example.com".into()],
             exclude: Vec::new(),

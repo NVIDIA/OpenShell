@@ -543,12 +543,15 @@ network rules allow, in ascending `order`.
 | `order` | integer | No | Run order. Lower values run first. Values must be unique. Defaults to `0`. |
 | `config` | object | No | Configuration for the middleware. |
 | `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. |
+| `on_uninspectable` | string | No | `deny` blocks selected traffic that no middleware can inspect, such as `tls: skip` endpoints. `allow` relays it uninspected. Defaults to `deny`. |
 | `name` | string | No | Display name. Defaults to the key. |
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per
-configuration. A `fail_closed` configuration cannot apply to an endpoint with
-`tls: skip`. Refer to [Supervisor
-Middleware](/extensibility/supervisor-middleware).
+configuration. A configuration with `on_uninspectable: deny` cannot apply to an
+endpoint with `tls: skip`. When `on_uninspectable` is omitted, `on_error:
+fail_open` selects `allow`; this fallback is deprecated. Refer to [Handle
+Uninspectable
+Traffic](/extensibility/supervisor-middleware/configure#handle-uninspectable-traffic).
 
 ```yaml showLineNumbers={false}
 network_middlewares:

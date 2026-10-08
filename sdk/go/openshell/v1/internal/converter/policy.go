@@ -186,10 +186,11 @@ func SandboxPolicyToProtoChecked(p *types.SandboxPolicy) (*sbv1.SandboxPolicy, e
 
 func middlewareConfigFromProto(m *sbv1.NetworkMiddlewareConfig) types.NetworkMiddlewareConfig {
 	result := types.NetworkMiddlewareConfig{
-		Name:       m.GetName(),
-		Middleware: m.GetMiddleware(),
-		OnError:    m.GetOnError(),
-		Order:      m.GetOrder(),
+		Name:            m.GetName(),
+		Middleware:      m.GetMiddleware(),
+		OnError:         m.GetOnError(),
+		OnUninspectable: m.GetOnUninspectable(),
+		Order:           m.GetOrder(),
 	}
 	if c := m.GetConfig(); c != nil {
 		result.Config = c.AsMap()
@@ -205,10 +206,11 @@ func middlewareConfigFromProto(m *sbv1.NetworkMiddlewareConfig) types.NetworkMid
 
 func middlewareConfigToProto(m *types.NetworkMiddlewareConfig) *sbv1.NetworkMiddlewareConfig {
 	result := &sbv1.NetworkMiddlewareConfig{
-		Name:       m.Name,
-		Middleware: m.Middleware,
-		OnError:    m.OnError,
-		Order:      m.Order,
+		Name:            m.Name,
+		Middleware:      m.Middleware,
+		OnError:         m.OnError,
+		OnUninspectable: m.OnUninspectable,
+		Order:           m.Order,
 	}
 	if m.Config != nil {
 		// Non-JSON-compatible values (e.g., chan, func) are silently dropped.

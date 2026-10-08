@@ -153,6 +153,10 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
   What happens when the middleware fails. Refer to [Choose Failure Behavior](#choose-failure-behavior).
 </ParamField>
 
+<ParamField path="on_uninspectable" type="'deny' | 'allow'" default="deny">
+  What happens to selected traffic that no middleware can inspect. Refer to [Handle Uninspectable Traffic](#handle-uninspectable-traffic).
+</ParamField>
+
 <ParamField path="config" type="object">
   Configuration passed to the middleware. The middleware defines and validates its format.
 </ParamField>
@@ -175,7 +179,33 @@ Middleware fails when it cannot complete its check, for example when its service
 
 A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
 
-`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic.
+`on_error` applies only to middleware failures. It does not extend what middleware can inspect, and the [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings.
+
+## Handle Uninspectable Traffic
+
+Some traffic that an entry selects cannot reach any middleware, such as connections to `tls: skip` endpoints, HTTP/2 prior-knowledge (h2c) connections, and other non-HTTP protocols. The `on_uninspectable` field decides what happens to it:
+
+- `deny`, the default, blocks the traffic and emits a high-severity `openshell.middleware.traffic_uninspectable` detection finding. An entry with this setting cannot select a `tls: skip` endpoint.
+- `allow` relays the traffic without inspection and emits a medium-severity `openshell.middleware.traffic_uninspectable` detection finding.
+
+When several entries select the same host, OpenShell relays uninspectable traffic only if every one of them allows it.
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  content-guard:
+    middleware: content-guard
+    on_uninspectable: allow
+    endpoints:
+      include: ["*.example.com"]
+```
+
+<Note>
+
+Earlier releases let uninspectable traffic through only for entries with `on_error: fail_open`. An entry that sets `on_error: fail_open` and omits `on_uninspectable` still allows it, and the sandbox supervisor emits a deprecation event each time it loads the policy. A future release removes this fallback, so set `on_uninspectable` explicitly. An explicit `deny` takes precedence over `fail_open`.
+
+Supervisors from releases before `on_uninspectable` ignore the field and reject a policy where an entry selects a `tls: skip` endpoint without `on_error: fail_open`. Until every sandbox runs a current supervisor, also set `on_error: fail_open` on entries that use `on_uninspectable: allow` for `tls: skip` endpoints.
+
+</Note>
 
 ## Operate Middleware Services
 

@@ -109,69 +109,6 @@ impl HttpMiddlewareExchange {
     }
 }
 
-/// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
-/// protocols without an L7 relay) must be handled for a matching chain.
-///
-/// This is derived from each entry's `on_error` today. A future per-config
-/// `on_uninspectable` knob could let an operator keep `fail_closed` error
-/// handling for HTTP traffic while allowing uninspectable protocols through
-/// without maintaining host excludes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UninspectableTrafficGate {
-    /// No middleware matches this destination; raw relay is unaffected.
-    Unrestricted,
-    /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
-    /// detection finding.
-    BypassWithFinding,
-    /// At least one matching entry is `fail_closed`: deny, the middleware
-    /// must be able to see the traffic for it to flow.
-    Deny,
-}
-
-pub fn uninspectable_traffic_gate(
-    chain: &[openshell_supervisor_middleware::ChainEntry],
-) -> UninspectableTrafficGate {
-    if chain.is_empty() {
-        return UninspectableTrafficGate::Unrestricted;
-    }
-    if chain
-        .iter()
-        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
-    {
-        UninspectableTrafficGate::BypassWithFinding
-    } else {
-        UninspectableTrafficGate::Deny
-    }
-}
-
-/// Emit the detection finding for traffic a matching middleware chain cannot
-/// inspect: denied under a fail-closed chain, bypassed under fail-open.
-pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-        .severity(if denied {
-            SeverityId::High
-        } else {
-            SeverityId::Medium
-        })
-        .finding_info(FindingInfo::new(
-            "openshell.middleware.traffic_uninspectable",
-            "Supervisor middleware cannot inspect this traffic",
-        ))
-        .evidence_pairs(&[
-            ("policy", ctx.policy_name.as_str()),
-            ("host", ctx.host.as_str()),
-            ("protocol", detail),
-            ("disposition", if denied { "denied" } else { "fail_open" }),
-        ])
-        .message(if denied {
-            "Uninspectable traffic to host with required middleware; denied"
-        } else {
-            "Uninspectable traffic bypassed middleware (fail_open)"
-        })
-        .build();
-    ocsf_emit!(event);
-}
-
 pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,

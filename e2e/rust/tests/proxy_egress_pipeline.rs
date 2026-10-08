@@ -227,7 +227,13 @@ fn write_middleware_policy(
     port: u16,
     endpoint_options: &str,
     on_error: &str,
+    on_uninspectable: &str,
 ) -> Result<NamedTempFile, String> {
+    let on_uninspectable = if on_uninspectable.is_empty() {
+        String::new()
+    } else {
+        format!("\n    on_uninspectable: {on_uninspectable}")
+    };
     let network_middlewares = format!(
         r#"network_middlewares:
   regex-redactor:
@@ -236,7 +242,7 @@ fn write_middleware_policy(
     order: 10
     config:
       mode: redact
-    on_error: {on_error}
+    on_error: {on_error}{on_uninspectable}
     endpoints:
       include: ["{host}"]
       exclude: []
@@ -1236,7 +1242,7 @@ async fn middleware_redacts_transparent_request_bodies() {
     let server = RequestBodyEchoServer::start()
         .await
         .expect("start request body echo server");
-    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
+    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed", "")
         .expect("write middleware policy");
     let policy_path = policy_path(&policy);
     let script = format!(
@@ -1307,7 +1313,7 @@ print(json.dumps({{"first": request_once(), "second": request_once()}}, sort_key
 #[serial(proxy_egress_pipeline)]
 async fn fail_closed_middleware_blocks_uninspectable_transparent_payload_before_upstream() {
     let server = EchoServer::start().await.expect("start TCP echo server");
-    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
+    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed", "")
         .expect("write fail-closed middleware policy");
     let policy_path = policy_path(&policy);
     let script = format!(
@@ -1378,23 +1384,14 @@ print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
     guard.cleanup().await;
 }
 
-#[tokio::test]
-#[serial(proxy_egress_pipeline)]
-async fn fail_open_middleware_bypasses_uninspectable_transparent_tls_skip() {
-    let server = EchoServer::start().await.expect("start TCP echo server");
-    let policy = write_middleware_policy(
-        TEST_SERVER_HOST,
-        server.port,
-        "        tls: skip",
-        "fail_open",
-    )
-    .expect("write fail-open middleware policy");
-    let policy_path = policy_path(&policy);
-    let script = format!(
+const UNINSPECTABLE_BYPASS_PAYLOAD: &[u8] = b"\x00\xff\x13\x37\x80middleware-bypass";
+
+fn uninspectable_bypass_script(port: u16) -> String {
+    format!(
         r#"
 import socket
 
-HOST = {host:?}
+HOST = {TEST_SERVER_HOST:?}
 PORT = {port}
 PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37, 0x80]) + b"middleware-bypass"
 
@@ -1407,31 +1404,182 @@ with socket.create_connection((HOST, PORT), timeout=10) as sock:
             break
         echoed += chunk
     if echoed != PAYLOAD:
-        raise RuntimeError(f"fail-open middleware did not preserve raw relay: {{echoed!r}}")
+        raise RuntimeError(f"middleware did not preserve raw relay: {{echoed!r}}")
 print("UNINSPECTABLE_MIDDLEWARE_BYPASSED")
+"#
+    )
+}
+
+/// Run the raw `tls: skip` probe in a long-lived sandbox so its OCSF logs can
+/// be inspected afterwards.
+async fn assert_uninspectable_tls_skip_bypassed(
+    on_error: &str,
+    on_uninspectable: &str,
+) -> (SandboxGuard, String) {
+    let server = EchoServer::start().await.expect("start TCP echo server");
+    let policy = write_middleware_policy(
+        TEST_SERVER_HOST,
+        server.port,
+        "        tls: skip",
+        on_error,
+        on_uninspectable,
+    )
+    .expect("write tls: skip middleware policy");
+    let policy_path = policy_path(&policy);
+    let script = uninspectable_bypass_script(server.port);
+
+    let guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_path],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox");
+    let output = guard
+        .exec(&["python3", "-c", &script])
+        .await
+        .expect("exercise uninspectable tls: skip traffic");
+    assert!(
+        output.contains("UNINSPECTABLE_MIDDLEWARE_BYPASSED"),
+        "middleware did not bypass uninspectable traffic:\n{output}"
+    );
+    assert_eq!(
+        server.observed_bytes(),
+        UNINSPECTABLE_BYPASS_PAYLOAD,
+        "upstream did not receive the unchanged payload"
+    );
+
+    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
+        logs.lines().any(|line| {
+            line.contains("FINDING:ALLOWED")
+                && line.contains("openshell.middleware.traffic_uninspectable")
+        })
+    })
+    .await
+    .expect("OCSF logs should record the allowed bypass");
+    (guard, logs)
+}
+
+#[tokio::test]
+#[serial(proxy_egress_pipeline)]
+async fn on_uninspectable_allow_bypasses_uninspectable_transparent_tls_skip() {
+    let (mut guard, logs) = assert_uninspectable_tls_skip_bypassed("fail_closed", "allow").await;
+    assert!(
+        !logs.contains("deprecated on_uninspectable fallback"),
+        "explicit on_uninspectable must not log the deprecated fallback:\n{logs}"
+    );
+    guard.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(proxy_egress_pipeline)]
+async fn legacy_fail_open_still_bypasses_uninspectable_transparent_tls_skip() {
+    let (mut guard, logs) = assert_uninspectable_tls_skip_bypassed("fail_open", "").await;
+    assert!(
+        logs.contains(
+            "middleware config 'regex-redactor' uses deprecated on_uninspectable fallback"
+        ),
+        "legacy fail_open bypass should log the deprecated fallback:\n{logs}"
+    );
+    guard.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(proxy_egress_pipeline)]
+async fn explicit_on_uninspectable_deny_overrides_fail_open() {
+    let server = EchoServer::start().await.expect("start TCP echo server");
+    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_open", "deny")
+        .expect("write deny middleware policy");
+    let tls_skip_policy = write_middleware_policy(
+        TEST_SERVER_HOST,
+        server.port,
+        "        tls: skip",
+        "fail_open",
+        "deny",
+    )
+    .expect("write tls: skip deny middleware policy");
+    let tls_skip_policy_path = policy_path(&tls_skip_policy);
+    let policy_path = policy_path(&policy);
+    let script = format!(
+        r#"
+import socket
+
+HOST = {host:?}
+PORT = {port}
+
+with socket.create_connection((HOST, PORT), timeout=10) as sock:
+    sock.sendall(bytes([0x00, 0xff, 0x13, 0x37]) + b"not-http-or-tls")
+    denial = b""
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        denial += chunk
+    if denial and b"unsupported_l7_protocol" not in denial:
+        raise RuntimeError(f"missing middleware denial: {{denial!r}}")
+print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
 "#,
         host = TEST_SERVER_HOST,
         port = server.port,
     );
 
-    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_path],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox");
+    let output = guard
+        .exec(&["python3", "-c", &script])
         .await
-        .expect("sandbox create");
+        .expect("exercise uninspectable traffic under on_uninspectable: deny");
     assert!(
-        guard
-            .create_output
-            .contains("UNINSPECTABLE_MIDDLEWARE_BYPASSED"),
-        "fail-open middleware did not bypass uninspectable traffic:\n{}",
-        guard.create_output
+        output.contains("UNINSPECTABLE_MIDDLEWARE_BLOCKED"),
+        "on_uninspectable: deny did not block uninspectable traffic:\n{output}"
     );
-    assert_eq!(
-        server.observed_bytes(),
-        [0x00, 0xff, 0x13, 0x37, 0x80]
-            .into_iter()
-            .chain(*b"middleware-bypass")
-            .collect::<Vec<_>>(),
-        "upstream did not receive the unchanged fail-open payload"
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        server.observed_bytes().is_empty(),
+        "uninspectable payload reached upstream despite on_uninspectable: deny"
     );
+    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
+        logs.contains("Unsupported tunnel protocol cannot be inspected by required middleware")
+    })
+    .await
+    .expect("fetch sandbox logs after middleware denial");
+    assert!(
+        !logs.contains("deprecated on_uninspectable fallback"),
+        "explicit deny must not use the fail_open fallback:\n{logs}"
+    );
+
+    let rejection = run_cli(&[
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &tls_skip_policy_path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await
+    .expect_err("deny must not select a tls: skip endpoint");
+    let unwrapped = rejection
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        unwrapped.contains("tls: skip endpoint")
+            && unwrapped.contains("set on_uninspectable: allow"),
+        "policy update should explain the tls: skip conflict:\n{rejection}"
+    );
+
+    guard.cleanup().await;
 }
 
 #[tokio::test]

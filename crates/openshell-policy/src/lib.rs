@@ -1086,7 +1086,8 @@ pub enum PolicyViolation {
     },
     /// Too many include and exclude patterns are attached to one middleware.
     TooManyMiddlewareSelectorPatterns { name: String, count: usize },
-    /// A middleware selector conflicts with an endpoint that skips TLS inspection.
+    /// A middleware selector with an effective `on_uninspectable: deny`
+    /// conflicts with an endpoint that skips TLS inspection.
     MiddlewareTlsSkipConflict {
         middleware_name: String,
         policy_name: String,
@@ -1273,7 +1274,8 @@ impl fmt::Display for PolicyViolation {
                 write!(
                     f,
                     "middleware config '{middleware_name}' selects network policy \
-                     '{policy_name}' tls: skip endpoint '{host}'"
+                     '{policy_name}' tls: skip endpoint '{host}', which middleware \
+                     cannot inspect; set on_uninspectable: allow or exclude the host"
                 )
             }
             Self::InvalidLandlockCompatibility { value } => {
@@ -2063,6 +2065,7 @@ network_middlewares:
     middleware: openshell/regex
     order: 20
     on_error: fail_open
+    on_uninspectable: allow
     endpoints:
       include: ["api.example.com", "*.service.test"]
       exclude: ["internal.example.com"]
@@ -2089,6 +2092,12 @@ network_policies:
         assert_eq!(redactor.middleware, "openshell/regex");
         assert_eq!(redactor.order, 20);
         assert_eq!(redactor.on_error, "fail_open");
+        assert_eq!(redactor.on_uninspectable, "allow");
+        assert!(
+            proto.network_middlewares["secondary-redactor"]
+                .on_uninspectable
+                .is_empty()
+        );
         assert_eq!(
             redactor.endpoints.as_ref().expect("selector").include,
             vec!["api.example.com", "*.service.test"]
@@ -2940,6 +2949,7 @@ network_policies:
             order: 0,
             config: None,
             on_error: String::new(),
+            on_uninspectable: String::new(),
             endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
                 include: vec!["api.example.com".into()],
                 exclude: Vec::new(),
@@ -3151,6 +3161,15 @@ network_policies:
                     middleware
                 },
                 "invalid on_error",
+            ),
+            (
+                "redactor",
+                {
+                    let mut middleware = middleware_config("openshell/regex");
+                    middleware.on_uninspectable = "fail_open".into();
+                    middleware
+                },
+                "invalid on_uninspectable 'fail_open'",
             ),
             (
                 "redactor",
@@ -3384,6 +3403,56 @@ network_policies:
             PolicyViolation::MiddlewareTlsSkipConflict { middleware_name, .. }
                 if middleware_name == "redactor"
         )));
+    }
+
+    #[test]
+    fn tls_skip_overlap_requires_effective_on_uninspectable_allow() {
+        let cases = [
+            ("", "", false),
+            ("", "fail_closed", false),
+            ("", "fail_open", true),
+            ("allow", "", true),
+            ("allow", "fail_closed", true),
+            ("allow", "fail_open", true),
+            ("deny", "", false),
+            ("deny", "fail_open", false),
+        ];
+        for (on_uninspectable, on_error, accepted) in cases {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            middleware.on_error = on_error.into();
+            middleware.on_uninspectable = on_uninspectable.into();
+            add_middleware(&mut policy, "redactor", middleware);
+            policy.network_policies.insert(
+                "api".into(),
+                NetworkPolicyRule {
+                    name: "api".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".into(),
+                        port: 443,
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+
+            let conflict = validate_sandbox_policy(&policy)
+                .err()
+                .is_some_and(|violations| {
+                    violations.iter().any(|violation| {
+                        matches!(
+                            violation,
+                            PolicyViolation::MiddlewareTlsSkipConflict { middleware_name, .. }
+                                if middleware_name == "redactor"
+                        )
+                    })
+                });
+            assert_eq!(
+                !conflict, accepted,
+                "on_uninspectable={on_uninspectable:?} on_error={on_error:?}"
+            );
+        }
     }
 
     #[test]

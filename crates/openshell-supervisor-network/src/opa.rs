@@ -276,6 +276,18 @@ impl TunnelPolicyEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         query_middleware_chain_locked(&mut engine, input)
     }
+
+    /// Query how uninspectable traffic to a destination within this tunnel is gated.
+    pub fn query_uninspectable_gate(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<crate::l7::uninspectable::UninspectableTrafficGate> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        query_uninspectable_gate_locked(&mut engine, input)
+    }
 }
 
 impl OpaEngine {
@@ -491,6 +503,7 @@ impl OpaEngine {
         }
         // Rejected candidates must not leak authored values through warnings.
         emit_l7_config_warnings(&warnings, "L7 policy validation warning");
+        crate::l7::uninspectable::emit_fail_open_fallback_deprecations(&data);
 
         normalize_l7_policy_rule_aliases(&mut data);
 
@@ -1051,6 +1064,18 @@ impl OpaEngine {
         Ok((chain, generation))
     }
 
+    /// Query how uninspectable traffic to an admitted destination is gated.
+    pub fn query_uninspectable_gate(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<crate::l7::uninspectable::UninspectableTrafficGate> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        query_uninspectable_gate_locked(&mut engine, input)
+    }
+
     /// Query `allowed_ips` from the matched endpoint config for a given request.
     ///
     /// Returns the list of CIDR/IP strings from the endpoint's `allowed_ips`
@@ -1224,6 +1249,29 @@ fn query_middleware_chain_locked(
         return Ok(Vec::new());
     }
     global_middleware_entries(&configs, &input.host)
+}
+
+fn query_uninspectable_gate_locked(
+    engine: &mut regorus::Engine,
+    input: &NetworkInput,
+) -> Result<crate::l7::uninspectable::UninspectableTrafficGate> {
+    let configs_val = engine
+        .eval_rule("data.openshell.sandbox.network_middlewares".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let mut selected = Vec::new();
+    for config in parse_middleware_configs(&configs_val)? {
+        if middleware_selector_matches(&config, &input.host)? {
+            let on_uninspectable = get_str(&config, "on_uninspectable").unwrap_or_default();
+            let on_error = get_str(&config, "on_error").unwrap_or_default();
+            selected.push(
+                openshell_policy_schema::OnUninspectable::effective(&on_uninspectable, &on_error)
+                    .ok_or_else(|| miette::miette!("invalid middleware on_uninspectable"))?,
+            );
+        }
+    }
+    Ok(crate::l7::uninspectable::uninspectable_traffic_gate(
+        &selected,
+    ))
 }
 
 fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
@@ -1693,6 +1741,7 @@ fn preprocess_yaml_data(
     }
     // Emit authored warnings only after the candidate passes validation.
     emit_l7_config_warnings(&warnings, "L7 policy validation warning");
+    crate::l7::uninspectable::emit_fail_open_fallback_deprecations(&data);
 
     normalize_l7_policy_rule_aliases(&mut data);
 
@@ -2231,7 +2280,7 @@ fn l7_matchers_to_json(
 /// user-specified symlink paths (e.g., `/usr/bin/python3`) match the
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
-fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+pub(crate) fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
     let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
@@ -2573,6 +2622,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             }
             if !mw.on_error.is_empty() {
                 value["on_error"] = mw.on_error.clone().into();
+            }
+            if !mw.on_uninspectable.is_empty() {
+                value["on_uninspectable"] = mw.on_uninspectable.clone().into();
             }
             if let Some(selector) = &mw.endpoints {
                 let mut endpoints = serde_json::json!({});

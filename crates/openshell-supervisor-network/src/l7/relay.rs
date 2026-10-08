@@ -8,8 +8,7 @@
 //! and either forwards or denies the request.
 
 use crate::l7::middleware::{
-    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain_with_request_id,
-    emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
+    MiddlewareApplyResult, apply_middleware_chain_with_request_id, middleware_network_input,
 };
 #[cfg(test)]
 use crate::l7::middleware::{
@@ -18,6 +17,7 @@ use crate::l7::middleware::{
 };
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
+use crate::l7::uninspectable::{UninspectableTrafficGate, emit_middleware_uninspectable};
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
@@ -1066,8 +1066,7 @@ where
             // The SQL relay is not implemented, so a matching middleware
             // chain can never inspect this stream: gate it like any other
             // uninspectable protocol.
-            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            match uninspectable_traffic_gate(&chain) {
+            match engine.query_uninspectable_gate(&middleware_network_input(ctx))? {
                 UninspectableTrafficGate::Deny => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", true);
                     return Ok(());
@@ -7128,32 +7127,6 @@ network_policies:
         .expect("fail-open chain must relay SQL bytes")
         .unwrap();
         assert_eq!(&upstream_bytes[..n], b"\x00\x00\x00\x08\x04\xd2\x16\x2f");
-    }
-
-    #[test]
-    fn uninspectable_gate_reflects_chain_on_error() {
-        use openshell_supervisor_middleware::{ChainEntry, OnError};
-
-        let entry = |on_error| ChainEntry {
-            name: "m".into(),
-            implementation: "example/guard".into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error,
-        };
-
-        assert_eq!(
-            uninspectable_traffic_gate(&[]),
-            UninspectableTrafficGate::Unrestricted
-        );
-        assert_eq!(
-            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailOpen)]),
-            UninspectableTrafficGate::BypassWithFinding
-        );
-        assert_eq!(
-            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailClosed)]),
-            UninspectableTrafficGate::Deny
-        );
     }
 
     /// One named middleware with one HTTP/pre-credentials binding. Two

@@ -19,6 +19,7 @@ pub mod relay;
 pub mod rest;
 pub mod tls;
 pub(crate) mod token_grant_injection;
+pub mod uninspectable;
 pub(crate) mod websocket;
 
 use openshell_core::endpoint_status::{

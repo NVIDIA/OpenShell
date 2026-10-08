@@ -590,7 +590,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, `fail_open` or `fail_closed` behavior, and `on_uninspectable` handling of traffic middleware cannot inspect
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 

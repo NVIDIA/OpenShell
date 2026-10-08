@@ -1244,13 +1244,13 @@ async fn handle_transparent_tcp_connection(
             endpoint_observation: None,
         },
     );
-    let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
-    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
-        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
+    let middleware_gate = crate::l7::uninspectable::destination_gate(&opa_engine, &ctx)?;
+    if middleware_gate == crate::l7::uninspectable::UninspectableTrafficGate::Deny {
+        crate::l7::uninspectable::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
         return Ok(());
     }
-    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
-        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
+    if middleware_gate == crate::l7::uninspectable::UninspectableTrafficGate::BypassWithFinding {
+        crate::l7::uninspectable::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
     }
     let approved_real_ip_candidates = connector.addrs().to_vec();
     generation_guard.ensure_current()?;
@@ -1709,11 +1709,11 @@ enum InspectionRequirement {
 
 fn inspection_requirement(
     should_inspect_l7: bool,
-    middleware_gate: crate::l7::middleware::UninspectableTrafficGate,
+    middleware_gate: crate::l7::uninspectable::UninspectableTrafficGate,
 ) -> InspectionRequirement {
     if should_inspect_l7 {
         InspectionRequirement::L7Route
-    } else if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
+    } else if middleware_gate == crate::l7::uninspectable::UninspectableTrafficGate::Deny {
         InspectionRequirement::RequiredMiddleware
     } else {
         InspectionRequirement::None
@@ -1739,20 +1739,6 @@ fn unsupported_l7_tunnel_protocol_detail(
             Some("Unsupported tunnel protocol cannot be inspected by required middleware")
         }
     }
-}
-
-/// Gate for traffic that would bypass L7 inspection entirely: query the
-/// middleware chain matching this destination and process identity, and
-/// decide whether raw relay is allowed. Uninspectable traffic is denied when
-/// any matching entry is `fail_closed`; an all-`fail_open` chain passes it
-/// through with a bypass detection finding.
-fn middleware_uninspectable_gate(
-    opa_engine: &OpaEngine,
-    ctx: &crate::l7::relay::L7EvalContext,
-) -> Result<crate::l7::middleware::UninspectableTrafficGate> {
-    let input = crate::l7::middleware::middleware_network_input(ctx);
-    let (chain, _generation) = opa_engine.query_middleware_chain_with_generation(&input)?;
-    Ok(crate::l7::middleware::uninspectable_traffic_gate(&chain))
 }
 
 async fn peek_tunnel_protocol<C>(client: &mut C) -> Result<Option<TunnelProtocol>>
@@ -3041,11 +3027,16 @@ async fn handle_mediated_connection(
     );
 
     if effective_tls_skip {
-        // Policy validation rejects fail-closed middleware overlapping
-        // `tls: skip` endpoints; this runtime gate is defense in depth.
-        match middleware_uninspectable_gate(&opa_engine, &ctx)? {
-            crate::l7::middleware::UninspectableTrafficGate::Deny => {
-                crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
+        // Policy validation rejects middleware with an effective
+        // `on_uninspectable: deny` overlapping `tls: skip` endpoints; this
+        // runtime gate is defense in depth.
+        match crate::l7::uninspectable::destination_gate(&opa_engine, &ctx)? {
+            crate::l7::uninspectable::UninspectableTrafficGate::Deny => {
+                crate::l7::uninspectable::emit_middleware_uninspectable(
+                    &ctx,
+                    "tls-skip tunnel",
+                    true,
+                );
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -3058,14 +3049,14 @@ async fn handle_mediated_connection(
                 .await?;
                 return Ok(());
             }
-            crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
-                crate::l7::middleware::emit_middleware_uninspectable(
+            crate::l7::uninspectable::UninspectableTrafficGate::BypassWithFinding => {
+                crate::l7::uninspectable::emit_middleware_uninspectable(
                     &ctx,
                     "tls-skip tunnel",
                     false,
                 );
             }
-            crate::l7::middleware::UninspectableTrafficGate::Unrestricted => {}
+            crate::l7::uninspectable::UninspectableTrafficGate::Unrestricted => {}
         }
         // tls: skip — raw tunnel, no termination, no credential injection.
         debug!(
@@ -3230,13 +3221,17 @@ async fn handle_mediated_connection(
             }
         }
     } else {
-        let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
+        let middleware_gate = crate::l7::uninspectable::destination_gate(&opa_engine, &ctx)?;
         let requirement = inspection_requirement(should_inspect_l7, middleware_gate);
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
         {
             if requirement == InspectionRequirement::RequiredMiddleware {
-                crate::l7::middleware::emit_middleware_uninspectable(&ctx, protocol_detail, true);
+                crate::l7::uninspectable::emit_middleware_uninspectable(
+                    &ctx,
+                    protocol_detail,
+                    true,
+                );
             }
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
@@ -3280,8 +3275,9 @@ async fn handle_mediated_connection(
             return Ok(());
         }
 
-        if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
-            crate::l7::middleware::emit_middleware_uninspectable(&ctx, "non-http tcp", false);
+        if middleware_gate == crate::l7::uninspectable::UninspectableTrafficGate::BypassWithFinding
+        {
+            crate::l7::uninspectable::emit_middleware_uninspectable(&ctx, "non-http tcp", false);
         }
         // Neither TLS nor HTTP — raw binary relay.
         debug!(
@@ -10137,7 +10133,7 @@ network_policies:
 
     #[tokio::test]
     async fn h2c_prior_knowledge_is_blocked_for_l7_tunnel() {
-        use crate::l7::middleware::UninspectableTrafficGate;
+        use crate::l7::uninspectable::UninspectableTrafficGate;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

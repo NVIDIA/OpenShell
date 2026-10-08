@@ -620,10 +620,11 @@ func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
 		Version: 3,
 		NetworkMiddlewares: map[string]*sbv1.NetworkMiddlewareConfig{
 			"sigv4-rewriter": {
-				Name:       "sigv4-rewriter",
-				Middleware: "aws-sigv4",
-				OnError:    "fail_closed",
-				Order:      10,
+				Name:            "sigv4-rewriter",
+				Middleware:      "aws-sigv4",
+				OnError:         "fail_closed",
+				OnUninspectable: "allow",
+				Order:           10,
 				Config: func() *structpb.Struct {
 					s, _ := structpb.NewStruct(map[string]any{
 						"region":  "us-east-1",
@@ -647,6 +648,7 @@ func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
 	assert.Equal(t, "sigv4-rewriter", mw.Name)
 	assert.Equal(t, "aws-sigv4", mw.Middleware)
 	assert.Equal(t, "fail_closed", mw.OnError)
+	assert.Equal(t, "allow", mw.OnUninspectable)
 	assert.Equal(t, int32(10), mw.Order)
 	require.NotNil(t, mw.Config)
 	assert.Equal(t, "us-east-1", mw.Config["region"])
@@ -661,10 +663,11 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 		Version: 5,
 		NetworkMiddlewares: map[string]v1.NetworkMiddlewareConfig{
 			"rate-limiter": {
-				Name:       "rate-limiter",
-				Middleware: "envoy-ratelimit",
-				OnError:    "fail_open",
-				Order:      20,
+				Name:            "rate-limiter",
+				Middleware:      "envoy-ratelimit",
+				OnError:         "fail_open",
+				OnUninspectable: "deny",
+				Order:           20,
 				Config: map[string]any{
 					"requests_per_second": float64(100),
 				},
@@ -686,6 +689,7 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Name, mw.Name)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Middleware, mw.Middleware)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].OnError, mw.OnError)
+	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].OnUninspectable, mw.OnUninspectable)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Order, mw.Order)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Config["requests_per_second"], mw.Config["requests_per_second"])
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Endpoints.Include, mw.Endpoints.Include)

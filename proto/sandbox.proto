@@ -83,6 +83,10 @@ message NetworkMiddlewareConfig {
   MiddlewareEndpointSelector endpoints = 5;
   // Execution order. Values must be unique within a policy; lower values run first.
   int32 order = 6;
+  // Handling for selected traffic that no middleware can inspect, such as
+  // `tls: skip` endpoints: "deny" (default) or "allow". When unset,
+  // `on_error: "fail_open"` selects "allow"; that fallback is deprecated.
+  string on_uninspectable = 7;
 }
 
 // Host selector controlling which admitted destinations use a middleware config.

@@ -479,6 +479,8 @@ pub struct NetworkMiddleware {
     pub config: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub on_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_uninspectable: String,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_optional_field",
@@ -753,6 +755,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
                 "order",
                 "config",
                 "on_error",
+                "on_uninspectable",
                 "endpoints",
             ],
         )? {
@@ -1085,6 +1088,46 @@ impl NetworkEndpoint {
     }
 }
 
+/// How a middleware entry treats selected traffic that no middleware can
+/// inspect, such as `tls: skip` endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUninspectable {
+    Deny,
+    Allow,
+}
+
+impl OnUninspectable {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deny" => Some(Self::Deny),
+            "allow" => Some(Self::Allow),
+            _ => None,
+        }
+    }
+
+    /// Resolve an entry's effective value, or `None` for an unrecognized
+    /// `on_uninspectable`. An unset value is `deny`, except that
+    /// `on_error: fail_open` selects `allow` through a deprecated fallback.
+    #[must_use]
+    pub fn effective(on_uninspectable: &str, on_error: &str) -> Option<Self> {
+        if Self::uses_fail_open_fallback(on_uninspectable, on_error) {
+            Some(Self::Allow)
+        } else if on_uninspectable.is_empty() {
+            Some(Self::Deny)
+        } else {
+            Self::parse(on_uninspectable)
+        }
+    }
+
+    /// Whether an entry's effective value comes from the deprecated
+    /// `on_error: fail_open` fallback.
+    #[must_use]
+    pub fn uses_fail_open_fallback(on_uninspectable: &str, on_error: &str) -> bool {
+        on_uninspectable.is_empty() && on_error == "fail_open"
+    }
+}
+
 /// Intrinsic access-preset vocabulary in the authored policy language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessPreset {
@@ -1327,6 +1370,66 @@ mod tests {
         let chain = decode_error_chain(&source);
         assert!(chain[1].contains("...: type mismatch"));
         assert!(chain[1].len() <= MAX_UNKNOWN_FIELD_PATH_BYTES + 100);
+    }
+
+    #[test]
+    fn middleware_on_uninspectable_round_trips() {
+        let source = "version: 1\nnetwork_middlewares:\n  guard:\n    middleware: logger\n    on_uninspectable: allow\n";
+        let document = parse_policy(source).unwrap();
+        assert_eq!(
+            document.network_middlewares["guard"].on_uninspectable,
+            "allow"
+        );
+        let serialized = serialize_policy(&document).unwrap();
+        assert!(
+            serialized.contains("on_uninspectable: allow"),
+            "{serialized}"
+        );
+        assert_eq!(parse_policy(&serialized).unwrap(), document);
+
+        let omitted =
+            parse_policy("version: 1\nnetwork_middlewares:\n  guard:\n    middleware: logger\n")
+                .unwrap();
+        assert!(
+            omitted.network_middlewares["guard"]
+                .on_uninspectable
+                .is_empty()
+        );
+        assert!(
+            !serialize_policy(&omitted)
+                .unwrap()
+                .contains("on_uninspectable")
+        );
+    }
+
+    #[test]
+    fn on_uninspectable_effective_value_honors_deprecated_fail_open_fallback() {
+        use OnUninspectable::{Allow, Deny};
+
+        let cases = [
+            ("", "", Some(Deny), false),
+            ("", "fail_closed", Some(Deny), false),
+            ("", "fail_open", Some(Allow), true),
+            ("deny", "", Some(Deny), false),
+            ("deny", "fail_open", Some(Deny), false),
+            ("allow", "", Some(Allow), false),
+            ("allow", "fail_closed", Some(Allow), false),
+            ("allow", "fail_open", Some(Allow), false),
+            ("Allow", "", None, false),
+            ("fail_open", "fail_open", None, false),
+        ];
+        for (on_uninspectable, on_error, effective, fallback) in cases {
+            assert_eq!(
+                OnUninspectable::effective(on_uninspectable, on_error),
+                effective,
+                "on_uninspectable={on_uninspectable:?} on_error={on_error:?}"
+            );
+            assert_eq!(
+                OnUninspectable::uses_fail_open_fallback(on_uninspectable, on_error),
+                fallback,
+                "on_uninspectable={on_uninspectable:?} on_error={on_error:?}"
+            );
+        }
     }
 
     #[test]

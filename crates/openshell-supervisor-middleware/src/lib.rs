@@ -4231,6 +4231,7 @@ mod tests {
                     order: 0,
                     config: Some(prost_types::Struct::default()),
                     on_error: "fail_closed".into(),
+                    on_uninspectable: String::new(),
                     endpoints: None,
                 },
             )]),
