@@ -98,9 +98,12 @@ etw_audit = false
 Only `process_container` supports this architecture. `isolation_session` is
 rejected during sandbox validation.
 
-Legacy configurations may retain `default_configuration_id`; it remains unused
-by ProcessContainer and does not enable IsolationSession. New configurations
-should omit that field.
+MXC 1.0.0 is required. Pre-1.0 executors and the retired
+`default_configuration_id` setting are not supported; remove that setting
+before upgrading. Both live launches and standalone mapper output use the
+stable directional `network.egress` / `network.ingress` schema. The standalone
+mapper emits numeric CIDRs and TCP ports, and reports DNS and L7 semantics as
+mapping losses; the host supervisor continues to enforce the full network policy.
 
 Supply the workload command and working directory per sandbox:
 

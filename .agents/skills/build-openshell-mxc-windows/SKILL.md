@@ -314,6 +314,29 @@ in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 ## Unsupported Driver Contract
 
+MXC requests and mapper artifacts use the stable 1.0.0 schema. Upgrade the
+native host executor to the signed MXC 1.0.0 release before running E2E; preserve
+the old executable for rollback and verify the release checksum, architecture,
+signature, and `--probe` output. Remove `default_configuration_id` from gateway
+configurations: it is retired and rejected. Do not restore alpha-version or
+wildcard compatibility knobs. Standalone network mapping emits numeric CIDRs
+and TCP ports and reports unrepresentable DNS/L7 semantics as losses; full
+network governance remains in the host supervisor. IsolationSession remains
+unsupported by this runtime pair, and its filesystem grants are not enforceable.
+
+MXC does not support external-resource label admission. Its factory explicitly
+acknowledges admission as disabled; do not add `resource_admission` to MXC TOML
+or weaken admission defaults for other drivers. Caller driver JSON still
+requires `allow_driver_config = true`. This does not waive native isolation,
+workload policy, authenticated transport, or outer-fence confirmation.
+
+UI controls remain in `SandboxPolicy`. Advertise `openshell.policy.ui.v1` using
+existing extension metadata, not a new per-driver boolean. The shared gateway
+checks effective policy before driver validation and provisioning; drivers
+without the capability reject explicit UI without implementing UI-specific
+handling. Keep native UI validation and mapping in MXC. Omitted UI settings deny
+graphical UI, clipboard access, and input injection. UI changes require
+recreating the sandbox.
 Windows must continue to reject unsupported compute drivers clearly.
 
 The gateway's `compute-driver-mxc` feature independently links and registers

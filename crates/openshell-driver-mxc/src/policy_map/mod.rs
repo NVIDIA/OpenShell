@@ -13,15 +13,18 @@
 //!
 //! Two mapping shapes are intended:
 //!
-//! - [`map_to_mxc`] — the *coarse / standalone* mapping. `OpenShell` network
-//!   policy is flattened into an MXC host allowlist (`network.allowedHosts`),
-//!   and anything MXC cannot express (ports, protocol, L7 rules, binary scope)
-//!   is recorded in the loss report. Use this when MXC enforces network on its
-//!   own, with no `OpenShell` proxy in the loop.
+//! - [`map_to_mxc`] — the *coarse / standalone* mapping. Numeric destinations
+//!   and ports become MXC 1.0 directional CIDR rules; DNS, L7, and binary scope
+//!   that MXC cannot express are recorded in the loss report. Use this when MXC
+//!   enforces network on its own, with no `OpenShell` proxy in the loop.
 //! - [`split_policy`] — the *lossless* split for the Windows MXC compute
 //!   driver: MXC handles filesystem + containment + loopback-only egress,
 //!   while the full `OpenShell` network policy is preserved in a trimmed policy
 //!   enforced by the host CONNECT proxy.
+//!
+//! Every generated MXC artifact uses the same stable 1.0 schema as the live
+//! driver. The embedded driver may use a coarse mapping as an intermediate
+//! policy translation but does not send that JSON to MXC.
 //!
 //! The report/loss-report helpers are only exercised by the example and the
 //! integration tests, so the Windows lib build would otherwise warn on them;

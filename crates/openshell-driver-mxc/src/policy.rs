@@ -157,6 +157,20 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             )
         })?;
 
+        if ctx.containment == "isolation_session"
+            && policy.filesystem.as_ref().is_some_and(|filesystem| {
+                filesystem.include_workdir
+                    || !filesystem.read_only.is_empty()
+                    || !filesystem.read_write.is_empty()
+            })
+        {
+            return Err(MapError::Unsupported(vec![LossItem {
+                rule_kind: "filesystem_policy".into(),
+                detail: "MXC 1.0 isolation_session cannot enforce OpenShell filesystem grants"
+                    .into(),
+            }]));
+        }
+
         let (config, loss, trimmed_policy, proxy_addr) = if let Some(addr) = ctx.egress {
             // Pattern C: MXC handles filesystem + a proxy redirect, while the
             // host CONNECT proxy receives the network-only trimmed policy.
@@ -265,7 +279,7 @@ mod tests {
     fn embedded_maps_policy_read_write_to_share() {
         let mapper = EmbeddedPolicyMapper;
         let policy = fs_policy(&["C:/work/openshell-mxc-demo"], &["C:/tools"]);
-        let ctx = demo_ctx();
+        let ctx = processcontainer_ctx();
         let config = mapper.map(Some(&policy), &ctx).unwrap();
         // Forward slashes normalized to Windows backslashes by the bridge.
         assert!(
@@ -303,6 +317,23 @@ mod tests {
         let ctx = demo_ctx();
         let err = mapper.map(Some(&policy), &ctx).unwrap_err();
         assert!(matches!(err, MapError::Unsupported(_)));
+    }
+
+    #[test]
+    fn embedded_rejects_filesystem_policy_on_isolation_session() {
+        let mapper = EmbeddedPolicyMapper;
+        let policy = fs_policy(&["C:/work/demo"], &[]);
+        let err = mapper.map(Some(&policy), &demo_ctx()).unwrap_err();
+        match err {
+            MapError::Unsupported(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].rule_kind, "filesystem_policy");
+                assert!(items[0].detail.contains("cannot enforce"));
+            }
+            MapError::Internal(message) => {
+                panic!("expected unsupported filesystem policy, got internal error: {message}")
+            }
+        }
     }
 
     #[test]

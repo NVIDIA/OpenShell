@@ -78,10 +78,6 @@ pub struct MxcComputeConfig {
     pub state_dir: PathBuf,
     pub grpc_endpoint: String,
     pub backend: MxcBackend,
-    /// Legacy isolation-session setting, accepted for existing
-    /// `ProcessContainer` configurations but unused by that backend.
-    #[serde(skip_serializing)]
-    pub default_configuration_id: Option<String>,
     pub pc_least_privilege: bool,
     pub pc_capabilities: Vec<String>,
     pub pc_allow_local_network: bool,
@@ -115,7 +111,6 @@ impl Default for MxcComputeConfig {
             state_dir,
             grpc_endpoint: String::new(),
             backend: MxcBackend::ProcessContainer,
-            default_configuration_id: None,
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
             pc_allow_local_network: true,
@@ -757,7 +752,7 @@ async fn run_lifecycle_inner(
         timeout: 0,
     };
     let network = MxcNetwork {
-        default_policy: "block".to_string(),
+        egress_default: "deny".to_string(),
         proxy: Some(proxy_addr),
         allow_local_network: context.config.pc_allow_local_network,
     };
@@ -1454,33 +1449,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_isolation_setting_does_not_change_processcontainer_contract() {
-        let config: MxcComputeConfig = serde_json::from_value(serde_json::json!({
+    fn gateway_config_rejects_pre_1_0_configuration_id() {
+        let error = serde_json::from_value::<MxcComputeConfig>(serde_json::json!({
             "backend": "process_container",
             "default_configuration_id": "composable",
         }))
-        .expect("legacy ProcessContainer config");
-        assert_eq!(config.backend, MxcBackend::ProcessContainer);
-        assert_eq!(
-            config.default_configuration_id.as_deref(),
-            Some("composable")
-        );
-        assert!(
-            serde_json::to_value(&config)
-                .expect("config")
-                .get("default_configuration_id")
-                .is_none()
-        );
-        let (mut backend, sandbox, _dir) = preflight_fixture();
-        backend.config.backend = MxcBackend::IsolationSession;
-        backend.config.default_configuration_id = config.default_configuration_id;
-        assert!(
-            backend
-                .validate_sandbox_create(&sandbox)
-                .expect_err("IsolationSession still unsupported")
-                .message()
-                .contains("requires process_container")
-        );
+        .expect_err("MXC pre-1.0 configurationId must not be accepted");
+        assert!(error.to_string().contains("default_configuration_id"));
     }
 
     #[test]

@@ -1219,7 +1219,7 @@ etw_audit = false
 
 The packaged supervisor and sandbox binaries default to siblings of `openshell-gateway.exe`; explicit paths are useful for development layouts. The driver protects host supervisor tokens and descriptors with an owner-only Windows DACL.
 
-Existing ProcessContainer configurations may retain `default_configuration_id`. This legacy IsolationSession-only field is accepted for configuration compatibility but has no effect on ProcessContainer. It does not enable the unsupported `isolation_session` backend; omit it in new configurations.
+The MXC driver requires MXC 1.0.0 and emits its stable directional network schema. Remove the retired `default_configuration_id` setting before upgrading; the gateway rejects it. The `isolation_session` backend remains unsupported.
 
 Supply the workload command and working directory through `sandbox create --driver-config-json`, for example `{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","echo hello"],"cwd":"C:\\work"}}`. Both are required. Supply workload environment through `sandbox create --env` or `--env-from`; it is not part of gateway configuration.
 

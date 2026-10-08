@@ -5,15 +5,18 @@
 
 use serde_json::{Value, json};
 
+use super::config::DEFAULT_MXC_VERSION;
 use super::loss::{LossItem, OPEN_SHELL_SUPERSET_GAPS, summarize_missing_mxc};
 
-/// Build the structured `loss-report.json` value.
+/// Build the structured `loss-report.json` value for a generated mapper artifact.
+///
+/// `target.schemaVersion` is the same stable schema used by the live MXC
+/// driver. The mapper does not expose a pre-1.0 compatibility mode.
 pub fn build_loss_report(
     source_policy: &str,
     generated_config: &str,
     items: &[LossItem],
     schema_errors: &[LossItem],
-    mxc_version: &str,
     containment: &str,
     schema: Option<&str>,
 ) -> Value {
@@ -23,7 +26,7 @@ pub fn build_loss_report(
         "sourcePolicy": source_policy,
         "generatedConfig": generated_config,
         "target": {
-            "schemaVersion": mxc_version,
+            "schemaVersion": DEFAULT_MXC_VERSION,
             "containment": containment,
         },
         "schemaValidation": {
@@ -62,7 +65,19 @@ pub fn render_readme(source_policy: &str, report: &Value, config: &Value) -> Str
         }
     };
 
-    let allowed = join_strs(&config["network"]["allowedHosts"]);
+    let allowed = config["network"]["egress"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["to"].as_array())
+        .flatten()
+        .filter_map(|peer| peer["cidr"].as_str())
+        .collect::<Vec<_>>();
+    let allowed = if allowed.is_empty() {
+        "(none)".to_owned()
+    } else {
+        allowed.join(", ")
+    };
     let rw = join_strs(&config["filesystem"]["readwritePaths"]);
     let ro = join_strs(&config["filesystem"]["readonlyPaths"]);
 
@@ -84,7 +99,7 @@ pub fn render_readme(source_policy: &str, report: &Value, config: &Value) -> Str
         String::new(),
         format!("- Containment: `{containment}`"),
         format!("- Schema validation: `{schema_valid}`"),
-        format!("- Allowed hosts: `{allowed}`"),
+        format!("- Allowed CIDRs: `{allowed}`"),
         format!("- Read-write paths: `{rw}`"),
         format!("- Read-only paths: `{ro}`"),
         String::new(),
@@ -131,7 +146,8 @@ pub fn render_readme(source_policy: &str, report: &Value, config: &Value) -> Str
         "## Notes".to_owned(),
         String::new(),
         "- OpenShell network policies are binary-, port-, protocol-, and often L7-scoped.".to_owned(),
-        "- This coarse mapper emits only MXC host/IP/CIDR allowlists plus filesystem lists.".to_owned(),
+        "- This coarse mapper emits MXC 1.0 directional CIDR/port rules plus filesystem lists.".to_owned(),
+        "- DNS, binary scope, and L7 policy require governed egress and are reported as mapping errors.".to_owned(),
         "- Treat any `error` item in the loss report as a semantic broadening or unsupported parity gap.".to_owned(),
         String::new(),
     ]);

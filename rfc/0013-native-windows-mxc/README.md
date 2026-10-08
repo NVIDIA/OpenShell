@@ -22,6 +22,12 @@ The authenticated Sandbox Protocol is the only runtime control and forwarding
 transport. MXC supplies the Windows outer fence; the existing supervisor owns
 policy evaluation, credentials, network proxying, and the gateway session.
 
+The runtime requires the signed MXC 1.0.0 executor. Live requests and standalone
+mapper artifacts share its stable directional network schema. Retired alpha
+compatibility settings, including `default_configuration_id`, are rejected;
+numeric CIDR/port rules belong to MXC, while DNS and L7 policy remain governed
+by the host supervisor. IsolationSession is still outside this runtime's scope.
+
 ## Motivation
 
 Docker Desktop and WSL2 add a Linux VM to Windows workflows. MXC provides a

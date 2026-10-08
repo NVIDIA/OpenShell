@@ -15,9 +15,9 @@
 //! Two families:
 //!
 //! **(a) Dry-run contract tests** — exercise `--dry-run` only; pass/fail on
-//!   schema acceptance. These pass on this box even though no enforcement
-//!   backend is live (dry-run validates the JSON schema without spinning up the
-//!   `AppContainer` or isolation session).
+//!   schema acceptance. Most require no live enforcement backend. Tests that
+//!   request a host capability such as bidirectional host loopback probe that
+//!   capability first because MXC validates platform support during dry-run.
 //!
 //! **(b) Enforcement tests** — probe-gated; print a human-readable SKIP reason
 //!   and return early when the backend is not live. The probe distinguishes
@@ -135,8 +135,10 @@ fn wxc_version(wxc: &Path) -> Option<(u64, u64, u64, String)> {
 
 // ── (a) Dry-run contract tests ────────────────────────────────────────────────
 //
-// These PASS on any box that has the wxc-exec binary — no enforcement backend
-// is required because --dry-run only validates the JSON schema.
+// Most PASS on any box that has the wxc-exec binary — no enforcement backend is
+// required. MXC also validates requested platform capabilities during dry-run,
+// so capability-specific configs probe those capabilities before asserting
+// schema acceptance.
 
 /// Minimal processcontainer one-shot config accepted by `--dry-run`.
 #[test]
@@ -149,7 +151,7 @@ fn dryrun_accepts_minimal_processcontainer_config() {
 
     let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "test-minimal",
         "containment": "processcontainer",
         "process": {
@@ -183,7 +185,7 @@ fn dryrun_accepts_processcontainer_ui_policy_matrix() {
     let temp_path = tempdir.path().to_string_lossy().into_owned();
     for clipboard in ["none", "read", "write", "all"] {
         let config = serde_json::json!({
-            "version": "0.7.0-alpha",
+            "version": "1.0.0",
             "containerId": format!("test-ui-{clipboard}"),
             "containment": "processcontainer",
             "process": {
@@ -209,10 +211,9 @@ fn dryrun_accepts_processcontainer_ui_policy_matrix() {
     }
 }
 
-/// MXC 0.8 and the 0.9 development schema reject the shared top-level
-/// UI object on `isolation_session`, while omission remains accepted. Older
-/// 0.7 builds accepted and ignored the object, so `OpenShell`'s gateway-level
-/// capability check is the stable enforcement boundary across versions.
+/// MXC 1.0 rejects the shared top-level UI object on `isolation_session`, while
+/// omission remains accepted. `OpenShell`'s gateway-level capability check is
+/// the stable enforcement boundary.
 #[test]
 #[ignore = "requires real wxc-exec"]
 fn dryrun_current_schema_rejects_isolation_session_ui() {
@@ -224,31 +225,20 @@ fn dryrun_current_schema_rejects_isolation_session_ui() {
         eprintln!("SKIP: could not determine wxc-exec version");
         return;
     };
-    if (major, minor) < (0, 8) {
+    if (major, minor) < (1, 0) {
         eprintln!("SKIP: {raw_version} predates the isolation_session UI rejection contract");
         return;
     }
 
-    let mut base = serde_json::json!({
-        "version": "0.8.0-alpha",
-        "phase": "provision",
+    let base = serde_json::json!({
+        "version": "1.0.0",
         "containment": "isolation_session",
         "network": {
-            "defaultPolicy": "allow",
-            "allowLocalNetwork": true,
-        },
-    });
-    let args: &[&str] = if (major, minor) >= (0, 9) {
-        base.as_object_mut().unwrap().remove("phase");
-        base["version"] = serde_json::json!("0.9.0-alpha");
-        base["network"] = serde_json::json!({
             "egress": { "default": "allow" },
             "ingress": { "default": "allow", "hostLoopback": "allow" },
-        });
-        &["--experimental", "--operation", "provision"]
-    } else {
-        &["--experimental"]
-    };
+        },
+    });
+    let args: &[&str] = &["--operation", "provision"];
     let (code, stdout, stderr) = dry_run_with_args(&wxc, &base, args);
     let output = format!("{stdout} {stderr}").to_ascii_lowercase();
     if code != 0
@@ -278,7 +268,7 @@ fn dryrun_current_schema_rejects_isolation_session_ui() {
     );
 }
 
-/// Network block without proxy (defaultPolicy block, empty host lists) accepted.
+/// Stable directional network block without proxy is accepted.
 #[test]
 #[ignore = "requires real wxc-exec"]
 fn dryrun_accepts_network_block_without_proxy() {
@@ -289,7 +279,7 @@ fn dryrun_accepts_network_block_without_proxy() {
 
     let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "test-net-block",
         "containment": "processcontainer",
         "process": {
@@ -301,7 +291,7 @@ fn dryrun_accepts_network_block_without_proxy() {
             "readwritePaths": [temp_path],
         },
         "network": {
-            "defaultPolicy": "block",
+            "egress": { "default": "deny" },
         },
     });
 
@@ -309,82 +299,6 @@ fn dryrun_accepts_network_block_without_proxy() {
     assert_eq!(
         code, 0,
         "network block without proxy rejected by --dry-run\nstdout={stdout}\nstderr={stderr}"
-    );
-}
-
-/// The ONLY accepted proxy shape in MXC 0.6.0-alpha: `{"localhost": <port>}`.
-/// Verified empirically against the real binary — any other shape is rejected
-/// with "Request error".
-#[test]
-#[ignore = "requires real wxc-exec"]
-fn dryrun_accepts_localhost_proxy_shape() {
-    let Some(wxc) = wxc_path() else {
-        eprintln!("SKIP: wxc-exec not found");
-        return;
-    };
-
-    let (_tempdir, temp_path) = temp_fixture();
-    let config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "containerId": "test-proxy-localhost",
-        "containment": "processcontainer",
-        "process": {
-            "commandLine": "cmd /c exit 0",
-            "cwd": temp_path,
-            "timeout": 0,
-        },
-        "filesystem": {
-            "readwritePaths": [temp_path],
-        },
-        "network": {
-            "defaultPolicy": "block",
-            "proxy": { "localhost": 18080 },
-        },
-    });
-
-    let (code, stdout, stderr) = dry_run(&wxc, &config);
-    assert_eq!(
-        code, 0,
-        "{{\"localhost\": N}} proxy shape rejected by --dry-run\nstdout={stdout}\nstderr={stderr}"
-    );
-}
-
-/// The `{"host": ..., "port": ...}` proxy shape is REJECTED by MXC 0.6.0-alpha.
-/// This test guards the schema contract discovered via dry-run bisection.
-/// See docs4gtb/mxc-box-capabilities.md §"Schema contract findings".
-#[test]
-#[ignore = "requires real wxc-exec"]
-fn dryrun_rejects_host_port_proxy_shape() {
-    let Some(wxc) = wxc_path() else {
-        eprintln!("SKIP: wxc-exec not found");
-        return;
-    };
-
-    let (_tempdir, temp_path) = temp_fixture();
-    let config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "containerId": "test-proxy-hostport",
-        "containment": "processcontainer",
-        "process": {
-            "commandLine": "cmd /c exit 0",
-            "cwd": temp_path,
-            "timeout": 0,
-        },
-        "filesystem": {
-            "readwritePaths": [temp_path],
-        },
-        "network": {
-            "defaultPolicy": "block",
-            // MXC 0.6.0-alpha rejects {"host","port"} — verified empirically.
-            "proxy": { "host": "127.0.0.1", "port": 18080 },
-        },
-    });
-
-    let (code, _stdout, _stderr) = dry_run(&wxc, &config);
-    assert_ne!(
-        code, 0,
-        "{{\"host\",\"port\"}} proxy shape was unexpectedly ACCEPTED — \
-         schema may have widened in a newer wxc-exec build"
     );
 }
 
@@ -399,7 +313,7 @@ fn dryrun_rejects_unknown_containment() {
 
     let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "test-bad-containment",
         "containment": "nonsense",
         "process": {
@@ -417,7 +331,7 @@ fn dryrun_rejects_unknown_containment() {
 }
 
 /// The most important dry-run test: build a typed Windows policy, run
-/// `split_policy` (MXC 0.8 loopback-only proxy access at 127.0.0.1:18080,
+/// `split_policy` (MXC 1.0 loopback-only proxy access at 127.0.0.1:18080,
 /// containment
 /// "processcontainer"), and verify the resulting config with `--dry-run`.
 ///
@@ -430,6 +344,10 @@ fn dryrun_accepts_split_policy_output() {
         eprintln!("SKIP: wxc-exec not found");
         return;
     };
+    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+        eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
+        return;
+    }
 
     let (_tempdir, temp_path) = temp_fixture();
     let policy = SandboxPolicy {
@@ -467,7 +385,7 @@ fn dryrun_accepts_split_policy_output() {
     }
 
     let mxc_config = result.mxc_config;
-    assert_eq!(mxc_config["version"], "0.8.0-alpha");
+    assert_eq!(mxc_config["version"], "1.0.0");
     assert_eq!(mxc_config["network"]["egress"]["default"], "deny");
     assert_eq!(
         mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
@@ -509,6 +427,89 @@ fn dryrun_accepts_split_policy_output() {
     );
 }
 
+/// The standalone mapper must emit the same stable MXC 1.0 schema as the live
+/// governed-egress path. Exercise a numeric destination and ports so this test
+/// would fail if the mapper regressed to the retired host-list shape. Some MXC
+/// builds select a backend that recognizes the directional schema but cannot
+/// enforce egress rules; that explicit capability error still proves the 1.0
+/// fields were parsed rather than rejected as unknown schema.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn dryrun_accepts_standalone_mapper_output() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    let (_tempdir, temp_path) = temp_fixture();
+    let mut policy = SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![temp_path.clone()],
+        }),
+        ..Default::default()
+    };
+    policy.network_policies.insert(
+        "numeric-egress".into(),
+        NetworkPolicyRule {
+            name: "numeric-egress".into(),
+            endpoints: vec![NetworkEndpoint {
+                host: "198.51.100.7".into(),
+                ports: vec![80, 443],
+                ..Default::default()
+            }],
+            binaries: Vec::new(),
+        },
+    );
+    let options = openshell_driver_mxc::MxcMappingOptions {
+        containment: "processcontainer".into(),
+        command: "cmd /c exit 0".into(),
+        container_id: "standalone-mapper-dryrun".into(),
+        cwd: Some(temp_path),
+        ..Default::default()
+    };
+    let result = openshell_driver_mxc::map_to_mxc(&policy, &options);
+    assert!(
+        result
+            .loss
+            .iter()
+            .all(|item| item.path != "network_policies.numeric-egress.endpoints[0].host")
+    );
+    let config = result.config;
+    assert_eq!(config["version"], "1.0.0");
+    assert_eq!(config["network"]["egress"]["default"], "deny");
+    assert_eq!(
+        config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "198.51.100.7/32"
+    );
+    assert_eq!(
+        config["network"]["egress"]["allow"][0]["ports"],
+        serde_json::json!([
+            { "protocol": "tcp", "port": 80 },
+            { "protocol": "tcp", "port": 443 }
+        ])
+    );
+
+    let (code, stdout, stderr) = dry_run(&wxc, &config);
+    let output = format!("{stdout} {stderr}").to_ascii_lowercase();
+    if code != 0
+        && output
+            .contains("network.egress allow/deny rules are not supported by the selected backend")
+    {
+        eprintln!(
+            "PASS: MXC parsed the 1.0 directional network schema; selected backend cannot enforce egress rules"
+        );
+        return;
+    }
+    assert_eq!(
+        code,
+        0,
+        "standalone mapper output rejected by MXC 1.0 --dry-run\nconfig={}\nstdout={stdout}\nstderr={stderr}",
+        serde_json::to_string_pretty(&config).unwrap_or_default()
+    );
+}
+
 // ── (b) Enforcement tests — probe-gated ───────────────────────────────────────
 //
 // These skip on this box (processcontainer velocity keys not enabled;
@@ -531,7 +532,7 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
 
     let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "probe-pc",
         "containment": "processcontainer",
         "process": {
@@ -594,55 +595,46 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Probe the released binary's live `network.proxy` support separately from
-/// ordinary `ProcessContainer` support. Some builds accept the proxy JSON during
-/// `--dry-run` but return `ERROR_INVALID_PARAMETER` from the live launcher.
-fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
-    let (_tempdir, temp_path) = temp_fixture();
-    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("failed to reserve proxy probe port: {error}"))?;
-    let proxy_port = proxy_listener
-        .local_addr()
-        .map_err(|error| format!("failed to read proxy probe port: {error}"))?
-        .port();
-    let config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "containerId": "probe-pc-proxy",
-        "containment": "processcontainer",
-        "process": {
-            "commandLine": "C:\\Windows\\System32\\cmd.exe /c exit 0",
-            "cwd": temp_path,
-            "timeout": 30_000,
-        },
-        "filesystem": {
-            "readwritePaths": [temp_path],
-        },
-        "processContainer": {
-            "leastPrivilege": false,
-        },
-        "network": {
-            "defaultPolicy": "block",
-            "proxy": { "localhost": proxy_port },
-        },
-    });
+/// Probe the released binary's native host-loopback capability separately from
+/// ordinary `ProcessContainer` support. Schema validation also checks requested
+/// platform capabilities, so loopback-dependent tests require a positive probe.
+fn probe_processcontainer_host_loopback(wxc: &Path) -> Result<(), String> {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|v| v == "1") {
+        return Err(
+            "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
+                .to_string(),
+        );
+    }
 
-    let json = serde_json::to_string(&config).unwrap();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
-    let output = Command::new(wxc)
-        .arg("--config-base64")
-        .arg(&b64)
+    let out = Command::new(wxc)
+        .arg("--probe")
         .output()
-        .map_err(|error| format!("wxc-exec proxy probe failed to spawn: {error}"))?;
+        .map_err(|e| format!("wxc-exec --probe spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "wxc-exec --probe returned exit {}: stdout={} stderr={}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
 
-    if output.status.success() {
+    let probe: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("could not parse wxc-exec --probe JSON: {e}"))?;
+    let supported = probe
+        .pointer("/probes/baseContainerSupportsIngressHostLoopbackAllow")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "wxc-exec --probe omitted baseContainerSupportsIngressHostLoopbackAllow".to_string()
+        })?;
+    if supported {
         return Ok(());
     }
 
+    let tier = probe["tier"].as_str().unwrap_or("unknown");
     Err(format!(
-        "live network.proxy probe returned exit {}: stdout={} stderr={}",
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        "wxc-exec --probe reports baseContainerSupportsIngressHostLoopbackAllow=false \
+         for isolation tier {tier}"
     ))
 }
 
@@ -659,18 +651,11 @@ fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
     }
 
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "phase": "provision",
+        "version": "1.0.0",
         "containment": "isolation_session",
-        "filesystem": {
-            "readwritePaths": [],
-            "readonlyPaths": [],
-        },
-        "experimental": {
-            "isolation_session": {
-                "configurationId": "composable",
-                "provision": {}
-            }
+        "network": {
+            "egress": { "default": "allow" },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
         }
     });
 
@@ -680,7 +665,8 @@ fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
     let out = Command::new(wxc)
         .arg("--config-base64")
         .arg(&b64)
-        .arg("--experimental")
+        .arg("--operation")
+        .arg("provision")
         .output()
         .map_err(|e| format!("wxc-exec spawn failed: {e}"))?;
 
@@ -691,7 +677,7 @@ fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
 
     if combined.contains("backend_unavailable") || combined.contains("0x80040154") {
         return Err(
-            "backend_unavailable: IsoSessionApp.dll absent or OS build < 26300.8553".to_string(),
+            "backend_unavailable: IsoSessionApp.dll absent or OS build < 26340.9212".to_string(),
         );
     }
 
@@ -742,15 +728,7 @@ impl<'a> DeprovisionGuard<'a> {
 
     fn run_deprovision(wxc: &PathBuf, sandbox_id: &str) {
         let config = serde_json::json!({
-            "version": "0.6.0-alpha",
-            "phase": "deprovision",
-            "sandboxId": sandbox_id,
-            "experimental": {
-                "isolation_session": {
-                    // Unit variant: must be null, not {} (malformed_request otherwise).
-                    "deprovision": null
-                }
-            }
+            "version": "1.0.0",
         });
         let json = serde_json::to_string(&config).unwrap_or_default();
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
@@ -758,7 +736,10 @@ impl<'a> DeprovisionGuard<'a> {
         let _ = Command::new(wxc)
             .arg("--config-base64")
             .arg(&b64)
-            .arg("--experimental")
+            .arg("--operation")
+            .arg("deprovision")
+            .arg("--container-id")
+            .arg(sandbox_id)
             .output();
     }
 }
@@ -794,7 +775,7 @@ fn pc_oneshot_in_policy_write_succeeds() {
     let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
 
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "pc-in-policy-write",
         "containment": "processcontainer",
         "process": {
@@ -853,8 +834,8 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         eprintln!("SKIP: processcontainer not live: {reason}");
         return;
     }
-    if let Err(reason) = probe_processcontainer_proxy(&wxc) {
-        eprintln!("SKIP: processcontainer network.proxy not live: {reason}");
+    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+        eprintln!("SKIP: processcontainer host loopback not live: {reason}");
         return;
     }
 
@@ -1008,7 +989,7 @@ fn pc_oneshot_out_of_policy_write_denied() {
     let granted_str = granted_dir.path().to_string_lossy().into_owned();
 
     let config = serde_json::json!({
-        "version": "0.6.0-alpha",
+        "version": "1.0.0",
         "containerId": "pc-out-of-policy-write",
         "containment": "processcontainer",
         "process": {
@@ -1080,21 +1061,17 @@ fn iso_lifecycle_round_trip() {
 
     // start
     let start_config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "phase": "start",
-        "sandboxId": sandbox_id,
-        "experimental": {
-            "isolation_session": {
-                "start": {}
-            }
-        }
+        "version": "1.0.0",
     });
     let json = serde_json::to_string(&start_config).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
     let out = Command::new(&wxc)
         .arg("--config-base64")
         .arg(&b64)
-        .arg("--experimental")
+        .arg("--operation")
+        .arg("start")
+        .arg("--container-id")
+        .arg(&sandbox_id)
         .output()
         .expect("start");
     assert!(
@@ -1109,13 +1086,12 @@ fn iso_lifecycle_round_trip() {
     // (HRESULT 0x80070057). 0 is the documented no-timeout value and matches
     // what the driver's exec path sends by default (MxcProcess.timeout = 0).
     let exec_config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "phase": "exec",
-        "sandboxId": sandbox_id,
+        "version": "1.0.0",
         "process": {
             "commandLine": "cmd /c exit 0",
             "cwd": "C:\\Windows\\Temp",
             "env": [],
+            "inheritDefaultEnv": true,
             "timeout": 0,
         }
     });
@@ -1124,7 +1100,10 @@ fn iso_lifecycle_round_trip() {
     let out = Command::new(&wxc)
         .arg("--config-base64")
         .arg(&b64)
-        .arg("--experimental")
+        .arg("--operation")
+        .arg("exec")
+        .arg("--container-id")
+        .arg(&sandbox_id)
         .output()
         .expect("exec");
     assert_eq!(
@@ -1136,22 +1115,17 @@ fn iso_lifecycle_round_trip() {
 
     // stop
     let stop_config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "phase": "stop",
-        "sandboxId": sandbox_id,
-        "experimental": {
-            "isolation_session": {
-                // Unit variant: must be null, not {} (malformed_request otherwise).
-                "stop": null
-            }
-        }
+        "version": "1.0.0",
     });
     let json = serde_json::to_string(&stop_config).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
     let out = Command::new(&wxc)
         .arg("--config-base64")
         .arg(&b64)
-        .arg("--experimental")
+        .arg("--operation")
+        .arg("stop")
+        .arg("--container-id")
+        .arg(&sandbox_id)
         .output()
         .expect("stop");
     assert!(
