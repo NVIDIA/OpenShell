@@ -17,6 +17,8 @@ use std::str::FromStr;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod yaml;
+
 /// Fixed resource bound for legacy MCP request batches inspected by Tower.
 pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
 
@@ -518,12 +520,7 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    // Some YAML deserializers treat null as an empty, defaulted struct.
-    // Decode the outer option explicitly so present null never becomes an
-    // authored empty value; omitted fields still use serde's field default.
-    Option::<T>::deserialize(deserializer)?
-        .map(Some)
-        .ok_or_else(|| serde::de::Error::custom("explicit null is not allowed"))
+    T::deserialize(deserializer).map(Some)
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
@@ -596,17 +593,16 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
-    let policy: PolicyDocument =
-        serde_path_to_error::deserialize(serde_yml::Deserializer::new(&value))
-            .map_err(|error| {
-                let path = bound_path(error.path().to_string());
-                if path == "." {
-                    miette::miette!("{}", error.inner())
-                } else {
-                    miette::miette!("{path}: {}", error.inner())
-                }
-            })
-            .wrap_err("failed to decode sandbox policy fields")?;
+    let policy: PolicyDocument = serde_path_to_error::deserialize(yaml::Deserializer::new(&value))
+        .map_err(|error| {
+            let path = bound_path(error.path().to_string());
+            if path == "." {
+                miette::miette!("{}", error.inner())
+            } else {
+                miette::miette!("{path}: {}", error.inner())
+            }
+        })
+        .wrap_err("failed to decode sandbox policy fields")?;
     validate_policy(&policy)?;
     Ok(policy)
 }
@@ -972,7 +968,7 @@ fn bound_path(mut path: String) -> String {
 
 /// Serialize the authored representation to YAML.
 pub fn serialize_policy(document: &PolicyDocument) -> Result<String> {
-    serde_yml::to_string(document)
+    yaml::to_string(document)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }
@@ -1201,6 +1197,55 @@ mod tests {
                 "explicit null unexpectedly parsed: {source}"
             );
         }
+    }
+
+    #[test]
+    fn nested_null_objects_remain_invalid() {
+        for spelling in ["null", "~", ""] {
+            for body in [
+                format!("network_policies: {spelling}"),
+                format!("network_policies: {{x: {spelling}}}"),
+                format!("network_middlewares: {spelling}"),
+                format!("landlock: {spelling}"),
+                format!("network_middlewares: {{x: {{middleware: foo, config: {spelling}}}}}"),
+                format!("network_middlewares: {{x: {{middleware: foo, endpoints: {spelling}}}}}"),
+                format!("network_policies: {{x: {{endpoints: [{spelling}]}}}}"),
+            ] {
+                // A bare [] is an empty collection rather than a null entry.
+                if spelling.is_empty() && body.ends_with("[]}}") {
+                    continue;
+                }
+                assert!(
+                    parse_policy(&format!("version: 1\n{body}\n")).is_err(),
+                    "{body}"
+                );
+            }
+            for field in [
+                format!("rules: [{{allow: {spelling}}}]"),
+                format!("deny_rules: [{{method: GET, query: {spelling}}}]"),
+                format!("deny_rules: [{spelling}]"),
+                format!("rules: [{{allow: {{query: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{params: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{tool: {spelling}}}}}]"),
+                format!("deny_rules: [{{tool: {spelling}}}]"),
+                format!("graphql_persisted_queries: {spelling}"),
+                format!("graphql_persisted_queries: {{op: {spelling}}}"),
+                format!("credential_binding: {spelling}"),
+                format!("json_rpc: {spelling}"),
+                format!("mcp: {spelling}"),
+            ] {
+                if field == "deny_rules: []" {
+                    continue;
+                }
+                let yaml = format!(
+                    "version: 1\nnetwork_policies: {{x: {{endpoints: [{{host: example.com, port: 443, {field}}}]}}}}\n"
+                );
+                assert!(parse_policy(&yaml).is_err(), "{yaml}");
+            }
+        }
+        let yaml =
+            "version: 1\nnetwork_middlewares: {x: {middleware: foo, config: {optional: null}}}\n";
+        assert!(parse_policy(yaml).is_ok());
     }
 
     #[test]

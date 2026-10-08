@@ -194,7 +194,7 @@ impl BinaryRegistry {
 // ---------------------------------------------------------------------------
 
 fn parse_binary_capability(contents: &str, source: &str) -> Result<BinaryCapability> {
-    let raw: BinaryCapabilityDef = serde_yml::from_str(contents)
+    let raw: BinaryCapabilityDef = openshell_policy_schema::yaml::from_str(contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("parsing binary descriptor {source}"))?;
 

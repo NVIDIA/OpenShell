@@ -1974,7 +1974,9 @@ fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperatio
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
-    Ok(serde_yml::from_str::<ProviderTypeProfile>(input)?)
+    Ok(openshell_core::yaml::from_str::<ProviderTypeProfile>(
+        input,
+    )?)
 }
 
 pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
@@ -1982,7 +1984,7 @@ pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileErr
 }
 
 pub fn profile_to_yaml(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profile)?)
+    Ok(openshell_core::yaml::to_string(profile)?)
 }
 
 pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
@@ -1990,7 +1992,7 @@ pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileE
 }
 
 pub fn profiles_to_yaml(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profiles)?)
+    Ok(openshell_core::yaml::to_string(profiles)?)
 }
 
 pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
@@ -3820,6 +3822,24 @@ credentials:
             reparsed.credentials[0].token_grant,
             proto.credentials[0].token_grant
         );
+    }
+
+    #[test]
+    fn yaml_profile_rejects_null_objects_and_duplicate_fields() {
+        for field in [
+            "annotations: null",
+            "discovery: null",
+            "endpoints: [null]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {query: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {params: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, graphql_persisted_queries: null}]",
+        ] {
+            let yaml = format!("id: sample\ndisplay_name: Sample\n{field}\n");
+            assert!(parse_profile_yaml(&yaml).is_err(), "{yaml}");
+        }
+        assert!(parse_profile_yaml("id: first\nid: second\ndisplay_name: Sample\n").is_err());
+        // Existing optional fields still accept null as absence.
+        assert!(parse_profile_yaml("id: sample\ndisplay_name: Sample\nendpoints: [{host: example.com, port: 443, rules: [{allow: null}]}]\n").is_ok());
     }
 
     #[test]
