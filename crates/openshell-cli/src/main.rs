@@ -3400,7 +3400,7 @@ async fn run_async() -> Result<()> {
 
                     // Parse --label and --annotation flags into maps.
                     let labels_map = run::parse_key_value_pairs(&labels, "--label")?;
-                    let annotations_map = run::parse_annotation_pairs(&annotations)?;
+                    let annotations_map = run::parse_key_value_pairs(&annotations, "--annotation")?;
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
