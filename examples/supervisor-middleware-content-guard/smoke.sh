@@ -437,6 +437,12 @@ response_request() {
     curl -sS -i --max-time 20 "http://host.openshell.internal:18081/$path"
 }
 
+head_request() {
+  local path="$1"
+  "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
+    curl -sS -I --max-time 20 "http://host.openshell.internal:18081/$path"
+}
+
 run_suite() {
   local guarded_output="$LOG_DIR/guarded.out"
   local unguarded_output="$LOG_DIR/unguarded.out"
@@ -493,6 +499,12 @@ run_suite() {
     fail "deny mode passes clean responses"
   fi
   printf 'PASS response denial\n'
+  # A HEAD response has no body to guard, so version 2 bindings let it pass.
+  if ! head_request sensitive >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Eq '^HTTP/1\.[01] 200 ' "$response_output"; then
+    fail "bodyless response passes"
+  fi
+  printf 'PASS bodyless response\n'
 
   "${CLI[@]}" sandbox delete "$SANDBOX_NAME" >>"$SETUP_LOG" 2>&1
   SANDBOX_CREATED=0

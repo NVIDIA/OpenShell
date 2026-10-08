@@ -58,5 +58,8 @@ network_policies:
           - allow:
               method: GET
               path: /sensitive
+          - allow:
+              method: HEAD
+              path: /sensitive
     binaries:
       - path: /usr/bin/curl

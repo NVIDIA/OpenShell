@@ -4,18 +4,27 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+BODIES = {
+    "/clean": b"ordinary public text",
+    "/sensitive": b"contains prototype-secret and internal-only",
+}
+
+
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        bodies = {
-            "/clean": b"ordinary public text",
-            "/sensitive": b"contains prototype-secret and internal-only",
-        }
-        body = bodies.get(self.path, b"not found")
-        self.send_response(200 if self.path in bodies else 404)
+    def respond(self, send_body):
+        body = BODIES.get(self.path, b"not found")
+        self.send_response(200 if self.path in BODIES else 404)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self.respond(send_body=True)
+
+    def do_HEAD(self):
+        self.respond(send_body=False)
 
 
 with ThreadingHTTPServer(("0.0.0.0", 18081), Handler) as server:
