@@ -172,7 +172,7 @@ sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
 systemctl --user reset-failed snap.openshell.user-gateway.service
-snap start openshell.user-gateway
+snap start --user openshell.user-gateway
 ```
 
 For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.

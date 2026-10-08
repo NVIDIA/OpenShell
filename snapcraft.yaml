@@ -28,7 +28,7 @@ description: |
        affected user's session after Docker is available:
 
          systemctl --user reset-failed snap.openshell.user-gateway.service
-         snap start openshell.user-gateway
+         snap start --user openshell.user-gateway
 
     2. Register the per-user gateway after it provisions its mTLS credentials:
 
