@@ -31,7 +31,7 @@ use report::{render_compact, render_report};
 ///
 /// - `Ok(0)` — pass (no findings, or all accepted)
 /// - `Ok(1)` — fail (one or more unaccepted findings present)
-/// - `Err(_)` — input or registry loading error
+/// - `Err(_)` — input, registry, or solver error
 ///
 /// Binary and API capability registries are embedded at compile time.
 /// Pass `registry_dir` to override with a custom filesystem registry.
@@ -59,7 +59,7 @@ pub fn prove(
     };
 
     let z3_model = build_model(policy, credential_set, binary_registry);
-    let mut findings = run_all_queries(&z3_model);
+    let mut findings = run_all_queries(&z3_model)?;
 
     if let Some(ar_path) = accepted_risks_path {
         let accepted = load_accepted_risks(Path::new(ar_path))?;
@@ -223,7 +223,7 @@ filesystem_policy:
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = build_model(pol, cred_set, bin_reg);
-        let findings = run_all_queries(&z3_model);
+        let findings = run_all_queries(&z3_model).expect("run queries");
 
         let categories: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
@@ -276,7 +276,7 @@ network_policies:
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = build_model(policy, cred_set, bin_reg);
-        let findings = run_all_queries(&z3_model);
+        let findings = run_all_queries(&z3_model).expect("run queries");
 
         let reach = findings
             .iter()
@@ -310,7 +310,7 @@ network_policies:
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = build_model(policy, credentials::CredentialSet::default(), bin_reg);
-        let findings = run_all_queries(&z3_model);
+        let findings = run_all_queries(&z3_model).expect("run queries");
 
         let link_local = findings
             .iter()
@@ -323,7 +323,104 @@ network_policies:
         )));
     }
 
-    // 7. Empty policy produces no findings.
+    #[test]
+    fn sibling_endpoints_preserve_findings_and_method_identity() {
+        use finding::{FindingPath, category};
+
+        // Exercise both conflicting write facts and agreeing write facts with
+        // different methods, in either endpoint order and on overlapping ports.
+        for (first_method, second_method) in [("GET", "*"), ("POST", "DELETE")] {
+            for reverse in [false, true] {
+                let mut policy = policy::parse_policy_str(&format!(
+                    r#"
+version: 1
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        ports: [443, 8443]
+        protocol: rest
+        rules:
+          - allow: {{method: "{first_method}", path: "/**"}}
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        rules:
+          - allow: {{method: "{second_method}", path: "/**"}}
+    binaries:
+      - path: /usr/bin/curl
+  metadata:
+    endpoints:
+      - host: 169.254.169.254
+        port: 80
+    binaries:
+      - path: /usr/bin/curl
+"#
+                ))
+                .unwrap();
+                if reverse {
+                    policy
+                        .network_policies
+                        .get_mut("github")
+                        .unwrap()
+                        .endpoints
+                        .reverse();
+                }
+                let credentials = credentials::load_credential_set_embedded(
+                    &testdata_dir().join("credentials.yaml"),
+                )
+                .unwrap();
+                let registry = registry::load_embedded_binary_registry().unwrap();
+                let model = build_model(policy, credentials, registry);
+                let findings = run_all_queries(&model).unwrap();
+                assert!(
+                    findings
+                        .iter()
+                        .any(|f| f.query == category::LINK_LOCAL_REACH)
+                );
+                assert!(
+                    findings
+                        .iter()
+                        .any(|f| f.query == category::CREDENTIAL_REACH_EXPANSION)
+                );
+                let methods = &findings
+                    .iter()
+                    .find(|f| f.query == category::CAPABILITY_EXPANSION)
+                    .unwrap()
+                    .paths;
+                assert!(methods.iter().any(|p| matches!(p, FindingPath::Exfil(p) if p.method == "DELETE" && p.endpoint_port == 443)));
+                assert!(!methods.iter().any(|p| matches!(p, FindingPath::Exfil(p) if p.method == "DELETE" && p.endpoint_port == 8443)));
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_l4_and_l7_endpoints_preserve_reach() {
+        let policy = policy::parse_policy_str(
+            r"
+version: 1
+network_policies:
+  metadata:
+    endpoints:
+      - host: 169.254.169.254
+        port: 80
+        protocol: rest
+        access: read-only
+      - host: 169.254.169.254
+        port: 80
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .unwrap();
+        let registry = registry::load_embedded_binary_registry().unwrap();
+        let model = build_model(policy, credentials::CredentialSet::default(), registry);
+        let findings = run_all_queries(&model).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].query, finding::category::LINK_LOCAL_REACH);
+    }
+
+    // Empty policy produces no findings.
     #[test]
     fn test_empty_policy_no_findings() {
         let policy_path = testdata_dir().join("empty-policy.yaml");
@@ -334,7 +431,7 @@ network_policies:
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = build_model(pol, cred_set, bin_reg);
-        let findings = run_all_queries(&z3_model);
+        let findings = run_all_queries(&z3_model).expect("run queries");
 
         assert!(
             findings.is_empty(),
