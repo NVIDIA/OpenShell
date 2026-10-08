@@ -6,6 +6,7 @@
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::proto::MiddlewareSessionEndReason;
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
@@ -13,9 +14,10 @@ use openshell_ocsf::{
 };
 use openshell_supervisor_middleware::{
     HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
-    HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics, HttpStageOutcome,
+    HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -482,66 +484,6 @@ fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
     ocsf_emit!(middleware_admission_exhausted_event(ctx));
 }
 
-/// Largest body-buffering limit across the entries that actually resolved to a
-/// registered binding. Buffering for the most capable stage lets every stage
-/// that can handle the body run; stages whose own limit is smaller are failed
-/// individually with `request_body_over_capacity` through their `on_error`
-/// policy in `evaluate_described`, instead of one undersized stage forcing the
-/// whole chain onto the unbuffered path. Unresolved entries
-/// (`is_resolved() == false`) report a zero limit and are excluded here: they
-/// are handled by their `on_error` policy without inspecting the body.
-/// Returns `None` when no entry resolved, so the caller can skip buffering.
-///
-/// A version 2 stage on this path runs over the collected body: a STREAM stage
-/// can take up to the platform payload maximum, and a preflight-only stage
-/// needs no body.
-pub(super) fn middleware_chain_body_limit(
-    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-) -> Option<usize> {
-    chain
-        .iter()
-        .filter(|entry| entry.is_resolved())
-        .map(|entry| {
-            if entry.http_protocol() != Some(openshell_supervisor_middleware::HttpProtocol::V2) {
-                entry.max_payload_bytes()
-            } else if entry.supports_http_body_mode(openshell_core::proto::HttpBodyMode::Stream) {
-                openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES
-            } else if entry.supports_http_body_mode(openshell_core::proto::HttpBodyMode::Buffered) {
-                entry.max_payload_bytes()
-            } else {
-                0
-            }
-        })
-        .max()
-}
-
-/// True when the version 2 stage pipeline runs the chain. Chains with legacy
-/// entries, and body-aware protocols whose stages can replace the body, run
-/// on the collector, which re-evaluates policy after every replacement and
-/// runs legacy and version 2 stages in chain order.
-fn uses_request_pipeline(
-    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
-) -> bool {
-    use openshell_supervisor_middleware::HttpProtocol;
-    if chain
-        .iter()
-        .any(|entry| entry.http_protocol() == Some(HttpProtocol::Legacy))
-    {
-        return false;
-    }
-    let has_v2 = chain
-        .iter()
-        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2));
-    has_v2
-        && (matches!(
-            transformed_body_policy,
-            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant
-        ) || !chain.iter().any(
-            openshell_supervisor_middleware::DescribedChainEntry::supports_http_body_processing,
-        ))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -648,124 +590,34 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
-    if uses_request_pipeline(&chain, transformed_body_policy) {
-        return Box::pin(apply_pipeline_middleware_chain(
-            req,
-            client,
-            ctx,
-            scheme,
-            chain,
-            runner,
-            generation_guard,
-            request_id,
-            delivery,
-        ))
-        .await;
+    if chain.is_empty() {
+        return Ok(MiddlewareApplyResult::Allowed(req));
     }
-    let admission = if chain.is_empty() {
-        None
-    } else {
-        let outcome = runner.reserve_middleware_work().await?;
-        match outcome {
-            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
-                admission,
-            ) => Some(admission),
-            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
-                emit_middleware_admission_exhausted(ctx);
-                return Ok(MiddlewareApplyResult::AdmissionExhausted);
-            }
+    // A body-aware policy re-checks every replaced body, so the upstream
+    // must not see any of it before the last stage's output is checked.
+    let delivery = match transformed_body_policy {
+        openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant => delivery,
+        openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(_) => {
+            RequestBodyDelivery::Withhold
         }
     };
-    let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
-        // No entry resolved to a registered binding, so nothing inspects the
-        // body. Apply each entry's `on_error` policy without buffering (an
-        // unresolved binding is handled before the body is read) and forward
-        // the original request unchanged if the chain allows.
-        let input = middleware_request_input_with_id(
-            openshell_ocsf::ctx::ctx(),
-            scheme,
-            &req,
-            ctx,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-            request_id,
-        );
-        let outcome = runner
-            .evaluate_described_with_policy_admitted(
-                &chain,
-                input,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-                admission,
-            )
-            .await?;
-        emit_middleware_events(ctx, &req, &outcome);
-        return Ok(if outcome.allowed {
-            MiddlewareApplyResult::Allowed(req)
-        } else {
-            MiddlewareApplyResult::Denied {
-                denial: outcome.denial,
-            }
-        });
-    };
-    // Admission was reserved above, before reading any request body. Keeping
-    // the guard through evaluation bounds aggregate buffered input across HTTP
-    // requests and WebSocket messages.
-    let admission = admission.expect("resolved middleware chain reserved work admission");
-    let buffer_result = crate::l7::rest::buffer_request_body_for_middleware(
-        &req,
+    Box::pin(apply_pipeline_middleware_chain(
+        req,
         client,
-        Some(generation_guard),
-        max_body_bytes,
-    )
-    .await?;
-    let buffered = match buffer_result {
-        crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
-        crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
-        }
-    };
-    let headers = safe_middleware_headers(&buffered.headers)?;
-    let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input_with_id(
-        openshell_ocsf::ctx::ctx(),
-        scheme,
-        &req,
         ctx,
-        headers.visible,
-        headers.connection_nominated,
-        query,
-        buffered.body,
+        scheme,
+        chain,
+        runner,
+        generation_guard,
+        transformed_body_policy,
         request_id,
-    );
-    // The explicitly selected transformation policy either re-checks every
-    // replacement or documents that this protocol's policy is body-independent.
-    // An ALLOW outcome therefore means the final body is policy-compliant.
-    let outcome = runner
-        .evaluate_described_with_policy_admitted(
-            &chain,
-            input,
-            transformed_body_policy,
-            Some(admission),
-        )
-        .await?;
-    emit_middleware_events(ctx, &req, &outcome);
-    if !outcome.allowed {
-        return Ok(MiddlewareApplyResult::Denied {
-            denial: outcome.denial,
-        });
-    }
-    let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
-        &req,
-        &buffered.headers,
-        &outcome.body,
-        &outcome.header_mutations,
-    )?;
-    Ok(MiddlewareApplyResult::Allowed(rebuilt))
+        delivery,
+    ))
+    .await
 }
 
-/// Run a chain of version 2 stages on the stage pipeline.
+/// Run a request chain on the stage pipeline. Legacy entries run as adapter
+/// stages in chain order with version 2 entries.
 #[allow(clippy::too_many_arguments)]
 async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -775,40 +627,12 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     chain: Vec<openshell_supervisor_middleware::DescribedChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
     delivery: RequestBodyDelivery,
 ) -> Result<MiddlewareApplyResult> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
-    let headers = safe_middleware_headers(head)?;
-    let sandbox = openshell_ocsf::ctx::ctx();
-    let input = HttpRequestPreflightInput {
-        context: openshell_core::proto::RequestContext {
-            request_id: request_id.to_string(),
-            sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox: sandbox.sandbox_name.clone(),
-            workspace: ctx.workspace.clone(),
-            originating_process: None,
-        },
-        target: openshell_core::proto::HttpRequestTarget {
-            scheme: scheme.to_string(),
-            host: ctx.host.clone(),
-            port: u32::from(ctx.port),
-            method: req.action.clone(),
-            path: req.target.clone(),
-            query: raw_query_from_request_headers(head)?,
-        },
-        declared_body_length: match req.body_length {
-            crate::l7::provider::BodyLength::ContentLength(length) => Some(length),
-            crate::l7::provider::BodyLength::None => Some(0),
-            crate::l7::provider::BodyLength::Chunked => None,
-        },
-        headers: headers
-            .visible
-            .into_iter()
-            .map(|(name, value)| openshell_core::proto::HttpHeader { name, value })
-            .collect(),
-        connection_nominated_headers: headers.connection_nominated,
-    };
+    let input = request_preflight_input(openshell_ocsf::ctx::ctx(), scheme, &req, ctx, request_id)?;
     let mut preflight = runner
         .preflight_described_http_request(chain, input)
         .await?;
@@ -825,7 +649,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         action: req.action.clone(),
         target: req.target.clone(),
         preflight: std::mem::take(&mut preflight.diagnostics),
-        emitted: false,
+        terminal_reason: None,
     };
     if !preflight.allowed {
         events.emit(
@@ -900,6 +724,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         generation_guard,
         progress,
         output,
+        transformed_body_policy,
     );
     let (result, collected) = tokio::join!(run, collect);
     let (mut finish, (late, body)) = match (result, collected) {
@@ -927,6 +752,46 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     )?;
     events.emit(true, "", None, std::mem::take(&mut finish.diagnostics));
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+/// Request head and framing shown to request middleware.
+fn request_preflight_input(
+    sandbox: &openshell_ocsf::EventContext,
+    scheme: &str,
+    req: &crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    request_id: &str,
+) -> Result<HttpRequestPreflightInput> {
+    let head = &req.raw_header[..request_header_end(&req.raw_header)];
+    let headers = safe_middleware_headers(head)?;
+    Ok(HttpRequestPreflightInput {
+        context: openshell_core::proto::RequestContext {
+            request_id: request_id.to_string(),
+            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox: sandbox.sandbox_name.clone(),
+            workspace: ctx.workspace.clone(),
+            originating_process: None,
+        },
+        target: openshell_core::proto::HttpRequestTarget {
+            scheme: scheme.to_string(),
+            host: ctx.host.clone(),
+            port: u32::from(ctx.port),
+            method: req.action.clone(),
+            path: req.target.clone(),
+            query: raw_query_from_request_headers(head)?,
+        },
+        declared_body_length: match req.body_length {
+            crate::l7::provider::BodyLength::ContentLength(length) => Some(length),
+            crate::l7::provider::BodyLength::None => Some(0),
+            crate::l7::provider::BodyLength::Chunked => None,
+        },
+        headers: headers
+            .visible
+            .into_iter()
+            .map(|(name, value)| openshell_core::proto::HttpHeader { name, value })
+            .collect(),
+        connection_nominated_headers: headers.connection_nominated,
+    })
 }
 
 fn request_header_end(raw_header: &[u8]) -> usize {
@@ -960,12 +825,13 @@ async fn run_request_body<C: AsyncRead + Unpin>(
     generation_guard: &PolicyGenerationGuard,
     progress: Option<Duration>,
     output: mpsc::Sender<HttpBodyOutput>,
+    body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> std::result::Result<HttpPipelineFinish, BodyRunError> {
     let limit = session.input_unit_limit();
     let (input, inputs) = mpsc::channel(4);
     let run = async {
         session
-            .run(inputs, output)
+            .run_with_body_policy(inputs, output, body_policy)
             .await
             .map_err(BodyRunError::Middleware)
     };
@@ -1076,7 +942,8 @@ struct RequestEvents {
     action: String,
     target: String,
     preflight: HttpStageDiagnostics,
-    emitted: bool,
+    /// Reason the events were emitted with, empty for an allowed request.
+    terminal_reason: Option<String>,
 }
 
 impl RequestEvents {
@@ -1087,9 +954,10 @@ impl RequestEvents {
         denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
         body: HttpStageDiagnostics,
     ) {
-        if std::mem::replace(&mut self.emitted, true) {
+        if self.terminal_reason.is_some() {
             return;
         }
+        self.terminal_reason = Some(reason.to_string());
         let mut diagnostics = std::mem::take(&mut self.preflight);
         diagnostics.extend(body);
         for event in request_middleware_events(
@@ -1178,11 +1046,15 @@ impl RequestBodyStream {
 
     /// Run the middleware over the client's body, sending output to
     /// `output`. A middleware failure or client timeout is a
-    /// [`crate::l7::rest::LiveRequestFailure`].
+    /// [`crate::l7::rest::LiveRequestFailure`]. The caller sets
+    /// `upstream_failed` before it stops reading `output` because writing to
+    /// the upstream failed, so the stages' cancellation is recorded with that
+    /// reason.
     pub(crate) async fn run_to<C: AsyncRead + Unpin>(
         &mut self,
         client: &mut C,
         output: mpsc::Sender<HttpBodyOutput>,
+        upstream_failed: &AtomicBool,
     ) -> Result<HttpPipelineFinish> {
         let session = self
             .session
@@ -1196,6 +1068,7 @@ impl RequestBodyStream {
             &self.generation_guard,
             progress,
             output,
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         )
         .await
         {
@@ -1205,6 +1078,21 @@ impl RequestBodyStream {
                 return Ok(finish);
             }
             Err(error) => error,
+        };
+        let error = match error {
+            BodyRunError::Middleware(failure)
+                if failure.end_reason == MiddlewareSessionEndReason::Cancellation
+                    && upstream_failed.load(Ordering::Acquire) =>
+            {
+                self.events.emit(
+                    false,
+                    "middleware_cancelled: upstream_write_failed",
+                    None,
+                    *failure.diagnostics,
+                );
+                return Err(miette!("upstream stopped accepting the request body"));
+            }
+            error => error,
         };
         let failure = match &error {
             BodyRunError::Middleware(failure) => crate::l7::rest::LiveRequestFailure::Middleware {
@@ -1218,6 +1106,12 @@ impl RequestBodyStream {
         };
         self.events.body_failed(error)?;
         Err(miette::Report::new(failure))
+    }
+
+    /// Reason the request's terminal events were emitted with.
+    #[cfg(test)]
+    pub(crate) fn terminal_reason(&self) -> Option<&str> {
+        self.events.terminal_reason.as_deref()
     }
 
     /// Record that the middleware stages were cancelled for `reason`.
@@ -1242,48 +1136,7 @@ pub(super) fn request_middleware_events(
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     diagnostics: &HttpStageDiagnostics,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    let mut applied = Vec::<openshell_supervisor_middleware::MiddlewareInvocation>::new();
-    for invocation in &diagnostics.invocations {
-        let denied = matches!(
-            invocation.outcome,
-            HttpStageOutcome::Reject | HttpStageOutcome::FailClosed
-        );
-        if let Some(existing) = applied
-            .iter_mut()
-            .find(|existing| existing.name == invocation.config_name)
-        {
-            existing.failed |= invocation.failed;
-            existing.transformed |= invocation.transformed;
-            if denied {
-                existing.decision = openshell_core::proto::Decision::Deny;
-            }
-            continue;
-        }
-        applied.push(openshell_supervisor_middleware::MiddlewareInvocation {
-            name: invocation.config_name.clone(),
-            implementation: invocation.implementation.clone(),
-            decision: if denied {
-                openshell_core::proto::Decision::Deny
-            } else {
-                openshell_core::proto::Decision::Allow
-            },
-            transformed: invocation.transformed,
-            failed: invocation.failed,
-        });
-    }
-    // HTTP protocol 1 (0.1): a fail_open stage reports that it passed its
-    // original input on, which 0.1.x records as a failed-open invocation.
-    for (config_name, report) in &diagnostics.reports {
-        if report.fail_open_reason().is_none() {
-            continue;
-        }
-        if let Some(existing) = applied
-            .iter_mut()
-            .find(|existing| &existing.name == config_name)
-        {
-            existing.failed = true;
-        }
-    }
+    let applied = diagnostics.applied();
     let req = crate::l7::provider::L7Request {
         action: action.to_string(),
         target: target.to_string(),
@@ -1408,61 +1261,6 @@ pub async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
     client.shutdown().await.into_diagnostic()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn middleware_request_input_with_id(
-    sandbox: &openshell_ocsf::EventContext,
-    scheme: &str,
-    req: &crate::l7::provider::L7Request,
-    ctx: &L7EvalContext,
-    headers: Vec<(String, String)>,
-    connection_nominated_headers: Vec<String>,
-    query: String,
-    body: Vec<u8>,
-    request_id: &str,
-) -> openshell_supervisor_middleware::HttpRequestInput {
-    openshell_supervisor_middleware::HttpRequestInput {
-        request_id: request_id.to_string(),
-        sandbox_id: sandbox.sandbox_id.clone(),
-        sandbox_name: sandbox.sandbox_name.clone(),
-        workspace: ctx.workspace.clone(),
-        scheme: scheme.into(),
-        host: ctx.host.clone(),
-        port: ctx.port,
-        method: req.action.clone(),
-        path: req.target.clone(),
-        query,
-        headers,
-        connection_nominated_headers,
-        body,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn middleware_request_input(
-    sandbox: &openshell_ocsf::EventContext,
-    scheme: &str,
-    req: &crate::l7::provider::L7Request,
-    ctx: &L7EvalContext,
-    headers: Vec<(String, String)>,
-    connection_nominated_headers: Vec<String>,
-    query: String,
-    body: Vec<u8>,
-) -> openshell_supervisor_middleware::HttpRequestInput {
-    let request_id = uuid::Uuid::new_v4().to_string();
-    middleware_request_input_with_id(
-        sandbox,
-        scheme,
-        req,
-        ctx,
-        headers,
-        connection_nominated_headers,
-        query,
-        body,
-        &request_id,
-    )
-}
-
 pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
@@ -1474,53 +1272,6 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
     Ok(target
         .split_once('?')
         .map_or_else(String::new, |(_, query)| query.to_string()))
-}
-
-/// Apply the chain's `on_error` policy when the request body exceeds every
-/// stage's buffering limit. No stage can inspect such a body, so each stage
-/// would individually fail with `request_body_over_capacity`; the aggregate is
-/// a deny unless every attached middleware is `fail_open`, and passing the
-/// body through is only safe when no bytes were consumed.
-pub(super) fn resolve_unbuffered_body(
-    ctx: &L7EvalContext,
-    req: crate::l7::provider::L7Request,
-    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-    recoverable: bool,
-) -> MiddlewareApplyResult {
-    let all_fail_open = chain
-        .iter()
-        .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
-    if recoverable && all_fail_open {
-        emit_middleware_body_unavailable(ctx, false);
-        return MiddlewareApplyResult::Allowed(req);
-    }
-    emit_middleware_body_unavailable(ctx, true);
-    MiddlewareApplyResult::Denied { denial: None }
-}
-
-fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-        .severity(if denied {
-            SeverityId::High
-        } else {
-            SeverityId::Medium
-        })
-        .finding_info(FindingInfo::new(
-            "openshell.middleware.body_unavailable",
-            "Supervisor middleware could not inspect request body",
-        ))
-        .evidence_pairs(&[
-            ("policy", ctx.policy_name.as_str()),
-            ("host", ctx.host.as_str()),
-            ("disposition", if denied { "denied" } else { "fail_open" }),
-        ])
-        .message(if denied {
-            "Request body exceeded middleware inspection cap; denied"
-        } else {
-            "Request body exceeded middleware inspection cap; passed through (fail_open)"
-        })
-        .build();
-    ocsf_emit!(event);
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -1635,7 +1386,12 @@ pub(super) fn middleware_events(
                 "MIDDLEWARE {} {} decision={:?}",
                 invocation.name, invocation.implementation, invocation.decision
             ));
-        if !allowed && !outcome.reason.is_empty() {
+        // A cancelled exchange has no denying stage, so its stages carry the
+        // cancellation reason.
+        if !outcome.reason.is_empty()
+            && (!allowed
+                || (!outcome.allowed && outcome.reason.starts_with("middleware_cancelled:")))
+        {
             event = event
                 .status(StatusId::Failure)
                 .status_detail(&outcome.reason);
@@ -1702,18 +1458,6 @@ pub(super) fn middleware_events(
     // for manually constructed or future outcome producers.
     events.extend(middleware_finding_events(&outcome.findings));
     events
-}
-
-/// Emit the OCSF events describing a middleware chain outcome through the
-/// tracing pipeline.
-fn emit_middleware_events(
-    ctx: &L7EvalContext,
-    req: &crate::l7::provider::L7Request,
-    outcome: &openshell_supervisor_middleware::ChainOutcome,
-) {
-    for event in middleware_events(ctx, req, outcome) {
-        ocsf_emit!(event);
-    }
 }
 
 #[cfg(test)]
@@ -1912,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn middleware_input_carries_real_sandbox_name() {
+    fn middleware_input_carries_real_sandbox_name_and_scheme() {
         let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
@@ -1926,7 +1670,7 @@ mod tests {
 
         let eval = L7EvalContext {
             host: "api.example.test".into(),
-            port: 443,
+            port: 80,
             workspace: "wrks-default".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
@@ -1939,26 +1683,21 @@ mod tests {
             action: "POST".into(),
             target: "/v1/messages".into(),
             query_params: std::collections::HashMap::new(),
-            raw_header: Vec::new(),
+            raw_header: b"POST /v1/messages?trace=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n"
+                .to_vec(),
             body_length: crate::l7::provider::BodyLength::None,
         };
 
-        let input = super::middleware_request_input_with_id(
-            &sandbox,
-            "https",
-            &req,
-            &eval,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-            "exchange-123",
-        );
+        let input = super::request_preflight_input(&sandbox, "http", &req, &eval, "exchange-123")
+            .expect("preflight input");
 
-        assert_eq!(input.sandbox_name, "nightly-build");
-        assert_eq!(input.sandbox_id, "sbx-123");
-        assert_eq!(input.workspace, "wrks-default");
-        assert_eq!(input.request_id, "exchange-123");
+        assert_eq!(input.context.sandbox, "nightly-build");
+        assert_eq!(input.context.sandbox_id, "sbx-123");
+        assert_eq!(input.context.workspace, "wrks-default");
+        assert_eq!(input.context.request_id, "exchange-123");
+        assert_eq!(input.target.scheme, "http");
+        assert_eq!(input.target.query, "trace=1");
+        assert_eq!(input.declared_body_length, Some(0));
     }
 
     #[tokio::test]
@@ -2183,6 +1922,29 @@ mod request_event_tests {
                 .filter(|event| event.class_uid() == 2004)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn cancelled_stages_carry_the_cancellation_reason() {
+        let diagnostics = HttpStageDiagnostics {
+            invocations: vec![invocation("stream", HttpStageOutcome::Stream, false, false)],
+            ..Default::default()
+        };
+        let events = request_middleware_events(
+            &ctx(),
+            "POST",
+            "/v1/upload",
+            false,
+            "middleware_cancelled: upstream_write_failed",
+            None,
+            &diagnostics,
+        );
+        assert_eq!(events.len(), 1);
+        let serialized = serde_json::to_string(&events[0]).expect("serialize event");
+        assert!(
+            serialized.contains("middleware_cancelled: upstream_write_failed"),
+            "{serialized}"
         );
     }
 

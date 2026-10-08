@@ -3,4 +3,5 @@
 
 //! Legacy HTTP response protocol (0.1). Removed in 0.2.0.
 
+pub mod adapter;
 pub mod engine;

@@ -5,33 +5,33 @@
 
 use super::*;
 
-pub(super) enum BodyAction {
+pub(in crate::legacy::response) enum BodyAction {
     PassThrough,
     Transform(Vec<u8>),
     BlockDelivery,
     SkipRemaining(CurrentBodyAction),
 }
 
-pub(super) enum CurrentBodyAction {
+pub(in crate::legacy::response) enum CurrentBodyAction {
     PassThrough,
     Transform(Vec<u8>),
 }
 
-pub(super) struct BodyDecision {
-    pub(super) action: BodyAction,
-    pub(super) reason_code: String,
-    pub(super) findings: Vec<Finding>,
-    pub(super) metadata: std::collections::HashMap<String, String>,
+pub(in crate::legacy::response) struct BodyDecision {
+    pub(in crate::legacy::response) action: BodyAction,
+    pub(in crate::legacy::response) reason_code: String,
+    pub(in crate::legacy::response) findings: Vec<Finding>,
+    pub(in crate::legacy::response) metadata: std::collections::HashMap<String, String>,
 }
 
-pub(super) struct TrailersDecision {
-    pub(super) headers: Vec<HttpHeader>,
-    pub(super) reason_code: String,
-    pub(super) findings: Vec<Finding>,
-    pub(super) metadata: std::collections::HashMap<String, String>,
+pub(in crate::legacy::response) struct TrailersDecision {
+    pub(in crate::legacy::response) headers: Vec<HttpHeader>,
+    pub(in crate::legacy::response) reason_code: String,
+    pub(in crate::legacy::response) findings: Vec<Finding>,
+    pub(in crate::legacy::response) metadata: std::collections::HashMap<String, String>,
 }
 
-pub(super) fn validate_trailers_result(
+pub(in crate::legacy::response) fn validate_trailers_result(
     result: HttpResponseEventResult,
     trailers: &[HttpHeader],
     entry: &DescribedChainEntry,
@@ -83,13 +83,13 @@ pub(super) fn validate_trailers_result(
     })
 }
 
-pub(super) fn encoded_header_bytes(headers: &[HttpHeader]) -> usize {
+pub(in crate::legacy::response) fn encoded_header_bytes(headers: &[HttpHeader]) -> usize {
     headers.iter().fold(0usize, |total, header| {
         total.saturating_add(header.encoded_len())
     })
 }
 
-pub(super) fn validate_body_result(
+pub(in crate::legacy::response) fn validate_body_result(
     result: HttpResponseEventResult,
     sequence: u64,
     max_payload_bytes: usize,
@@ -152,7 +152,7 @@ fn validate_replacement(
     Ok(replacement)
 }
 
-pub(super) fn validate_inspect(
+pub(in crate::legacy::response) fn validate_inspect(
     entry: &DescribedChainEntry,
     inspect: &openshell_core::proto::HttpResponsePreflightInspect,
     permitted_modes: &[i32],
@@ -186,7 +186,9 @@ pub(super) fn validate_inspect(
     Ok(mode)
 }
 
-pub(super) fn validate_preflight_input(input: &HttpResponsePreflightInput) -> miette::Result<()> {
+pub(in crate::legacy::response) fn validate_preflight_input(
+    input: &HttpResponsePreflightInput,
+) -> miette::Result<()> {
     if input.context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
         return Err(miette::miette!("response context exceeds platform limit"));
     }
@@ -207,7 +209,7 @@ pub(super) fn validate_preflight_input(input: &HttpResponsePreflightInput) -> mi
     Ok(())
 }
 
-pub(super) fn validate_diagnostics(
+pub(in crate::legacy::response) fn validate_diagnostics(
     reason: &str,
     reason_code: &str,
     findings: &[Finding],
@@ -243,7 +245,9 @@ pub(super) fn validate_diagnostics(
     Ok(())
 }
 
-pub(super) fn body_restriction(input: &HttpResponsePreflightInput) -> Option<String> {
+pub(in crate::legacy::response) fn body_restriction(
+    input: &HttpResponsePreflightInput,
+) -> Option<String> {
     if input.target.method.eq_ignore_ascii_case("HEAD")
         || input.status_code == 204
         || input.status_code == 304
@@ -289,7 +293,7 @@ pub(super) fn body_restriction(input: &HttpResponsePreflightInput) -> Option<Str
     None
 }
 
-pub(super) fn permitted_body_modes(
+pub(in crate::legacy::response) fn permitted_body_modes(
     input: &HttpResponsePreflightInput,
     entry: &DescribedChainEntry,
     body_restriction: Option<&str>,
@@ -323,6 +327,6 @@ fn is_open_ended_response(input: &HttpResponsePreflightInput) -> bool {
     })
 }
 
-pub(super) fn strip_stale_integrity(headers: &mut Vec<HttpHeader>) {
+pub(in crate::legacy::response) fn strip_stale_integrity(headers: &mut Vec<HttpHeader>) {
     headers.retain(|header| !is_stale_http_response_integrity_header(&header.name));
 }

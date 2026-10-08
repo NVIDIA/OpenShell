@@ -1639,120 +1639,6 @@ struct PreparedRequestBody {
     body: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub(crate) struct BufferedRequestBody {
-    pub(crate) headers: Vec<u8>,
-    pub(crate) body: Vec<u8>,
-}
-
-/// Result of attempting to buffer a request body for middleware inspection.
-#[derive(Debug)]
-pub(crate) enum BufferResult {
-    /// The full body was buffered within the size cap.
-    Buffered(BufferedRequestBody),
-    /// The body exceeded the inspection cap. `recoverable` is true when no body
-    /// bytes were consumed yet (a declared `Content-Length` over the cap), so the
-    /// request can still be streamed through unprocessed under fail-open. It is
-    /// false once bytes have been consumed (chunked overflow), where denying is
-    /// the only safe outcome.
-    OverCapacity { recoverable: bool },
-}
-
-pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite + Unpin>(
-    req: &L7Request,
-    client: &mut C,
-    generation_guard: Option<&PolicyGenerationGuard>,
-    max_body_bytes: usize,
-) -> Result<BufferResult> {
-    let header_end = req
-        .raw_header
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(req.raw_header.len(), |p| p + 4);
-    let mut headers = req.raw_header[..header_end].to_vec();
-    let already_read = &req.raw_header[header_end..];
-    match req.body_length {
-        BodyLength::None => {
-            // Leftover bytes after `\r\n\r\n` on a no-body request are
-            // read-ahead or pipelined data, not a framed body. Promoting them
-            // into `body` would later stamp `Content-Length` and forward them
-            // upstream as if they belonged to this request.
-            if !already_read.is_empty() {
-                return Err(miette!(
-                    "HTTP request with no body framing has {} unread byte(s) after headers; \
-                     refusing to treat read-ahead bytes as a request body",
-                    already_read.len()
-                ));
-            }
-            handle_buffered_expect_continue(client, &mut headers, false).await?;
-            Ok(BufferResult::Buffered(BufferedRequestBody {
-                headers,
-                body: Vec::new(),
-            }))
-        }
-        BodyLength::ContentLength(len) => {
-            // The declared length is known before any further reads, so an
-            // over-cap body here has not consumed the stream and can be passed
-            // through unprocessed if every middleware is fail-open.
-            let Ok(len) = usize::try_from(len) else {
-                return Ok(BufferResult::OverCapacity { recoverable: true });
-            };
-            if len > max_body_bytes {
-                return Ok(BufferResult::OverCapacity { recoverable: true });
-            }
-            let initial_len = already_read.len().min(len);
-            let mut body = Vec::new();
-            body.try_reserve_exact(len).map_err(|_| {
-                miette!("unable to allocate {len} bytes for middleware request body")
-            })?;
-            body.extend_from_slice(&already_read[..initial_len]);
-            let mut remaining = len.saturating_sub(initial_len);
-            handle_buffered_expect_continue(client, &mut headers, remaining > 0).await?;
-            let mut buf = [0u8; RELAY_BUF_SIZE];
-            while remaining > 0 {
-                let to_read = remaining.min(buf.len());
-                let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
-                if n == 0 {
-                    return Err(miette!(
-                        "Connection closed with {remaining} body bytes remaining"
-                    ));
-                }
-                if let Some(guard) = generation_guard {
-                    guard.ensure_current()?;
-                }
-                body.extend_from_slice(&buf[..n]);
-                remaining -= n;
-            }
-            Ok(BufferResult::Buffered(BufferedRequestBody {
-                headers,
-                body,
-            }))
-        }
-        BodyLength::Chunked => {
-            // Chunked bodies are decoded incrementally into the payload bytes
-            // middleware expects, but the middleware cap counts the complete
-            // wire representation, including framing and trailers. On overflow,
-            // we have already consumed wire bytes from the client stream and
-            // cannot re-enter the normal raw relay path without a separate
-            // splice-through buffer.
-            let needs_client_read = !chunked_body_is_fully_buffered(already_read);
-            handle_buffered_expect_continue(client, &mut headers, needs_client_read).await?;
-            match collect_chunked_body(client, already_read, generation_guard, Some(max_body_bytes))
-                .await
-            {
-                Ok(body) => Ok(BufferResult::Buffered(BufferedRequestBody {
-                    headers,
-                    body,
-                })),
-                Err(CollectChunkedError::OverCapacity) => {
-                    Ok(BufferResult::OverCapacity { recoverable: false })
-                }
-                Err(CollectChunkedError::Failed(error)) => Err(error),
-            }
-        }
-    }
-}
-
 async fn handle_buffered_expect_continue<C: AsyncWrite + Unpin>(
     client: &mut C,
     headers: &mut Vec<u8>,
@@ -5351,6 +5237,19 @@ mod tests {
         assert!(!sanitized.contains("keep-alive"));
     }
 
+    /// Read every body unit `prepare_request_body_stream` yields.
+    async fn read_prepared_body<C: AsyncRead + AsyncWrite + Unpin>(
+        req: &L7Request,
+        client: &mut C,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let (headers, mut reader) = prepare_request_body_stream(req, client).await?;
+        let mut body = Vec::new();
+        while let Some(unit) = reader.next_unit(client, None, 1024).await? {
+            body.extend_from_slice(&unit);
+        }
+        Ok((headers, body))
+    }
+
     #[tokio::test]
     async fn middleware_fixed_read_ahead_consumes_expect_continue() {
         for (already_read, remaining, should_acknowledge) in [
@@ -5369,15 +5268,12 @@ mod tests {
             let (mut client, mut peer) = tokio::io::duplex(128);
             peer.write_all(remaining).await.unwrap();
 
-            let result = buffer_request_body_for_middleware(&req, &mut client, None, 1024)
+            let (headers, body) = read_prepared_body(&req, &mut client)
                 .await
-                .expect("fixed body should buffer");
-            let BufferResult::Buffered(buffered) = result else {
-                panic!("fixed body unexpectedly exceeded capacity")
-            };
-            assert_eq!(buffered.body, b"hello");
+                .expect("fixed body should be read");
+            assert_eq!(body, b"hello");
             assert!(
-                !String::from_utf8_lossy(&buffered.headers)
+                !String::from_utf8_lossy(&headers)
                     .to_ascii_lowercase()
                     .contains("expect:")
             );
@@ -5418,15 +5314,12 @@ mod tests {
             let (mut client, mut peer) = tokio::io::duplex(128);
             peer.write_all(remaining).await.unwrap();
 
-            let result = buffer_request_body_for_middleware(&req, &mut client, None, 1024)
+            let (headers, body) = read_prepared_body(&req, &mut client)
                 .await
-                .expect("chunked body should buffer");
-            let BufferResult::Buffered(buffered) = result else {
-                panic!("chunked body unexpectedly exceeded capacity")
-            };
-            assert_eq!(buffered.body, b"hello");
+                .expect("chunked body should be read");
+            assert_eq!(body, b"hello");
             assert!(
-                !String::from_utf8_lossy(&buffered.headers)
+                !String::from_utf8_lossy(&headers)
                     .to_ascii_lowercase()
                     .contains("expect:")
             );
@@ -5462,30 +5355,6 @@ mod tests {
         .expect("chunked body should decode");
 
         assert_eq!(body, b"hello world");
-    }
-
-    #[tokio::test]
-    async fn middleware_chunked_request_with_trailers_is_rejected() {
-        let mut raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n".to_vec();
-        raw.extend_from_slice(b"5\r\nhello\r\n0\r\nX-Checksum: digest\r\n\r\n");
-        let req = L7Request {
-            action: "POST".into(),
-            target: "/api".into(),
-            query_params: HashMap::new(),
-            raw_header: raw,
-            body_length: BodyLength::Chunked,
-        };
-
-        let error =
-            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
-                .await
-                .expect_err("middleware must reject non-empty chunked trailers");
-        assert!(
-            error.to_string().contains(
-                "chunked request trailers are not supported when buffering or transforming request bodies"
-            ),
-            "unexpected error: {error}"
-        );
     }
 
     #[tokio::test]
@@ -5585,32 +5454,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extreme_content_length_is_rejected_before_allocation() {
-        let req = L7Request {
-            action: "POST".into(),
-            target: "/upload".into(),
-            query_params: HashMap::new(),
-            raw_header: b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 18446744073709551615\r\n\r\n".to_vec(),
-            body_length: BodyLength::ContentLength(u64::MAX),
-        };
-        let (mut client, _peer) = tokio::io::duplex(1);
-
-        let result = buffer_request_body_for_middleware(
-            &req,
-            &mut client,
-            None,
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES,
-        )
-        .await
-        .expect("oversized body should produce a capacity result");
-
-        assert!(matches!(
-            result,
-            BufferResult::OverCapacity { recoverable: true }
-        ));
-    }
-
-    #[tokio::test]
     async fn middleware_chunked_wire_body_at_cap_is_allowed() {
         let max_body_bytes = max_middleware_body_bytes().await;
         let payload_len = max_body_bytes - 14;
@@ -5664,63 +5507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn middleware_chunked_invalid_size_is_not_over_capacity() {
-        let mut raw =
-            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
-                .to_vec();
-        raw.extend_from_slice(b"xyz\r\n");
-        let req = L7Request {
-            action: "POST".into(),
-            target: "/api".into(),
-            query_params: HashMap::new(),
-            raw_header: raw,
-            body_length: BodyLength::Chunked,
-        };
-        let err =
-            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
-                .await
-                .expect_err("invalid chunk framing must surface as an error");
-
-        assert!(
-            err.to_string().contains("Invalid chunk size token"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !err.to_string().contains("over_capacity")
-                && !err.to_string().contains("exceeds configured buffer limit"),
-            "protocol errors must not be reported as over-capacity: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn middleware_chunked_over_capacity_still_maps_to_buffer_over_capacity() {
-        let max_body_bytes = 32;
-        let payload = "hello world that is definitely over the tiny cap";
-        let wire = format!("{:x}\r\n{payload}\r\n0\r\n\r\n", payload.len());
-        let mut raw =
-            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
-                .to_vec();
-        raw.extend_from_slice(wire.as_bytes());
-        let req = L7Request {
-            action: "POST".into(),
-            target: "/api".into(),
-            query_params: HashMap::new(),
-            raw_header: raw,
-            body_length: BodyLength::Chunked,
-        };
-
-        let result =
-            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, max_body_bytes)
-                .await
-                .expect("over-capacity is a BufferResult, not an Err");
-
-        assert!(
-            matches!(result, BufferResult::OverCapacity { recoverable: false }),
-            "expected OverCapacity, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn middleware_none_body_with_header_overshoot_is_rejected() {
         // Mimic the forward-proxy multi-byte read: headers plus pipelined bytes
         // after `\r\n\r\n` on a request with no body framing.
@@ -5733,10 +5519,9 @@ mod tests {
             body_length: BodyLength::None,
         };
 
-        let err =
-            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
-                .await
-                .expect_err("read-ahead leftovers must not become a request body");
+        let err = read_prepared_body(&req, &mut tokio::io::empty())
+            .await
+            .expect_err("read-ahead leftovers must not become a request body");
 
         assert!(
             err.to_string().contains("no body framing"),
@@ -5745,7 +5530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn middleware_none_body_without_overshoot_buffers_empty() {
+    async fn middleware_none_body_without_overshoot_keeps_no_body_framing() {
         let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let req = L7Request {
             action: "GET".into(),
@@ -5755,33 +5540,19 @@ mod tests {
             body_length: BodyLength::None,
         };
 
-        let result =
-            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
-                .await
-                .expect("empty no-body request should buffer");
-
-        match result {
-            BufferResult::Buffered(buffered) => {
-                assert!(buffered.body.is_empty());
-                let rebuilt = rebuild_request_with_buffered_body(
-                    &req,
-                    &buffered.headers,
-                    &buffered.body,
-                    &[],
-                )
-                .expect("rebuild no-body request");
-                assert!(matches!(rebuilt.body_length, BodyLength::None));
-                let text = String::from_utf8(rebuilt.raw_header).unwrap();
-                assert!(
-                    !text.to_ascii_lowercase().contains("content-length"),
-                    "rebuild must preserve no-body framing: {text}"
-                );
-                assert!(!text.contains("GET /other"));
-            }
-            other @ BufferResult::OverCapacity { .. } => {
-                panic!("expected Buffered, got {other:?}")
-            }
-        }
+        let (headers, body) = read_prepared_body(&req, &mut tokio::io::empty())
+            .await
+            .expect("empty no-body request should be read");
+        assert!(body.is_empty());
+        let rebuilt = rebuild_request_with_middleware_body(&req, &headers, &body, &[], &[])
+            .expect("rebuild no-body request");
+        assert!(matches!(rebuilt.body_length, BodyLength::None));
+        let text = String::from_utf8(rebuilt.raw_header).unwrap();
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length"),
+            "rebuild must preserve no-body framing: {text}"
+        );
+        assert!(!text.contains("GET /other"));
     }
 
     /// SEC-009: Bare LF in headers enables header injection.

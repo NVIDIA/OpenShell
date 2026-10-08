@@ -11,9 +11,12 @@
 //! to the legacy RPCs, and reports outcomes that version 2 results cannot
 //! express to a [`StageReportSink`].
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use openshell_core::proto::{HttpEvent, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase};
+use openshell_core::proto::{
+    Finding, HttpEvent, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+};
 use tokio::sync::mpsc;
 
 use crate::HttpResultStream;
@@ -82,7 +85,7 @@ pub trait HttpStageTransport: Send + Sync {
 }
 
 /// Outcome a stage reports beside its results.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StageReport {
     /// HTTP protocol 1 (0.1). Removed in 0.2.0.
@@ -90,6 +93,18 @@ pub enum StageReport {
     /// A legacy stage failed and `fail_open` passed its original input on.
     /// `reason` is a platform-owned failure reason, never service text.
     LegacyFailOpen { reason: String },
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    ///
+    /// One step of a legacy response stage, as the 0.1.x engine recorded it,
+    /// with the normalized findings and metadata of that step's result.
+    /// Version 2 results cannot express per-unit outcomes, so legacy response
+    /// stages report their invocation telemetry and diagnostics here as each
+    /// step completes.
+    LegacyResponseInvocation {
+        invocation: crate::HttpResponseInvocation,
+        findings: Vec<Finding>,
+        metadata: BTreeMap<String, String>,
+    },
 }
 
 impl StageReport {
@@ -98,6 +113,7 @@ impl StageReport {
     pub fn fail_open_reason(&self) -> Option<&str> {
         match self {
             Self::LegacyFailOpen { reason } => Some(reason),
+            Self::LegacyResponseInvocation { .. } => None,
         }
     }
 }

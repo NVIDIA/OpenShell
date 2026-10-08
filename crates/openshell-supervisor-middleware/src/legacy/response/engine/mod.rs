@@ -4,7 +4,7 @@
 //! HTTP response pre-return middleware chain execution.
 
 mod preflight;
-mod validation;
+pub(in crate::legacy::response) mod validation;
 
 #[cfg(test)]
 use validation::permitted_body_modes;
@@ -41,7 +41,7 @@ use crate::{
     is_stable_reason_code, middleware_denial_reason,
 };
 
-const STREAM_CHANNEL_CAPACITY: usize = 4;
+pub(in crate::legacy::response) const STREAM_CHANNEL_CAPACITY: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
 pub const MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum logical body bytes retained across a session's stage buffers and
@@ -93,7 +93,7 @@ pub enum HttpResponseInvocationOutcome {
     FailClosed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponseInvocation {
     pub config_name: String,
     pub implementation: String,
@@ -162,13 +162,13 @@ pub struct HttpResponseDiagnostics {
     pub invocations: Vec<HttpResponseInvocation>,
 }
 
-struct HttpResponseStageTransport {
-    sender: mpsc::Sender<HttpResponseEvent>,
-    responses: crate::HttpResponseResultStream,
+pub(in crate::legacy::response) struct HttpResponseStageTransport {
+    pub(in crate::legacy::response) sender: mpsc::Sender<HttpResponseEvent>,
+    pub(in crate::legacy::response) responses: crate::HttpResponseResultStream,
 }
 
 impl HttpResponseStageTransport {
-    async fn end(self, reason: MiddlewareSessionEndReason) {
+    pub(in crate::legacy::response) async fn end(self, reason: MiddlewareSessionEndReason) {
         let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.end_inner(reason)).await;
     }
 
@@ -193,7 +193,7 @@ impl HttpResponseStageTransport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StageMode {
+pub(in crate::legacy::response) enum StageMode {
     HeadersOnly,
     WholeBody,
     Stream,
@@ -939,7 +939,11 @@ async fn exchange(
     }
 }
 
-fn body_event(sequence: u64, data: Vec<u8>, end_of_stream: bool) -> HttpResponseEvent {
+pub(in crate::legacy::response) fn body_event(
+    sequence: u64,
+    data: Vec<u8>,
+    end_of_stream: bool,
+) -> HttpResponseEvent {
     HttpResponseEvent {
         event: Some(http_response_event::Event::Body(HttpResponseBodyUnit {
             sequence,
@@ -989,20 +993,7 @@ fn collect_diagnostics(
     all_findings: &mut Vec<NamespacedFinding>,
     all_metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
 ) {
-    if stage
-        .entry
-        .service
-        .as_ref()
-        .is_some_and(|service| service.diagnostic_policy == MiddlewareDiagnosticPolicy::Normalize)
-    {
-        metadata.clear();
-        for finding in &mut findings {
-            finding.r#type = format!("{}.finding", stage.entry.entry.implementation);
-            finding.label = crate::EXTERNAL_FINDING_LABEL.to_string();
-            finding.confidence.clear();
-            finding.severity = "medium".into();
-        }
-    }
+    normalize_diagnostics(&stage.entry, &mut findings, &mut metadata);
     all_findings.extend(findings.into_iter().map(|finding| NamespacedFinding {
         middleware: stage.entry.entry.name.clone(),
         finding,
@@ -1012,6 +1003,28 @@ fn collect_diagnostics(
             stage.entry.entry.name.clone(),
             metadata.into_iter().collect(),
         );
+    }
+}
+
+/// Replace service-provided diagnostic text from operator services with
+/// platform-owned values. Built-in diagnostics are kept as they are.
+pub(in crate::legacy::response) fn normalize_diagnostics(
+    entry: &DescribedChainEntry,
+    findings: &mut [Finding],
+    metadata: &mut std::collections::HashMap<String, String>,
+) {
+    if entry
+        .service
+        .as_ref()
+        .is_some_and(|service| service.diagnostic_policy == MiddlewareDiagnosticPolicy::Normalize)
+    {
+        metadata.clear();
+        for finding in findings {
+            finding.r#type = format!("{}.finding", entry.entry.implementation);
+            finding.label = crate::EXTERNAL_FINDING_LABEL.to_string();
+            finding.confidence.clear();
+            finding.severity = "medium".into();
+        }
     }
 }
 
@@ -1078,7 +1091,7 @@ fn collect_contract_failure(
     format!("middleware_failed: {}", kind.reason())
 }
 
-fn response_failure_category(reason: &str) -> &'static str {
+pub(in crate::legacy::response) fn response_failure_category(reason: &str) -> &'static str {
     if ContractFailureKind::from_reason(reason).is_some() {
         "contract_failure"
     } else if reason == "middleware_session_capacity_exhausted" {

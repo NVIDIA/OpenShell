@@ -6,5 +6,9 @@
 //! Code under this module serves only the deprecated HTTP middleware protocol
 //! and is deleted with it.
 
+#[cfg(test)]
+mod adapter_tests;
+pub mod codec;
 pub mod hooks;
+pub mod request;
 pub mod response;

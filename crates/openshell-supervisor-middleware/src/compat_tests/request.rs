@@ -14,10 +14,8 @@ use openshell_supervisor_middleware_wire_fixture::{
 };
 use tonic::Status;
 
-use super::harness::{
-    Engine, StageOutcome, connect, entry, registration, request, run_request, transcode,
-};
-use crate::{MIDDLEWARE_GRPC_MESSAGE_BYTES, OnError};
+use super::harness::{StageOutcome, connect, entry, registration, request, run_request, transcode};
+use crate::{MAX_MIDDLEWARE_HEADERS, MIDDLEWARE_GRPC_MESSAGE_BYTES, OnError};
 
 const GUARD: &str = "legacy-guard";
 
@@ -52,331 +50,319 @@ fn redacting_guard(request: &HttpRequestEvaluation) -> Reply<HttpRequestResult> 
 
 #[tokio::test]
 async fn request_envelope_and_decisions_round_trip_over_the_v0_1_2_wire() {
-    for engine in Engine::ALL {
-        let fixture = LegacyMiddlewareFixture::new("compat/guard")
-            .with_binding(http_request_binding(4096))
-            .on_http_request(redacting_guard)
-            .spawn()
-            .await
-            .expect("spawn fixture");
-        let runner = connect(vec![registration(GUARD, &fixture, 4096)]).await;
-        let chain = [entry("guard", GUARD, 10, OnError::FailClosed)];
+    let fixture = LegacyMiddlewareFixture::new("compat/guard")
+        .with_binding(http_request_binding(4096))
+        .on_http_request(redacting_guard)
+        .spawn()
+        .await
+        .expect("spawn fixture");
+    let runner = connect(vec![registration(GUARD, &fixture, 4096)]).await;
+    let chain = [entry("guard", GUARD, 10, OnError::FailClosed)];
 
-        let redacted = run_request(
-            engine,
-            &runner,
-            &chain,
-            request(
-                b"{\"note\":\"secret\"}",
-                &[
-                    ("content-type", "application/json"),
-                    ("x-repeat", "one"),
-                    ("x-repeat", "two"),
-                ],
-            ),
-        )
-        .await;
-        assert!(redacted.allowed, "{engine:?}: {}", redacted.reason);
-        assert_eq!(redacted.body, b"{\"note\":\"[FILTERED]\"}");
-        let expected_mutation: HeaderMutation = transcode(&results::write_header(
-            "x-guard",
-            "redacted",
-            ExistingHeaderAction::Overwrite,
-        ));
-        assert_eq!(redacted.header_mutations, vec![expected_mutation]);
-        assert_eq!(
-            redacted.stages,
-            vec![StageOutcome {
-                name: "guard".into(),
-                decision: Decision::Allow,
-                transformed: true,
-                failed: false,
-            }]
-        );
-
-        let evaluation = fixture.http_requests().remove(0);
-        assert_eq!(
-            evaluation.phase,
-            SupervisorMiddlewarePhase::PreCredentials as i32
-        );
-        assert_eq!(evaluation.middleware_name, GUARD);
-        assert_eq!(evaluation.body, b"{\"note\":\"secret\"}");
-        let target = evaluation.target.expect("request target");
-        assert_eq!(
-            (
-                target.scheme.as_str(),
-                target.host.as_str(),
-                target.port,
-                target.method.as_str(),
-                target.path.as_str(),
-                target.query.as_str()
-            ),
-            (
-                "https",
-                "api.example.test",
-                443,
-                "POST",
-                "/v1/messages",
-                "trace=1"
-            )
-        );
-        let context = evaluation.context.expect("request context");
-        assert_eq!(context.request_id, "compat-request");
-        assert_eq!(context.sandbox_id, "compat-sandbox-id");
-        assert_eq!(context.sandbox, "compat-sandbox");
-        assert_eq!(context.workspace, "compat-workspace");
-        let headers: Vec<_> = evaluation
-            .headers
-            .iter()
-            .map(|header| (header.name.as_str(), header.value.as_str()))
-            .collect();
-        assert_eq!(
-            headers,
-            [
+    let redacted = run_request(
+        &runner,
+        &chain,
+        request(
+            b"{\"note\":\"secret\"}",
+            &[
                 ("content-type", "application/json"),
                 ("x-repeat", "one"),
                 ("x-repeat", "two"),
             ],
-            "headers arrive in wire order with repeated names kept"
-        );
-        assert_eq!(
-            evaluation
-                .config
-                .expect("attachment config")
-                .fields
-                .get("attachment")
-                .and_then(|value| value.kind.clone()),
-            Some(prost_types::value::Kind::StringValue("guard".into()))
-        );
+        ),
+    )
+    .await;
+    assert!(redacted.allowed, "{}", redacted.reason);
+    assert_eq!(redacted.body, b"{\"note\":\"[FILTERED]\"}");
+    let expected_mutation: HeaderMutation = transcode(&results::write_header(
+        "x-guard",
+        "redacted",
+        ExistingHeaderAction::Overwrite,
+    ));
+    assert_eq!(redacted.header_mutations, vec![expected_mutation]);
+    assert_eq!(
+        redacted.stages,
+        vec![StageOutcome {
+            name: "guard".into(),
+            decision: Decision::Allow,
+            transformed: true,
+            failed: false,
+        }]
+    );
 
-        let denied = run_request(engine, &runner, &chain, request(b"forbidden", &[])).await;
-        assert!(!denied.allowed);
-        assert_eq!(denied.reason, "middleware_denied:guard:content_match");
-        let denial = denied.denial.expect("explicit denial");
-        assert_eq!(denial.config_name, "guard");
-        assert_eq!(denial.reason_code.as_deref(), Some("content_match"));
-        // Operator services keep only platform-owned finding text.
-        assert_eq!(denied.findings.len(), 1);
-        assert_eq!(denied.findings[0].0, "guard");
-        assert_eq!(denied.findings[0].1.r#type, format!("{GUARD}.finding"));
-        assert!(!denied.findings[0].1.label.contains("sk-secret-value"));
-        assert_eq!(denied.findings[0].1.severity, "high");
+    let evaluation = fixture.http_requests().remove(0);
+    assert_eq!(
+        evaluation.phase,
+        SupervisorMiddlewarePhase::PreCredentials as i32
+    );
+    assert_eq!(evaluation.middleware_name, GUARD);
+    assert_eq!(evaluation.body, b"{\"note\":\"secret\"}");
+    let target = evaluation.target.expect("request target");
+    assert_eq!(
+        (
+            target.scheme.as_str(),
+            target.host.as_str(),
+            target.port,
+            target.method.as_str(),
+            target.path.as_str(),
+            target.query.as_str()
+        ),
+        (
+            "https",
+            "api.example.test",
+            443,
+            "POST",
+            "/v1/messages",
+            "trace=1"
+        )
+    );
+    let context = evaluation.context.expect("request context");
+    assert_eq!(context.request_id, "compat-request");
+    assert_eq!(context.sandbox_id, "compat-sandbox-id");
+    assert_eq!(context.sandbox, "compat-sandbox");
+    assert_eq!(context.workspace, "compat-workspace");
+    let headers: Vec<_> = evaluation
+        .headers
+        .iter()
+        .map(|header| (header.name.as_str(), header.value.as_str()))
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            ("content-type", "application/json"),
+            ("x-repeat", "one"),
+            ("x-repeat", "two"),
+        ],
+        "headers arrive in wire order with repeated names kept"
+    );
+    assert_eq!(
+        evaluation
+            .config
+            .expect("attachment config")
+            .fields
+            .get("attachment")
+            .and_then(|value| value.kind.clone()),
+        Some(prost_types::value::Kind::StringValue("guard".into()))
+    );
 
-        let unchanged = run_request(engine, &runner, &chain, request(b"plain", &[])).await;
-        assert!(unchanged.allowed);
-        assert_eq!(unchanged.body, b"plain");
-        assert!(unchanged.header_mutations.is_empty());
-        assert!(!unchanged.stages[0].transformed);
-    }
+    let denied = run_request(&runner, &chain, request(b"forbidden", &[])).await;
+    assert!(!denied.allowed);
+    assert_eq!(denied.reason, "middleware_denied:guard:content_match");
+    let denial = denied.denial.expect("explicit denial");
+    assert_eq!(denial.config_name, "guard");
+    assert_eq!(denial.reason_code.as_deref(), Some("content_match"));
+    // Operator services keep only platform-owned finding text.
+    assert_eq!(denied.findings.len(), 1);
+    assert_eq!(denied.findings[0].0, "guard");
+    assert_eq!(denied.findings[0].1.r#type, format!("{GUARD}.finding"));
+    assert!(!denied.findings[0].1.label.contains("sk-secret-value"));
+    assert_eq!(denied.findings[0].1.severity, "high");
+
+    let unchanged = run_request(&runner, &chain, request(b"plain", &[])).await;
+    assert!(unchanged.allowed);
+    assert_eq!(unchanged.body, b"plain");
+    assert!(unchanged.header_mutations.is_empty());
+    assert!(!unchanged.stages[0].transformed);
 }
 
 #[tokio::test]
 async fn later_stages_observe_earlier_header_mutations_in_chain_order() {
-    for engine in Engine::ALL {
-        let first = LegacyMiddlewareFixture::new("compat/first")
-            .with_binding(http_request_binding(4096))
-            .on_http_request(|_| {
-                results::mutate_headers(vec![
-                    results::write_header("x-shared", "first", ExistingHeaderAction::Overwrite),
-                    results::write_header("x-trace", "first", ExistingHeaderAction::Append),
-                    results::remove_header("x-drop"),
-                ])
-                .into()
-            })
-            .spawn()
-            .await
-            .expect("spawn first fixture");
-        let second = LegacyMiddlewareFixture::new("compat/second")
-            .with_binding(http_request_binding(4096))
-            .on_http_request(|_| {
-                results::mutate_headers(vec![
-                    results::write_header("x-shared", "second", ExistingHeaderAction::Skip),
-                    results::write_header("x-trace", "second", ExistingHeaderAction::Append),
-                    results::write_header("x-second", "set", ExistingHeaderAction::Overwrite),
-                ])
-                .into()
-            })
-            .spawn()
-            .await
-            .expect("spawn second fixture");
-        let runner = connect(vec![
-            registration("legacy-first", &first, 4096),
-            registration("legacy-second", &second, 4096),
-        ])
-        .await;
-        // Declared out of order; policy order decides execution order.
-        let chain = [
-            entry("second", "legacy-second", 20, OnError::FailClosed),
-            entry("first", "legacy-first", 10, OnError::FailClosed),
-        ];
+    let first = LegacyMiddlewareFixture::new("compat/first")
+        .with_binding(http_request_binding(4096))
+        .on_http_request(|_| {
+            results::mutate_headers(vec![
+                results::write_header("x-shared", "first", ExistingHeaderAction::Overwrite),
+                results::write_header("x-trace", "first", ExistingHeaderAction::Append),
+                results::remove_header("x-drop"),
+            ])
+            .into()
+        })
+        .spawn()
+        .await
+        .expect("spawn first fixture");
+    let second = LegacyMiddlewareFixture::new("compat/second")
+        .with_binding(http_request_binding(4096))
+        .on_http_request(|_| {
+            results::mutate_headers(vec![
+                results::write_header("x-shared", "second", ExistingHeaderAction::Skip),
+                results::write_header("x-trace", "second", ExistingHeaderAction::Append),
+                results::write_header("x-second", "set", ExistingHeaderAction::Overwrite),
+            ])
+            .into()
+        })
+        .spawn()
+        .await
+        .expect("spawn second fixture");
+    let runner = connect(vec![
+        registration("legacy-first", &first, 4096),
+        registration("legacy-second", &second, 4096),
+    ])
+    .await;
+    // Declared out of order; policy order decides execution order.
+    let chain = [
+        entry("second", "legacy-second", 20, OnError::FailClosed),
+        entry("first", "legacy-first", 10, OnError::FailClosed),
+    ];
 
-        let observed = run_request(
-            engine,
-            &runner,
-            &chain,
-            request(
-                b"{}",
-                &[
-                    ("x-shared", "original"),
-                    ("x-drop", "gone"),
-                    ("x-keep", "kept"),
-                ],
-            ),
-        )
-        .await;
-        assert!(observed.allowed, "{engine:?}: {}", observed.reason);
-        assert_eq!(
-            observed
-                .stages
-                .iter()
-                .map(|stage| stage.name.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
-
-        let second_saw: Vec<_> = second.http_requests()[0]
-            .headers
-            .iter()
-            .map(|header| (header.name.clone(), header.value.clone()))
-            .collect();
-        // OVERWRITE removes every existing value and appends the new one.
-        assert_eq!(
-            second_saw,
-            [
-                ("x-keep".to_string(), "kept".to_string()),
-                ("x-shared".to_string(), "first".to_string()),
-                ("x-trace".to_string(), "first".to_string()),
+    let observed = run_request(
+        &runner,
+        &chain,
+        request(
+            b"{}",
+            &[
+                ("x-shared", "original"),
+                ("x-drop", "gone"),
+                ("x-keep", "kept"),
             ],
-            "the second stage sees the first stage's mutations applied"
-        );
+        ),
+    )
+    .await;
+    assert!(observed.allowed, "{}", observed.reason);
+    assert_eq!(
+        observed
+            .stages
+            .iter()
+            .map(|stage| stage.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
 
-        let first_mutations: Vec<HeaderMutation> = [
-            results::write_header("x-shared", "first", ExistingHeaderAction::Overwrite),
-            results::write_header("x-trace", "first", ExistingHeaderAction::Append),
-            results::remove_header("x-drop"),
-        ]
+    let second_saw: Vec<_> = second.http_requests()[0]
+        .headers
         .iter()
-        .map(transcode)
+        .map(|header| (header.name.clone(), header.value.clone()))
         .collect();
-        let second_mutations: Vec<HeaderMutation> = [
-            results::write_header("x-shared", "second", ExistingHeaderAction::Skip),
-            results::write_header("x-trace", "second", ExistingHeaderAction::Append),
-            results::write_header("x-second", "set", ExistingHeaderAction::Overwrite),
-        ]
-        .iter()
-        .map(transcode)
-        .collect();
-        assert_eq!(
-            observed.header_mutations,
-            [first_mutations, second_mutations].concat(),
-            "the relay replays every stage's mutations in chain order"
-        );
-    }
+    // OVERWRITE removes every existing value and appends the new one.
+    assert_eq!(
+        second_saw,
+        [
+            ("x-keep".to_string(), "kept".to_string()),
+            ("x-shared".to_string(), "first".to_string()),
+            ("x-trace".to_string(), "first".to_string()),
+        ],
+        "the second stage sees the first stage's mutations applied"
+    );
+
+    let first_mutations: Vec<HeaderMutation> = [
+        results::write_header("x-shared", "first", ExistingHeaderAction::Overwrite),
+        results::write_header("x-trace", "first", ExistingHeaderAction::Append),
+        results::remove_header("x-drop"),
+    ]
+    .iter()
+    .map(transcode)
+    .collect();
+    let second_mutations: Vec<HeaderMutation> = [
+        results::write_header("x-shared", "second", ExistingHeaderAction::Skip),
+        results::write_header("x-trace", "second", ExistingHeaderAction::Append),
+        results::write_header("x-second", "set", ExistingHeaderAction::Overwrite),
+    ]
+    .iter()
+    .map(transcode)
+    .collect();
+    assert_eq!(
+        observed.header_mutations,
+        [first_mutations, second_mutations].concat(),
+        "the relay replays every stage's mutations in chain order"
+    );
 }
 
 #[tokio::test]
 async fn deny_short_circuits_later_stages() {
-    for engine in Engine::ALL {
-        let denying = LegacyMiddlewareFixture::new("compat/deny")
-            .with_binding(http_request_binding(4096))
-            .on_http_request(|_| {
-                HttpRequestResult {
-                    // A deny wins even when the rest of the result is unusable.
-                    header_mutations: vec![results::write_header(
-                        "authorization",
-                        "forged",
-                        ExistingHeaderAction::Overwrite,
-                    )],
-                    ..results::deny("blocked_by_guard")
-                }
-                .into()
-            })
-            .spawn()
-            .await
-            .expect("spawn denying fixture");
-        let later = LegacyMiddlewareFixture::new("compat/later")
-            .with_binding(http_request_binding(4096))
-            .spawn()
-            .await
-            .expect("spawn later fixture");
-        let runner = connect(vec![
-            registration("legacy-deny", &denying, 4096),
-            registration("legacy-later", &later, 4096),
-        ])
-        .await;
-        let chain = [
-            entry("deny", "legacy-deny", 10, OnError::FailOpen),
-            entry("later", "legacy-later", 20, OnError::FailClosed),
-        ];
+    let denying = LegacyMiddlewareFixture::new("compat/deny")
+        .with_binding(http_request_binding(4096))
+        .on_http_request(|_| {
+            HttpRequestResult {
+                // A deny wins even when the rest of the result is unusable.
+                header_mutations: vec![results::write_header(
+                    "authorization",
+                    "forged",
+                    ExistingHeaderAction::Overwrite,
+                )],
+                ..results::deny("blocked_by_guard")
+            }
+            .into()
+        })
+        .spawn()
+        .await
+        .expect("spawn denying fixture");
+    let later = LegacyMiddlewareFixture::new("compat/later")
+        .with_binding(http_request_binding(4096))
+        .spawn()
+        .await
+        .expect("spawn later fixture");
+    let runner = connect(vec![
+        registration("legacy-deny", &denying, 4096),
+        registration("legacy-later", &later, 4096),
+    ])
+    .await;
+    let chain = [
+        entry("deny", "legacy-deny", 10, OnError::FailOpen),
+        entry("later", "legacy-later", 20, OnError::FailClosed),
+    ];
 
-        let observed = run_request(engine, &runner, &chain, request(b"{}", &[])).await;
-        assert!(!observed.allowed);
-        assert_eq!(observed.reason, "middleware_denied:deny:blocked_by_guard");
-        assert!(observed.header_mutations.is_empty());
-        assert!(later.http_requests().is_empty());
-    }
+    let observed = run_request(&runner, &chain, request(b"{}", &[])).await;
+    assert!(!observed.allowed);
+    assert_eq!(observed.reason, "middleware_denied:deny:blocked_by_guard");
+    assert!(observed.header_mutations.is_empty());
+    assert!(later.http_requests().is_empty());
 }
 
 #[tokio::test]
 async fn over_capacity_bodies_skip_or_fail_each_stage_by_its_own_limit() {
-    for engine in Engine::ALL {
-        let small = LegacyMiddlewareFixture::new("compat/small")
-            .with_binding(http_request_binding(16))
-            .spawn()
-            .await
-            .expect("spawn small fixture");
-        let large = LegacyMiddlewareFixture::new("compat/large")
-            .with_binding(http_request_binding(64))
-            .on_http_request(|_| results::replace_body("large-stage-ran").into())
-            .spawn()
-            .await
-            .expect("spawn large fixture");
-        let runner = connect(vec![
-            registration("legacy-small", &small, 16),
-            registration("legacy-large", &large, 64),
-        ])
-        .await;
-        let body = [b'x'; 32];
+    let small = LegacyMiddlewareFixture::new("compat/small")
+        .with_binding(http_request_binding(16))
+        .spawn()
+        .await
+        .expect("spawn small fixture");
+    let large = LegacyMiddlewareFixture::new("compat/large")
+        .with_binding(http_request_binding(64))
+        .on_http_request(|_| results::replace_body("large-stage-ran").into())
+        .spawn()
+        .await
+        .expect("spawn large fixture");
+    let runner = connect(vec![
+        registration("legacy-small", &small, 16),
+        registration("legacy-large", &large, 64),
+    ])
+    .await;
+    let body = [b'x'; 32];
 
-        let skipped = run_request(
-            engine,
-            &runner,
-            &[
-                entry("small", "legacy-small", 10, OnError::FailOpen),
-                entry("large", "legacy-large", 20, OnError::FailClosed),
-            ],
-            request(&body, &[]),
-        )
-        .await;
-        assert!(skipped.allowed, "{engine:?}: {}", skipped.reason);
-        assert_eq!(skipped.body, b"large-stage-ran");
-        assert_eq!(
-            skipped.stages[0],
-            StageOutcome {
-                name: "small".into(),
-                decision: Decision::Allow,
-                transformed: false,
-                failed: true,
-            }
-        );
-        assert!(small.http_requests().is_empty(), "fail_open skips the call");
-        assert_eq!(large.http_requests().len(), 1);
+    let skipped = run_request(
+        &runner,
+        &[
+            entry("small", "legacy-small", 10, OnError::FailOpen),
+            entry("large", "legacy-large", 20, OnError::FailClosed),
+        ],
+        request(&body, &[]),
+    )
+    .await;
+    assert!(skipped.allowed, "{}", skipped.reason);
+    assert_eq!(skipped.body, b"large-stage-ran");
+    assert_eq!(
+        skipped.stages[0],
+        StageOutcome {
+            name: "small".into(),
+            decision: Decision::Allow,
+            transformed: false,
+            failed: true,
+        }
+    );
+    assert!(small.http_requests().is_empty(), "fail_open skips the call");
+    assert_eq!(large.http_requests().len(), 1);
 
-        let denied = run_request(
-            engine,
-            &runner,
-            &[entry("small", "legacy-small", 10, OnError::FailClosed)],
-            request(&body, &[]),
-        )
-        .await;
-        assert!(!denied.allowed);
-        assert_eq!(
-            denied.reason,
-            "middleware_failed: request_body_over_capacity"
-        );
-        assert!(denied.denial.is_none());
-        assert!(small.http_requests().is_empty());
-    }
+    let denied = run_request(
+        &runner,
+        &[entry("small", "legacy-small", 10, OnError::FailClosed)],
+        request(&body, &[]),
+    )
+    .await;
+    assert!(!denied.allowed);
+    assert_eq!(
+        denied.reason,
+        "middleware_failed: request_body_over_capacity"
+    );
+    assert!(denied.denial.is_none());
+    assert!(small.http_requests().is_empty());
 }
 
 /// One way a legacy service can fail an evaluation, and the 0.1.x reason
@@ -440,44 +426,80 @@ const FAILURE_CASES: [FailureCase; 7] = [
 
 #[tokio::test]
 async fn service_failures_follow_on_error() {
-    for engine in Engine::ALL {
-        for case in &FAILURE_CASES {
-            let fixture = LegacyMiddlewareFixture::new("compat/failing")
-                .with_binding(http_request_binding(64))
-                .on_http_request(case.reply)
-                .spawn()
-                .await
-                .expect("spawn failing fixture");
-            let runner = connect(vec![registration(GUARD, &fixture, 64)]).await;
+    for case in &FAILURE_CASES {
+        let fixture = LegacyMiddlewareFixture::new("compat/failing")
+            .with_binding(http_request_binding(64))
+            .on_http_request(case.reply)
+            .spawn()
+            .await
+            .expect("spawn failing fixture");
+        let runner = connect(vec![registration(GUARD, &fixture, 64)]).await;
 
-            let open = run_request(
-                engine,
-                &runner,
-                &[entry("guard", GUARD, 10, OnError::FailOpen)],
-                request(b"original", &[]),
-            )
-            .await;
-            assert!(open.allowed, "{engine:?} {}: {}", case.name, open.reason);
-            assert_eq!(open.body, b"original", "{}", case.name);
-            assert!(open.header_mutations.is_empty(), "{}", case.name);
-            assert!(open.stages[0].failed, "{}", case.name);
+        let open = run_request(
+            &runner,
+            &[entry("guard", GUARD, 10, OnError::FailOpen)],
+            request(b"original", &[]),
+        )
+        .await;
+        assert!(open.allowed, "{}: {}", case.name, open.reason);
+        assert_eq!(open.body, b"original", "{}", case.name);
+        assert!(open.header_mutations.is_empty(), "{}", case.name);
+        assert!(open.stages[0].failed, "{}", case.name);
 
-            let closed = run_request(
-                engine,
-                &runner,
-                &[entry("guard", GUARD, 10, OnError::FailClosed)],
-                request(b"original", &[]),
-            )
-            .await;
-            assert!(!closed.allowed, "{engine:?} {}", case.name);
-            assert_eq!(closed.reason, case.fail_closed_reason, "{}", case.name);
-            assert!(closed.denial.is_none(), "{}", case.name);
-            assert!(
-                !closed.reason.contains("sk-secret-value"),
-                "service text never reaches the outcome"
-            );
-        }
+        let closed = run_request(
+            &runner,
+            &[entry("guard", GUARD, 10, OnError::FailClosed)],
+            request(b"original", &[]),
+        )
+        .await;
+        assert!(!closed.allowed, "{}", case.name);
+        assert_eq!(closed.reason, case.fail_closed_reason, "{}", case.name);
+        assert!(closed.denial.is_none(), "{}", case.name);
+        assert!(
+            !closed.reason.contains("sk-secret-value"),
+            "service text never reaches the outcome"
+        );
     }
+}
+
+/// 0.1.x checked each stage's request envelope against the platform limits
+/// before calling it, so input over those limits followed each stage's
+/// `on_error` with a reason naming the limit.
+#[tokio::test]
+async fn request_input_over_platform_limits_follows_on_error() {
+    let fixture = LegacyMiddlewareFixture::new("compat/guard")
+        .with_binding(http_request_binding(64))
+        .spawn()
+        .await
+        .expect("spawn fixture");
+    let runner = connect(vec![registration(GUARD, &fixture, 64)]).await;
+    let mut input = request(b"original", &[]);
+    input.headers = (0..=MAX_MIDDLEWARE_HEADERS)
+        .map(|index| (format!("x-header-{index}"), "value".to_string()))
+        .collect();
+
+    let open = run_request(
+        &runner,
+        &[entry("guard", GUARD, 10, OnError::FailOpen)],
+        input.clone(),
+    )
+    .await;
+    assert!(open.allowed, "{}", open.reason);
+    assert_eq!(open.body, b"original");
+    assert!(open.stages[0].failed);
+
+    let closed = run_request(
+        &runner,
+        &[entry("guard", GUARD, 10, OnError::FailClosed)],
+        input,
+    )
+    .await;
+    assert!(!closed.allowed);
+    assert_eq!(
+        closed.reason,
+        "middleware_failed: request_header_count_over_capacity"
+    );
+    assert!(fixture.http_requests().is_empty());
 }
 
 /// 0.1.x skipped a stage that answered `UNIMPLEMENTED` under `fail_open`, so
@@ -486,49 +508,46 @@ async fn service_failures_follow_on_error() {
 /// `on_error` and asks the supervisor to describe its services again.
 #[tokio::test]
 async fn unimplemented_evaluate_http_request_fails_closed_regardless_of_on_error() {
-    for engine in Engine::ALL {
-        let fixture = LegacyMiddlewareFixture::new("compat/swapped")
-            .with_binding(http_request_binding(64))
-            .on_http_request(|_| results::replace_body("inspected").into())
-            .spawn()
-            .await
-            .expect("spawn fixture");
-        let runner = connect(vec![registration(GUARD, &fixture, 64)]).await;
-        let describes_after_registration = fixture.describe_requests().len();
-        fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
+    let fixture = LegacyMiddlewareFixture::new("compat/swapped")
+        .with_binding(http_request_binding(64))
+        .on_http_request(|_| results::replace_body("inspected").into())
+        .spawn()
+        .await
+        .expect("spawn fixture");
+    let runner = connect(vec![registration(GUARD, &fixture, 64)]).await;
+    let describes_after_registration = fixture.describe_requests().len();
+    fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
 
-        for on_error in [OnError::FailOpen, OnError::FailClosed] {
-            let observation = run_request(
-                engine,
-                &runner,
-                &[entry("guard", GUARD, 10, on_error)],
-                request(b"original", &[]),
-            )
-            .await;
-            assert!(!observation.allowed, "{engine:?} {on_error:?}");
-            // The status is classified before diagnostics are normalized.
-            assert_eq!(
-                observation.reason,
-                "middleware_failed: middleware_contract_failure_unimplemented"
-            );
-            assert_eq!(
-                observation.stages,
-                vec![StageOutcome {
-                    name: "guard".into(),
-                    decision: Decision::Deny,
-                    transformed: false,
-                    failed: true,
-                }]
-            );
-            assert!(runner.take_reconciliation_request(), "{on_error:?}");
-        }
+    for on_error in [OnError::FailOpen, OnError::FailClosed] {
+        let observation = run_request(
+            &runner,
+            &[entry("guard", GUARD, 10, on_error)],
+            request(b"original", &[]),
+        )
+        .await;
+        assert!(!observation.allowed, "{on_error:?}");
+        // The status is classified before diagnostics are normalized.
         assert_eq!(
-            fixture.describe_requests().len(),
-            describes_after_registration,
-            "the supervisor's next poll describes the services again"
+            observation.reason,
+            "middleware_failed: middleware_contract_failure_unimplemented"
         );
-        assert!(fixture.http_requests().is_empty());
+        assert_eq!(
+            observation.stages,
+            vec![StageOutcome {
+                name: "guard".into(),
+                decision: Decision::Deny,
+                transformed: false,
+                failed: true,
+            }]
+        );
+        assert!(runner.take_reconciliation_request(), "{on_error:?}");
     }
+    assert_eq!(
+        fixture.describe_requests().len(),
+        describes_after_registration,
+        "the supervisor's next poll describes the services again"
+    );
+    assert!(fixture.http_requests().is_empty());
 }
 
 #[tokio::test]

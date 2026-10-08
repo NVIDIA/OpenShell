@@ -9,10 +9,11 @@ use futures::future::BoxFuture;
 use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
 use openshell_core::proto::{
     ExistingHeaderAction, HttpBufferedMode, HttpBufferedResult, HttpContinue, HttpFinish,
-    HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflight, HttpPreflightResult, HttpReject,
-    HttpRequestResult, HttpResult, HttpStreamMode, HttpUnchanged, MiddlewareDiagnostics,
-    MiddlewareSessionEndReason, WriteHeader, header_mutation, http_buffered_result, http_event,
-    http_inspect, http_preflight_result, http_result,
+    HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflight, HttpPreflightResult,
+    HttpReject, HttpRequestResult, HttpRequestTarget, HttpResult, HttpStreamMode, HttpUnchanged,
+    MiddlewareDiagnostics, MiddlewareSessionEndReason, RequestContext, WriteHeader,
+    header_mutation, http_buffered_result, http_event, http_inspect, http_preflight_result,
+    http_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -539,6 +540,25 @@ async fn run_session(
     std::result::Result<HttpPipelineFinish, HttpMiddlewareFailure>,
     Vec<HttpBodyOutput>,
 ) {
+    run_session_with_policy(
+        session,
+        chunks,
+        trailers,
+        TransformedBodyPolicy::NotPolicyRelevant,
+    )
+    .await
+}
+
+/// [`run_session`] with a transformed-body policy.
+async fn run_session_with_policy(
+    session: HttpRequestSession,
+    chunks: Vec<Vec<u8>>,
+    trailers: Vec<HttpHeader>,
+    body_policy: TransformedBodyPolicy<'_>,
+) -> (
+    std::result::Result<HttpPipelineFinish, HttpMiddlewareFailure>,
+    Vec<HttpBodyOutput>,
+) {
     let (input_tx, input_rx) = mpsc::channel(4);
     let (output_tx, mut output_rx) = mpsc::channel(4);
     let feed = async move {
@@ -556,7 +576,11 @@ async fn run_session(
         }
         output
     };
-    let (finish, (), output) = tokio::join!(session.run(input_rx, output_tx), feed, collect);
+    let (finish, (), output) = tokio::join!(
+        session.run_with_body_policy(input_rx, output_tx, body_policy),
+        feed,
+        collect
+    );
     (finish, output)
 }
 
@@ -1434,6 +1458,93 @@ async fn unresolved_entries_follow_on_error_before_preflight() {
     assert_eq!(outcome.reason, "middleware_failed: binding_not_described");
 }
 
+/// A body-aware policy re-checks every replaced body before the next stage
+/// or the output sees it. Bodies a stage passes on unchanged are not
+/// re-checked.
+#[tokio::test]
+async fn replaced_bodies_are_rechecked_before_the_next_stage() {
+    let runner = runner_for(&[
+        stream_stage("test/upper", uppercase),
+        stream_stage("test/tail", identity),
+    ])
+    .await;
+    let checked = Mutex::new(Vec::new());
+    let validate = |body: &[u8]| -> Result<Option<String>> {
+        checked.lock().expect("checked").push(body.to_vec());
+        Ok(String::from_utf8_lossy(body)
+            .contains("SECRET")
+            .then(|| "middleware transformation denied by policy: test".to_string()))
+    };
+
+    let session = preflight(&runner, &["test/upper", "test/tail"], None)
+        .await
+        .session
+        .expect("session");
+    let (finish, output) = run_session_with_policy(
+        session,
+        vec![b"ok".to_vec()],
+        Vec::new(),
+        TransformedBodyPolicy::Reevaluate(&validate),
+    )
+    .await;
+    finish.expect("an allowed replacement continues");
+    assert_eq!(output_body(&output), b"OK");
+    assert_eq!(*checked.lock().expect("checked"), [b"OK".to_vec()]);
+
+    checked.lock().expect("checked").clear();
+    let tail = stream_stage("test/tail", identity);
+    let runner = runner_for(&[stream_stage("test/upper", uppercase), tail.clone()]).await;
+    let session = preflight(&runner, &["test/upper", "test/tail"], None)
+        .await
+        .session
+        .expect("session");
+    let (finish, output) = run_session_with_policy(
+        session,
+        vec![b"a secret".to_vec()],
+        Vec::new(),
+        TransformedBodyPolicy::Reevaluate(&validate),
+    )
+    .await;
+    let failure = finish.expect_err("a denied replacement stops the chain");
+    assert_eq!(
+        failure.reason,
+        "middleware transformation denied by policy: test"
+    );
+    assert!(failure.denial.is_none());
+    assert_eq!(failure.end_reason, MiddlewareSessionEndReason::PolicyDenial);
+    assert!(
+        output.is_empty(),
+        "the denied body never reaches the output"
+    );
+    assert_eq!(*checked.lock().expect("checked"), [b"A SECRET".to_vec()]);
+    assert!(
+        !tail.log.kinds().contains(&"input_chunk"),
+        "the next stage never sees the denied body: {:?}",
+        tail.log.kinds()
+    );
+}
+
+#[tokio::test]
+async fn failed_body_rechecks_fail_the_chain() {
+    let runner = runner_for(&[stream_stage("test/upper", uppercase)]).await;
+    let session = preflight(&runner, &["test/upper"], None)
+        .await
+        .session
+        .expect("session");
+    let validate = |_: &[u8]| -> Result<Option<String>> { Err(miette!("policy engine down")) };
+    let (finish, _output) = run_session_with_policy(
+        session,
+        vec![b"body".to_vec()],
+        Vec::new(),
+        TransformedBodyPolicy::Reevaluate(&validate),
+    )
+    .await;
+    assert_eq!(
+        finish.expect_err("evaluation failed").reason,
+        "transformed_body_policy_evaluation_failed: policy engine down"
+    );
+}
+
 #[tokio::test]
 async fn output_is_resplit_to_the_next_stages_chunk_limit() {
     let first = stream_stage("test/first", identity);
@@ -1510,8 +1621,46 @@ async fn session_budget_bounds_concurrent_request_sessions() {
     assert!(outcome.session.is_some(), "an ended session frees its slot");
 }
 
+/// As for responses and WebSocket sessions, the session budget is checked
+/// before the work queue, so a request refused for lack of sessions never
+/// waits for, or holds, a work slot.
 #[tokio::test]
-async fn collector_runs_legacy_and_version_2_stages_in_chain_order() {
+async fn the_session_budget_is_checked_before_work_admission() {
+    let runner = legacy_runner(false).await;
+    let sessions: Vec<_> = (0..MAX_CONCURRENT_MIDDLEWARE_SESSIONS)
+        .map(|_| {
+            Arc::clone(&runner.registry.session_admission)
+                .try_acquire_owned()
+                .expect("session")
+        })
+        .collect();
+    let work: Vec<_> = (0..MAX_CONCURRENT_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission)
+                .try_acquire_owned()
+                .expect("active work")
+        })
+        .collect();
+    let waiters: Vec<_> = (0..MAX_QUEUED_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission_waiters)
+                .try_acquire_owned()
+                .expect("queued work")
+        })
+        .collect();
+
+    let outcome = preflight(&runner, &["test/small"], None).await;
+    assert!(!outcome.allowed);
+    assert!(outcome.session_capacity_exhausted);
+    assert!(!outcome.admission_exhausted);
+    drop((sessions, work, waiters));
+}
+
+/// Legacy and version 2 stages run as one pipeline in chain order. Legacy
+/// header mutations are late mutations, so every preflight mutation comes
+/// first, then every late mutation in chain order.
+#[tokio::test]
+async fn legacy_and_version_2_stages_run_as_one_pipeline_in_chain_order() {
     let v2 = buffered_stage(
         "test/v2",
         vec![write("x-v2-pre", "1")],
@@ -1537,40 +1686,30 @@ async fn collector_runs_legacy_and_version_2_stages_in_chain_order() {
             .await
             .expect("registry"),
     );
-    let input = HttpRequestInput {
-        request_id: "req".into(),
-        sandbox_id: "sbx-id".into(),
-        sandbox_name: "sbx".into(),
-        workspace: "default".into(),
-        scheme: "https".into(),
-        host: "api.example.com".into(),
-        port: 443,
-        method: "POST".into(),
-        path: "/v1".into(),
-        query: String::new(),
-        headers: Vec::new(),
-        connection_nominated_headers: Vec::new(),
-        body: b"body".to_vec(),
-    };
-    let outcome = runner
-        .evaluate(&chain(&["test/before", "test/v2", "test/after"]), input)
-        .await
-        .expect("evaluate");
-
+    let outcome = preflight(&runner, &["test/before", "test/v2", "test/after"], Some(4)).await;
     assert!(outcome.allowed, "{}", outcome.reason);
-    assert_eq!(outcome.body, b"body+before+v2+after");
+    assert_eq!(outcome.header_mutations, [write("x-v2-pre", "1")]);
+    let mut diagnostics = outcome.diagnostics;
+    let (finish, output) = run_session(
+        outcome.session.expect("session"),
+        vec![b"body".to_vec()],
+        Vec::new(),
+    )
+    .await;
+    diagnostics.extend(finish.expect("chain completes").diagnostics);
+
+    assert_eq!(output_body(&output), b"body+before+v2+after");
     assert_eq!(
-        outcome.header_mutations,
+        output_start_mutations(&output),
         [
             write("x-test-before", "legacy"),
-            write("x-v2-pre", "1"),
             write("x-v2-late", "1"),
             write("x-test-after", "legacy"),
         ]
     );
     assert_eq!(
-        outcome
-            .applied
+        diagnostics
+            .applied()
             .iter()
             .map(|invocation| (invocation.name.as_str(), invocation.transformed))
             .collect::<Vec<_>>(),
@@ -1727,8 +1866,9 @@ async fn legacy_request_stages_collect_up_to_the_chain_legacy_limit() {
         (8, Ok(format!("{}!!", "x".repeat(8)))),
         // Past the small stage's limit: that adapter passes the body on.
         (32, Ok(format!("{}!", "x".repeat(32)))),
-        // Past every legacy limit: denied before upstream contact.
-        (65, Err("middleware_failed: buffered_input_over_capacity")),
+        // Past every legacy limit: denied before upstream contact, with the
+        // 0.1.x reason for a body over a stage's limit.
+        (65, Err("middleware_failed: request_body_over_capacity")),
     ] {
         let outcome = runner
             .preflight_described_http_request(described.clone(), preflight_input(None))
@@ -2117,16 +2257,215 @@ async fn legacy_adapter_contract_failures_are_reported_as_legacy() {
     assert!(runner.take_reconciliation_request());
 }
 
-#[tokio::test]
-async fn legacy_entries_without_an_adapter_fail_closed_in_the_pipeline() {
-    let runner = legacy_runner(false).await;
-    let outcome = runner
-        .preflight_http_request(&chain(&["test/small"]), preflight_input(Some(1)))
+async fn appending_legacy_runner() -> ChainRunner {
+    ChainRunner::from_registry(
+        MiddlewareRegistry::connect_services(
+            vec![Arc::new(LegacyStage {
+                name: "test/legacy",
+                suffix: b"+legacy",
+            })],
+            Vec::new(),
+        )
         .await
-        .expect("preflight");
-    assert!(!outcome.allowed);
+        .expect("registry"),
+    )
+}
+
+#[tokio::test]
+async fn legacy_request_entries_run_on_the_request_adapter() {
+    let runner = appending_legacy_runner().await;
+    let outcome = preflight(&runner, &["test/legacy"], Some(4)).await;
+    assert!(outcome.allowed, "{}", outcome.reason);
     assert_eq!(
-        outcome.reason,
+        outcome.diagnostics.invocations[0].outcome,
+        HttpStageOutcome::Buffered
+    );
+    let session = outcome
+        .session
+        .expect("a legacy request stage buffers the body");
+    assert!(session.withholds_output());
+    let (finish, output) = run_session(session, vec![b"body".to_vec()], Vec::new()).await;
+    let finish = finish.expect("the legacy stage completes");
+    assert_eq!(output_body(&output), b"body+legacy");
+    assert_eq!(
+        output_start_mutations(&output),
+        [write("x-test-legacy", "legacy")],
+        "legacy header mutations are late mutations"
+    );
+    assert_eq!(
+        finish.diagnostics.invocations[0].outcome,
+        HttpStageOutcome::Replacement
+    );
+}
+
+/// A stage the body never reached made no decision, so it is not reported,
+/// as 0.1.x reported no stage after the one that ended the chain.
+#[tokio::test]
+async fn stages_after_a_failure_are_not_reported() {
+    let runner = ChainRunner::from_registry(
+        MiddlewareRegistry::connect_services(
+            vec![
+                Arc::new(LimitedLegacy {
+                    name: "test/small",
+                    max_payload_bytes: 16,
+                    response: false,
+                }),
+                Arc::new(LegacyStage {
+                    name: "test/legacy",
+                    suffix: b"+legacy",
+                }),
+            ],
+            Vec::new(),
+        )
+        .await
+        .expect("registry"),
+    );
+    let outcome = preflight(&runner, &["test/small", "test/legacy"], Some(4)).await;
+    let mut diagnostics = outcome.diagnostics;
+    let (finish, _output) = run_session(
+        outcome.session.expect("session"),
+        vec![b"body".to_vec()],
+        Vec::new(),
+    )
+    .await;
+    diagnostics.extend(
+        *finish
+            .expect_err("the first stage fails closed")
+            .diagnostics,
+    );
+    assert_eq!(
+        diagnostics
+            .applied()
+            .iter()
+            .map(|invocation| (invocation.name.as_str(), invocation.decision))
+            .collect::<Vec<_>>(),
+        [("test-small", Decision::Deny)]
+    );
+}
+
+fn stage_invocation(name: &str, outcome: HttpStageOutcome) -> HttpStageInvocation {
+    HttpStageInvocation {
+        config_name: name.into(),
+        implementation: format!("test/{name}"),
+        outcome,
+        input_bytes: 0,
+        output_bytes: None,
+        transformed: false,
+        failed: false,
+        reason_code: None,
+        failure_reason: None,
+    }
+}
+
+/// Stages before the stage that ended the exchange stay reported in chain
+/// order, and a cancelled exchange, where no stage decided, reports every
+/// stage it selected.
+#[test]
+fn reported_stages_keep_chain_order_up_to_the_last_decision() {
+    let names = |diagnostics: &HttpStageDiagnostics| {
+        diagnostics
+            .applied()
+            .into_iter()
+            .map(|invocation| (invocation.name, invocation.decision))
+            .collect::<Vec<_>>()
+    };
+    let rejected = HttpStageDiagnostics {
+        invocations: vec![
+            stage_invocation("first", HttpStageOutcome::Stream),
+            stage_invocation("second", HttpStageOutcome::Stream),
+            stage_invocation("third", HttpStageOutcome::Buffered),
+            stage_invocation("second", HttpStageOutcome::Reject),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        names(&rejected),
+        [
+            ("first".to_string(), Decision::Allow),
+            ("second".to_string(), Decision::Deny),
+        ]
+    );
+    let cancelled = HttpStageDiagnostics {
+        invocations: vec![
+            stage_invocation("first", HttpStageOutcome::Stream),
+            stage_invocation("second", HttpStageOutcome::Buffered),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        names(&cancelled),
+        [
+            ("first".to_string(), Decision::Allow),
+            ("second".to_string(), Decision::Allow),
+        ]
+    );
+}
+
+/// 0.1.x started the 30 s chain deadline after the body was buffered, so a
+/// slow upload never failed with `middleware_chain_timeout`.
+#[tokio::test(start_paused = true)]
+async fn legacy_chain_deadline_starts_after_a_slow_upload() {
+    let runner = appending_legacy_runner().await;
+    let session = preflight(&runner, &["test/legacy"], None)
+        .await
+        .session
+        .expect("session");
+    let (input_tx, input_rx) = mpsc::channel(4);
+    let (output_tx, mut output_rx) = mpsc::channel(4);
+    let feed = async move {
+        input_tx
+            .send(HttpBodyInput::Chunk(b"early".to_vec()))
+            .await
+            .expect("input");
+        tokio::time::sleep(MAX_MIDDLEWARE_CHAIN_TIMEOUT * 2).await;
+        input_tx
+            .send(HttpBodyInput::Chunk(b"late".to_vec()))
+            .await
+            .expect("input");
+        input_tx
+            .send(HttpBodyInput::End {
+                trailers: Vec::new(),
+            })
+            .await
+            .expect("end");
+    };
+    let collect = async move {
+        let mut output = Vec::new();
+        while let Some(event) = output_rx.recv().await {
+            output.push(event);
+        }
+        output
+    };
+    let (finish, (), output) = tokio::join!(session.run(input_rx, output_tx), feed, collect);
+    finish.expect("the chain deadline starts with the legacy evaluation");
+    assert_eq!(output_body(&output), b"earlylate+legacy");
+}
+
+#[tokio::test]
+async fn legacy_response_entries_without_an_adapter_fail_closed_in_the_pipeline() {
+    let runner = legacy_runner(true).await;
+    let described = runner
+        .describe_http_response_chain(&chain(&["test/small"]))
+        .await
+        .expect("describe");
+    let preflight = pipeline::preflight(
+        &runner,
+        &described,
+        PipelineSpec {
+            direction: HttpDirection::Response,
+            head_authority: headers::HeaderAuthority::Response,
+            trailer_authority: headers::HeaderAuthority::ResponseTrailers,
+            connection_nominated: Vec::new(),
+            timeouts: PipelineTimeouts::default(),
+        },
+        Vec::new(),
+        None,
+        &ResponseHead,
+    )
+    .await;
+    assert!(!preflight.allowed);
+    assert_eq!(
+        preflight.reason,
         "middleware_failed: http_stage_not_executable"
     );
 }

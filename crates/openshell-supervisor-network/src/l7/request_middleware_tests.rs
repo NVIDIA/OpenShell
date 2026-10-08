@@ -1204,6 +1204,166 @@ async fn early_upstream_response_closes_the_client_connection() {
     drop(relay_client);
 }
 
+/// An upstream that answers and stops reading before the upload ends still
+/// has its answer delivered when the relay fails writing the rest of the
+/// body before it finishes relaying that answer.
+#[tokio::test]
+async fn early_upstream_answer_survives_a_failed_body_write() {
+    let supervisor =
+        Supervisor::with_stages(&[RequestStage::new("test/append", Mode::AppendPerChunk)]).await;
+    let (config, tunnel, ctx) = supervisor.tunnel();
+    // The client reads only after it sends the rest of the body, so the
+    // small buffer holds the answer back while the relay writes that body.
+    let (mut app, mut relay_client) = tokio::io::duplex(64);
+    let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+    let relay = tokio::spawn(async move {
+        relay_with_inspection(
+            &config,
+            tunnel,
+            &mut relay_client,
+            &mut relay_upstream,
+            &ctx,
+        )
+        .await
+    });
+    let answer = format!(
+        "HTTP/1.1 413 Content Too Large\r\nContent-Length: 256\r\nConnection: close\r\n\r\n{}",
+        "x".repeat(256)
+    );
+
+    app.write_all(
+        b"POST /v1/early HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 10\r\n\r\nhello",
+    )
+    .await
+    .expect("partial request");
+    within(read_head(&mut upstream)).await;
+    assert_eq!(
+        within(read_chunk(&mut upstream)).await.as_deref(),
+        Some(b"hello!".as_slice())
+    );
+    upstream
+        .write_all(answer.as_bytes())
+        .await
+        .expect("early answer");
+    drop(upstream);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    app.write_all(b"world").await.expect("rest of the body");
+
+    let mut received = Vec::new();
+    within(app.read_to_end(&mut received))
+        .await
+        .expect("client EOF");
+    assert_eq!(String::from_utf8_lossy(&received), answer);
+    within(relay).await.expect("relay task").expect("relay");
+}
+
+/// A client that sends its whole body before it reads the answer still gets
+/// an early answer larger than the connection buffers: the relay keeps
+/// reading and discarding the body while it delivers the answer.
+#[tokio::test]
+async fn early_upstream_answer_reaches_a_client_still_sending_its_body() {
+    let supervisor =
+        Supervisor::with_stages(&[RequestStage::new("test/append", Mode::AppendPerChunk)]).await;
+    let (config, tunnel, ctx) = supervisor.tunnel();
+    let (mut app, mut relay_client) = tokio::io::duplex(64);
+    let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+    let relay = tokio::spawn(async move {
+        relay_with_inspection(
+            &config,
+            tunnel,
+            &mut relay_client,
+            &mut relay_upstream,
+            &ctx,
+        )
+        .await
+    });
+    let answer = format!(
+        "HTTP/1.1 413 Content Too Large\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{}",
+        "x".repeat(1024)
+    );
+
+    app.write_all(
+        b"POST /v1/early HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 4096\r\n\r\nhello",
+    )
+    .await
+    .expect("partial request");
+    within(read_head(&mut upstream)).await;
+    assert_eq!(
+        within(read_chunk(&mut upstream)).await.as_deref(),
+        Some(b"hello!".as_slice())
+    );
+    upstream
+        .write_all(answer.as_bytes())
+        .await
+        .expect("early answer");
+    drop(upstream);
+    within(app.write_all(&[b'b'; 4091]))
+        .await
+        .expect("rest of the body");
+
+    let mut received = Vec::new();
+    within(app.read_to_end(&mut received))
+        .await
+        .expect("client EOF");
+    assert_eq!(String::from_utf8_lossy(&received), answer);
+    within(relay).await.expect("relay task").expect("relay");
+}
+
+/// Stages cancelled because the upstream stopped accepting the body are
+/// recorded with that reason rather than as a closed pipeline output.
+#[tokio::test]
+async fn upstream_write_failures_are_recorded_with_their_own_reason() {
+    let supervisor =
+        Supervisor::with_stages(&[RequestStage::new("test/append", Mode::AppendPerChunk)]).await;
+    for (upstream_failed, expected) in [
+        (true, "middleware_cancelled: upstream_write_failed"),
+        (false, "middleware_cancelled: output_closed"),
+    ] {
+        let (_config, tunnel, ctx) = supervisor.tunnel();
+        let chain = tunnel
+            .query_middleware_chain(&crate::l7::middleware::middleware_network_input(&ctx))
+            .expect("middleware chain");
+        let (mut app, mut relay_client) = tokio::io::duplex(1024);
+        let request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/upload".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header:
+                b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 5\r\n\r\n"
+                    .to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(5),
+        };
+        let applied = crate::l7::middleware::apply_middleware_chain_with_request_id_and_delivery(
+            request,
+            &mut relay_client,
+            &ctx,
+            chain,
+            tunnel.middleware_runner(),
+            tunnel.generation_guard(),
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            "request",
+            crate::l7::middleware::RequestBodyDelivery::Incremental,
+        )
+        .await
+        .expect("apply request middleware");
+        let crate::l7::middleware::MiddlewareApplyResult::Streamed { mut body, .. } = applied
+        else {
+            panic!("STREAM request middleware streams the body");
+        };
+        app.write_all(b"hello").await.expect("body");
+        let (output, outputs) = mpsc::channel(4);
+        drop(outputs);
+        body.run_to(
+            &mut relay_client,
+            output,
+            &std::sync::atomic::AtomicBool::new(upstream_failed),
+        )
+        .await
+        .expect_err("the output closed");
+        assert_eq!(body.terminal_reason(), Some(expected));
+    }
+}
+
 #[tokio::test]
 async fn pipelined_requests_stay_in_read_ahead_through_request_middleware() {
     for route_selected in [false, true] {
@@ -1501,8 +1661,13 @@ async fn stream_middleware_keeps_trailers_and_answers_expect_continue() {
     within(relay).await.expect("relay task").expect("relay");
 }
 
+/// A chain that mixes legacy and version 2 entries runs as one pipeline in
+/// chain order. Legacy header mutations are late mutations, so the upstream
+/// head carries every preflight mutation before any late one. The 0.1.x
+/// collector applied the legacy mutation before the later version 2 stage's
+/// preflight mutation.
 #[tokio::test]
-async fn mixed_legacy_and_version_2_chain_runs_in_chain_order() {
+async fn mixed_legacy_and_version_2_chain_runs_as_one_pipeline() {
     let v2 = RequestStage::new("test/v2", Mode::AppendPerChunk)
         .preflight(vec![write("x-v2-pre", "1")])
         .late(vec![write("x-v2-late", "1")]);
@@ -1526,7 +1691,7 @@ async fn mixed_legacy_and_version_2_chain_runs_in_chain_order() {
     let mutated: Vec<&str> = head.lines().filter(|line| line.starts_with("x-")).collect();
     assert_eq!(
         mutated,
-        ["x-legacy: 1", "x-v2-pre: 1", "x-v2-late: 1"],
+        ["x-v2-pre: 1", "x-legacy: 1", "x-v2-late: 1"],
         "{head}"
     );
     assert_eq!(header_value(&head, "content-length"), Some("13"));
@@ -1540,6 +1705,75 @@ async fn mixed_legacy_and_version_2_chain_runs_in_chain_order() {
             .starts_with("HTTP/1.1 204")
     );
     within(relay).await.expect("relay task").expect("relay");
+}
+
+/// Session capacity is platform load shedding for every request chain. A
+/// chain with legacy entries gets the same 503 as a version 2 chain, where
+/// the collector failed its version 2 stage with a 403.
+#[tokio::test]
+async fn exhausted_request_sessions_shed_mixed_chains_with_503() {
+    let supervisor = Supervisor::start(
+        vec![
+            Arc::new(LegacyStage),
+            Arc::new(RequestStage::new("test/v2", Mode::AppendPerChunk)),
+        ],
+        &["test/legacy", "test/v2"],
+    )
+    .await;
+    let runner = supervisor
+        .engine
+        .middleware_runner()
+        .expect("installed middleware runner");
+    let held_chain = [openshell_supervisor_middleware::ChainEntry {
+        name: "held".into(),
+        implementation: "test/v2".into(),
+        order: 0,
+        config: prost_types::Struct::default(),
+        on_error: openshell_supervisor_middleware::OnError::FailClosed,
+    }];
+    let mut held = Vec::new();
+    for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+        let preflight = runner
+            .preflight_http_request(
+                &held_chain,
+                openshell_supervisor_middleware::HttpRequestPreflightInput {
+                    context: openshell_core::proto::RequestContext::default(),
+                    target: openshell_core::proto::HttpRequestTarget::default(),
+                    declared_body_length: None,
+                    headers: Vec::new(),
+                    connection_nominated_headers: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        held.push(preflight.session.expect("a session within the budget"));
+    }
+
+    let Tunnel {
+        mut app,
+        mut upstream,
+        relay,
+    } = supervisor.connect();
+    app.write_all(
+        b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )
+    .await
+    .expect("request");
+    let response = within(read_response(&mut app)).await;
+    assert!(
+        response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "{response}"
+    );
+    assert_eq!(json_body(&response)["error"], "middleware_failed");
+    drop(app);
+    within(relay).await.expect("relay task").expect("relay");
+    let mut forwarded = Vec::new();
+    upstream
+        .read_to_end(&mut forwarded)
+        .await
+        .expect("upstream EOF");
+    assert!(forwarded.is_empty(), "shed before upstream contact");
+    drop(held);
 }
 
 #[tokio::test]

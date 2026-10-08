@@ -15,6 +15,10 @@
 //! stages run independent input and output pumps with no total deadline and
 //! no total byte cap; a stage fails only when it stalls. The supervisor never
 //! retains STREAM input for replay.
+//!
+//! A request whose policy inspects the body runs with a checkpoint after
+//! every stage: it holds the stage's output until the stage ends and
+//! re-checks a replaced body before the next stage or the output sees it.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -25,11 +29,11 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use prost::Message as _;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use openshell_core::proto::{
-    HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBufferedBody, HttpEvent,
+    Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBufferedBody, HttpEvent,
     HttpHeader, HttpInputChunk, HttpInputEnd, HttpPreflight, HttpResult, MiddlewareDiagnostics,
     MiddlewareSessionEnd, MiddlewareSessionEndReason, http_buffered_result, http_event,
     http_inspect, http_preflight, http_preflight_result, http_result,
@@ -44,9 +48,11 @@ use crate::{
     ChainRunner, ContractFailure, ContractFailureKind, DescribedChainEntry, EXTERNAL_FINDING_LABEL,
     HttpDirection, HttpProtocol, HttpResultStream, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
     MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
-    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_REASON_BYTES, MAX_MIDDLEWARE_REASON_CODE_BYTES,
-    MiddlewareDenial, MiddlewareDiagnosticPolicy, NamespacedFinding, OnError, StageReport,
-    StageReports, is_stable_reason_code, middleware_denial_reason,
+    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
+    MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
+    MiddlewareInvocation, NamespacedFinding, OnError, StageReport, StageReports,
+    TransformedBodyPolicy, is_stable_reason_code, middleware_denial_reason,
+    transformed_body_denial,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -147,6 +153,76 @@ impl HttpStageDiagnostics {
         self.metadata.extend(other.metadata);
         self.invocations.extend(other.invocations);
         self.reports.extend(other.reports);
+    }
+
+    /// One invocation record per stage, in chain order, as 0.1.x recorded a
+    /// chain: a stage that rejected or failed closed in any phase denied,
+    /// and a stage that failed in any phase or reported that it passed its
+    /// input on after a failure is failed. A stage after the last stage that
+    /// recorded an outcome, which only selected a body mode, made no decision
+    /// before the exchange ended and is left out, as 0.1.x left out the
+    /// stages after the one that ended a chain. When no stage recorded an
+    /// outcome, as when the exchange was cancelled, every stage is kept.
+    #[must_use]
+    pub fn applied(&self) -> Vec<MiddlewareInvocation> {
+        let mut applied = Vec::<(MiddlewareInvocation, bool)>::new();
+        for invocation in &self.invocations {
+            let denied = matches!(
+                invocation.outcome,
+                HttpStageOutcome::Reject | HttpStageOutcome::FailClosed
+            );
+            let decided = !matches!(
+                invocation.outcome,
+                HttpStageOutcome::Buffered | HttpStageOutcome::Stream
+            );
+            if let Some((existing, existing_decided)) = applied
+                .iter_mut()
+                .find(|(existing, _)| existing.name == invocation.config_name)
+            {
+                existing.failed |= invocation.failed;
+                existing.transformed |= invocation.transformed;
+                if denied {
+                    existing.decision = Decision::Deny;
+                }
+                *existing_decided |= decided;
+                continue;
+            }
+            applied.push((
+                MiddlewareInvocation {
+                    name: invocation.config_name.clone(),
+                    implementation: invocation.implementation.clone(),
+                    decision: if denied {
+                        Decision::Deny
+                    } else {
+                        Decision::Allow
+                    },
+                    transformed: invocation.transformed,
+                    failed: invocation.failed,
+                },
+                decided,
+            ));
+        }
+        for (config_name, report) in &self.reports {
+            if report.fail_open_reason().is_none() {
+                continue;
+            }
+            if let Some((existing, decided)) = applied
+                .iter_mut()
+                .find(|(existing, _)| &existing.name == config_name)
+            {
+                existing.failed = true;
+                *decided = true;
+            }
+        }
+        let last_decided = applied.iter().rposition(|(_, decided)| *decided);
+        applied
+            .into_iter()
+            .enumerate()
+            .filter(|(index, (_, decided))| {
+                *decided || last_decided.is_none_or(|last| *index < last)
+            })
+            .map(|(_, (invocation, _))| invocation)
+            .collect()
     }
 }
 
@@ -651,6 +727,20 @@ impl Pipeline {
         input: mpsc::Receiver<HttpBodyInput>,
         output: mpsc::Sender<HttpBodyOutput>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
+        self.run_with_body_policy(input, output, TransformedBodyPolicy::NotPolicyRelevant)
+            .await
+    }
+
+    /// [`Self::run`], re-checking every replaced body with `body_policy`
+    /// before the next stage or the output sees it. Under
+    /// [`TransformedBodyPolicy::Reevaluate`] each stage's output is held until
+    /// the stage ends, at most [`MAX_MIDDLEWARE_PAYLOAD_BYTES`].
+    pub async fn run_with_body_policy(
+        self,
+        input: mpsc::Receiver<HttpBodyInput>,
+        output: mpsc::Sender<HttpBodyOutput>,
+        body_policy: TransformedBodyPolicy<'_>,
+    ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
         let Self {
             spec,
             stages,
@@ -678,6 +768,13 @@ impl Pipeline {
             reports: Arc::clone(&reports),
         };
 
+        let checks = matches!(body_policy, TransformedBodyPolicy::Reevaluate(_));
+        let (source_body, mut checked_body) = if checks {
+            let (sender, receiver) = oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let mut tasks: FuturesUnordered<Pin<Box<dyn Future<Output = TaskResult> + Send + '_>>> =
             FuturesUnordered::new();
         tasks.push(Box::pin(run_source(
@@ -685,19 +782,39 @@ impl Pipeline {
             senders[0].take().expect("source link"),
             limits[0],
             declared_input_bytes,
+            source_body,
             aborted.clone(),
         )));
         for (index, stage) in stages.into_iter().enumerate() {
+            let mut stage_output = senders[index + 1].take().expect("stage output link");
+            if let Some(previous) = checked_body.take() {
+                let (checkpoint_input, checkpoint_link) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+                let (checked, next) = oneshot::channel();
+                checked_body = Some(next);
+                tasks.push(Box::pin(run_checkpoint(
+                    Checkpoint {
+                        entry: stage.entry.clone(),
+                        previous,
+                        checked,
+                        output_limit: limits[index + 1],
+                        body_policy,
+                    },
+                    checkpoint_link,
+                    std::mem::replace(&mut stage_output, checkpoint_input),
+                    aborted.clone(),
+                )));
+            }
             tasks.push(Box::pin(run_stage(
                 index,
                 stage,
                 receivers[index].take().expect("stage input link"),
-                senders[index + 1].take().expect("stage output link"),
+                stage_output,
                 limits[index + 1],
                 &shared,
                 aborted.clone(),
             )));
         }
+        drop(checked_body);
         tasks.push(Box::pin(run_sink(
             receivers[count].take().expect("sink link"),
             output,
@@ -716,7 +833,7 @@ impl Pipeline {
                     abort.send_replace(Some(error.end_reason));
                     failure = Some(error);
                 }
-                Ok(TaskDone::Source) | Err(_) => {}
+                Ok(TaskDone::Source | TaskDone::Checkpoint) | Err(_) => {}
             }
         }
         drop(tasks);
@@ -787,6 +904,7 @@ struct StageDone {
 
 enum TaskDone {
     Source,
+    Checkpoint,
     Stage(usize, StageDone),
     Sink(Vec<HttpHeader>),
 }
@@ -824,14 +942,18 @@ async fn abort_reason(
         .unwrap_or(MiddlewareSessionEndReason::Cancellation)
 }
 
+/// Feeds the first stage. With `original`, it also records the input body
+/// for the first checkpoint, or `None` past [`MAX_MIDDLEWARE_PAYLOAD_BYTES`].
 async fn run_source(
     mut input: mpsc::Receiver<HttpBodyInput>,
     link: mpsc::Sender<Frame>,
     limit: usize,
     declared_input_bytes: Option<u64>,
+    original: Option<oneshot::Sender<Option<Vec<u8>>>>,
     mut aborted: watch::Receiver<Option<MiddlewareSessionEndReason>>,
 ) -> TaskResult {
     let work = async {
+        let mut recorded = original.is_some().then(Vec::new);
         link.send(Frame::Start {
             header_mutations: Vec::new(),
             output_body_bytes: declared_input_bytes,
@@ -841,6 +963,13 @@ async fn run_source(
         loop {
             match input.recv().await {
                 Some(HttpBodyInput::Chunk(data)) => {
+                    if let Some(body) = recorded.as_mut() {
+                        if body.len().saturating_add(data.len()) > MAX_MIDDLEWARE_PAYLOAD_BYTES {
+                            recorded = None;
+                        } else {
+                            body.extend_from_slice(&data);
+                        }
+                    }
                     for unit in data.chunks(limit) {
                         link.send(Frame::Chunk(unit.to_vec()))
                             .await
@@ -851,6 +980,9 @@ async fn run_source(
                     link.send(Frame::End(trailers))
                         .await
                         .map_err(|_| TaskError::Aborted)?;
+                    if let Some(original) = original {
+                        let _ = original.send(recorded);
+                    }
                     return Ok(TaskDone::Source);
                 }
                 None => {
@@ -858,6 +990,99 @@ async fn run_source(
                 }
             }
         }
+    };
+    tokio::select! {
+        biased;
+        _ = abort_reason(&mut aborted) => Err(TaskError::Aborted),
+        result = work => result,
+    }
+}
+
+/// What one checkpoint compares and where it sends what it checked.
+struct Checkpoint<'p> {
+    /// The stage whose output the checkpoint holds.
+    entry: DescribedChainEntry,
+    /// The body that stage received, or `None` when it was not recorded.
+    previous: oneshot::Receiver<Option<Vec<u8>>>,
+    /// Receives the body this checkpoint released, for the next checkpoint.
+    checked: oneshot::Sender<Option<Vec<u8>>>,
+    output_limit: usize,
+    body_policy: TransformedBodyPolicy<'p>,
+}
+
+/// Holds one stage's output until the stage ends, re-checks it with the body
+/// policy when it differs from the stage's input, and then releases it. A
+/// policy denial fails the exchange before the next stage or the output sees
+/// the body, as 0.1.x re-checked every replacement before the next stage ran.
+async fn run_checkpoint(
+    checkpoint: Checkpoint<'_>,
+    mut link: mpsc::Receiver<Frame>,
+    output: mpsc::Sender<Frame>,
+    mut aborted: watch::Receiver<Option<MiddlewareSessionEndReason>>,
+) -> TaskResult {
+    let Checkpoint {
+        entry,
+        previous,
+        checked,
+        output_limit,
+        body_policy,
+    } = checkpoint;
+    let work = async {
+        let mut start = None;
+        let mut body = Vec::new();
+        let trailers = loop {
+            match link.recv().await {
+                Some(Frame::Start {
+                    header_mutations,
+                    output_body_bytes,
+                }) if start.is_none() => start = Some((header_mutations, output_body_bytes)),
+                Some(Frame::Chunk(data)) if start.is_some() => {
+                    if body.len().saturating_add(data.len()) > MAX_MIDDLEWARE_PAYLOAD_BYTES {
+                        return Err(TaskError::Failed(entry_failure(
+                            &entry,
+                            "request_output_over_capacity",
+                        )));
+                    }
+                    body.extend_from_slice(&data);
+                }
+                Some(Frame::End(trailers)) if start.is_some() => break trailers,
+                Some(_) => {
+                    return Err(TaskError::Failed(platform_failure(
+                        "pipeline_event_order_invalid",
+                    )));
+                }
+                None => return Err(TaskError::Aborted),
+            }
+        };
+        let replaced = previous
+            .await
+            .ok()
+            .flatten()
+            .is_none_or(|previous| previous != body);
+        if replaced && let Some(reason) = transformed_body_denial(body_policy, &body) {
+            return Err(TaskError::Failed(HttpMiddlewareFailure {
+                reason,
+                denial: None,
+                end_reason: MiddlewareSessionEndReason::PolicyDenial,
+                diagnostics: Box::default(),
+            }));
+        }
+        let (header_mutations, output_body_bytes) = start.expect("a started stage output");
+        let release = async {
+            send_frame(
+                &output,
+                Frame::Start {
+                    header_mutations,
+                    output_body_bytes,
+                },
+            )
+            .await?;
+            send_body(&output, &body, output_limit).await?;
+            send_frame(&output, Frame::End(trailers)).await
+        };
+        release.await.map_err(|_| TaskError::Aborted)?;
+        let _ = checked.send(Some(body));
+        Ok(TaskDone::Checkpoint)
     };
     tokio::select! {
         biased;
@@ -1147,9 +1372,14 @@ async fn drive_buffered(
             Some(Frame::Chunk(data)) => {
                 if body.len().saturating_add(data.len()) > max_body_bytes {
                     return match on_overflow {
-                        LegacyOverflow::Fail => {
-                            Err(entry_failure(entry, "buffered_input_over_capacity").into())
-                        }
+                        LegacyOverflow::Fail => Err(entry_failure(
+                            entry,
+                            legacy.map_or(
+                                "buffered_input_over_capacity",
+                                LegacyStagePolicy::overflow_failure_reason,
+                            ),
+                        )
+                        .into()),
                         LegacyOverflow::Release { reason } => {
                             body.extend_from_slice(&data);
                             release_original(

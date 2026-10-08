@@ -9,6 +9,8 @@
 //! legacy middleware does. A live body streams to the upstream while the
 //! client uploads; its head commits on the pipeline's final `Start`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use futures::FutureExt as _;
 use openshell_supervisor_middleware::{HttpBodyOutput, HttpPipelineFinish};
 
@@ -502,6 +504,62 @@ pub enum LiveRequestFailure {
     ClientTimeout,
 }
 
+/// The upstream stopped accepting the request body. It may have answered
+/// before it stopped reading, for example with 413.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("upstream stopped accepting the request body: {detail}")]
+pub struct UpstreamWriteFailed {
+    detail: String,
+}
+
+/// Upstream write half that records whether a write failed.
+struct UpstreamWrites<'a, W> {
+    inner: &'a mut W,
+    failed: &'a AtomicBool,
+}
+
+impl<W> UpstreamWrites<'_, W> {
+    fn record<T>(
+        &self,
+        result: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        if matches!(result, std::task::Poll::Ready(Err(_))) {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for UpstreamWrites<'_, W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf);
+        this.record(result)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_flush(cx);
+        this.record(result)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_shutdown(cx);
+        this.record(result)
+    }
+}
+
 /// Write half that records whether any response byte reached the client.
 struct ResponseCommit<W> {
     inner: W,
@@ -541,9 +599,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ResponseCommit<W> {
 ///
 /// The upload and the response run concurrently. An upstream response that
 /// arrives before the upload ends cancels the middleware stages; the client
-/// may still have unread request bytes, so the connection closes. An upload
-/// failure before any response byte returns [`LiveRequestFailure`] or a body
-/// credential error for the caller to answer; after that, delivery aborts.
+/// may still have unread request bytes, so the connection closes. An upstream
+/// that stops accepting the body may have answered first, so its response is
+/// still delivered. Any other upload failure before a response byte returns
+/// [`LiveRequestFailure`] or a body credential error for the caller to answer;
+/// after that, delivery aborts.
 pub(super) async fn relay_live_request_and_response<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -584,6 +644,27 @@ where
         uploaded = upload.as_mut() => {
             drop(upload);
             if let Err(error) = uploaded {
+                if error.downcast_ref::<UpstreamWriteFailed>().is_some() {
+                    let _ = upstream_writer.shutdown().await;
+                    // The client may finish sending its body before it reads
+                    // the answer, so keep reading and discarding it.
+                    let mut sink = tokio::io::sink();
+                    let discard = tokio::io::copy(&mut client_reader, &mut sink);
+                    let responded = tokio::select! {
+                        responded = response.as_mut() => responded,
+                        _ = discard => response.as_mut().await,
+                    };
+                    drop(response);
+                    return match responded {
+                        Ok(RelayOutcome::Reusable) => {
+                            finish_response(&mut client_writer, true).await
+                        }
+                        Ok(RelayOutcome::Consumed | RelayOutcome::Upgraded { .. }) => {
+                            Ok(RelayOutcome::Consumed)
+                        }
+                        Err(_) => Err(error),
+                    };
+                }
                 drop(response);
                 let _ = upstream_writer.shutdown().await;
                 if client_writer.committed {
@@ -619,6 +700,8 @@ enum LiveWriteError {
     Failed(miette::Report),
 }
 
+/// Upload a live request body. A failed upstream write is an
+/// [`UpstreamWriteFailed`], whatever else the upload reports.
 async fn upload_live_request<C, U>(
     head: &[u8],
     body: &mut crate::l7::middleware::RequestBodyStream,
@@ -630,11 +713,39 @@ where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
+    let failed = AtomicBool::new(false);
+    let mut upstream = UpstreamWrites {
+        inner: upstream,
+        failed: &failed,
+    };
+    let uploaded = upload_live_body(head, body, client, &mut upstream, options, &failed).await;
+    match uploaded {
+        Err(error) if failed.load(Ordering::Acquire) => {
+            Err(miette::Report::new(UpstreamWriteFailed {
+                detail: error.to_string(),
+            }))
+        }
+        uploaded => uploaded,
+    }
+}
+
+async fn upload_live_body<C, U>(
+    head: &[u8],
+    body: &mut crate::l7::middleware::RequestBodyStream,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    upstream_failed: &AtomicBool,
+) -> Result<()>
+where
+    C: AsyncRead + Unpin,
+    U: AsyncWrite + Unpin,
+{
     let injected = body.take_injected_headers();
     // Chunked input may end with trailers, which only chunked output carries.
     let input_chunked = body.input_is_chunked();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-    let run = body.run_to(client, sender);
+    let run = body.run_to(client, sender, upstream_failed);
     let upstream_for_write = &mut *upstream;
     let write = async move {
         let mut scanner = options
@@ -768,6 +879,22 @@ mod tests {
             units.push(unit);
         }
         Ok(units)
+    }
+
+    #[tokio::test]
+    async fn upstream_writes_record_a_failed_write() {
+        let (mut upstream, peer) = tokio::io::duplex(16);
+        drop(peer);
+        let failed = AtomicBool::new(false);
+        let mut writes = UpstreamWrites {
+            inner: &mut upstream,
+            failed: &failed,
+        };
+        writes
+            .write_all(b"body")
+            .await
+            .expect_err("the upstream closed");
+        assert!(failed.load(Ordering::Acquire));
     }
 
     #[tokio::test]

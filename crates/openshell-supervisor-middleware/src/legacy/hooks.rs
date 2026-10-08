@@ -15,6 +15,8 @@ use std::sync::{Arc, OnceLock};
 use openshell_core::proto::HttpBodyMode;
 use tokio::time::Instant;
 
+use super::codec::LegacyStageFailure;
+use super::request::{LegacyRequestExchange, LegacyRequestStage, legacy_request_collection_limit};
 use crate::{
     DescribedChainEntry, HttpDirection, HttpProtocol, HttpStageTransport,
     MAX_MIDDLEWARE_CHAIN_TIMEOUT, OnError, StageReportSink,
@@ -22,7 +24,6 @@ use crate::{
 
 /// What the pipeline gives a legacy adapter stage when it opens it.
 #[derive(Clone)]
-#[allow(dead_code, reason = "the legacy adapters read these fields")]
 pub struct LegacyStageContext {
     /// The legacy entry. Its service, binding, payload limit, timeout, and
     /// `on_error` are visible inside the crate.
@@ -46,45 +47,58 @@ pub struct LegacyStageContext {
 /// Each legacy RPC runs under `entry.timeout()` capped by it.
 #[derive(Clone, Debug, Default)]
 pub struct LegacyChainClock {
-    started: Arc<OnceLock<Instant>>,
+    deadline: Arc<OnceLock<Instant>>,
 }
 
 impl LegacyChainClock {
     /// Start the clock if it has not started, and return the deadline.
-    #[allow(dead_code, reason = "the legacy adapters start the clock")]
     pub fn deadline(&self) -> Instant {
         *self
-            .started
+            .deadline
             .get_or_init(|| Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT)
+    }
+
+    /// A clock whose deadline has already passed.
+    #[cfg(test)]
+    pub fn expired() -> Self {
+        let clock = Self::default();
+        let _ = clock.deadline.set(Instant::now());
+        clock
     }
 }
 
 /// Open the adapter transport for a legacy entry, or `None` while the
 /// direction has no adapter.
 ///
-/// The request adapter (`legacy::request`, L1) and the response adapter
-/// (`legacy::response::adapter`, L2) plug in here. Until their cutovers,
-/// legacy entries run on the legacy engines, and the pipeline fails a legacy
-/// entry closed if one reaches it.
+/// Legacy request entries run on the request adapter (`legacy::request`).
+/// Legacy response entries run on the legacy response engine until the
+/// response cutover (`legacy::response::adapter`), and the pipeline fails a
+/// legacy response entry closed if one reaches it.
 pub fn open_stage(context: &LegacyStageContext) -> Option<Arc<dyn HttpStageTransport>> {
     #[cfg(test)]
-    {
-        test_support::open(context)
+    if let Some(stage) = test_support::open(context) {
+        return Some(stage);
     }
-    #[cfg(not(test))]
-    {
-        let _ = context;
-        None
+    match context.direction {
+        HttpDirection::Request => {
+            let stage = LegacyRequestStage::new(
+                &context.entry,
+                LegacyRequestExchange {
+                    reports: Arc::clone(&context.reports),
+                    connection_nominated_headers: Arc::clone(&context.connection_nominated_headers),
+                    chain_clock: context.chain_clock.clone(),
+                },
+            )?;
+            Some(Arc::new(stage))
+        }
+        HttpDirection::Response => None,
     }
 }
 
-/// Platform-owned failure reason for a status a legacy adapter returns that
-/// is not a contract failure, keeping the 0.1.x reason. The pipeline checks
-/// contract failures first. The adapters' status classification plugs in
-/// here.
+/// Platform-owned failure reason a legacy adapter ended its stage with,
+/// keeping the 0.1.x reason. The pipeline checks contract failures first.
 pub fn failure_reason(status: &tonic::Status) -> Option<String> {
-    let _ = status;
-    None
+    LegacyStageFailure::from_status(status).map(|failure| failure.reason)
 }
 
 /// Body modes the pipeline offers a legacy stage. The adapter applies 0.1.x
@@ -106,6 +120,16 @@ pub fn requires_work_admission(entries: &[DescribedChainEntry]) -> bool {
         .any(|entry| entry.http_protocol() == Some(HttpProtocol::Legacy))
 }
 
+/// Legacy request stages check their request envelope against the platform
+/// limits before every call, with the 0.1.x reasons, so a chain without
+/// version 2 entries leaves input over those limits to each stage's
+/// `on_error`, as 0.1.x did.
+pub fn checks_request_input_per_stage(entries: &[DescribedChainEntry]) -> bool {
+    entries
+        .iter()
+        .all(|entry| entry.http_protocol() != Some(HttpProtocol::V2))
+}
+
 /// What a legacy BUFFERED stage does when its input outgrows the selected
 /// limit or its accumulation deadline expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +147,7 @@ pub struct LegacyStagePolicy {
     direction: HttpDirection,
     /// The entry's effective `on_error` is `fail_open`.
     fail_open: bool,
-    /// Largest payload limit among the chain's legacy stages.
+    /// Largest payload limit among a request chain's legacy stages.
     chain_payload_limit: usize,
 }
 
@@ -136,12 +160,12 @@ impl LegacyStagePolicy {
         Self {
             direction,
             fail_open: entry.on_error() == OnError::FailOpen,
-            chain_payload_limit: chain
-                .iter()
-                .filter(|entry| entry.http_protocol() == Some(HttpProtocol::Legacy))
-                .map(DescribedChainEntry::max_payload_bytes)
-                .max()
-                .unwrap_or_default(),
+            chain_payload_limit: match direction {
+                HttpDirection::Request => {
+                    legacy_request_collection_limit(chain).unwrap_or_default()
+                }
+                HttpDirection::Response => 0,
+            },
         }
     }
 
@@ -169,6 +193,17 @@ impl LegacyStagePolicy {
         }
     }
 
+    /// Failure reason when input outgrows the selected limit and the stage
+    /// fails. 0.1.x failed a request body over a stage's limit with
+    /// `request_body_over_capacity`, and a body over every legacy limit is
+    /// over each stage's limit.
+    pub fn overflow_failure_reason(self) -> &'static str {
+        match self.direction {
+            HttpDirection::Request => "request_body_over_capacity",
+            HttpDirection::Response => "buffered_input_over_capacity",
+        }
+    }
+
     /// Whether collecting the stage's input has the BUFFERED whole-body
     /// deadline, and what its expiry does. 0.1.x collected request bodies
     /// without a deadline and gave response stages 2 minutes to accumulate.
@@ -186,7 +221,7 @@ impl LegacyStagePolicy {
 
 #[cfg(test)]
 pub mod test_support {
-    //! Test seam that stands in for the adapters until L1 and L2 land.
+    //! Test seam that replaces the adapters with test transports.
 
     use std::cell::RefCell;
 

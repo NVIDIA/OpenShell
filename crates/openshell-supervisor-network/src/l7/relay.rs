@@ -12,10 +12,7 @@ use crate::l7::middleware::{
     apply_middleware_chain_with_request_id_and_delivery, middleware_network_input,
 };
 #[cfg(test)]
-use crate::l7::middleware::{
-    middleware_chain_body_limit, middleware_events, middleware_request_input,
-    raw_query_from_request_headers, resolve_unbuffered_body,
-};
+use crate::l7::middleware::{middleware_events, raw_query_from_request_headers};
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::uninspectable::{UninspectableTrafficGate, emit_middleware_uninspectable};
@@ -6621,110 +6618,6 @@ network_policies:
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn over_capacity_resolution_honors_on_error() {
-        use openshell_supervisor_middleware::{ChainEntry, OnError};
-
-        let ctx = L7EvalContext {
-            host: "api.example.test".into(),
-            port: 443,
-            request_default_port: Some(443),
-            policy_name: "p".into(),
-            binary_path: "/usr/bin/curl".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-            secret_resolver: None,
-            ..Default::default()
-        };
-        let req = || crate::l7::provider::L7Request {
-            action: "POST".into(),
-            target: "/v1".into(),
-            query_params: std::collections::HashMap::new(),
-            raw_header: Vec::new(),
-            body_length: crate::l7::provider::BodyLength::None,
-        };
-        let fail_open = ChainEntry {
-            name: "m".into(),
-            implementation: "openshell/regex".into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error: OnError::FailOpen,
-        };
-        let fail_closed = ChainEntry {
-            on_error: OnError::FailClosed,
-            ..fail_open.clone()
-        };
-
-        let runner = openshell_supervisor_middleware::ChainRunner::default();
-        let open_chain = runner
-            .describe_chain(std::slice::from_ref(&fail_open))
-            .await
-            .expect("describe fail-open chain");
-        let mixed_chain = runner
-            .describe_chain(&[fail_open.clone(), fail_closed])
-            .await
-            .expect("describe mixed chain");
-
-        // Recoverable (Content-Length over cap, nothing consumed) + all fail-open
-        // -> stream through unprocessed.
-        assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &open_chain, true),
-            MiddlewareApplyResult::Allowed(_)
-        ));
-        // Any fail-closed entry -> deny.
-        assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &mixed_chain, true),
-            MiddlewareApplyResult::Denied { .. }
-        ));
-        // Not recoverable (chunked overflow already consumed bytes) -> deny even
-        // when every entry is fail-open.
-        assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &open_chain, false),
-            MiddlewareApplyResult::Denied { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn body_limit_ignores_unresolved_entries() {
-        use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
-
-        let resolved = ChainEntry {
-            name: "redact".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error: OnError::FailClosed,
-        };
-        let unresolved = ChainEntry {
-            name: "missing".into(),
-            implementation: "third-party/missing".into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error: OnError::FailOpen,
-        };
-
-        // A single unresolved (0-limit) entry must not drag the chain limit to
-        // zero: the buffer limit reflects only the resolved built-in.
-        let mixed = ChainRunner::new(
-            openshell_supervisor_middleware_builtins::services()
-                .into_iter()
-                .next()
-                .expect("built-in middleware service"),
-        )
-        .describe_chain(&[resolved, unresolved.clone()])
-        .await
-        .expect("describe mixed chain");
-        assert_eq!(middleware_chain_body_limit(&mixed), Some(256 * 1024));
-
-        // When nothing resolves, there is no body limit and the caller skips
-        // buffering entirely.
-        let none = ChainRunner::default()
-            .describe_chain(std::slice::from_ref(&unresolved))
-            .await
-            .expect("describe unresolved chain");
-        assert_eq!(middleware_chain_body_limit(&none), None);
-    }
-
     /// A middleware service whose single binding replaces every request body
     /// with a fixed payload, for exercising post-transformation policy
     /// re-evaluation.
@@ -7436,9 +7329,6 @@ network_policies:
                 on_error: OnError::FailOpen,
             },
         ];
-        let described = runner.describe_chain(&chain).await.expect("describe chain");
-        assert_eq!(middleware_chain_body_limit(&described), Some(8192));
-
         let body = [b'a'; 64];
         let raw_header = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\n\r\n",
@@ -7557,41 +7447,6 @@ network_policies:
         .expect("query from request headers");
 
         assert_eq!(query, "token=a%2Bb&scope=private");
-    }
-
-    #[test]
-    fn middleware_request_input_preserves_plain_http_scheme() {
-        let req = crate::l7::provider::L7Request {
-            action: "POST".into(),
-            target: "/v1/messages".into(),
-            query_params: std::collections::HashMap::new(),
-            raw_header: Vec::new(),
-            body_length: crate::l7::provider::BodyLength::None,
-        };
-        let ctx = L7EvalContext {
-            host: "api.example.test".into(),
-            port: 80,
-            request_default_port: Some(80),
-            policy_name: "api".into(),
-            binary_path: "/usr/bin/curl".into(),
-            ancestors: Vec::new(),
-            cmdline_paths: Vec::new(),
-            secret_resolver: None,
-            ..Default::default()
-        };
-
-        let input = middleware_request_input(
-            openshell_ocsf::ctx::ctx(),
-            "http",
-            &req,
-            &ctx,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
-
-        assert_eq!(input.scheme, "http");
     }
 
     #[test]

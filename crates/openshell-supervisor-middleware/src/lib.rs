@@ -61,11 +61,10 @@ use openshell_core::extension_protocol::{
 use openshell_core::proto::extension::v1::PeerMetadata;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpBodyMode, HttpEvent, HttpHeader, HttpRequestEvaluation,
-    HttpRequestTarget, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
-    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
-    ValidateConfigResponse,
+    Decision, Finding, HeaderMutation, HttpBodyMode, HttpEvent, HttpRequestEvaluation,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
+    SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
@@ -575,17 +574,9 @@ impl DescribedChainEntry {
             .is_some_and(|binding| binding.supported_http_body_modes.contains(&(mode as i32)))
     }
 
-    /// True when the resolved version 2 binding can inspect bodies at all.
-    #[must_use]
-    pub fn supports_http_body_processing(&self) -> bool {
-        self.binding
-            .as_ref()
-            .is_some_and(|binding| !binding.supported_http_body_modes.is_empty())
-    }
-
     /// Transport for this entry's version 2 HTTP stage, or `None` for entries
-    /// that are unresolved or use another protocol. Legacy HTTP entries run on
-    /// the legacy engines until adapters implement [`HttpStageTransport`].
+    /// that are unresolved or use another protocol. The pipeline opens legacy
+    /// HTTP entries as adapter stages instead.
     #[must_use]
     pub fn http_stage_transport(&self) -> Option<Arc<dyn HttpStageTransport>> {
         if self.http_protocol() != Some(HttpProtocol::V2) {
@@ -635,31 +626,9 @@ pub type TransformedBodyValidator<'a> = dyn Fn(&[u8]) -> Result<Option<String>> 
 pub enum TransformedBodyPolicy<'a> {
     /// The selected policy does not inspect the request body.
     NotPolicyRelevant,
-    /// Re-evaluate every body replacement before the next stage runs.
+    /// Re-evaluate every body replacement before the next stage or the
+    /// upstream sees it.
     Reevaluate(&'a TransformedBodyValidator<'a>),
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpRequestInput {
-    pub request_id: String,
-    pub sandbox_id: String,
-    pub sandbox_name: String,
-    pub workspace: String,
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
-    pub method: String,
-    pub path: String,
-    pub query: String,
-    /// Lowercased request headers in wire order. Repeated header names are
-    /// preserved as separate entries so middleware inspects every value the
-    /// upstream will receive.
-    pub headers: Vec<(String, String)>,
-    /// Lowercased names nominated by the original request's `Connection`
-    /// headers. Their values are not exposed to middleware, but mutations must
-    /// still treat these dynamically hop-by-hop fields as protected.
-    pub connection_nominated_headers: Vec<String>,
-    pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -703,44 +672,6 @@ pub struct MiddlewareInvocation {
     /// (service error, malformed/unsafe response, etc.). The `decision` reflects
     /// the `on_error` outcome, not a decision the middleware actually returned.
     pub failed: bool,
-}
-
-enum OnErrorAction {
-    /// `fail_open`: skip this middleware, leaving the request unchanged.
-    FailOpen,
-    /// `fail_closed`: short-circuit the chain and deny with the given reason.
-    FailClosed(String),
-}
-
-/// Apply a middleware entry's `on_error` policy after a failure (service error or
-/// malformed response). Records a `failed` invocation for telemetry in both cases.
-fn apply_on_error(
-    entry: &DescribedChainEntry,
-    reason: &str,
-    applied: &mut Vec<MiddlewareInvocation>,
-) -> OnErrorAction {
-    match entry.on_error() {
-        OnError::FailOpen => {
-            applied.push(MiddlewareInvocation {
-                name: entry.entry.name.clone(),
-                implementation: entry.entry.implementation.clone(),
-                decision: Decision::Allow,
-                transformed: false,
-                failed: true,
-            });
-            OnErrorAction::FailOpen
-        }
-        OnError::FailClosed => {
-            applied.push(MiddlewareInvocation {
-                name: entry.entry.name.clone(),
-                implementation: entry.entry.implementation.clone(),
-                decision: Decision::Deny,
-                transformed: false,
-                failed: true,
-            });
-            OnErrorAction::FailClosed(format!("middleware_failed: {reason}"))
-        }
-    }
 }
 
 fn request_view_to_evaluation(request: HttpRequestView<'_>) -> HttpRequestEvaluation {
@@ -2199,523 +2130,14 @@ impl ChainRunner {
             Err(miette!("{}", safe_reason(&response.reason)))
         }
     }
-
-    pub async fn evaluate(
-        &self,
-        entries: &[ChainEntry],
-        input: HttpRequestInput,
-    ) -> Result<ChainOutcome> {
-        let entries = self.describe_chain(entries).await?;
-        self.evaluate_described(&entries, input).await
-    }
-
-    pub async fn evaluate_described(
-        &self,
-        entries: &[DescribedChainEntry],
-        input: HttpRequestInput,
-    ) -> Result<ChainOutcome> {
-        self.evaluate_described_with_policy(
-            entries,
-            input,
-            TransformedBodyPolicy::NotPolicyRelevant,
-        )
-        .await
-    }
-
-    /// Evaluate a described chain, re-checking the request body against sandbox
-    /// policy after every stage that replaces it. Policy runs on the original
-    /// body before the chain, so without this a stage could hand the next stage
-    /// (or the upstream) a payload the policy rejects. When the evaluator returns
-    /// a deny reason the chain stops with that reason, so no later stage ever
-    /// sees a non-compliant body. Body-independent protocols must select
-    /// [`TransformedBodyPolicy::NotPolicyRelevant`] explicitly.
-    pub async fn evaluate_described_with_policy(
-        &self,
-        entries: &[DescribedChainEntry],
-        input: HttpRequestInput,
-        transformed_body_policy: TransformedBodyPolicy<'_>,
-    ) -> Result<ChainOutcome> {
-        let admission = if entries.is_empty() {
-            None
-        } else {
-            Some(self.reserve_middleware_work_admission().await?)
-        };
-        self.evaluate_described_with_policy_admitted(
-            entries,
-            input,
-            transformed_body_policy,
-            admission,
-        )
-        .await
-    }
-
-    /// Evaluate a chain using capacity reserved before its request body was
-    /// buffered. The guard is retained until the ordered chain completes.
-    pub async fn evaluate_described_with_policy_admitted(
-        &self,
-        entries: &[DescribedChainEntry],
-        input: HttpRequestInput,
-        transformed_body_policy: TransformedBodyPolicy<'_>,
-        admission: Option<MiddlewareWorkAdmission>,
-    ) -> Result<ChainOutcome> {
-        ensure_chain_capacity(entries.len())?;
-        let HttpRequestInput {
-            request_id,
-            sandbox_id,
-            sandbox_name,
-            workspace,
-            scheme,
-            host,
-            port,
-            method,
-            path,
-            query,
-            headers,
-            connection_nominated_headers,
-            body,
-        } = input;
-        // The request envelope is moved into one stable chain state. Built-ins
-        // borrow these values for every stage; only the gRPC adapter clones them
-        // when an operator service requires an owned protobuf message.
-        let context = RequestContext {
-            request_id,
-            sandbox_id,
-            sandbox: sandbox_name,
-            workspace,
-            originating_process: None,
-        };
-        let target = HttpRequestTarget {
-            scheme,
-            host,
-            port: u32::from(port),
-            method,
-            path,
-            query,
-        };
-        let mut headers: Vec<HttpHeader> = headers
-            .into_iter()
-            .map(|(name, value)| HttpHeader { name, value })
-            .collect();
-        let mut body = body;
-        let mut header_mutations = Vec::new();
-        let mut findings = Vec::new();
-        let mut metadata = BTreeMap::new();
-        let mut applied = Vec::new();
-        let _admission = admission;
-        let chain_deadline = tokio::time::Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
-
-        for entry in entries {
-            let Some(_binding) = entry.binding.as_ref() else {
-                match apply_on_error(entry, "binding_not_described", &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            };
-            // A version 2 stage runs over the collected body, so stages keep
-            // chain order with the legacy stages around it.
-            if entry.http_protocol() == Some(HttpProtocol::V2) {
-                let stage = self
-                    .collect_request_stage(
-                        entry,
-                        &context,
-                        &target,
-                        &headers,
-                        &connection_nominated_headers,
-                        std::mem::take(&mut body),
-                    )
-                    .await;
-                body = stage.body;
-                findings.extend(stage.diagnostics.findings);
-                metadata.extend(stage.diagnostics.metadata);
-                if !stage.allowed {
-                    applied.push(MiddlewareInvocation {
-                        name: entry.entry.name.clone(),
-                        implementation: entry.entry.implementation.clone(),
-                        decision: Decision::Deny,
-                        transformed: false,
-                        failed: stage.denial.is_none(),
-                    });
-                    return Ok(ChainOutcome {
-                        allowed: false,
-                        reason: stage.reason,
-                        body,
-                        header_mutations,
-                        findings,
-                        metadata,
-                        applied,
-                        denial: stage.denial,
-                    });
-                }
-                let headers_transformed = stage.headers != headers;
-                headers = stage.headers;
-                header_mutations.extend(stage.header_mutations);
-                applied.push(MiddlewareInvocation {
-                    name: entry.entry.name.clone(),
-                    implementation: entry.entry.implementation.clone(),
-                    decision: Decision::Allow,
-                    transformed: stage.body_transformed || headers_transformed,
-                    failed: false,
-                });
-                if stage.body_transformed
-                    && let Some(reason) = transformed_body_denial(transformed_body_policy, &body)
-                {
-                    return Ok(ChainOutcome {
-                        allowed: false,
-                        reason,
-                        body,
-                        header_mutations,
-                        findings,
-                        metadata,
-                        applied,
-                        denial: None,
-                    });
-                }
-                continue;
-            }
-            if body.len() > entry.max_payload_bytes {
-                match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            }
-            let request = HttpRequestView::new(
-                PRE_CREDENTIALS_PHASE,
-                &context,
-                &entry.entry.config,
-                &target,
-                &headers,
-                &body,
-                &entry.entry.implementation,
-            );
-            if let Err(reason) = validate_request_view(request) {
-                match apply_on_error(entry, reason, &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            }
-            let Some(service) = entry.service.as_ref() else {
-                unreachable!("described binding always has a service")
-            };
-            let remaining = chain_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                match apply_on_error(entry, "middleware_chain_timeout", &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            }
-            let mut result = match call_with_timeout(
-                entry.timeout.min(remaining),
-                "EvaluateHttpRequest",
-                service.service.evaluate_http_request(request),
-            )
-            .await
-            {
-                Ok(result) => result.into_inner(),
-                Err(err) => {
-                    // A contract failure means the service no longer speaks the
-                    // protocol its cached binding selected. Failing open here
-                    // would silently skip it, so on_error does not apply.
-                    if let Some(kind) = ContractFailureKind::from_status(&err) {
-                        self.report_contract_failure(entry, HttpDirection::Request, kind);
-                        applied.push(MiddlewareInvocation {
-                            name: entry.entry.name.clone(),
-                            implementation: entry.entry.implementation.clone(),
-                            decision: Decision::Deny,
-                            transformed: false,
-                            failed: true,
-                        });
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason: format!("middleware_failed: {}", kind.reason()),
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                    let reason = if err.code() == tonic::Code::DeadlineExceeded {
-                        "middleware_timeout".to_string()
-                    } else {
-                        service.diagnostic_policy.error_reason(&err)
-                    };
-                    match apply_on_error(entry, &reason, &mut applied) {
-                        OnErrorAction::FailOpen => continue,
-                        OnErrorAction::FailClosed(reason) => {
-                            return Ok(ChainOutcome {
-                                allowed: false,
-                                reason,
-                                body,
-                                header_mutations,
-                                findings,
-                                metadata,
-                                applied,
-                                denial: None,
-                            });
-                        }
-                    }
-                }
-            };
-
-            if let Err(reason) = validate_response_envelope(&result) {
-                match apply_on_error(entry, reason, &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            }
-
-            service
-                .diagnostic_policy
-                .process_result(&entry.entry.implementation, &mut result);
-
-            let decision = match Decision::try_from(result.decision) {
-                Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
-                Ok(Decision::Unspecified) | Err(_) => {
-                    match apply_on_error(entry, "invalid_response_decision", &mut applied) {
-                        OnErrorAction::FailOpen => continue,
-                        OnErrorAction::FailClosed(reason) => {
-                            return Ok(ChainOutcome {
-                                allowed: false,
-                                reason,
-                                body,
-                                header_mutations,
-                                findings,
-                                metadata,
-                                applied,
-                                denial: None,
-                            });
-                        }
-                    }
-                }
-            };
-
-            if decision == Decision::Deny {
-                let reason_code =
-                    (!result.reason_code.is_empty()).then(|| result.reason_code.clone());
-                let denial = MiddlewareDenial {
-                    config_name: entry.entry.name.clone(),
-                    reason_code,
-                };
-                for finding in result.findings {
-                    findings.push(NamespacedFinding {
-                        middleware: entry.entry.name.clone(),
-                        finding,
-                    });
-                }
-                if !result.metadata.is_empty() {
-                    metadata.insert(
-                        entry.entry.name.clone(),
-                        result.metadata.into_iter().collect(),
-                    );
-                }
-                applied.push(MiddlewareInvocation {
-                    name: entry.entry.name.clone(),
-                    implementation: entry.entry.implementation.clone(),
-                    decision,
-                    transformed: false,
-                    failed: false,
-                });
-                return Ok(ChainOutcome {
-                    allowed: false,
-                    reason: middleware_denial_reason(
-                        &denial.config_name,
-                        denial.reason_code.as_deref(),
-                    ),
-                    body,
-                    header_mutations,
-                    findings,
-                    metadata,
-                    applied,
-                    denial: Some(denial),
-                });
-            }
-
-            if result.has_body && result.body.len() > entry.max_payload_bytes {
-                match apply_on_error(entry, "response_body_over_capacity", &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
-                }
-            }
-
-            // Validate and apply the entire stage atomically. Under fail-open,
-            // one malformed mutation must not leave earlier mutations from the
-            // same response visible to later middleware.
-            let updated_headers = if result.header_mutations.is_empty() {
-                None
-            } else {
-                match headers::apply(
-                    headers::HeaderAuthority::Request,
-                    &headers,
-                    &connection_nominated_headers,
-                    &result.header_mutations,
-                ) {
-                    Ok(updated) => Some(updated),
-                    Err(error) => {
-                        let reason = service
-                            .diagnostic_policy
-                            .header_mutation_error_reason(&error);
-                        match apply_on_error(entry, &reason, &mut applied) {
-                            OnErrorAction::FailOpen => continue,
-                            OnErrorAction::FailClosed(reason) => {
-                                return Ok(ChainOutcome {
-                                    allowed: false,
-                                    reason,
-                                    body,
-                                    header_mutations,
-                                    findings,
-                                    metadata,
-                                    applied,
-                                    denial: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            };
-            let headers_transformed = updated_headers
-                .as_ref()
-                .is_some_and(|updated| updated != &headers);
-            if let Some(updated) = updated_headers {
-                headers = updated;
-            }
-            header_mutations.extend(std::mem::take(&mut result.header_mutations));
-
-            let body_transformed = result.has_body;
-            if body_transformed {
-                body = std::mem::take(&mut result.body);
-            }
-            for finding in result.findings {
-                findings.push(NamespacedFinding {
-                    middleware: entry.entry.name.clone(),
-                    finding,
-                });
-            }
-            if !result.metadata.is_empty() {
-                metadata.insert(
-                    entry.entry.name.clone(),
-                    result.metadata.into_iter().collect(),
-                );
-            }
-            applied.push(MiddlewareInvocation {
-                name: entry.entry.name.clone(),
-                implementation: entry.entry.implementation.clone(),
-                decision,
-                transformed: body_transformed || headers_transformed,
-                failed: false,
-            });
-
-            // The stage ran successfully but its output must still satisfy the
-            // sandbox policy the original body was admitted under. Re-check now,
-            // before the next stage or the upstream sees the replaced body. A
-            // policy deny here is a hard deny, independent of `on_error`.
-            if body_transformed
-                && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
-            {
-                let denied = match validate(&body) {
-                    Ok(reason) => reason,
-                    Err(error) => Some(format!(
-                        "transformed_body_policy_evaluation_failed: {}",
-                        safe_reason(&error.to_string())
-                    )),
-                };
-                if let Some(reason) = denied {
-                    return Ok(ChainOutcome {
-                        allowed: false,
-                        reason,
-                        body,
-                        header_mutations,
-                        findings,
-                        metadata,
-                        applied,
-                        denial: None,
-                    });
-                }
-            }
-        }
-
-        Ok(ChainOutcome {
-            allowed: true,
-            reason: String::new(),
-            body,
-            header_mutations,
-            findings,
-            metadata,
-            applied,
-            denial: None,
-        })
-    }
 }
 
 /// Re-check a replaced request body against sandbox policy. Returns the deny
 /// reason, if any.
-fn transformed_body_denial(policy: TransformedBodyPolicy<'_>, body: &[u8]) -> Option<String> {
+pub(crate) fn transformed_body_denial(
+    policy: TransformedBodyPolicy<'_>,
+    body: &[u8],
+) -> Option<String> {
     let TransformedBodyPolicy::Reevaluate(validate) = policy else {
         return None;
     };
@@ -2767,11 +2189,14 @@ pub(crate) fn safe_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat_tests::harness::{RequestChains, RequestInput};
     use futures::{FutureExt, Stream, StreamExt};
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
-    use openshell_core::proto::{ExistingHeaderAction, header_mutation};
+    use openshell_core::proto::{
+        ExistingHeaderAction, HttpHeader, HttpRequestTarget, RequestContext, header_mutation,
+    };
     use openshell_supervisor_middleware_builtins::{BUILTIN_REGEX, services};
 
     use tokio_stream::wrappers::TcpListenerStream;
@@ -2841,8 +2266,8 @@ mod tests {
         }
     }
 
-    fn input(body: &str) -> HttpRequestInput {
-        HttpRequestInput {
+    fn input(body: &str) -> RequestInput {
+        RequestInput {
             request_id: "req".into(),
             sandbox_id: "sbx-id".into(),
             sandbox_name: "sbx-name".into(),
@@ -2871,31 +2296,26 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct RequestAddresses {
+    #[derive(Debug, Clone, PartialEq)]
+    struct ReceivedRequest {
         phase: SupervisorMiddlewarePhase,
-        context: usize,
-        request_id: usize,
-        config: usize,
-        target: usize,
-        host: usize,
-        headers: usize,
-        first_header_name: usize,
-        body: usize,
-        originating_process_present: bool,
+        context: RequestContext,
+        config: prost_types::Struct,
+        target: HttpRequestTarget,
+        headers: Vec<HttpHeader>,
+        body: Vec<u8>,
         middleware_name: String,
     }
 
-    /// Records borrowed addresses so the test can detect an owned envelope
-    /// being reconstructed between otherwise no-op in-process stages.
-    struct BorrowedRecordingService {
+    /// Records every request envelope an in-process stage receives.
+    struct RecordingInProcessService {
         manifest_name: String,
-        received: std::sync::Mutex<Vec<RequestAddresses>>,
+        received: std::sync::Mutex<Vec<ReceivedRequest>>,
         advertise_protocol: bool,
     }
 
     #[tonic::async_trait]
-    impl InProcessMiddleware for BorrowedRecordingService {
+    impl InProcessMiddleware for RecordingInProcessService {
         async fn describe(&self) -> MiddlewareManifest {
             MiddlewareManifest {
                 name: self.manifest_name.clone(),
@@ -2931,33 +2351,25 @@ mod tests {
             &self,
             request: HttpRequestView<'_>,
         ) -> Result<openshell_core::proto::HttpRequestResult> {
-            let addresses = RequestAddresses {
-                phase: request.phase(),
-                context: std::ptr::from_ref(request.context()).addr(),
-                request_id: request.context().request_id.as_ptr().addr(),
-                config: std::ptr::from_ref(request.config()).addr(),
-                target: std::ptr::from_ref(request.target()).addr(),
-                host: request.target().host.as_ptr().addr(),
-                headers: request.headers().as_ptr().addr(),
-                first_header_name: request
-                    .headers()
-                    .first()
-                    .map_or(0, |header| header.name.as_ptr().addr()),
-                body: request.body().as_ptr().addr(),
-                originating_process_present: request.context().originating_process.is_some(),
-                middleware_name: request.middleware_name().to_string(),
-            };
             self.received
                 .lock()
-                .expect("borrowed request recorder lock")
-                .push(addresses);
+                .expect("recorded requests lock")
+                .push(ReceivedRequest {
+                    phase: request.phase(),
+                    context: request.context().clone(),
+                    config: request.config().clone(),
+                    target: request.target().clone(),
+                    headers: request.headers().to_vec(),
+                    body: request.body().to_vec(),
+                    middleware_name: request.middleware_name().to_string(),
+                });
             Ok(allow_result())
         }
     }
 
     #[tokio::test]
-    async fn in_process_stages_share_one_borrowed_request_envelope() {
-        let service = Arc::new(BorrowedRecordingService {
+    async fn in_process_stages_receive_the_request_envelope() {
+        let service = Arc::new(RecordingInProcessService {
             manifest_name: "acme/redactor".into(),
             received: std::sync::Mutex::new(Vec::new()),
             advertise_protocol: true,
@@ -2983,34 +2395,32 @@ mod tests {
             .describe_chain(&entries)
             .await
             .expect("describe chain");
-        let expected_configs: Vec<_> = described
-            .iter()
-            .map(|entry| std::ptr::from_ref(&entry.entry.config).addr())
-            .collect();
         let mut request = input("payload");
         request.headers = vec![("x-test".into(), "value".into())];
-        let expected_body = request.body.as_ptr().addr();
-        let expected_request_id = request.request_id.as_ptr().addr();
-        let expected_host = request.host.as_ptr().addr();
-        let expected_header_name = request.headers[0].0.as_ptr().addr();
 
         let outcome = runner
-            .evaluate_described(&described, request)
+            .run_described(&described, request)
             .await
-            .expect("evaluate borrowed chain");
-        let received = service.received.lock().expect("borrowed requests");
+            .expect("run chain");
+        let received = service.received.lock().expect("recorded requests");
 
         assert!(outcome.allowed);
-        assert_eq!(outcome.body.as_ptr().addr(), expected_body);
+        assert_eq!(outcome.body, b"payload");
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
-        assert!(!received[0].originating_process_present);
-        assert_eq!(received[0].request_id, expected_request_id);
-        assert_eq!(received[0].host, expected_host);
-        assert_eq!(received[0].first_header_name, expected_header_name);
-        assert_eq!(received[0].body, expected_body);
-        assert_eq!(received[0].config, expected_configs[0]);
-        assert_eq!(received[1].config, expected_configs[1]);
+        assert!(received[0].context.originating_process.is_none());
+        assert_eq!(received[0].context.request_id, "req");
+        assert_eq!(received[0].target.host, "api.example.com");
+        assert_eq!(
+            received[0].headers,
+            [HttpHeader {
+                name: "x-test".into(),
+                value: "value".into(),
+            }]
+        );
+        assert_eq!(received[0].body, b"payload");
+        assert_eq!(received[0].config, described[0].entry.config);
+        assert_eq!(received[1].config, described[1].entry.config);
         assert_eq!(received[0].context, received[1].context);
         assert_eq!(received[0].target, received[1].target);
         assert_eq!(received[0].headers, received[1].headers);
@@ -3024,13 +2434,11 @@ mod tests {
 
     const TEST_REPLACEMENT_BODY: &[u8] = b"stage-one-replacement";
 
-    /// Records both sides of a successful body replacement so the test can
-    /// distinguish ownership transfer from a content-preserving body copy.
+    /// Records what the second stage receives after the first replaced the
+    /// body.
     #[derive(Debug, Default)]
     struct ReplacementTransferRecord {
         invocations: usize,
-        returned_body: Option<usize>,
-        second_body: Option<usize>,
         second_body_bytes: Vec<u8>,
     }
 
@@ -3080,14 +2488,11 @@ mod tests {
             record.invocations += 1;
 
             if invocation == 0 {
-                let replacement = TEST_REPLACEMENT_BODY.to_vec();
-                record.returned_body = Some(replacement.as_ptr().addr());
                 let mut result = allow_result();
-                result.body = replacement;
+                result.body = TEST_REPLACEMENT_BODY.to_vec();
                 result.has_body = true;
                 Ok(result)
             } else {
-                record.second_body = Some(request.body().as_ptr().addr());
                 record.second_body_bytes = request.body().to_vec();
                 Ok(allow_result())
             }
@@ -3095,7 +2500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_body_allocation_moves_through_next_stage_and_outcome() {
+    async fn replacement_body_reaches_the_next_stage_and_the_outcome() {
         let service = Arc::new(ReplacementTransferService {
             record: std::sync::Mutex::new(ReplacementTransferRecord::default()),
         });
@@ -3118,20 +2523,15 @@ mod tests {
         ];
 
         let outcome = runner
-            .evaluate(&entries, input("original-body"))
+            .run_chain(&entries, input("original-body"))
             .await
             .expect("evaluate replacement transfer chain");
         let record = service.record.lock().expect("replacement transfer record");
-        let returned_body = record
-            .returned_body
-            .expect("first-stage replacement pointer");
 
         assert!(outcome.allowed);
         assert_eq!(record.invocations, 2);
         assert_eq!(record.second_body_bytes, TEST_REPLACEMENT_BODY);
-        assert_eq!(record.second_body, Some(returned_body));
         assert_eq!(outcome.body, TEST_REPLACEMENT_BODY);
-        assert_eq!(outcome.body.as_ptr().addr(), returned_body);
     }
 
     /// An in-process service that yields forever so the runtime must enforce
@@ -3188,11 +2588,11 @@ mod tests {
             on_error,
         };
         let closed = runner
-            .evaluate(&[entry(OnError::FailClosed)], input("payload"))
+            .run_chain(&[entry(OnError::FailClosed)], input("payload"))
             .await
             .expect("timed-out in-process evaluation");
         let open = runner
-            .evaluate(&[entry(OnError::FailOpen)], input("payload"))
+            .run_chain(&[entry(OnError::FailOpen)], input("payload"))
             .await
             .expect("fail-open timed-out in-process evaluation");
 
@@ -3218,7 +2618,7 @@ mod tests {
     #[tokio::test]
     async fn applies_fixed_regex_replacements() {
         let outcome = builtin_runner()
-            .evaluate(
+            .run_chain(
                 &[entry("redact", OnError::FailClosed)],
                 input(r#"{"api_key":"sk-1234567890abcdef"}"#),
             )
@@ -3239,7 +2639,7 @@ mod tests {
             entry("second", OnError::FailClosed),
         ];
         let outcome = builtin_runner()
-            .evaluate(&entries, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
+            .run_chain(&entries, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate");
         assert!(outcome.allowed);
@@ -3318,7 +2718,7 @@ mod tests {
             on_error: OnError::FailOpen,
         };
         let outcome = builtin_runner()
-            .evaluate(&[unavailable], input("hello"))
+            .run_chain(&[unavailable], input("hello"))
             .await
             .expect("evaluate");
         assert!(outcome.allowed);
@@ -3335,7 +2735,7 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let outcome = builtin_runner()
-            .evaluate(&[unavailable], input("hello"))
+            .run_chain(&[unavailable], input("hello"))
             .await
             .expect("evaluate");
         assert!(!outcome.allowed);
@@ -3364,12 +2764,12 @@ mod tests {
 
     #[tokio::test]
     async fn injected_services_cannot_duplicate_middleware_names() {
-        let first: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
+        let first: Arc<dyn InProcessMiddleware> = Arc::new(RecordingInProcessService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
             advertise_protocol: true,
         });
-        let second: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
+        let second: Arc<dyn InProcessMiddleware> = Arc::new(RecordingInProcessService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
             advertise_protocol: true,
@@ -3387,7 +2787,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_service_without_protocol_metadata_is_rejected() {
-        let service: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
+        let service: Arc<dyn InProcessMiddleware> = Arc::new(RecordingInProcessService {
             manifest_name: "openshell/legacy".into(),
             received: std::sync::Mutex::new(Vec::new()),
             advertise_protocol: false,
@@ -3659,7 +3059,7 @@ mod tests {
             }
         });
         let outcome = runner
-            .evaluate_described_with_policy(
+            .run_described_with_policy(
                 &described,
                 input("original"),
                 TransformedBodyPolicy::Reevaluate(&*validator),
@@ -3715,7 +3115,7 @@ mod tests {
 
         let validator: Box<TransformedBodyValidator<'_>> = Box::new(|_body: &[u8]| Ok(None));
         let outcome = runner
-            .evaluate_described_with_policy(
+            .run_described_with_policy(
                 &described,
                 input("original"),
                 TransformedBodyPolicy::Reevaluate(&*validator),
@@ -3770,7 +3170,7 @@ mod tests {
             Box::new(|_body: &[u8]| Err(miette!("OPA engine unavailable")));
 
         let outcome = runner
-            .evaluate_described_with_policy(
+            .run_described_with_policy(
                 &described,
                 input("original"),
                 TransformedBodyPolicy::Reevaluate(&*validator),
@@ -4062,7 +3462,7 @@ mod tests {
             ];
 
             let outcome = runner
-                .evaluate(&entries, input("payload"))
+                .run_chain(&entries, input("payload"))
                 .await
                 .expect("evaluate header chain");
             assert!(outcome.allowed);
@@ -4101,7 +3501,7 @@ mod tests {
         ];
 
         let outcome = runner
-            .evaluate(&entries, input("payload"))
+            .run_chain(&entries, input("payload"))
             .await
             .expect("evaluate in-process header chain");
         let received = service
@@ -4168,10 +3568,9 @@ mod tests {
             ("x-api-key".into(), "second-value".into()),
         ];
         request.query = "page=2".into();
-        let original_body = request.body.as_ptr().addr();
 
         let outcome = runner
-            .evaluate(&[recorder_entry], request)
+            .run_chain(&[recorder_entry], request)
             .await
             .expect("evaluate recording chain");
         assert!(outcome.allowed);
@@ -4184,8 +3583,7 @@ mod tests {
 
         let received = service.received.lock().expect("recorded evaluations");
         assert_eq!(received.len(), 1);
-        assert_eq!(outcome.body.as_ptr().addr(), original_body);
-        assert_ne!(received[0].body.as_ptr().addr(), original_body);
+        assert_eq!(outcome.body, b"payload");
         assert_eq!(received[0].body, b"payload");
         assert_eq!(
             received[0].phase,
@@ -4342,7 +3740,7 @@ mod tests {
         );
 
         let outcome = runner
-            .evaluate_described(&described, input("hello"))
+            .run_described(&described, input("hello"))
             .await
             .expect("evaluate external middleware");
         assert!(outcome.allowed);
@@ -4374,7 +3772,7 @@ mod tests {
         assert_eq!(described[1].max_payload_bytes(), 1024);
 
         let outcome = runner
-            .evaluate_described(&described, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
+            .run_described(&described, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate mixed chain");
         assert!(outcome.allowed);
@@ -4410,7 +3808,7 @@ mod tests {
 
         let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
-            .evaluate(&entries, input(&body))
+            .run_chain(&entries, input(&body))
             .await
             .expect("evaluate mixed-limit chain");
 
@@ -4451,7 +3849,7 @@ mod tests {
 
         let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
-            .evaluate(&entries, input(&body))
+            .run_chain(&entries, input(&body))
             .await
             .expect("evaluate mixed-limit chain");
 
@@ -4786,14 +4184,14 @@ mod tests {
         assert_eq!(described[0].timeout(), Duration::from_millis(10));
 
         let closed = runner
-            .evaluate(&[slow_entry(OnError::FailClosed)], input("payload"))
+            .run_chain(&[slow_entry(OnError::FailClosed)], input("payload"))
             .await
             .expect("fail-closed timeout outcome");
         assert!(!closed.allowed);
         assert_eq!(closed.reason, "middleware_failed: middleware_timeout");
 
         let open = runner
-            .evaluate(&[slow_entry(OnError::FailOpen)], input("payload"))
+            .run_chain(&[slow_entry(OnError::FailOpen)], input("payload"))
             .await
             .expect("fail-open timeout outcome");
         assert!(open.allowed);
@@ -4828,7 +4226,7 @@ mod tests {
         assert_eq!(described[0].timeout(), Duration::from_millis(10));
 
         let outcome = runner
-            .evaluate(&[slow_entry], input("payload"))
+            .run_chain(&[slow_entry], input("payload"))
             .await
             .expect("operator timeout outcome");
         assert!(!outcome.allowed);
@@ -4877,7 +4275,7 @@ mod tests {
         assert!(validation_error.to_string().contains("timed out"));
 
         let outcome = runner
-            .evaluate(&[slow_entry], input("payload"))
+            .run_chain(&[slow_entry], input("payload"))
             .await
             .expect("operator-capped evaluation outcome");
         assert!(!outcome.allowed);
@@ -4938,7 +4336,7 @@ mod tests {
         );
 
         let outcome = ChainRunner::from_registry(registry)
-            .evaluate(
+            .run_chain(
                 &[
                     ChainEntry {
                         name: "primary".into(),
@@ -5045,7 +4443,7 @@ mod tests {
         )];
         request.body = vec![b'b'; MAX_MIDDLEWARE_PAYLOAD_BYTES];
         let outcome = ChainRunner::from_registry(registry)
-            .evaluate(
+            .run_chain(
                 &[ChainEntry {
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
@@ -5102,7 +4500,7 @@ mod tests {
         });
         let registry = registry_with_external(service, registration).await;
         let outcome = ChainRunner::from_registry(registry)
-            .evaluate(
+            .run_chain(
                 &[ChainEntry {
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
@@ -5144,7 +4542,7 @@ mod tests {
             },
         )));
         let outcome = runner
-            .evaluate(
+            .run_chain(
                 &[entry("content-guard", OnError::FailClosed)],
                 input("hello"),
             )
@@ -5178,7 +4576,7 @@ mod tests {
         });
         let registry = registry_with_external(service, registration).await;
         let outcome = ChainRunner::from_registry(registry)
-            .evaluate(
+            .run_chain(
                 &[ChainEntry {
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
@@ -5220,7 +4618,7 @@ mod tests {
 
         for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
             let outcome = runner
-                .evaluate(
+                .run_chain(
                     &[ChainEntry {
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
@@ -5278,7 +4676,7 @@ mod tests {
             request.connection_nominated_headers = vec!["x-openshell-middleware-tag".into()];
 
             let outcome = ChainRunner::from_registry(registry)
-                .evaluate(
+                .run_chain(
                     &[ChainEntry {
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
@@ -5315,7 +4713,7 @@ mod tests {
 
         for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
             let outcome = runner
-                .evaluate(
+                .run_chain(
                     &[ChainEntry {
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
@@ -5371,7 +4769,7 @@ mod tests {
             .collect();
 
         let outcome = runner
-            .evaluate(&entries, input("hello"))
+            .run_chain(&entries, input("hello"))
             .await
             .expect("evaluate maximum chain");
 
@@ -5401,7 +4799,7 @@ mod tests {
             },
         )));
         let outcome = runner
-            .evaluate(
+            .run_chain(
                 &[
                     entry("first", OnError::FailClosed),
                     entry("second", OnError::FailClosed),
@@ -5442,7 +4840,7 @@ mod tests {
         )));
 
         let outcome = runner
-            .evaluate(&[entry("guard", OnError::FailOpen)], input("hello"))
+            .run_chain(&[entry("guard", OnError::FailOpen)], input("hello"))
             .await
             .expect("evaluate");
 
@@ -5469,7 +4867,7 @@ mod tests {
         }));
 
         let outcome = runner
-            .evaluate(&[entry("guard", OnError::FailOpen)], input("safe"))
+            .run_chain(&[entry("guard", OnError::FailOpen)], input("safe"))
             .await
             .expect("evaluate");
 
@@ -5499,7 +4897,7 @@ mod tests {
             },
         )));
         let outcome = runner
-            .evaluate(
+            .run_chain(
                 &[
                     entry("alpha", OnError::FailClosed),
                     entry("beta", OnError::FailClosed),
@@ -5543,7 +4941,7 @@ mod tests {
     async fn malformed_response_headers_fail_closed_denies() {
         let runner = ChainRunner::new_protobuf_for_tests(Arc::new(unsafe_header_service()));
         let outcome = runner
-            .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))
+            .run_chain(&[entry("redact", OnError::FailClosed)], input("hello"))
             .await
             .expect("evaluate");
         assert!(!outcome.allowed);
@@ -5565,7 +4963,7 @@ mod tests {
     async fn malformed_response_headers_fail_open_continues() {
         let runner = ChainRunner::new_protobuf_for_tests(Arc::new(unsafe_header_service()));
         let outcome = runner
-            .evaluate(&[entry("redact", OnError::FailOpen)], input("hello"))
+            .run_chain(&[entry("redact", OnError::FailOpen)], input("hello"))
             .await
             .expect("evaluate");
         assert!(outcome.allowed);
@@ -5591,7 +4989,7 @@ mod tests {
         fail_closed.on_error = OnError::FailClosed;
 
         let open_outcome = runner
-            .evaluate(&[fail_open], input("safe"))
+            .run_chain(&[fail_open], input("safe"))
             .await
             .expect("fail-open evaluation");
         assert!(open_outcome.allowed);
@@ -5599,7 +4997,7 @@ mod tests {
         assert!(open_outcome.applied[0].failed);
 
         let closed_outcome = runner
-            .evaluate(&[fail_closed], input("safe"))
+            .run_chain(&[fail_closed], input("safe"))
             .await
             .expect("fail-closed evaluation");
         assert!(!closed_outcome.allowed);
@@ -5622,7 +5020,7 @@ mod tests {
         fail_closed.on_error = OnError::FailClosed;
 
         let open_outcome = runner
-            .evaluate(&[fail_open], input("hello"))
+            .run_chain(&[fail_open], input("hello"))
             .await
             .expect("fail-open evaluation");
         assert!(open_outcome.allowed);
@@ -5630,7 +5028,7 @@ mod tests {
         assert!(open_outcome.applied[0].failed);
 
         let closed_outcome = runner
-            .evaluate(&[fail_closed], input("hello"))
+            .run_chain(&[fail_closed], input("hello"))
             .await
             .expect("fail-closed evaluation");
         assert!(!closed_outcome.allowed);
@@ -5651,7 +5049,7 @@ mod tests {
         )));
 
         let outcome = runner
-            .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))
+            .run_chain(&[entry("redact", OnError::FailClosed)], input("hello"))
             .await
             .expect("evaluate");
 

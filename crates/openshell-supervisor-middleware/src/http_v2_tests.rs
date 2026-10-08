@@ -19,16 +19,18 @@ use openshell_core::proto::middleware::v1::http_response_pre_return_server::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
 use openshell_core::proto::{
-    HttpContinue, HttpPreflight, HttpPreflightResult, HttpRequestPreflightHead, HttpRequestResult,
-    HttpResponseBodyMode, HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflightInspect,
-    HttpResponsePreflightResult, HttpResponsePreflightSkip, HttpResult, WebSocketSessionEvent,
-    http_event, http_preflight, http_preflight_result, http_response_event,
-    http_response_event_result, http_response_preflight_result, http_result,
+    HttpContinue, HttpHeader, HttpPreflight, HttpPreflightResult, HttpRequestPreflightHead,
+    HttpRequestResult, HttpRequestTarget, HttpResponseBodyMode, HttpResponseEvent,
+    HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
+    HttpResponsePreflightSkip, HttpResult, RequestContext, WebSocketSessionEvent, http_event,
+    http_preflight, http_preflight_result, http_response_event, http_response_event_result,
+    http_response_preflight_result, http_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 use super::*;
+use crate::compat_tests::harness::{RequestChains, RequestInput};
 
 const MAX_PAYLOAD_BYTES: u64 = 4096;
 
@@ -319,8 +321,8 @@ fn entry(name: &str, implementation: &str, on_error: OnError) -> ChainEntry {
     }
 }
 
-fn request_input() -> HttpRequestInput {
-    HttpRequestInput {
+fn request_input() -> RequestInput {
+    RequestInput {
         request_id: "req".into(),
         sandbox_id: "sbx-id".into(),
         sandbox_name: "sbx".into(),
@@ -536,7 +538,7 @@ async fn legacy_service_still_registers_and_evaluates_through_the_legacy_rpc() {
     assert!(chain[0].http_stage_transport().is_none());
 
     let outcome = runner
-        .evaluate_described(&chain, request_input())
+        .run_described(&chain, request_input())
         .await
         .expect("evaluate");
     assert!(outcome.allowed);
@@ -598,7 +600,7 @@ async fn dual_protocol_service_gets_version_2_bindings_only_when_the_caller_adve
     assert_eq!(chain[0].http_protocol(), Some(HttpProtocol::Legacy));
     assert!(
         runner
-            .evaluate_described(&chain, request_input())
+            .run_described(&chain, request_input())
             .await
             .expect("evaluate")
             .allowed
@@ -688,9 +690,9 @@ async fn version_2_stages_never_reach_legacy_rpcs() {
     );
     let entries = [entry("guard", "guard-service", OnError::FailOpen)];
 
-    // The request collector runs the stage over EvaluateHttp.
+    // The request pipeline runs the stage over EvaluateHttp.
     let outcome = runner
-        .evaluate(&entries, request_input())
+        .run_chain(&entries, request_input())
         .await
         .expect("evaluate");
     assert!(outcome.allowed, "{}", outcome.reason);
@@ -991,7 +993,7 @@ async fn unimplemented_legacy_request_rpc_fails_closed_under_fail_open_and_reque
     service.switch_to(Build::V2Only);
 
     let outcome = runner
-        .evaluate(
+        .run_chain(
             &[entry("guard", "guard-service", OnError::FailOpen)],
             request_input(),
         )
@@ -1090,7 +1092,7 @@ async fn re_describe_after_a_contract_failure_installs_the_swapped_services_bind
     service.switch_to(Build::V2Only);
     assert!(
         !runner
-            .evaluate(&entries, request_input())
+            .run_chain(&entries, request_input())
             .await
             .expect("evaluate")
             .allowed

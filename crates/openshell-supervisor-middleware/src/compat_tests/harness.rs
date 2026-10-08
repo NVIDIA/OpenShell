@@ -5,10 +5,15 @@
 //!
 //! Suites build chains with [`connect`] and [`entry`], run them with
 //! [`run_request`], [`run_response`], or [`preflight_response`], and assert
-//! only on the returned observations. A cutover adds an [`Engine`] variant and
-//! one match arm per driver.
+//! only on the returned observations. Request chains run on the request
+//! pipeline, where legacy entries are adapter stages. A response cutover adds
+//! an [`Engine`] variant and one match arm per response driver.
 
+use std::collections::BTreeMap;
+
+use miette::Result;
 use prost::Message;
+use tokio::sync::mpsc;
 
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestTarget, MiddlewareSessionEndReason,
@@ -16,17 +21,18 @@ use openshell_core::proto::{
 };
 use openshell_supervisor_middleware_wire_fixture::RunningFixture;
 
+use crate::pipeline::STAGE_QUEUE_MESSAGES;
 use crate::{
-    ChainEntry, ChainRunner, HttpRequestInput, HttpResponseInvocationOutcome,
-    HttpResponseMiddlewareFailure, HttpResponsePreflightInput, HttpResponseSession,
-    MiddlewareDenial, MiddlewareRegistry, OnError,
+    ChainEntry, ChainOutcome, ChainRunner, DescribedChainEntry, HttpBodyInput, HttpBodyOutput,
+    HttpRequestPreflightInput, HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure,
+    HttpResponsePreflightInput, HttpResponseSession, HttpStageDiagnostics, MiddlewareDenial,
+    MiddlewareRegistry, OnError, TransformedBodyPolicy,
 };
 
-/// Engine that executes a legacy chain.
+/// Engine that executes a legacy response chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Engine {
-    /// The 0.1.x engines on `main`: `ChainRunner::evaluate_described` for
-    /// requests and the lockstep `HttpResponseSession` for responses.
+    /// The 0.1.x lockstep `HttpResponseSession` on `main`.
     Legacy,
 }
 
@@ -87,9 +93,208 @@ pub(super) fn transcode<T: Message, U: Message + Default>(message: &T) -> U {
         .expect("a v0.1.2 message decodes with the in-tree schema")
 }
 
+/// One request as the relay hands it to request middleware once it has
+/// received the whole body.
+#[derive(Debug, Clone)]
+pub struct RequestInput {
+    pub request_id: String,
+    pub sandbox_id: String,
+    pub sandbox_name: String,
+    pub workspace: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    /// Lowercased middleware-visible headers in wire order.
+    pub headers: Vec<(String, String)>,
+    /// Lowercased names nominated by the request's `Connection` headers.
+    pub connection_nominated_headers: Vec<String>,
+    pub body: Vec<u8>,
+}
+
+/// Request chains run on the request pipeline, as the relay runs a request
+/// with a `Content-Length` body, and reported as 0.1.x reported a chain.
+pub trait RequestChains {
+    async fn run_chain(&self, entries: &[ChainEntry], input: RequestInput) -> Result<ChainOutcome>;
+
+    async fn run_described(
+        &self,
+        entries: &[DescribedChainEntry],
+        input: RequestInput,
+    ) -> Result<ChainOutcome> {
+        self.run_described_with_policy(entries, input, TransformedBodyPolicy::NotPolicyRelevant)
+            .await
+    }
+
+    async fn run_described_with_policy(
+        &self,
+        entries: &[DescribedChainEntry],
+        input: RequestInput,
+        body_policy: TransformedBodyPolicy<'_>,
+    ) -> Result<ChainOutcome>;
+}
+
+impl RequestChains for ChainRunner {
+    async fn run_chain(&self, entries: &[ChainEntry], input: RequestInput) -> Result<ChainOutcome> {
+        let described = self.describe_chain(entries).await?;
+        self.run_described(&described, input).await
+    }
+
+    async fn run_described_with_policy(
+        &self,
+        entries: &[DescribedChainEntry],
+        input: RequestInput,
+        body_policy: TransformedBodyPolicy<'_>,
+    ) -> Result<ChainOutcome> {
+        let RequestInput {
+            request_id,
+            sandbox_id,
+            sandbox_name,
+            workspace,
+            scheme,
+            host,
+            port,
+            method,
+            path,
+            query,
+            headers,
+            connection_nominated_headers,
+            body,
+        } = input;
+        let preflight = self
+            .preflight_described_http_request(
+                entries.to_vec(),
+                HttpRequestPreflightInput {
+                    context: RequestContext {
+                        request_id,
+                        sandbox_id,
+                        sandbox: sandbox_name,
+                        workspace,
+                        originating_process: None,
+                    },
+                    target: HttpRequestTarget {
+                        scheme,
+                        host,
+                        port: u32::from(port),
+                        method,
+                        path,
+                        query,
+                    },
+                    declared_body_length: Some(body.len() as u64),
+                    headers: headers
+                        .into_iter()
+                        .map(|(name, value)| HttpHeader { name, value })
+                        .collect(),
+                    connection_nominated_headers,
+                },
+            )
+            .await?;
+        let mut diagnostics = preflight.diagnostics;
+        if !preflight.allowed {
+            return Ok(chain_outcome(
+                Err((preflight.reason, preflight.denial)),
+                body,
+                Vec::new(),
+                diagnostics,
+            ));
+        }
+        let Some(session) = preflight.session else {
+            return Ok(chain_outcome(
+                Ok(()),
+                body,
+                preflight.header_mutations,
+                diagnostics,
+            ));
+        };
+        let limit = session.input_unit_limit();
+        let (input, inputs) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+        let (output, mut outputs) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+        let feed = async move {
+            for unit in body.chunks(limit) {
+                if input
+                    .send(HttpBodyInput::Chunk(unit.to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return body;
+                }
+            }
+            let _ = input
+                .send(HttpBodyInput::End {
+                    trailers: Vec::new(),
+                })
+                .await;
+            body
+        };
+        let collect = async move {
+            let mut late = Vec::new();
+            let mut released = Vec::new();
+            while let Some(event) = outputs.recv().await {
+                match event {
+                    HttpBodyOutput::Start {
+                        header_mutations, ..
+                    } => late = header_mutations,
+                    HttpBodyOutput::Chunk(data) => released.extend_from_slice(&data),
+                    HttpBodyOutput::End { .. } => {}
+                }
+            }
+            (late, released)
+        };
+        let (finish, body, (late, released)) = tokio::join!(
+            session.run_with_body_policy(inputs, output, body_policy),
+            feed,
+            collect
+        );
+        Ok(match finish {
+            Ok(finish) => {
+                diagnostics.extend(finish.diagnostics);
+                let mut header_mutations = preflight.header_mutations;
+                header_mutations.extend(late);
+                chain_outcome(Ok(()), released, header_mutations, diagnostics)
+            }
+            Err(failure) => {
+                diagnostics.extend(*failure.diagnostics);
+                chain_outcome(
+                    Err((failure.reason, failure.denial)),
+                    body,
+                    Vec::new(),
+                    diagnostics,
+                )
+            }
+        })
+    }
+}
+
+/// A finished request chain. A denied chain keeps the request body it was
+/// given and replays no header mutation.
+fn chain_outcome(
+    result: std::result::Result<(), (String, Option<MiddlewareDenial>)>,
+    body: Vec<u8>,
+    header_mutations: Vec<HeaderMutation>,
+    diagnostics: HttpStageDiagnostics,
+) -> ChainOutcome {
+    let applied = diagnostics.applied();
+    let (allowed, reason, denial) = match result {
+        Ok(()) => (true, String::new(), None),
+        Err((reason, denial)) => (false, reason, denial),
+    };
+    ChainOutcome {
+        allowed,
+        reason,
+        body,
+        header_mutations,
+        findings: diagnostics.findings,
+        metadata: diagnostics.metadata.into_iter().collect::<BTreeMap<_, _>>(),
+        applied,
+        denial,
+    }
+}
+
 /// Request input with a fixed identity and target.
-pub(super) fn request(body: &[u8], headers: &[(&str, &str)]) -> HttpRequestInput {
-    HttpRequestInput {
+pub(super) fn request(body: &[u8], headers: &[(&str, &str)]) -> RequestInput {
+    RequestInput {
         request_id: "compat-request".into(),
         sandbox_id: "compat-sandbox-id".into(),
         sandbox_name: "compat-sandbox".into(),
@@ -131,46 +336,37 @@ pub(super) struct RequestObservation {
     pub(super) findings: Vec<(String, Finding)>,
 }
 
-/// Run one request chain on `engine`.
+/// Run one request chain on the request pipeline.
 pub(super) async fn run_request(
-    engine: Engine,
     runner: &ChainRunner,
     entries: &[ChainEntry],
-    input: HttpRequestInput,
+    input: RequestInput,
 ) -> RequestObservation {
-    match engine {
-        Engine::Legacy => {
-            let described = runner
-                .describe_chain(entries)
-                .await
-                .expect("describe request chain");
-            let outcome = runner
-                .evaluate_described(&described, input)
-                .await
-                .expect("evaluate request chain");
-            RequestObservation {
-                allowed: outcome.allowed,
-                reason: outcome.reason,
-                body: outcome.body,
-                header_mutations: outcome.header_mutations,
-                stages: outcome
-                    .applied
-                    .into_iter()
-                    .map(|invocation| StageOutcome {
-                        name: invocation.name,
-                        decision: invocation.decision,
-                        transformed: invocation.transformed,
-                        failed: invocation.failed,
-                    })
-                    .collect(),
-                denial: outcome.denial,
-                findings: outcome
-                    .findings
-                    .into_iter()
-                    .map(|finding| (finding.middleware, finding.finding))
-                    .collect(),
-            }
-        }
+    let outcome = runner
+        .run_chain(entries, input)
+        .await
+        .expect("run request chain");
+    RequestObservation {
+        allowed: outcome.allowed,
+        reason: outcome.reason,
+        body: outcome.body,
+        header_mutations: outcome.header_mutations,
+        stages: outcome
+            .applied
+            .into_iter()
+            .map(|invocation| StageOutcome {
+                name: invocation.name,
+                decision: invocation.decision,
+                transformed: invocation.transformed,
+                failed: invocation.failed,
+            })
+            .collect(),
+        denial: outcome.denial,
+        findings: outcome
+            .findings
+            .into_iter()
+            .map(|finding| (finding.middleware, finding.finding))
+            .collect(),
     }
 }
 
