@@ -135,38 +135,59 @@ fn sandbox_workspace_key(workspace: &str) -> &str {
     }
 }
 
+/// Table length up to which [`LocalMutationLocks`] never sweeps.
+const LOCK_TABLE_MIN_SWEEP_LEN: usize = 64;
+
 /// Process-local table of mutation lock keys.
 ///
-/// Entries are weak, so a key disappears once no guard holds it and no
-/// acquisition waits on it. Tokio's `RwLock` is fair and write-preferring: a
-/// queued exclusive request blocks later shared requests on the same key.
+/// Entries are weak, so a key's lock is freed once no guard holds it and no
+/// acquisition waits on it, including an acquisition that was cancelled. Its
+/// entry stays until the next sweep, which runs only when a new key grows the
+/// table past the larger of `LOCK_TABLE_MIN_SWEEP_LEN` and twice the live
+/// entries the last sweep left. Acquisition is amortized O(1), and the table
+/// stays within about twice its peak live set. Tokio's `RwLock` is fair and
+/// write-preferring: a queued exclusive request blocks later shared requests
+/// on the same key.
 #[derive(Debug)]
 pub struct LocalMutationLocks {
-    entries: StdMutex<HashMap<i64, Weak<RwLock<()>>>>,
+    table: StdMutex<LockTable>,
     timeout_ms: AtomicU64,
+}
+
+#[derive(Debug)]
+struct LockTable {
+    entries: HashMap<i64, Weak<RwLock<()>>>,
+    /// Length past which the next new key sweeps released entries.
+    sweep_above: usize,
 }
 
 impl LocalMutationLocks {
     pub(crate) fn new() -> Self {
         Self {
-            entries: StdMutex::new(HashMap::new()),
+            table: StdMutex::new(LockTable {
+                entries: HashMap::new(),
+                sweep_above: LOCK_TABLE_MIN_SWEEP_LEN,
+            }),
             timeout_ms: AtomicU64::new(duration_millis(MUTATION_LOCK_TIMEOUT)),
         }
     }
 
     fn lock_for(&self, key: i64) -> Arc<RwLock<()>> {
-        let mut entries = self
-            .entries
+        let mut table = self
+            .table
             .lock()
             .expect("mutation lock registry lock poisoned");
-        entries.retain(|_, lock| lock.strong_count() > 0);
-
-        if let Some(lock) = entries.get(&key).and_then(Weak::upgrade) {
+        if let Some(lock) = table.entries.get(&key).and_then(Weak::upgrade) {
             return lock;
         }
 
         let lock = Arc::new(RwLock::new(()));
-        entries.insert(key, Arc::downgrade(&lock));
+        // Replacing a released entry for the same key does not grow the table.
+        let replaced = table.entries.insert(key, Arc::downgrade(&lock));
+        if replaced.is_none() && table.entries.len() > table.sweep_above {
+            table.entries.retain(|_, lock| lock.strong_count() > 0);
+            table.sweep_above = (2 * table.entries.len()).max(LOCK_TABLE_MIN_SWEEP_LEN);
+        }
         lock
     }
 
@@ -202,13 +223,14 @@ impl LocalMutationLocks {
             .store(duration_millis(timeout), Ordering::Relaxed);
     }
 
-    /// Entries in the table, including released keys that `lock_for` has not
-    /// pruned yet.
+    /// Entries in the table, including released keys that no sweep has
+    /// removed yet.
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
-        self.entries
+        self.table
             .lock()
             .expect("mutation lock registry lock poisoned")
+            .entries
             .len()
     }
 
@@ -216,9 +238,10 @@ impl LocalMutationLocks {
     /// prune, so it cannot hide a leak in `lock_for`.
     #[cfg(test)]
     pub(crate) fn live_entry_count(&self) -> usize {
-        self.entries
+        self.table
             .lock()
             .expect("mutation lock registry lock poisoned")
+            .entries
             .values()
             .filter(|lock| lock.strong_count() > 0)
             .count()
@@ -228,9 +251,10 @@ impl LocalMutationLocks {
     /// acquisition waiting for it.
     #[cfg(test)]
     pub(crate) fn key_references(&self, key: i64) -> usize {
-        self.entries
+        self.table
             .lock()
             .expect("mutation lock registry lock poisoned")
+            .entries
             .get(&key)
             .map_or(0, Weak::strong_count)
     }
@@ -681,23 +705,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_registry_drops_released_entries() {
+    async fn local_registry_stays_bounded() {
         let runtime = test_runtime().await;
-        let sandbox = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox("w", "a")))
+        let held = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox("w", "held")))
             .await
             .unwrap();
-        let lifecycle = runtime.lock_sandbox_local("b").await;
-        assert_eq!(runtime.mutation_locks.entry_count(), 4);
 
-        drop(sandbox);
-        drop(lifecycle);
+        // Few live keys: released keys pile up to the minimum, never past it.
+        let mut peak = 0;
+        for i in 0..4 * LOCK_TABLE_MIN_SWEEP_LEN {
+            drop(runtime.lock_sandbox_local(&format!("sb-{i}")).await);
+            let entries = runtime.mutation_locks.entry_count();
+            assert!(entries <= LOCK_TABLE_MIN_SWEEP_LEN, "{entries} entries");
+            peak = peak.max(entries);
+        }
+        assert_eq!(peak, LOCK_TABLE_MIN_SWEEP_LEN, "sweeps are not per call");
+
+        // Sweeps keep the held global, workspace, and sandbox keys.
+        assert_eq!(runtime.mutation_locks.live_entry_count(), 3);
+        let held_key = MutationLockKey::Sandbox("held").advisory_key();
+        assert_eq!(runtime.mutation_locks.key_references(held_key), 1);
+        drop(held);
         assert_eq!(runtime.mutation_locks.live_entry_count(), 0);
+    }
 
-        // The next acquisition prunes the released keys, so the table holds
-        // only the new guard's global and sandbox keys.
-        let fresh = runtime.lock_sandbox_local("c").await;
-        assert_eq!(runtime.mutation_locks.entry_count(), 2);
-        drop(fresh);
+    #[tokio::test]
+    async fn local_registry_bound_scales_with_live_keys() {
+        const HELD: usize = 50;
+        let runtime = test_runtime().await;
+        let mut held = Vec::new();
+        for i in 0..HELD {
+            held.push(lock_order::branch(runtime.lock_sandbox_local(&format!("held-{i}"))).await);
+        }
+
+        // A sweep keeps the held sandbox keys, the global key, and the key
+        // being inserted, then lets the table grow to twice that.
+        let bound = 2 * (HELD + 2);
+        let mut peak = 0;
+        for i in 0..4 * HELD {
+            drop(runtime.lock_sandbox_local(&format!("sb-{i}")).await);
+            let entries = runtime.mutation_locks.entry_count();
+            assert!(entries <= bound, "{entries} entries");
+            peak = peak.max(entries);
+        }
+        assert_eq!(peak, bound, "sweeps wait until the table doubles");
+        assert_eq!(runtime.mutation_locks.live_entry_count(), HELD + 1);
+
+        drop(held);
+        assert_eq!(runtime.mutation_locks.live_entry_count(), 0);
     }
 
     #[tokio::test]
