@@ -991,7 +991,7 @@ pub(crate) async fn run_server(
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
         .supervisor_sessions
-        .shutdown(Duration::from_secs(10))
+        .shutdown(supervisor_session::SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT)
         .await;
     if let Err(err) = &session_cleanup {
         warn!(error = %err, "Gateway supervisor session cleanup incomplete");

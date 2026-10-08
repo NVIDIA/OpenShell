@@ -354,7 +354,7 @@ struct SessionConfig {
 }
 
 async fn run_session_loop(config: SessionConfig) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::new();
     let mut attempt: u64 = 0;
 
     // The gateway may hand this sandbox to the replica that should own it. We
@@ -363,7 +363,6 @@ async fn run_session_loop(config: SessionConfig) {
     // back to the configured address, which load-balances across replicas.
     let mut target = config.endpoint.clone();
     let mut redirected = false;
-    let mut backoff_skipped = false;
 
     loop {
         attempt += 1;
@@ -384,10 +383,7 @@ async fn run_session_loop(config: SessionConfig) {
                 peer_endpoint,
                 owner_replica_id,
             }) => {
-                if config.ready_tx.send_replace(false) {
-                    backoff_skipped = false;
-                    backoff = INITIAL_BACKOFF;
-                }
+                backoff.on_redirect(config.ready_tx.send_replace(false));
                 info!(
                     sandbox_id = %config.sandbox_id,
                     owner_replica_id = %owner_replica_id,
@@ -410,29 +406,58 @@ async fn run_session_loop(config: SessionConfig) {
                 // Fall back to the configured gateway address so a redirect
                 // to a replica that is going away cannot strand the sandbox.
                 let failed_redirect_target = target != config.endpoint && !accepted;
-                if accepted {
-                    backoff_skipped = false;
-                }
-                backoff = backoff_after_failure(backoff, accepted);
                 target.clone_from(&config.endpoint);
                 redirected = redirect_survives_failure(redirected, accepted);
-                if skip_backoff(failed_redirect_target, backoff_skipped) {
-                    backoff_skipped = true;
-                } else {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                if let Some(delay) = backoff.on_failure(accepted, failed_redirect_target) {
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
     }
 }
 
-/// A session the gateway accepted proves the path works again, so its loss
-/// starts backoff over. Without the reset, every gateway restart over the
-/// sandbox's lifetime doubles the delay until each reconnect waits the full
-/// maximum.
-fn backoff_after_failure(backoff: Duration, accepted: bool) -> Duration {
-    if accepted { INITIAL_BACKOFF } else { backoff }
+/// Reconnect delays for the supervisor session loop.
+///
+/// Delays double up to [`MAX_BACKOFF`] while reconnects keep failing. A session
+/// the gateway accepted proves the path works again, so its loss starts the
+/// delays over. Without that reset, every gateway restart over the sandbox's
+/// lifetime would compound until each reconnect waited the full maximum.
+#[derive(Debug)]
+struct ReconnectBackoff {
+    delay: Duration,
+    skipped_since_accept: bool,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            delay: INITIAL_BACKOFF,
+            skipped_since_accept: false,
+        }
+    }
+
+    /// Record a gateway redirect. Following it is an expected handoff, so the
+    /// supervisor reconnects without waiting.
+    fn on_redirect(&mut self, accepted: bool) {
+        if accepted {
+            *self = Self::new();
+        }
+    }
+
+    /// Record a failed or dropped session and return how long to wait before
+    /// the next attempt, or `None` to reconnect at once.
+    fn on_failure(&mut self, accepted: bool, failed_redirect_target: bool) -> Option<Duration> {
+        if accepted {
+            *self = Self::new();
+        }
+        if skip_backoff(failed_redirect_target, self.skipped_since_accept) {
+            self.skipped_since_accept = true;
+            return None;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(MAX_BACKOFF);
+        Some(delay)
+    }
 }
 
 /// Keep asking not to be redirected when a redirected attempt never got a
@@ -1326,9 +1351,40 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn backoff_resets_after_accepted_session() {
-        assert_eq!(backoff_after_failure(MAX_BACKOFF, true), INITIAL_BACKOFF);
-        assert_eq!(backoff_after_failure(MAX_BACKOFF, false), MAX_BACKOFF);
+    fn reconnect_backoff_doubles_until_a_session_is_accepted() {
+        let mut backoff = ReconnectBackoff::new();
+        let delays: Vec<_> = (0..7)
+            .map(|_| backoff.on_failure(false, false).unwrap())
+            .collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs).to_vec()
+        );
+
+        // Losing an accepted session starts over instead of waiting the maximum.
+        assert_eq!(backoff.on_failure(true, false), Some(INITIAL_BACKOFF));
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF * 2));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_when_an_accepted_session_redirects() {
+        let mut backoff = ReconnectBackoff::new();
+        for _ in 0..5 {
+            backoff.on_failure(false, false);
+        }
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn reconnect_backoff_skips_one_failed_redirect_target_per_accepted_session() {
+        let mut backoff = ReconnectBackoff::new();
+        assert_eq!(backoff.on_failure(false, true), None);
+        assert_eq!(backoff.on_failure(false, true), Some(INITIAL_BACKOFF));
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, true), None);
     }
 
     #[test]
