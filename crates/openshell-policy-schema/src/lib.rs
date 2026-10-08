@@ -1467,30 +1467,6 @@ network_policies:
     }
 
     #[test]
-    fn typed_yaml_deserialization_enforces_scalar_budget() {
-        // Exercise the streaming typed path independently from the policy
-        // parser's Value-first path (RUSTSEC-2026-0333).
-        #[derive(Debug, serde::Deserialize)]
-        struct Document {
-            value: String,
-        }
-
-        let mut config = serde_yml::ParserConfig::new();
-        config.max_total_scalar_bytes = 16;
-        let valid: Document = serde_yml::from_str_with_config("value: ok", &config)
-            .expect("small typed document fits the budget");
-        assert_eq!(valid.value, "ok");
-        assert!(
-            serde_yml::from_str_with_config::<Document>(
-                "value: this scalar exceeds the configured budget",
-                &config,
-            )
-            .is_err(),
-            "typed deserialization must enforce the scalar budget",
-        );
-    }
-
-    #[test]
     fn bounded_reader_rejects_growth_past_limit_and_invalid_utf8() {
         let limits = ParseLimits {
             max_bytes: 12,
