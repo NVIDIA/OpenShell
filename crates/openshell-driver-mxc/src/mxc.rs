@@ -21,6 +21,10 @@ use tracing::{debug, info};
 /// MXC 0.8 directional network schema.
 pub const MXC_SCHEMA_VERSION: &str = "0.8.0-alpha";
 
+/// Schema version used in proxy-peer mode, which needs
+/// `processContainer.network.allowedProxyPeer` (introduced after 0.8).
+pub const MXC_PEER_SCHEMA_VERSION: &str = "0.9.0-alpha";
+
 /// Default `configurationId` for isolation session. Never use `"small"` (known OS bug).
 pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
 
@@ -134,6 +138,17 @@ fn ui_json(ui: &MxcUi) -> serde_json::Value {
     })
 }
 
+/// Proxy-peer mode: the sandbox runs under MXC `runtimeConfig.networkProxy`
+/// with `processContainer.network.allowedProxyPeer`, so the only identity that
+/// may talk to its listeners is the named `AppContainer` profile (see `peer.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcProxyPeer {
+    /// `AppContainer` profile name of the peer process (`allowedProxyPeer`).
+    pub profile: String,
+    /// Loopback address of the peer's proxy listener (`networkProxy`).
+    pub proxy: SocketAddr,
+}
+
 /// `processContainer`-specific knobs (one-shot `AppContainer` backend).
 #[derive(Debug, Default, Clone)]
 pub struct MxcProcessContainer {
@@ -141,6 +156,8 @@ pub struct MxcProcessContainer {
     pub least_privilege: bool,
     /// `AppContainer` capabilities to grant (e.g. `internetClient`).
     pub capabilities: Vec<String>,
+    /// Run in proxy-peer mode. Replaces the loopback-allow network section.
+    pub proxy_peer: Option<MxcProxyPeer>,
 }
 
 /// Process config for the exec phase.
@@ -253,6 +270,22 @@ fn provision_config_json(
     config
 }
 
+/// Rewrite a one-shot config for proxy-peer mode.
+///
+/// MXC validates this combination: `networkProxy` needs `egress.default: deny`
+/// and `ingress.default: allow`, and a named peer needs `hostLoopback: deny`
+/// (no broad host-loopback grant -- the peer identity is the only way in).
+fn apply_proxy_peer(config: &mut serde_json::Value, peer: &MxcProxyPeer) {
+    config["version"] = serde_json::json!(MXC_PEER_SCHEMA_VERSION);
+    config["network"] = serde_json::json!({
+        "egress": { "default": "deny" },
+        "ingress": { "default": "allow", "hostLoopback": "deny" },
+    });
+    config["processContainer"]["network"] =
+        serde_json::json!({ "allowedProxyPeer": &peer.profile });
+    config["runtimeConfig"] = serde_json::json!({ "networkProxy": format!("http://{}", peer.proxy) });
+}
+
 fn oneshot_config_json(
     container_id: &str,
     filesystem: &MxcFilesystem,
@@ -299,6 +332,9 @@ fn oneshot_config_json(
     });
     if let Some(network) = network {
         config["network"] = network_json(network);
+    }
+    if let Some(peer) = &pc.proxy_peer {
+        apply_proxy_peer(&mut config, peer);
     }
     // Root-level ui section required by mxc-fixes-env-vars build. Comes from
     // the typed SandboxPolicy via `ui` -- EmbeddedPolicyMapper always
@@ -1005,6 +1041,65 @@ mod tests {
 
         assert!(config.get("network").is_none());
         assert!(config.get("ui").is_none());
+    }
+
+    #[test]
+    fn oneshot_config_json_proxy_peer_mode_uses_network_proxy_and_named_peer() {
+        let filesystem = MxcFilesystem::default();
+        let pc = MxcProcessContainer {
+            capabilities: vec!["privateNetworkClientServer".into()],
+            proxy_peer: Some(MxcProxyPeer {
+                profile: "openshell-mxc-abc".into(),
+                proxy: "127.0.0.1:4242".parse().unwrap(),
+            }),
+            ..MxcProcessContainer::default()
+        };
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: "C:\\work\\demo".into(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        // A loopback-allow network section (the non-peer default) must be replaced.
+        let loopback_network = MxcNetwork {
+            default_policy: "block".into(),
+            proxy: Some("127.0.0.1:18080".parse().unwrap()),
+            allow_local_network: false,
+        };
+        let config =
+            oneshot_config_json("sb-1", &filesystem, &pc, &process, Some(&loopback_network), None);
+
+        assert_eq!(config["version"], MXC_PEER_SCHEMA_VERSION);
+        assert_eq!(config["runtimeConfig"]["networkProxy"], "http://127.0.0.1:4242");
+        assert_eq!(
+            config["processContainer"]["network"]["allowedProxyPeer"],
+            "openshell-mxc-abc"
+        );
+        // Existing processContainer settings are preserved next to `network`.
+        assert_eq!(
+            config["processContainer"]["capabilities"][0],
+            "privateNetworkClientServer"
+        );
+        // MXC validation: proxy => egress deny + ingress allow; peer => hostLoopback deny.
+        assert_eq!(config["network"]["egress"]["default"], "deny");
+        assert!(config["network"]["egress"].get("allow").is_none());
+        assert_eq!(config["network"]["ingress"]["default"], "allow");
+        assert_eq!(config["network"]["ingress"]["hostLoopback"], "deny");
+    }
+
+    #[test]
+    fn oneshot_config_json_without_proxy_peer_has_no_runtime_config() {
+        let pc = MxcProcessContainer::default();
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: String::new(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let config = oneshot_config_json("sb-1", &MxcFilesystem::default(), &pc, &process, None, None);
+        assert_eq!(config["version"], MXC_SCHEMA_VERSION);
+        assert!(config.get("runtimeConfig").is_none());
+        assert!(config["processContainer"].get("network").is_none());
     }
 
     #[tokio::test]

@@ -73,6 +73,9 @@ pc_allow_local_network = false
 # Pattern C governed egress. Requires backend = "process_container".
 egress_proxy = false
 egress_proxy_addr = ""
+# processContainer only: proxy-peer mode (see "Proxy-peer mode" below). Absolute
+# path to openshell-mxc-peer.exe; empty (default) keeps the loopback-allow model.
+pc_proxy_peer_path = ""
 debug = false
 etw_audit = false
 ```
@@ -94,6 +97,55 @@ authenticated host CONNECT proxy.
 fallback. If it is combined with `egress_proxy = true`, a sandbox policy
 without explicit network rules is rejected synchronously rather than falling
 through from governed egress to `defaultPolicy = "allow"`.
+
+### Proxy-peer mode
+
+By default a `process_container` sandbox gets `hostLoopback: allow` plus an
+`egress.allow` rule for `127.0.0.1/32`, so the sandbox can reach the host relay
+and the host egress proxy, but also any other service bound to host loopback.
+
+Setting `pc_proxy_peer_path` switches the sandbox to MXC's strict model instead:
+`runtimeConfig.networkProxy` + `processContainer.network.allowedProxyPeer` with
+`hostLoopback: deny` (MXC schema `0.9.0-alpha`). The sandbox can then reach only
+its proxy endpoint, and only one `AppContainer` identity may talk to its
+listeners. The driver provides both from one helper process, `openshell-mxc-peer.exe`,
+which it starts for every sandbox under a per-sandbox `AppContainer` profile
+(`openshell-mxc-<sandbox id>`); the profile is the `allowedProxyPeer`:
+
+```text
+forward:  host client -> gateway forward listener -> named pipe -> peer
+          -> 127.0.0.1:<target port> inside the sandbox
+egress:   sandbox (HTTP(S)_PROXY) -> peer proxy listener -> named pipe
+          -> gateway -> per-sandbox host egress proxy (OpenShell policy)
+```
+
+- In this mode the driver sets no `HTTP_PROXY`/`HTTPS_PROXY`. MXC puts its
+  `networkProxy` endpoint into the environment of the process it launches
+  (`openshell-supervisor-relay`), and the relay copies `HTTP_PROXY`, `HTTPS_PROXY`
+  and their lowercase forms to the target unless the launch request sets them
+  (`NO_PROXY` is never copied). Clients still have to honor the variables (for
+  Node.js, `NODE_OPTIONS=--use-env-proxy`); anything that ignores them is blocked
+  by MXC's per-container network rules.
+- MXC's variables carry no credentials, so the host proxy accepts connections
+  that arrive through the peer tunnel without the per-sandbox proxy password.
+  Only the gateway can mark a connection as tunnelled, and only the peer can open
+  the pipe. Direct connections to the host proxy still need the password.
+
+- The pipes are created with a DACL that admits only the gateway's user and the
+  peer's profile SID. The peer is a byte tunnel only; policy decisions, TLS
+  interception and credential substitution stay in the gateway's host proxy.
+- Per-process binary rules still apply: the peer reports the sandbox client's
+  source port, and the gateway registers it so the host proxy resolves the owner
+  of the original sandbox socket rather than the gateway's bridge socket.
+- Without `egress_proxy`, or for a policy with no network rules, the peer's proxy
+  answers `403` and the sandbox has no egress.
+- `openshell-mxc-peer.exe` must be readable and executable by "ALL APPLICATION
+  PACKAGES" (for example `icacls <dir> /grant *S-1-15-2-1:(OI)(CI)(RX)`).
+- Requires `pc_relay_spawner_path` / `pc_relay_target_port` and the `process_container`
+  backend, and cannot be combined with `pc_network_allow` or `pc_allow_local_network`.
+- The peer and its profile are removed when the sandbox is deleted. If the gateway
+  is killed, the peer exits when its control pipe closes, but its profile stays
+  registered until it is removed by hand (`DeleteAppContainerProfile`).
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 

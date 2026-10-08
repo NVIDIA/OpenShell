@@ -61,6 +61,7 @@
 //! service from that point on.
 
 use crate::control_channel::ControlChannel;
+use crate::peer::PeerHandle;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -213,6 +214,91 @@ pub async fn start_control_channel_relay(
     ));
     info!(sandbox = %sandbox_name, relay = %actual, "MXC control-channel relay started");
     Ok((RelayHandle { shutdown_tx }, actual))
+}
+
+/// Start a host-loopback listener whose sandbox leg runs through the sandbox's
+/// proxy peer (see `peer.rs`): each authenticated host connection makes the peer
+/// dial `127.0.0.1:<target_port>` inside the sandbox over a private named pipe.
+/// Used when the sandbox runs under MXC `networkProxy` + `allowedProxyPeer`,
+/// where the in-sandbox relay cannot dial its own loopback target.
+pub async fn start_peer_relay(
+    bind_addr: SocketAddr,
+    sandbox_name: String,
+    nonce: [u8; NONCE_LEN],
+    peer: Arc<PeerHandle>,
+    target_port: u16,
+) -> std::io::Result<(RelayHandle, SocketAddr)> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    let actual = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(peer_relay_task(
+        listener,
+        sandbox_name.clone(),
+        nonce,
+        peer,
+        target_port,
+        shutdown_rx,
+    ));
+    info!(sandbox = %sandbox_name, relay = %actual, "MXC peer relay started");
+    Ok((RelayHandle { shutdown_tx }, actual))
+}
+
+async fn peer_relay_task(
+    listener: TcpListener,
+    sandbox_name: String,
+    nonce: [u8; NONCE_LEN],
+    peer: Arc<PeerHandle>,
+    target_port: u16,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    // Connections are bridged concurrently; dropping the set on shutdown aborts
+    // any bridge that is still running.
+    let mut bridges = tokio::task::JoinSet::new();
+    loop {
+        let mut host_stream = tokio::select! {
+            result = listener.accept() => match result {
+                Ok((stream, addr)) => {
+                    info!(sandbox = %sandbox_name, %addr, "MXC peer relay: host client connected");
+                    set_tcp_nodelay_best_effort(&stream);
+                    stream
+                }
+                Err(error) => {
+                    warn!(sandbox = %sandbox_name, "MXC peer relay listener error: {error}");
+                    return;
+                }
+            },
+            Some(_) = bridges.join_next(), if !bridges.is_empty() => continue,
+            _ = &mut shutdown_rx => return,
+        };
+
+        let sandbox = sandbox_name.clone();
+        let peer = Arc::clone(&peer);
+        bridges.spawn(async move {
+            let mut auth_buf = [0_u8; NONCE_LEN];
+            match tokio::time::timeout(AUTH_TIMEOUT, host_stream.read_exact(&mut auth_buf)).await {
+                Ok(Ok(_)) if constant_time_eq(&auth_buf, &nonce) => {}
+                Ok(Ok(_) | Err(_)) | Err(_) => return,
+            }
+            let mut data = match peer.open_data(target_port).await {
+                Ok(data) => data,
+                Err(error) => {
+                    warn!(sandbox = %sandbox, "MXC peer relay: peer could not open session: {error}");
+                    return;
+                }
+            };
+            match tokio::io::copy_bidirectional(&mut host_stream, &mut data).await {
+                Ok((host_to_sandbox_bytes, sandbox_to_host_bytes)) => info!(
+                    sandbox = %sandbox,
+                    host_to_sandbox_bytes,
+                    sandbox_to_host_bytes,
+                    "MXC peer relay: host client disconnected"
+                ),
+                Err(error) => {
+                    info!(sandbox = %sandbox, "MXC peer relay: bridge ended: {error}");
+                }
+            }
+        });
+    }
 }
 
 async fn control_channel_relay_task(

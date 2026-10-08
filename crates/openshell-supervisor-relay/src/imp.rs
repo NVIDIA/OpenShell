@@ -293,6 +293,36 @@ fn byte_preview(data: &[u8]) -> String {
 /// because our stdout is reserved exclusively for the control-channel
 /// protocol with the driver. The child's stdin is closed; it isn't part of
 /// this channel.
+/// Proxy variables the target inherits from this process's own environment when
+/// the launch request does not set them. MXC puts its `networkProxy` endpoint
+/// into the environment of the process it launches (this relay); the target is
+/// started with a cleared environment, so without this it would never see them.
+/// `NO_PROXY` is deliberately not inherited: it could only widen what bypasses
+/// the proxy.
+const INHERITED_PROXY_ENV: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
+
+/// Proxy variables from `parent` that `child_env` does not already define
+/// (names compare case-insensitively, as on Windows). Values the launch request
+/// sets always win.
+fn inherited_proxy_env(
+    parent: impl Fn(&str) -> Option<String>,
+    child_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    INHERITED_PROXY_ENV
+        .iter()
+        .filter(|key| {
+            !child_env
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(key))
+        })
+        .filter_map(|key| {
+            parent(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
 fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<SpawnedTarget> {
     if command.is_empty() {
         anyhow::bail!("launch command must not be empty");
@@ -305,7 +335,7 @@ fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<Spawne
     cmd.stderr(std::process::Stdio::piped());
 
     if !env.is_empty() {
-        let child_env: Vec<(String, String)> = env
+        let mut child_env: Vec<(String, String)> = env
             .iter()
             .filter(|l| l.contains('='))
             .filter_map(|l| {
@@ -317,6 +347,14 @@ fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<Spawne
             "[openshell-supervisor-relay] using {} child env vars from launch request",
             child_env.len()
         );
+        let inherited = inherited_proxy_env(|key| std::env::var(key).ok(), &child_env);
+        if !inherited.is_empty() {
+            eprintln!(
+                "[openshell-supervisor-relay] inheriting {} proxy env var(s) set for this container",
+                inherited.len()
+            );
+            child_env.extend(inherited);
+        }
         cmd.env_clear().envs(child_env);
     }
 
@@ -1100,6 +1138,65 @@ async fn run_lifecycle(mut target: SpawnedTarget, shutdown_rx: oneshot::Receiver
             eprintln!("[openshell-supervisor-relay] done");
             std::process::exit(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod inherited_proxy_env_tests {
+    use super::inherited_proxy_env;
+    use std::collections::HashMap;
+
+    fn parent(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn copies_missing_proxy_variables_from_the_parent() {
+        let mut got = inherited_proxy_env(
+            parent(&[
+                ("HTTP_PROXY", "http://127.0.0.1:1"),
+                ("HTTPS_PROXY", "http://127.0.0.1:1"),
+            ]),
+            &[("PATH".into(), "C:\\Windows".into())],
+        );
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("HTTPS_PROXY".to_string(), "http://127.0.0.1:1".to_string()),
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_request_values_win_case_insensitively() {
+        let got = inherited_proxy_env(
+            parent(&[("HTTP_PROXY", "http://parent"), ("HTTPS_PROXY", "http://parent")]),
+            &[("http_proxy".into(), "http://driver".into())],
+        );
+        assert_eq!(
+            got,
+            vec![("HTTPS_PROXY".to_string(), "http://parent".to_string())]
+        );
+    }
+
+    #[test]
+    fn never_inherits_no_proxy_or_empty_values() {
+        let got = inherited_proxy_env(
+            parent(&[
+                ("NO_PROXY", "*"),
+                ("no_proxy", "*"),
+                ("HTTP_PROXY", ""),
+                ("ALL_PROXY", "http://x"),
+            ]),
+            &[],
+        );
+        assert!(got.is_empty());
     }
 }
 

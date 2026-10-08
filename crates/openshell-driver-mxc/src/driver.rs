@@ -5,7 +5,10 @@
 //! and self-reported readiness.
 
 use crate::control_channel::ControlChannel;
-use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
+use crate::mxc::{
+    MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, MxcProxyPeer, WxcExecInvoker,
+};
+use crate::peer::{EgressTunnel, PeerHandle};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, MappedConfig, PolicyMapper};
 use crate::relay;
 use base64::Engine as _;
@@ -236,6 +239,21 @@ pub struct MxcComputeConfig {
     /// Ignored unless `pc_relay_spawner_path` is set. `0` disables spawner
     /// wrapping (default) — the per-sandbox command runs directly.
     pub pc_relay_target_port: u16,
+    /// `processContainer` only: absolute path to `openshell-mxc-peer.exe`. When
+    /// set, each sandbox runs under MXC `networkProxy` + `allowedProxyPeer`
+    /// instead of the loopback-allow network section: the driver starts the peer
+    /// under a per-sandbox `AppContainer` profile, which is the only identity
+    /// admitted to the sandbox's listeners, and `openshell forward service`
+    /// reaches the target through that peer over a private named pipe (no
+    /// broad host-loopback grant). The peer must be readable and executable by
+    /// "ALL APPLICATION PACKAGES". Requires the relay spawner settings above.
+    /// With `egress_proxy` enabled, the peer's proxy listener is the sandbox's
+    /// only network endpoint and tunnels the sandbox's proxy connections over a
+    /// named pipe to the gateway's per-sandbox host egress proxy, so policy
+    /// enforcement is unchanged; without it (or for a policy with no network
+    /// rules) the sandbox has no egress. Incompatible with `pc_network_allow` and
+    /// `pc_allow_local_network`. Empty (default) disables the mode.
+    pub pc_proxy_peer_path: String,
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
@@ -273,6 +291,7 @@ impl Default for MxcComputeConfig {
             pc_network_allow: false,
             pc_relay_spawner_path: String::new(),
             pc_relay_target_port: 0,
+            pc_proxy_peer_path: String::new(),
             pc_allow_local_network: false,
             pc_minimal_env: false,
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
@@ -307,7 +326,38 @@ impl MxcComputeConfig {
                 self.wxc_exec_path
             )));
         }
-        Ok(())
+        self.validate_proxy_peer()
+    }
+
+    /// Cross-field rules for `pc_proxy_peer_path`.
+    fn validate_proxy_peer(&self) -> openshell_core::Result<()> {
+        let path = self.pc_proxy_peer_path.trim();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let problem = if !Path::new(path).is_absolute() {
+            Some(format!("pc_proxy_peer_path must be an absolute path, got '{path}'"))
+        } else if self.backend != MxcBackend::ProcessContainer {
+            Some("pc_proxy_peer_path only applies to backend = \"process_container\"".to_string())
+        } else if self.pc_relay_spawner_path.is_empty() || self.pc_relay_target_port == 0 {
+            Some(
+                "pc_proxy_peer_path requires pc_relay_spawner_path and pc_relay_target_port"
+                    .to_string(),
+            )
+        } else if self.pc_network_allow || self.pc_allow_local_network {
+            Some(
+                "pc_proxy_peer_path cannot be combined with pc_network_allow or pc_allow_local_network"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        match problem {
+            Some(message) => Err(openshell_core::Error::config(format!(
+                "[openshell.drivers.mxc] {message}"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -379,6 +429,10 @@ struct SandboxEntry {
     /// wrapping is active (`pc_relay_spawner_path` configured); dropped on
     /// delete, which closes the child's stdin.
     control_channel: Option<Arc<ControlChannel>>,
+    /// Proxy peer process for this sandbox (`pc_proxy_peer_path` mode). Dropping
+    /// the last reference terminates the peer and deletes its `AppContainer`
+    /// profile, so `delete_sandbox` just takes it out of the entry.
+    peer: Option<Arc<PeerHandle>>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -1252,6 +1306,7 @@ impl MxcComputeBackend {
                     proxy_addr: mapped.proxy_addr,
                     host_proxy: None,
                     control_channel: None,
+                    peer: None,
                 },
             );
         }
@@ -1435,6 +1490,7 @@ impl MxcComputeBackend {
             signal_file,
             control_channel,
             host_proxy,
+            peer,
         ) = {
             let mut registry = self.registry.lock().await;
             let Some(entry) = registry.get_mut(sandbox_id) else {
@@ -1451,6 +1507,7 @@ impl MxcComputeBackend {
                 entry.signal_file.take(),
                 entry.control_channel.take(),
                 entry.host_proxy.take(),
+                entry.peer.take(),
             )
         };
         drop(host_proxy);
@@ -1538,6 +1595,13 @@ impl MxcComputeBackend {
                     "sandbox {sandbox_name} did not terminate within the delete timeout"
                 )));
             }
+        }
+
+        // The sandbox is gone; stop its proxy peer and delete the peer's
+        // AppContainer profile. Forward bridges may still hold the handle, so
+        // terminate explicitly instead of waiting for the last reference.
+        if let Some(peer) = peer {
+            let _ = tokio::task::spawn_blocking(move || peer.terminate()).await;
         }
 
         let mut registry = self.registry.lock().await;
@@ -1652,7 +1716,7 @@ impl ForwardSink {
         target_port: u16,
     ) -> Result<(SocketAddr, [u8; relay::NONCE_LEN], relay::RelayHandle), OpenDynamicForwardError>
     {
-        let (control_channel, sandbox_name) = {
+        let (control_channel, peer, sandbox_name) = {
             let reg = self.registry.lock().await;
             let entry = reg
                 .get(sandbox_id)
@@ -1661,7 +1725,7 @@ impl ForwardSink {
                 .control_channel
                 .clone()
                 .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
-            (channel, entry.sandbox.name.clone())
+            (channel, entry.peer.clone(), entry.sandbox.name.clone())
         };
 
         // Fresh per forward -- see relay.rs module docs for why this matters
@@ -1669,14 +1733,24 @@ impl ForwardSink {
         let nonce: [u8; relay::NONCE_LEN] = rand::random();
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (relay_handle, relay_addr) = relay::start_control_channel_relay(
-            bind_addr,
-            sandbox_name,
-            nonce,
-            control_channel,
-            target_port,
-        )
-        .await
+        // In proxy-peer mode the sandbox only admits the peer identity (and the
+        // in-sandbox relay cannot dial its own loopback target), so the sandbox
+        // leg of the forward goes through the peer instead of the control channel.
+        let (relay_handle, relay_addr) = match peer {
+            Some(peer) => {
+                relay::start_peer_relay(bind_addr, sandbox_name, nonce, peer, target_port).await
+            }
+            None => {
+                relay::start_control_channel_relay(
+                    bind_addr,
+                    sandbox_name,
+                    nonce,
+                    control_channel,
+                    target_port,
+                )
+                .await
+            }
+        }
         .map_err(OpenDynamicForwardError::RelayBind)?;
 
         Ok((relay_addr, nonce, relay_handle))
@@ -1747,6 +1821,11 @@ async fn run_lifecycle(
     } else {
         None
     };
+    // Taken before the handle moves into the registry below; the proxy peer's
+    // egress tunnel uses it to keep per-process identity (see peer.rs).
+    let forwarded_clients = host_proxy
+        .as_ref()
+        .map(openshell_supervisor_network::host::HostProxyHandle::forwarded_clients);
     let host_proxy_ca_paths = host_proxy
         .as_ref()
         .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
@@ -1783,6 +1862,47 @@ async fn run_lifecycle(
             format!("MXC egress redirected to OpenShell host CONNECT proxy at {addr}"),
         ));
     }
+
+    // Proxy-peer mode: the peer must be listening before wxc-exec starts, because
+    // its address is the sandbox's networkProxy and its profile is the sandbox's
+    // allowedProxyPeer. When a host egress proxy exists (policy has network
+    // rules) the peer tunnels the sandbox's proxy connections to it.
+    let proxy_peer = if config.backend == MxcBackend::ProcessContainer
+        && !config.pc_proxy_peer_path.trim().is_empty()
+    {
+        let egress = match (proxy_addr, forwarded_clients) {
+            (Some(host_proxy_addr), Some(clients)) => Some(EgressTunnel {
+                host_proxy: host_proxy_addr,
+                clients,
+            }),
+            _ => None,
+        };
+        match PeerHandle::spawn(config.pc_proxy_peer_path.trim(), &sandbox_id, egress).await {
+            Ok(peer) => {
+                let peer = Arc::new(peer);
+                {
+                    let mut registry = registry.lock().await;
+                    if let Some(entry) = registry.get_mut(&sandbox_id) {
+                        entry.peer = Some(Arc::clone(&peer));
+                    }
+                }
+                Some(peer)
+            }
+            Err(error) => {
+                set_failed(
+                    &registry,
+                    &watch_tx,
+                    &sandbox,
+                    &sandbox_id,
+                    &format!("failed to start proxy peer: {error}"),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let readwrite_paths = mapped.readwrite_paths;
     let readonly_paths = mapped.readonly_paths;
@@ -1824,7 +1944,15 @@ async fn run_lifecycle(
     // Layer proxy configuration for every env tier using the staged CA copies
     // above. The host proxy's private temporary directory is never shared.
     append_tls_env_vars(&mut env, agent_proxy_ca_paths.as_ref());
-    append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
+    // In proxy-peer mode the driver sets no HTTP(S)_PROXY / NO_PROXY variables:
+    // MXC puts the networkProxy endpoint (the peer's listener) into the
+    // environment of the process it launches, and openshell-supervisor-relay
+    // passes those variables on to the target. Connections that arrive through
+    // the peer tunnel are trusted by the host proxy without the per-sandbox
+    // password, which MXC's variables do not carry.
+    if proxy_peer.is_none() {
+        append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
+    }
     env.sort(); // deterministic order for logging / debugging
     info!(sandbox = %sandbox_name, count = env.len(), "MXC process env vars");
 
@@ -1930,6 +2058,10 @@ async fn run_lifecycle(
             let process_container = MxcProcessContainer {
                 least_privilege: config.pc_least_privilege,
                 capabilities: config.pc_capabilities.clone(),
+                proxy_peer: proxy_peer.as_ref().map(|peer| MxcProxyPeer {
+                    profile: peer.profile().to_string(),
+                    proxy: peer.proxy_addr(),
+                }),
             };
             // Build the effective network config:
             // - egress_proxy: use the proxy-based network (already in `network`)
@@ -3098,6 +3230,48 @@ mod lifecycle_tests {
         config.validate_configuration().unwrap();
     }
 
+    fn proxy_peer_config() -> MxcComputeConfig {
+        MxcComputeConfig {
+            wxc_exec_path: r"C:\mxc-kit\bin\wxc-exec.exe".into(),
+            pc_relay_spawner_path: "C:/openshell-openclaw/openshell-supervisor-relay.exe".into(),
+            pc_relay_target_port: 18889,
+            pc_proxy_peer_path: r"C:\openshell-openclaw\openshell-mxc-peer.exe".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proxy_peer_mode_is_off_by_default_and_valid_with_the_spawner() {
+        assert!(MxcComputeConfig::default().pc_proxy_peer_path.is_empty());
+        proxy_peer_config().validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn proxy_peer_mode_accepts_egress_proxy() {
+        let mut config = proxy_peer_config();
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        config.validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn proxy_peer_mode_rejects_incompatible_settings() {
+        let cases: [(&str, fn(&mut MxcComputeConfig)); 6] = [
+            ("absolute", |c| c.pc_proxy_peer_path = "openshell-mxc-peer.exe".into()),
+            ("process_container", |c| c.backend = MxcBackend::IsolationSession),
+            ("pc_relay_spawner_path", |c| c.pc_relay_spawner_path.clear()),
+            ("pc_relay_spawner_path", |c| c.pc_relay_target_port = 0),
+            ("pc_network_allow", |c| c.pc_network_allow = true),
+            ("pc_network_allow", |c| c.pc_allow_local_network = true),
+        ];
+        for (needle, mutate) in cases {
+            let mut config = proxy_peer_config();
+            mutate(&mut config);
+            let error = config.validate_configuration().unwrap_err().to_string();
+            assert!(error.contains(needle), "expected '{needle}' in: {error}");
+        }
+    }
+
     #[test]
     fn governed_egress_defaults_off_and_allocates_unique_loopback_ports() {
         let config = MxcComputeConfig::default();
@@ -3646,6 +3820,7 @@ mod lifecycle_tests {
                 proxy_addr: None,
                 host_proxy: None,
                 control_channel: None,
+                peer: None,
             },
         );
         let mut events = backend.watch_tx.subscribe();
