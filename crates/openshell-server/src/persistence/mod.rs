@@ -4,6 +4,7 @@
 //! Persistence layer for `OpenShell` Server.
 
 mod legacy_time_wire;
+pub mod lock_order;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
@@ -213,6 +214,7 @@ pub struct DistributedMutationGuard {
 /// RAII guard for the database-backed SSH identity lock.
 pub struct SshIdentityMutationGuard {
     _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+    _order: lock_order::Held,
 }
 
 pub struct RefreshMutationGuard {
@@ -343,6 +345,7 @@ impl Store {
     pub(crate) async fn acquire_ssh_identity_mutation_guard(
         &self,
     ) -> PersistenceResult<SshIdentityMutationGuard> {
+        lock_order::check(lock_order::Lock::SshIdentity);
         match self {
             Self::Postgres(store) => Ok(SshIdentityMutationGuard {
                 _postgres: Some(
@@ -350,8 +353,12 @@ impl Store {
                         .acquire_data_pool_lock(mutation_lock::SSH_IDENTITY_LOCK_KEY)
                         .await?,
                 ),
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
             }),
-            Self::Sqlite(_) => Ok(SshIdentityMutationGuard { _postgres: None }),
+            Self::Sqlite(_) => Ok(SshIdentityMutationGuard {
+                _postgres: None,
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
+            }),
         }
     }
 

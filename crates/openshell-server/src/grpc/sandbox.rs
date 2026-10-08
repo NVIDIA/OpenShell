@@ -5972,11 +5972,13 @@ mod tests {
             .unwrap();
         let unrelated = test_sandbox("unrelated", Vec::new());
         state.store.put_message(&unrelated).await.unwrap();
-        let unrelated_guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox("default", unrelated.object_id()))
-            .await
-            .unwrap();
+        let unrelated_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", unrelated.object_id())),
+        )
+        .await
+        .unwrap();
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),

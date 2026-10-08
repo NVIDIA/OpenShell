@@ -412,11 +412,13 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
         let before = load_global_settings(state.store.as_ref())
             .await
             .expect("read settings before update");
-        let guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox("default", "endpoint-report-guard"))
-            .await
-            .unwrap();
+        let guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", "endpoint-report-guard")),
+        )
+        .await
+        .unwrap();
         let mut pending = Box::pin(handle_update_config(&state, authed_request(update)));
 
         // Poll the actual writer while an endpoint report owns the mutation
@@ -454,14 +456,11 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
 async fn report_endpoint_status_does_not_wait_for_unrelated_sandbox_guard() {
     let sandbox_id = "endpoint-unrelated-guard";
     let (state, mut report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
-    let unrelated_guard = state
-        .compute
-        .mutation_guard(MutationScope::sandbox(
-            "default",
-            "endpoint-unrelated-other",
-        ))
-        .await
-        .expect("hold an unrelated sandbox guard");
+    let unrelated_guard = crate::persistence::lock_order::branch(state.compute.mutation_guard(
+        MutationScope::sandbox("default", "endpoint-unrelated-other"),
+    ))
+    .await
+    .expect("hold an unrelated sandbox guard");
 
     report.report_sequence = 2;
     report.observations[0].result = EndpointResult::TransportFailed as i32;
@@ -916,14 +915,11 @@ async fn startup_reconciliation_does_not_hold_a_fleet_guard() {
     let state = test_server_state().await;
     let sandbox_id = "endpoint-startup-fleet-target";
     let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
-    let unrelated_guard = state
-        .compute
-        .mutation_guard(MutationScope::sandbox(
-            "default",
-            "endpoint-startup-fleet-unrelated",
-        ))
-        .await
-        .expect("hold an unrelated sandbox guard");
+    let unrelated_guard = crate::persistence::lock_order::branch(state.compute.mutation_guard(
+        MutationScope::sandbox("default", "endpoint-startup-fleet-unrelated"),
+    ))
+    .await
+    .expect("hold an unrelated sandbox guard");
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -1413,11 +1409,10 @@ async fn disconnect_reset_waits_for_guard_without_replacement() {
     let sandbox_id = "endpoint-disconnect-no-replacement";
     let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
     let before = stored_sandbox(&state, sandbox_id).await;
-    let guard = state
-        .compute
-        .mutation_guard(MutationScope::Global)
-        .await
-        .expect("hold a guard that excludes every sandbox guard");
+    let guard =
+        crate::persistence::lock_order::branch(state.compute.mutation_guard(MutationScope::Global))
+            .await
+            .expect("hold a guard that excludes every sandbox guard");
     let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
         &state, sandbox_id,
     ));
@@ -1449,11 +1444,10 @@ async fn disconnect_reset_waits_for_guard_without_replacement() {
 async fn disconnect_reset_rechecks_for_replacement_under_guard() {
     let sandbox_id = "endpoint-disconnect-late-replacement";
     let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
-    let guard = state
-        .compute
-        .mutation_guard(MutationScope::Global)
-        .await
-        .expect("hold a guard that excludes every sandbox guard");
+    let guard =
+        crate::persistence::lock_order::branch(state.compute.mutation_guard(MutationScope::Global))
+            .await
+            .expect("hold a guard that excludes every sandbox guard");
     let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
         &state, sandbox_id,
     ));

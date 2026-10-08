@@ -8155,8 +8155,14 @@ mod tests {
         // A duplicate report racing the initial registration must share one
         // persisted transition; either may acquire the lifecycle fence first.
         let (first, duplicate) = tokio::join!(
-            handle_report_sandbox_configuration(&state, request()),
-            handle_report_sandbox_configuration(&state, request()),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
         );
         first.unwrap();
         duplicate.unwrap();
@@ -21652,11 +21658,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let unrelated_guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox("default", "sb-setting-unrelated"))
-            .await
-            .unwrap();
+        let unrelated_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", "sb-setting-unrelated")),
+        )
+        .await
+        .unwrap();
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),

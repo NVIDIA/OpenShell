@@ -8148,7 +8148,10 @@ mod tests {
             release_first_store.send(()).unwrap();
             result
         };
-        let (first_result, second_result) = tokio::join!(first, second);
+        let (first_result, second_result) = tokio::join!(
+            crate::persistence::lock_order::branch(first),
+            crate::persistence::lock_order::branch(second)
+        );
 
         assert_eq!(first_result.unwrap_err().code(), Code::Aborted);
         second_result.unwrap();
@@ -9485,11 +9488,13 @@ mod tests {
         let state = test_server_state().await;
         let current = create_openai_provider(&state, "unguarded-update-provider").await;
         // The "team-a" workspace row is not needed to hold its keys.
-        let other_workspace_guard = state
-            .compute
-            .mutation_guard(MutationScope::sandbox("team-a", "x"))
-            .await
-            .unwrap();
+        let other_workspace_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("team-a", "x")),
+        )
+        .await
+        .unwrap();
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -14988,8 +14993,14 @@ mod tests {
         };
 
         let (result_a, result_b) = tokio::join!(
-            handle_configure_provider_refresh(&state, configure("aws-a")),
-            handle_configure_provider_refresh(&state, configure("aws-b")),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                configure("aws-a")
+            )),
+            crate::persistence::lock_order::branch(handle_configure_provider_refresh(
+                &state,
+                configure("aws-b")
+            )),
         );
 
         // Exactly one configuration wins; the other is rejected as a collision

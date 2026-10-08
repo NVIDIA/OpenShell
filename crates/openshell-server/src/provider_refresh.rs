@@ -4717,11 +4717,13 @@ mod tests {
         prov.credential_handles.clone_from(&original_handles);
         let stored_credential_count = credentials.stored_credential_count();
         state.store.put_message(&prov).await.unwrap();
-        let provider_writer = state
-            .compute
-            .mutation_guard(crate::compute::MutationScope::Workspace("default"))
-            .await
-            .unwrap();
+        let provider_writer = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(crate::compute::MutationScope::Workspace("default")),
+        )
+        .await
+        .unwrap();
 
         let minted = super::MintedCredential {
             access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),

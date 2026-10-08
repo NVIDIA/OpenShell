@@ -7,11 +7,13 @@
 //! See [`crate::persistence::mutation_lock`] for the key hierarchy and the
 //! ordering rules. In short: lifecycle gate first, then local keys in
 //! ascending order, then `PostgreSQL` keys in ascending order on one
-//! connection. A task never acquires a guard while it holds one.
+//! connection. A task never acquires a guard while it holds one, which debug
+//! builds check.
 
 use super::{ComputeRuntime, SandboxLifecycleGuard};
 use crate::gateway_metrics::{self, LockScope};
 use crate::grpc::workspace::DEFAULT_WORKSPACE_NAME;
+use crate::persistence::lock_order;
 use crate::persistence::mutation_lock::MUTATION_LOCK_TIMEOUT;
 use crate::persistence::{
     DistributedMutationGuard, LockMode, MutationLockKey, MutationLockSet, PersistenceError,
@@ -150,6 +152,7 @@ impl LocalMutationLocks {
     /// Acquire `set` in ascending key order. Dropping the future releases the
     /// keys already taken and leaves no queue entry behind.
     async fn acquire(&self, set: &MutationLockSet) -> LocalMutationGuard {
+        lock_order::check(lock_order::Lock::Mutation);
         let mut guards = Vec::new();
         for (key, mode) in set.iter() {
             let lock = self.lock_for(key);
@@ -162,7 +165,10 @@ impl LocalMutationLocks {
                 },
             });
         }
-        LocalMutationGuard { _guards: guards }
+        LocalMutationGuard {
+            _guards: guards,
+            _order: lock_order::hold(lock_order::Lock::Mutation),
+        }
     }
 
     fn timeout(&self) -> Duration {
@@ -222,6 +228,7 @@ enum LocalKeyGuard {
 #[must_use = "dropping the guard releases the local mutation locks"]
 pub struct LocalMutationGuard {
     _guards: Vec<LocalKeyGuard>,
+    _order: lock_order::Held,
 }
 
 /// Local and, on `PostgreSQL`, distributed keys of one guarded mutation.
@@ -647,8 +654,7 @@ mod tests {
     #[tokio::test]
     async fn local_registry_drops_released_entries() {
         let runtime = test_runtime().await;
-        let sandbox = runtime
-            .mutation_guard(MutationScope::sandbox("w", "a"))
+        let sandbox = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox("w", "a")))
             .await
             .unwrap();
         let lifecycle = runtime.lock_sandbox_local("b").await;
@@ -690,8 +696,7 @@ mod tests {
     async fn local_timeout_returns_lock_timeout_and_unavailable() {
         let runtime = test_runtime().await;
         runtime.set_mutation_lock_timeout_for_tests(Duration::from_millis(50));
-        let held = runtime
-            .mutation_guard(MutationScope::sandbox("w", "a"))
+        let held = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox("w", "a")))
             .await
             .unwrap();
 
@@ -724,8 +729,7 @@ mod tests {
         let runtime = test_runtime().await;
         runtime.set_mutation_lock_timeout_for_tests(Duration::from_millis(50));
 
-        let held = runtime
-            .mutation_guard(MutationScope::sandbox("w", "a"))
+        let held = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox("w", "a")))
             .await
             .unwrap();
         assert_eq!(metrics.value(WAITS), Some(1));
@@ -1027,6 +1031,144 @@ mod tests {
         run_random_scope_mix(&[runtime], "", 64, 50, Duration::from_secs(20)).await;
     }
 
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "mutation lock ordering violated")]
+    async fn nested_mutation_guard_panics_in_debug_builds() {
+        let runtime = test_runtime().await;
+        let _held = runtime
+            .mutation_guard(MutationScope::sandbox("w", "a"))
+            .await
+            .unwrap();
+        // A different sandbox, so the scheme alone would not deadlock here.
+        let _nested = runtime
+            .mutation_guard(MutationScope::sandbox("w", "b"))
+            .await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn lock_order_branches_are_separate_owners() {
+        let runtime = test_runtime().await;
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = async {
+            let _guard = runtime
+                .mutation_guard(MutationScope::sandbox("w", "a"))
+                .await
+                .unwrap();
+            gate_rx.await.unwrap();
+        };
+        let second = async {
+            let _guard = runtime
+                .mutation_guard(MutationScope::sandbox("w", "b"))
+                .await
+                .unwrap();
+            gate_tx.send(()).unwrap();
+        };
+        tokio::join!(lock_order::branch(first), lock_order::branch(second));
+
+        let nested = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                lock_order::branch(async {
+                    let _outer = runtime.lock_sandbox_local("c").await;
+                    drop(runtime.lock_sandbox_local("d").await);
+                })
+                .await;
+            }
+        });
+        assert!(
+            nested.await.unwrap_err().is_panic(),
+            "nesting inside a branch"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn lock_order_check_is_per_task_and_covers_rules_1_and_5() {
+        let runtime = test_runtime().await;
+        let held = runtime
+            .mutation_guard(MutationScope::sandbox("w", "a"))
+            .await
+            .unwrap();
+        // Another task may take a guard while this one holds its own.
+        drop(
+            assert_proceeds(
+                spawn_guard(&runtime, MutationScope::sandbox("w", "b")),
+                "another task",
+            )
+            .await,
+        );
+
+        let nested_in_task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let _outer = runtime.lock_sandbox_local("c").await;
+                drop(runtime.lock_sandbox_local("d").await);
+            }
+        });
+        assert!(
+            nested_in_task.await.unwrap_err().is_panic(),
+            "rule 4 in a spawned task"
+        );
+
+        let gate_under_local = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let _local = runtime.lock_sandbox_local("e").await;
+                drop(runtime.lifecycle_gates.lock_for("e").await);
+            }
+        });
+        assert!(gate_under_local.await.unwrap_err().is_panic(), "rule 1");
+
+        let guard_under_ssh = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let _ssh = runtime
+                    .store
+                    .acquire_ssh_identity_mutation_guard()
+                    .await
+                    .unwrap();
+                drop(
+                    runtime
+                        .mutation_guard(MutationScope::sandbox("w", "f"))
+                        .await,
+                );
+            }
+        });
+        assert!(guard_under_ssh.await.unwrap_err().is_panic(), "rule 5");
+
+        // Gate first, then local keys, then SSH identity under a guard: allowed.
+        let allowed = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let gate = runtime.lifecycle_gates.lock_for("g").await;
+                let guard = runtime
+                    .mutation_guard(MutationScope::sandbox("w", "g"))
+                    .await
+                    .unwrap();
+                drop(
+                    runtime
+                        .store
+                        .acquire_ssh_identity_mutation_guard()
+                        .await
+                        .unwrap(),
+                );
+                drop(guard);
+                drop(runtime.lock_sandbox_for_lifecycle(&gate).await);
+            }
+        });
+        allowed.await.expect("ordered acquisitions");
+
+        drop(held);
+        drop(
+            runtime
+                .mutation_guard(MutationScope::sandbox("w", "a"))
+                .await
+                .unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn unrelated_supervisor_state_update_does_not_wait_for_sandbox_guard() {
         let runtime = test_runtime().await;
@@ -1041,13 +1183,12 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         runtime.store.put_message(&sandbox).await.unwrap();
-        let held = runtime
-            .mutation_guard(MutationScope::sandbox(
-                "default",
-                "mutation-guard-unrelated-b",
-            ))
-            .await
-            .unwrap();
+        let held = lock_order::branch(runtime.mutation_guard(MutationScope::sandbox(
+            "default",
+            "mutation-guard-unrelated-b",
+        )))
+        .await
+        .unwrap();
 
         tokio::time::timeout(
             PROCEEDS_WITHIN,

@@ -222,6 +222,7 @@ struct LifecycleGateRegistry {
 
 impl LifecycleGateRegistry {
     async fn lock_for(&self, sandbox_id: &str) -> SandboxLifecycleGuard {
+        crate::persistence::lock_order::check(crate::persistence::lock_order::Lock::LifecycleGate);
         let gate = self.gate_for(sandbox_id);
         SandboxLifecycleGuard {
             sandbox_id: sandbox_id.to_string(),
@@ -10295,10 +10296,11 @@ mod tests {
             .await
             .unwrap();
 
-        let unrelated = runtime
-            .mutation_guard(MutationScope::sandbox("default", "sb-2"))
-            .await
-            .unwrap();
+        let unrelated = crate::persistence::lock_order::branch(
+            runtime.mutation_guard(MutationScope::sandbox("default", "sb-2")),
+        )
+        .await
+        .unwrap();
         let held = runtime.lock_sandbox_local("sb-1").await;
         let mut cleanup = tokio::spawn({
             let runtime = runtime.clone();

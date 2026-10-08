@@ -29,7 +29,8 @@
 //!
 //! Within each layer every waiter on a key holds only smaller keys, and the
 //! local phase ends before the `PostgreSQL` phase starts, so no wait-for cycle
-//! can form.
+//! can form. Debug builds check rules 1, 4, and 5 before every acquisition
+//! that can wait; see [`super::lock_order`].
 //!
 //! The global key is the legacy cross-object key. Gateways from earlier
 //! releases hold it exclusively for every mutation, which conflicts with every

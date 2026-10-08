@@ -553,7 +553,8 @@ pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> 
                 ))
             })?;
         // Each future holds at most its own sandbox guard and never waits on
-        // another, so running them in one task cannot deadlock.
+        // another, so running them in one task cannot deadlock. Each runs as
+        // its own lock-order branch so the debug-build nesting check agrees.
         futures::stream::iter(
             page.messages
                 .iter()
@@ -561,7 +562,11 @@ pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> 
                 .map(Ok::<_, Status>),
         )
         .try_for_each_concurrent(ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY, |candidate| {
-            invalidate_sandbox_endpoint_status_on_startup(state, candidate, retry_deadline)
+            crate::persistence::lock_order::branch(invalidate_sandbox_endpoint_status_on_startup(
+                state,
+                candidate,
+                retry_deadline,
+            ))
         })
         .await?;
         let Some(next_cursor) = page.next_cursor else {

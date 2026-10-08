@@ -49,6 +49,134 @@ fn random_id(kind: &str) -> String {
     format!("{kind}-{}", uuid::Uuid::new_v4())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_concurrent_sandbox_creates_with_ssh_identity_do_not_exhaust_lock_pool() {
+    use crate::credentials::CredentialRuntime;
+    use openshell_core::jwt::{
+        CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionRotation,
+        SupervisorAuthBundle,
+    };
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+    use openshell_core::{SandboxSessionId, sandbox_generation::SandboxGenerationId};
+    use russh::keys::{HashAlg, PrivateKey};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let schema = TestSchema::create("ssh_create").await;
+    let store = Arc::new(schema.connect_store().await);
+    let runtime = crate::compute::new_test_runtime(store.clone()).await;
+    let config = crate::Config::new(None);
+    runtime.configure_ssh_identities(
+        CredentialRuntime::from_config_with_store(&config, store.clone()).unwrap(),
+    );
+    let authentication = SandboxLaunchAuthentication {
+        supervisor: SupervisorAuthBundle {
+            session_id: SandboxSessionId::new(),
+            runtime_generation: SandboxGenerationId::parse("generation").unwrap(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_token: SecretJwt::parse("gateway-token").unwrap(),
+            gateway_expires_at: 0,
+            sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+        },
+        gateway_id: "gateway".to_string(),
+        verification_keys: Vec::new(),
+    };
+
+    let mut pending = Vec::new();
+    for _ in 0..MUTATION_LOCK_POOL_MAX_CONNECTIONS {
+        let id = random_id("ssh-create");
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: id.clone(),
+                name: id.clone(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let guards =
+            crate::persistence::lock_order::branch(runtime.sandbox_create_guards("default", &id))
+                .await
+                .expect("each create holds one mutation-pool slot");
+        pending.push((sandbox, guards));
+    }
+    let Store::Postgres(postgres) = store.as_ref() else {
+        unreachable!();
+    };
+    assert_eq!(
+        postgres.lock_pool_size(),
+        MUTATION_LOCK_POOL_MAX_CONNECTIONS
+    );
+    assert_eq!(postgres.lock_pool_idle(), 0, "all lock slots are occupied");
+
+    let mut tasks = JoinSet::new();
+    for (sandbox, (lifecycle_guard, mutation_guard)) in pending {
+        let runtime = runtime.clone();
+        let encoded = serde_json::to_vec(&authentication).unwrap();
+        tasks.spawn(async move {
+            Box::pin(runtime.create_sandbox_authenticated_with_guards(
+                sandbox,
+                None,
+                Some(encoded),
+                false,
+                lifecycle_guard,
+                mutation_guard,
+            ))
+            .await
+        });
+    }
+    let created = tokio::time::timeout(PROCEEDS_WITHIN, async {
+        let mut created = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            created.push(
+                result
+                    .expect("create task")
+                    .expect("create with SSH identity"),
+            );
+        }
+        created
+    })
+    .await
+    .expect("SSH setup must progress while all mutation-pool slots are held");
+    assert_eq!(created.len(), MUTATION_LOCK_POOL_MAX_CONNECTIONS as usize);
+
+    let identities = crate::ssh_identity::SshIdentityStore::new(
+        store.clone(),
+        CredentialRuntime::from_config_with_store(&config, store.clone()).unwrap(),
+    );
+    let mut fingerprints = HashSet::new();
+    for mut sandbox in created {
+        let fingerprint = sandbox.host_key_fingerprint.clone();
+        assert!(!fingerprint.is_empty());
+        assert!(
+            fingerprints.insert(fingerprint.clone()),
+            "distinct SSH keys"
+        );
+        let mut authentication = authentication.clone();
+        identities
+            .prepare(&mut sandbox, &mut authentication)
+            .await
+            .unwrap();
+        let private_key = authentication.supervisor.ssh_host_private_key.unwrap();
+        let key = PrivateKey::from_openssh(private_key.expose_secret()).unwrap();
+        assert_eq!(
+            key.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            fingerprint
+        );
+        assert_eq!(sandbox.host_key_fingerprint, fingerprint);
+    }
+
+    store.close().await;
+    schema.drop_schema().await;
+}
+
 /// Drop client traffic while keeping sockets open, like a failed network path.
 /// Client EOF still closes the upstream socket so `PostgreSQL` can release locks.
 struct StallingProxy {
