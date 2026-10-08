@@ -1264,10 +1264,10 @@ wait_for_docker_daemon() {
   _elapsed=0
   _last_output=""
 
-  info "waiting for Docker daemon to become reachable..."
+  info "waiting for Docker daemon at /var/run/docker.sock to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_root docker info 2>&1)"; then
-      info "Docker daemon is reachable"
+    if _last_output="$(as_root env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
+      info "Docker daemon at /var/run/docker.sock is reachable"
       return 0
     fi
     sleep 1
@@ -1279,7 +1279,7 @@ wait_for_docker_daemon() {
     snap services docker >&2 || true
     snap changes >&2 || true
   fi
-  error "Docker daemon did not become reachable within ${_timeout}s"
+  error "Docker daemon at /var/run/docker.sock did not become reachable within ${_timeout}s"
 }
 
 wait_for_user_docker_daemon() {
@@ -1287,10 +1287,10 @@ wait_for_user_docker_daemon() {
   _elapsed=0
   _last_output=""
 
-  info "waiting for Docker daemon to become reachable as ${TARGET_USER}..."
+  info "waiting for Docker daemon at /var/run/docker.sock to become reachable as ${TARGET_USER}..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_target_user docker info 2>&1)"; then
-      info "Docker daemon is reachable as ${TARGET_USER}"
+    if _last_output="$(as_target_user env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
+      info "Docker daemon at /var/run/docker.sock is reachable as ${TARGET_USER}"
       return 0
     fi
     sleep 1
@@ -1298,7 +1298,7 @@ wait_for_user_docker_daemon() {
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
-  error "Docker daemon did not become reachable as ${TARGET_USER} within ${_timeout}s. Ensure ${TARGET_USER} can access the Docker socket, then log out and back in after changing group membership."
+  error "Docker daemon at /var/run/docker.sock did not become reachable as ${TARGET_USER} within ${_timeout}s. Ensure ${TARGET_USER} can access the Docker socket, then log out and back in after changing group membership."
 }
 
 snap_gateway_mode() {

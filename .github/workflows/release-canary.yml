@@ -223,7 +223,8 @@ jobs:
           set -euo pipefail
           systemctl --user set-environment \
             "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh |
+            DOCKER_HOST=unix:///tmp/nonexistent-docker.sock DOCKER_CONTEXT=nonexistent sh
           sudo snap list openshell
           if sudo snap list docker >/dev/null 2>&1; then
             echo "install.sh unexpectedly installed the Docker snap" >&2

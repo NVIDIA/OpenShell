@@ -456,7 +456,11 @@ root_probes_file="${tmpdir}/docker-root-probes"
 printf '0\n' >"$attempts_file"
 printf '0\n' >"$root_probes_file"
 if ! (
-  docker() {
+  env() {
+    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
+      echo "unexpected Docker readiness probe: $*" >&2
+      return 1
+    fi
     attempts="$(cat "$attempts_file")"
     attempts=$((attempts + 1))
     printf '%s\n' "$attempts" >"$attempts_file"
@@ -485,7 +489,7 @@ if [ "$(cat "$root_probes_file")" != "3" ]; then
 fi
 
 if (
-  docker() { return 1; }
+  env() { return 1; }
   as_root() { "$@"; }
   snap() { return 1; }
   sleep() { :; }
@@ -495,8 +499,65 @@ if (
   echo "FAIL: Docker readiness timeout should fail" >&2
   exit 1
 fi
-if ! grep -Fq "Docker daemon did not become reachable within 2s" "$err"; then
+if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable within 2s" "$err"; then
   echo "FAIL: missing Docker readiness timeout message" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
+user_attempts_file="${tmpdir}/docker-user-attempts"
+user_probes_file="${tmpdir}/docker-user-probes"
+printf '0\n' >"$user_attempts_file"
+printf '0\n' >"$user_probes_file"
+if ! (
+  env() {
+    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
+      echo "unexpected user Docker readiness probe: $*" >&2
+      return 1
+    fi
+    attempts="$(cat "$user_attempts_file")"
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" >"$user_attempts_file"
+    [ "$attempts" -ge 3 ]
+  }
+  as_target_user() {
+    user_probes="$(cat "$user_probes_file")"
+    printf '%s\n' "$((user_probes + 1))" >"$user_probes_file"
+    "$@"
+  }
+  sleep() { :; }
+  info() { :; }
+  TARGET_USER=test-user
+  export DOCKER_HOST=tcp://remote.example:2376
+  export DOCKER_CONTEXT=remote
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_user_docker_daemon
+) >"$out" 2>"$err"; then
+  echo "FAIL: user Docker readiness should succeed after retries" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [ "$(cat "$user_attempts_file")" != "3" ]; then
+  echo "FAIL: user Docker readiness did not retry three times" >&2
+  exit 1
+fi
+if [ "$(cat "$user_probes_file")" != "3" ]; then
+  echo "FAIL: user Docker readiness probes did not run through as_target_user" >&2
+  exit 1
+fi
+
+if (
+  env() { return 1; }
+  as_target_user() { "$@"; }
+  sleep() { :; }
+  info() { :; }
+  TARGET_USER=test-user
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_user_docker_daemon
+) >"$out" 2>"$err"; then
+  echo "FAIL: user Docker readiness timeout should fail" >&2
+  exit 1
+fi
+if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable as test-user within 2s" "$err"; then
+  echo "FAIL: missing user Docker readiness timeout message" >&2
   cat "$err" >&2 || true
   exit 1
 fi
