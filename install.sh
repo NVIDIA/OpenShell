@@ -61,21 +61,22 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 or non-snap installation.
+    OPENSHELL_INSTALL_METHOD
+                        Linux package to install: snap, deb, or rpm. Unset
+                        selects deb or rpm from the host package manager.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    On Linux, the installer uses the OpenShell snap when the snap command is
-    available and OPENSHELL_VERSION is unset or dev. Snap installs use
-    latest/stable by default and latest/edge for dev. Explicit release tags
-    and prereleases use Debian or RPM packages. The OpenShell snap requires a
-    running Docker Engine installed from a system package or Docker's package
+    Linux installs the Debian package on amd64/arm64 or the RPM packages on
+    x86_64/aarch64, depending on the host package manager. Set
+    OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
+    that already have the OpenShell snap keep refreshing it. Snap installs use
+    latest/stable by default and latest/edge for dev, and do not support
+    explicit release tags or prereleases. The OpenShell snap requires a running
+    Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
-
-    For explicit versions or without snap, Linux installs the Debian package
-    on amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the
-    host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -658,9 +659,20 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
+  case "${OPENSHELL_INSTALL_METHOD:-}" in
+    snap | deb | rpm)
+      echo "$OPENSHELL_INSTALL_METHOD"
+      return 0
+      ;;
+    '') ;;
+    *) error "unsupported OPENSHELL_INSTALL_METHOD=${OPENSHELL_INSTALL_METHOD}; use snap, deb, or rpm" ;;
+  esac
+
+  # Keep refreshing an existing snap install instead of adding a second
+  # gateway on the same port.
   case "${OPENSHELL_VERSION:-}" in
     '' | dev)
-      if has_cmd snap; then
+      if has_cmd snap && snap list openshell >/dev/null 2>&1; then
         echo "snap"
         return 0
       fi
@@ -923,8 +935,19 @@ start_user_gateway() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_local_gateway_listener
+  wait_for_local_gateway_listener user_gateway_service_failed
   wait_for_local_gateway_status
+}
+
+# Succeeds when the gateway user service has failed or is waiting to restart
+# after a failure. A unit that is starting or running does not match, even if
+# it failed before it was restarted.
+user_gateway_service_failed() {
+  _unit_state="$(as_target_user systemctl --user show openshell-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
+  case "$_unit_state" in
+    *ActiveState=failed* | *SubState=auto-restart*) return 0 ;;
+  esac
+  return 1
 }
 
 dump_local_gateway_diagnostics() {
@@ -1003,10 +1026,14 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+# An optional command name stops the wait early when it succeeds, so a service
+# that already failed does not run out the full timeout.
 wait_for_local_gateway_listener() {
+  _failed_check="${1:-}"
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
   _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
@@ -1018,12 +1045,19 @@ wait_for_local_gateway_listener() {
       info "local gateway listener is reachable"
       return 0
     fi
+    if [ -n "$_failed_check" ] && "$_failed_check"; then
+      _service_failed=1
+      break
+    fi
     sleep 1
     _elapsed=$((_elapsed + 1))
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
+  if [ "$_service_failed" -eq 1 ]; then
+    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+  fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
@@ -1220,43 +1254,6 @@ openshell_snap_channel() {
   esac
 }
 
-ensure_snap_gateway_config() {
-  _config_file="${1:-/var/snap/openshell/common/gateway.toml}"
-
-  as_root sh -c '
-    set -eu
-    config_file=$1
-    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-      exit 0
-    fi
-
-    config_dir=${config_file%/*}
-    mkdir -p "$config_dir"
-    umask 077
-    temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
-    trap '\''rm -f "$temporary_file"'\'' 0 HUP INT TERM
-
-    cat >"$temporary_file" <<'\''EOF'\''
-[openshell]
-version = 2
-
-[openshell.gateway]
-
-[openshell.gateway.auth]
-allow_unauthenticated_users = true
-EOF
-
-    if ! ln "$temporary_file" "$config_file"; then
-      if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-        exit 0
-      fi
-      exit 1
-    fi
-    rm -f "$temporary_file"
-    trap - 0 HUP INT TERM
-  ' sh "$_config_file"
-}
-
 wait_for_docker_daemon() {
   _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
   _elapsed=0
@@ -1280,9 +1277,39 @@ wait_for_docker_daemon() {
   error "Docker daemon did not become reachable within ${_timeout}s"
 }
 
+# Copy the snap gateway's client bundle into the target user's snap state
+# directory, where `openshell gateway add --local` imports it. Root only reads
+# the source files; the target user writes the copies into their own home.
+copy_snap_client_bundle() {
+  _src="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+  _dst="${TARGET_HOME}/snap/openshell/common/.local/state/openshell/tls"
+
+  as_target_user mkdir -p "${_dst}/client"
+  as_target_user chmod 700 "$_dst" "${_dst}/client"
+  for _file in ca.crt client/tls.crt client/tls.key; do
+    as_root cat "${_src}/${_file}" |
+      as_target_user sh -c 'umask 077; cat >"$1"' sh "${_dst}/${_file}"
+    as_target_user chmod 600 "${_dst}/${_file}"
+  done
+}
+
+# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# older plaintext configs.
+snap_gateway_uses_mtls() {
+  [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
+}
+
 register_snap_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
-  _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+
+  if snap_gateway_uses_mtls; then
+    _endpoint="https://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+    info "copying the gateway client certificate for ${TARGET_USER}..."
+    copy_snap_client_bundle
+  else
+    _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+    warn "this OpenShell snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
+  fi
 
   if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
@@ -1304,15 +1331,28 @@ register_snap_gateway() {
   esac
 }
 
+# The mTLS gateway rejects TLS handshakes without a client certificate, so
+# probe it with the root-owned client bundle.
 wait_for_snap_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
-  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+  _tls_dir="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+
+  if snap_gateway_uses_mtls; then
+    _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=as_root
+    set -- --cacert "${_tls_dir}/ca.crt" \
+      --cert "${_tls_dir}/client/tls.crt" --key "${_tls_dir}/client/tls.key"
+  else
+    _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=""
+    set --
+  fi
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(curl -sS --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+    if _last_output="$($_probe_as curl -sS --max-time 2 "$@" -o /dev/null "$_probe_url" 2>&1)"; then
       info "local gateway listener is reachable"
       return 0
     fi
@@ -1350,13 +1390,12 @@ Install Docker Engine from a system package or Docker's package repository, then
     as_root snap install openshell --channel="$_channel"
   fi
 
-  ensure_snap_gateway_config
   as_root snap restart openshell.gateway
 
   info "installed OpenShell snap from ${_channel}"
+  wait_for_snap_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_snap_gateway
-  wait_for_snap_gateway_listener
   OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
   wait_for_local_gateway_status
 }

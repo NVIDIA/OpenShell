@@ -16,7 +16,7 @@ Examples organized by detail tier — from minimal (just host + intent) to full 
 
 **User**: "Let claude talk to api.anthropic.com and statsig.anthropic.com, just let everything through."
 
-No API docs needed. No L7 inspection.
+No API docs needed. No method or path rules.
 
 ```yaml
 network_policies:
@@ -29,7 +29,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-No `protocol`, `rules`, or `access` — this is pure L4 (host:port + binary identity check).
+No `protocol`, `rules`, or `access` — the endpoint has no method or path rules, so any request to host:port from the listed binary is allowed. With default TLS handling, the proxy terminates detected TLS and rejects parsed HTTP requests whose authority does not match the endpoint, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP protocols, can pass through a raw relay. `tls: skip` also bypasses TLS termination and HTTP parsing.
 
 ---
 
@@ -551,7 +551,7 @@ network_policies:
 
 ### Analysis
 
-- Anthropic API: L4-only (no inspection), standard claude binary
+- Anthropic API: L4-only (no method or path rules), standard claude binary
 - Internal docs: L7 with read-only, HTTP so no TLS config needed
 - Two separate policies because different binaries
 
@@ -579,7 +579,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-**Note**: The first policy has no `protocol` field — this means L4-only (host:port check, no HTTP inspection). The second policy has `protocol: rest` so every HTTP request is inspected.
+**Note**: The first policy has no `protocol` field, so it applies no method or path rules. With default TLS handling, the proxy still terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads can pass through a raw relay. The second policy has `protocol: rest`, so every HTTP request is also checked against the `read-only` preset.
 
 ---
 
@@ -623,7 +623,7 @@ network_policies:
 
 **User**: "Allow curl to reach our internal API at api.internal.corp on port 8080. It resolves to 10.0.5.x addresses."
 
-The user knows the service resolves to private IPs. Use `allowed_ips` to permit the specific subnet.
+The user knows the service resolves to private IPs. An exact hostname can reach them without `allowed_ips`; add `allowed_ips` to pin connections to the known subnet.
 
 ```yaml
 network_policies:

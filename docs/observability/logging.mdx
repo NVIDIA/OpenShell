@@ -194,7 +194,7 @@ Common reason phrases emitted by the sandbox include:
 | Reason | Meaning |
 |---|---|
 | `no matching policy` | OPA evaluated the request and no allow rule matched. |
-| `resolves to always-blocked address` | The destination resolved to loopback, link-local, or unspecified. These ranges are always blocked, even when listed in `allowed_ips`. |
+| `resolves to always-blocked address` | An outbound policy endpoint resolved to loopback, link-local, or unspecified. Network policy cannot authorize these destinations, even when they appear in `allowed_ips`; sandbox-local loopback connections do not use this policy path. |
 | `resolves to <ip> which is not in allowed_ips, connection rejected` | The destination resolved to an IP outside the policy's `allowed_ips` allowlist. |
 | `DNS resolution failed for <host>:<port>` | The proxy could not resolve the destination. |
 | `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
@@ -228,13 +228,15 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 }
 ```
 
-The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript. The optional `reason` field, when present, provides the specific denial cause from the policy engine (for example, which binary was not allowed or which rule was missing).
+The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`, `unsupported_l7_protocol`). The `detail` field is a human-readable explanation suitable for display in an agent transcript. The optional `reason` field, when present, provides the specific denial cause from the policy engine (for example, which binary was not allowed or which rule was missing).
 
-For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
+For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When the policy advisor is enabled, the body also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
 
 ## Filesystem Sandbox Logs
 
 Landlock filesystem restrictions emit `CONFIG:` events at startup and whenever the sandbox has to skip a requested path.
+
+These events originate in the sandbox runtime and appear in [workload container logs](/observability/accessing-logs#main-process-output) when the runtime's diagnostic log filter permits them. They are not included in the supervisor's JSONL file or pushed to the gateway log stream.
 
 On startup, the probe reports the kernel's supported Landlock ABI version alongside the requested path counts:
 
@@ -254,17 +256,21 @@ Set `landlock.compatibility` to `hard_requirement` in the policy to make these f
 
 ## Log File Location
 
-Inside the sandbox, logs are written to `/var/log/`:
+The supervisor writes logs to `/var/log/` in its own filesystem, separate from the sandbox workload:
 
 | File | Format | Rotation |
 |---|---|---|
-| `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
-| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily, 3 files max |
+| `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily |
+| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily |
 
-Both files rotate daily and retain the 3 most recent files to bound disk usage.
+Each supervisor file appender is configured with a three-file limit. The shorthand appender's filename prefix also matches JSONL files, so its cleanup can delete JSONL history on filesystems that expose file creation timestamps. Do not rely on independent three-file retention for each format.
+
+File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output. Enabling `ocsf_json_enabled` adds full `OCSF-JSON` records to stderr even without a file sink; see [OCSF JSON collection](/observability/ocsf-json-export#output-location).
+
+Docker and Podman use tmpfs for this directory; Kubernetes uses an `emptyDir` in the supervisor pod. Collect logs externally before rotation or teardown for durable retention. See [Accessing Logs](/observability/accessing-logs#direct-filesystem-access) for driver-specific access and storage lifetimes.
 
 ## Next Steps
 
-- [Access logs](/observability/accessing-logs) through the CLI, TUI, or sandbox filesystem.
+- [Access logs](/observability/accessing-logs) through the CLI, TUI, or supervisor resources.
 - [Enable OCSF JSON export](/observability/ocsf-json-export) for SIEM integration and compliance.
-- Learn about [network policies](/sandboxes/policies) that generate these events.
+- Learn about [network policies](/how-it-works/policies/overview) that generate these events.

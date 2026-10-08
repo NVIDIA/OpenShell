@@ -20,9 +20,16 @@ import {
   SandboxClient,
   SandboxTemplateClient,
   SCOPE_NAMES,
+  ServiceAuthorizationMode,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import {
+  OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  SandboxPhase,
+  SandboxRestartPolicy,
+  ServiceStatus,
+} from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
@@ -57,6 +64,24 @@ function readySandbox(
 }
 
 const enc = (s: string) => new TextEncoder().encode(s);
+
+describe('sandbox SSH host identity', () => {
+  it('exposes the fingerprint from get and list, and accepts legacy responses', async () => {
+    let fingerprint = 'SHA256:expected';
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: { metadata: { id: 'id', name: 'work', workspace: 'default' }, hostKeyFingerprint: fingerprint },
+      }),
+      listSandboxes: () => ({
+        sandboxes: [{ metadata: { id: 'id', name: 'work', workspace: 'default' }, hostKeyFingerprint: fingerprint }],
+      }),
+    });
+    expect((await sandbox.get('work')).hostKeyFingerprint).toBe(fingerprint);
+    expect((await sandbox.list().all())[0]?.hostKeyFingerprint).toBe(fingerprint);
+    fingerprint = '';
+    expect((await sandbox.get('work')).hostKeyFingerprint).toBeUndefined();
+  });
+});
 
 describe('deletion outcomes', () => {
   it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
@@ -276,7 +301,9 @@ describe('exec / execStream', () => {
 
 describe('create', () => {
   it('sends create-time service exposures', async () => {
-    let created: { serviceExposures?: Array<{ service?: string; targetPort?: number }> } = {};
+    let created: {
+      serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+    } = {};
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -292,12 +319,29 @@ describe('create', () => {
 
     const result = await sandbox.create({
       image: 'img',
-      serviceExposures: [{ targetPort: 4500 }, { service: 'metrics', targetPort: 9090 }],
+      serviceExposures: [
+        { targetPort: 4500 },
+        {
+          service: 'metrics',
+          targetPort: 9090,
+          authorizationMode: ServiceAuthorizationMode.BearerPassthrough,
+        },
+      ],
     });
 
-    expect(created.serviceExposures?.map(({ service, targetPort }) => ({ service, targetPort }))).toEqual([
-      { service: '', targetPort: 4500 },
-      { service: 'metrics', targetPort: 9090 },
+    expect(
+      created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
+        service,
+        targetPort,
+        authorizationMode,
+      })),
+    ).toEqual([
+      { service: '', targetPort: 4500, authorizationMode: ProtoServiceAuthorizationMode.STRIP },
+      {
+        service: 'metrics',
+        targetPort: 9090,
+        authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
+      },
     ]);
     expect(result.serviceUrls).toEqual({
       '': 'https://sb.example.test/',
@@ -334,6 +378,20 @@ describe('create', () => {
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+  });
+
+  it('sends the restart policy', async () => {
+    let created: { spec?: { restartPolicy?: SandboxRestartPolicy } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', restartPolicy: 'on-failure' });
+
+    expect(created.spec?.restartPolicy).toBe(SandboxRestartPolicy.ON_FAILURE);
   });
 
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
@@ -841,6 +899,29 @@ describe('sandbox templates', () => {
     await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('maps restart controller status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.STARTING,
+            restartCount: 3,
+            nextRestartTime: { seconds: 1_700_000_000n, nanos: 0 },
+            mainProcessStartedTime: { seconds: 1_699_999_000n, nanos: 0 },
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'starting',
+      restartCount: 3,
+      nextRestartAtMs: 1_700_000_000_000,
+      mainProcessStartedAtMs: 1_699_999_000_000,
+    });
   });
 });
 

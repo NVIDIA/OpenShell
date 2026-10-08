@@ -31,6 +31,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"restart_policy":        true,
 	}
 
 	// The gateway owns this identity. Provider status exposes it through the
@@ -115,15 +116,18 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"agent_pod":               true,
-		"agent_fd":                true,
-		"sandbox_fd":              true,
-		"phase":                   true,
-		"conditions":              true,
-		"endpoint_statuses":       true,
-		"current_policy_version":  true,
-		"exit_code":               true,
-		"configuration_admission": true,
+		"agent_pod":                 true,
+		"agent_fd":                  true,
+		"sandbox_fd":                true,
+		"phase":                     true,
+		"conditions":                true,
+		"endpoint_statuses":         true,
+		"current_policy_version":    true,
+		"exit_code":                 true,
+		"configuration_admission":   true,
+		"restart_count":             true,
+		"next_restart_time":         true,
+		"main_process_started_time": true,
 	}
 	// The instance ID coordinates internal gateway/supervisor lifecycle
 	// fencing. The first-activation marker governs static policy repair.
@@ -225,7 +229,12 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"credential_binding":              true,
 	}
 
-	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway derives this authority from the effective policy. It is
+	// available through the raw API, not authored SDK endpoint settings.
+	skipped := fieldSet{
+		"token_grant_owner": true,
+	}
+	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_L7Allow(t *testing.T) {
@@ -304,6 +313,7 @@ func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
 		"description":       true,
 		"category":          true,
 		"credentials":       true,
+		"files":             true,
 		"endpoints":         true,
 		"binaries":          true,
 		"inference_capable": true,
@@ -331,7 +341,12 @@ func TestConverterCoversAllProtoFields_ProviderProfileCredential(t *testing.T) {
 		"token_grant":   true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, nil)
+	// Resolved grant authorities belong to gateway-to-supervisor delivery,
+	// not authored provider profiles. They remain available in the raw API.
+	skipped := fieldSet{
+		"token_grant_owners": true,
+	}
+	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T) {

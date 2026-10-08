@@ -7,9 +7,9 @@ use super::{
     map_migrate_error,
 };
 use crate::policy_store::{
-    AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
-    policy_payload_from_record, policy_record_for_atomic_write, policy_record_from_parts,
-    project_policy_revision_onto_sandbox,
+    AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
+    draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
+    policy_record_for_atomic_write, policy_record_from_parts, project_policy_revision_onto_sandbox,
 };
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
@@ -117,6 +117,14 @@ impl PostgresStore {
     pub(super) async fn acquire_cross_object_lock(
         &self,
     ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        self.acquire_mutation_lock(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .await
+    }
+
+    pub(super) async fn acquire_mutation_lock(
+        &self,
+        key: i64,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
         let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         connection.close_on_drop();
         sqlx::query("SELECT set_config('lock_timeout', $1, false)")
@@ -125,7 +133,7 @@ impl PostgresStore {
             .await
             .map_err(|e| map_db_error(&e))?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .bind(key)
             .execute(&mut *connection)
             .await
             .map_err(|e| map_db_error(&e))?;
@@ -1541,6 +1549,54 @@ WHERE "object_type" = $1 AND "id" = $2 AND "status" IN ('pending', 'rejected')
         .bind(&chunk.id)
         .bind(payload)
         .bind(chunk.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_draft_chunk_evaluation_if_unchanged(
+        &self,
+        expected: &DraftChunkRecord,
+        evaluated: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let Some(row) = sqlx::query(
+            r#"
+SELECT "id", "scope", "status", "hit_count", "payload", "created_at_ms", "updated_at_ms"
+FROM "objects"
+WHERE "object_type" = $1 AND "id" = $2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        else {
+            return Ok(false);
+        };
+        let stored_payload: Vec<u8> = row.get("payload");
+        let mut current = row_to_draft_chunk_record(row)?;
+        if !draft_chunk_evaluation_inputs_match(&current, expected) {
+            return Ok(false);
+        }
+        apply_draft_chunk_evaluation(&mut current, evaluated);
+        let payload = draft_chunk_payload_from_record(&current)?;
+        // Compare-and-swap on the payload read above: a concurrent edit or
+        // evaluation between the read and this write leaves nothing updated.
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = $3, "updated_at_ms" = $4
+WHERE "object_type" = $1 AND "id" = $2 AND "status" IN ('pending', 'rejected')
+  AND "payload" = $5
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .bind(payload)
+        .bind(current.last_seen_ms)
+        .bind(stored_payload)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

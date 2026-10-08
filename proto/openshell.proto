@@ -1006,6 +1006,10 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only SSH host identity in OpenSSH SHA256:<base64> form. Stable for
+  // this sandbox's lifetime, including runtime restarts. Empty on legacy
+  // runtimes that do not provide a gateway-managed SSH identity.
+  string host_key_fingerprint = 6;
   // Read-only provenance for sandboxes created from a reusable workload template.
   SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
@@ -1045,6 +1049,9 @@ message SandboxSpec {
   // Gateway-owned attachment identity, changed atomically with the provider set.
   // Equality only: detach and reattach must not revive an older receipt.
   string provider_attachment_epoch = 14;
+  // Gateway-owned policy for replacing the sandbox runtime after the canonical
+  // main process exits. Unspecified is normalized to Never before persistence.
+  SandboxRestartPolicy restart_policy = 15;
 }
 
 message ResourceRequirements {
@@ -1170,9 +1177,8 @@ message SandboxStatus {
   // Supervisor instance currently associated with the canonical main process.
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
-  // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the canonical main process exited. Exit code 0
-  // produces Completed; nonzero and signal-normalized exits produce Error.
+  // Most recent normalized main process result. Signal exits use 128 + signal number.
+  // Cleared when a replacement main process becomes ready.
   optional int32 exit_code = 9;
   // Last accepted network result for each configured tool server endpoint.
   // Currently populated for MCP-over-HTTP endpoints. These passive results
@@ -1182,8 +1188,14 @@ message SandboxStatus {
   SandboxConfigurationAdmission configuration_admission = 11;
   // Durable first-acceptance marker. Absent on legacy records; never reset by restart.
   optional bool configuration_activated = 12;
-  // Gateway-owned repair window. Retained after timeout for inspection and retry.
+  // Gateway-owned provisioning deadlines, retained after timeout for inspection and retry.
   SandboxProvisioning provisioning = 13;
+  // Consecutive policy-driven restart number in the current crash loop.
+  uint32 restart_count = 14;
+  // Deadline for the next restart attempt or recovery check.
+  google.protobuf.Timestamp next_restart_time = 15;
+  // Time when the current main process became ready.
+  google.protobuf.Timestamp main_process_started_time = 16;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1218,6 +1230,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STARTING = 8;
   // The canonical main process exited successfully and its result is final.
   SANDBOX_PHASE_COMPLETED = 9;
+  reserved 10;
+  reserved "SANDBOX_PHASE_RESTARTING";
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -1743,7 +1757,8 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
+  // Expected sandbox SSH host identity in OpenSSH SHA256:<base64> form.
+  // Stable for the sandbox's lifetime. Empty only for legacy runtimes.
   string host_key_fingerprint = 7;
 
   // Absolute expiry. Absence means no expiry.
@@ -1764,6 +1779,8 @@ message ExposeServiceRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 6;
+  // Application authorization behavior. Omission resolves to STRIP.
+  ServiceAuthorizationMode authorization_mode = 7;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -1830,6 +1847,8 @@ message ServiceEndpoint {
   uint32 target_port = 5;
   // Whether browser-facing service routing is enabled for this endpoint.
   bool domain = 6;
+  // Effective application authorization behavior for ingress requests.
+  ServiceAuthorizationMode authorization_mode = 7;
 }
 
 // Response containing a service endpoint and, when available, its local URL.
@@ -2298,6 +2317,12 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Output-only gateway-derived endpoint authorities for resolved token grants.
+  // For inspected L7 requests, empty means no endpoint may obtain this grant.
+  // L4 injection uses selectors without checking these authorities.
+  // Profile-authored values are ignored; normal policies name the originating
+  // provider endpoint, while a global policy uses its own endpoint authorities.
+  repeated string token_grant_owners = 11;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -2470,6 +2495,19 @@ message ProviderProfile {
   // Server-set visibility: "platform", "workspace", or empty for
   // non-scoped sources. Ignored on import/update payloads.
   string scope = 13;
+  // EXPERIMENTAL: Non-secret files rendered from provider configuration for the
+  // workload. This API and its behavior may change or be removed.
+  repeated ProviderProfileFile files = 14;
+}
+
+// EXPERIMENTAL: Provider file templates may change or be removed.
+message ProviderProfileFile {
+  // One virtual file name below /run/openshell/providers/<provider>/.
+  string path = 1;
+  // UTF-8 template. Only {{config.KEY}} references are supported.
+  string content = 2;
+  // Optional environment variable containing the virtual absolute path.
+  string env_var = 3;
 }
 
 // Provider profile response.
@@ -2623,6 +2661,8 @@ message GetSandboxProviderEnvironmentResponse {
   string policy_hash = 8;
   // Nonzero when material was withheld; installing an empty map is not readiness.
   ProviderReadinessReason readiness_reason = 9;
+  // Complete desired set of non-secret managed files, keyed by absolute path.
+  map<string, string> files = 10;
 }
 
 message ExchangeProviderSubjectTokenRequest {
@@ -2958,6 +2998,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    SessionRedirect session_redirect = 6;
   }
 }
 
@@ -2972,6 +3013,14 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Set when this connection is the result of following a SessionRedirect. The
+  // receiving gateway serves a redirected hello locally instead of redirecting
+  // again, so a disagreement about membership cannot bounce the supervisor
+  // between replicas. A gateway that is shutting down may still redirect it.
+  bool redirected = 5;
+  // The supervisor understands SessionRedirect. Gateways never redirect a
+  // supervisor that does not set this.
+  bool supports_session_redirect = 6;
 }
 
 // Gateway accepts the supervisor session.
@@ -2988,6 +3037,20 @@ message SessionAccepted {
 message SessionRejected {
   // Human-readable rejection reason.
   string reason = 1;
+}
+
+// Gateway declines to own this session and names the replica that should.
+//
+// Sent instead of SessionAccepted when the placement ring puts the sandbox on
+// a different live replica, and to established sessions when their gateway
+// shuts down. The supervisor reconnects to peer_endpoint once with
+// SupervisorHello.redirected set, and falls back to its configured gateway
+// address if that fails.
+message SessionRedirect {
+  // Peer endpoint of the replica that should own this sandbox.
+  string peer_endpoint = 1;
+  // Replica ID that should own this sandbox, for logging.
+  string owner_replica_id = 2;
 }
 
 // Supervisor heartbeat.
@@ -3552,6 +3615,16 @@ enum ProviderCredentialRefreshRecoveryAction {
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
 }
 
+// Policy applied when the canonical main process exits outside an intentional
+// stop or delete operation. Kept after existing enums so generated enum
+// descriptors remain stable.
+enum SandboxRestartPolicy {
+  SANDBOX_RESTART_POLICY_UNSPECIFIED = 0;
+  SANDBOX_RESTART_POLICY_NEVER = 1;
+  SANDBOX_RESTART_POLICY_ON_FAILURE = 2;
+  SANDBOX_RESTART_POLICY_ALWAYS = 3;
+}
+
 // Workspace membership record.
 message WorkspaceMember {
   openshell.datamodel.v1.ObjectMeta metadata = 1;
@@ -3730,7 +3803,7 @@ message SandboxProvisioning {
   string configuration_change_id = 2;
   google.protobuf.Timestamp configuration_change_time = 3;
   google.protobuf.Timestamp first_rejection_time = 4;
-  // Present only while the repair window is armed.
+  // Active preparation or admission-repair deadline. Absent after Ready/timeout.
   google.protobuf.Timestamp deadline = 5;
   google.protobuf.Timestamp timeout_time = 6;
   // Set only after both supervisor and workload compute have been reclaimed.
@@ -3742,6 +3815,24 @@ message SandboxProvisioning {
   // Attachment edits have their own durable clock; status writes do not change it.
   string attachment_change_id = 10;
   google.protobuf.Timestamp attachment_change_time = 11;
+  // Absolute ceiling for image preparation and initial supervisor startup.
+  // Set once per new attempt; progress, configuration writes, and restarts
+  // cannot extend it. Absent on attempts created before preparation timing.
+  google.protobuf.Timestamp preparation_deadline = 12;
+  // First authenticated supervisor configuration report for this attempt.
+  // Starts the admission repair window. Absent while preparing, including
+  // after a preparation timeout. Duplicate reports never change this value.
+  google.protobuf.Timestamp admission_start_time = 13;
+  // An owned driver create/start future is still pending. Claimed before
+  // dispatch and cleared on its actual success or error response. Monitor
+  // interruption, owner loss, and StopSandbox/NotFound do not clear it.
+  // While set, cleanup cannot complete and retry/deletion remain blocked.
+  // This does not strengthen a driver's transport-error settlement contract.
+  bool driver_operation_pending = 14;
+  // Unique for each claimed driver operation, including recovery and automatic
+  // restart. Retained after settlement to reject delayed callbacks from an
+  // earlier operation on the same attempt and runtime generation.
+  string driver_operation_id = 15;
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.
@@ -3750,4 +3841,17 @@ message SandboxServiceExposure {
   string service = 1;
   // Loopback TCP port inside the sandbox.
   uint32 target_port = 2;
+  // Application authorization behavior. Omission resolves to STRIP.
+  ServiceAuthorizationMode authorization_mode = 3;
+}
+
+// Controls whether an exposed service receives the request's application
+// Authorization header.
+enum ServiceAuthorizationMode {
+  // Omission preserves the secure legacy behavior and resolves to STRIP.
+  SERVICE_AUTHORIZATION_MODE_UNSPECIFIED = 0;
+  // Remove Authorization before forwarding to the sandbox service.
+  SERVICE_AUTHORIZATION_MODE_STRIP = 1;
+  // Forward one syntactically valid bearer Authorization header unchanged.
+  SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
 }

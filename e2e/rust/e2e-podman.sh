@@ -22,8 +22,7 @@ source "${ROOT}/e2e/support/conformance.sh"
 # stabilized and can be added here.
 PODMAN_CI_TESTS=(
   bypass_detection
-  cf_auth_smoke
-  cli_smoke
+  ephemeral_cleanup
   core_dump_hardening
   credential_gating
   default_image
@@ -40,6 +39,7 @@ PODMAN_CI_TESTS=(
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
+  podman_oci_identity
   provider_token_exchange
 )
 

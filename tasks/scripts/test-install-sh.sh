@@ -100,43 +100,63 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
+# snap_state: 0 = no snap command, 1 = snap command only,
+# installed = the OpenShell snap is already installed.
 assert_linux_package_method() {
   local name=$1
-  local requested_version=$2
-  local snap_present=$3
-  local dpkg_present=$4
-  local rpm_present=$5
-  local expected=$6
+  local install_method=$2
+  local requested_version=$3
+  local snap_state=$4
+  local dpkg_present=$5
+  local rpm_present=$6
+  local expected=$7
   local actual
 
-  actual="$(
+  (
+    export OPENSHELL_INSTALL_METHOD="$install_method"
     export OPENSHELL_VERSION="$requested_version"
     has_cmd() {
       case "$1" in
-        snap) [ "$snap_present" = "1" ] ;;
+        snap) [ "$snap_state" != "0" ] ;;
         dpkg) [ "$dpkg_present" = "1" ] ;;
         rpm) [ "$rpm_present" = "1" ] ;;
         *) return 1 ;;
       esac
     }
+    snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
     linux_package_method
-  )"
+  ) >"$out"
+  actual="$(cat "$out")"
   if [ "$actual" != "$expected" ]; then
     echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
     exit 1
   fi
 }
 
-assert_linux_package_method "snap takes precedence over deb and rpm" "" 1 1 1 snap
-assert_linux_package_method "dev uses snap" dev 1 1 1 snap
-assert_linux_package_method "pre uses deb despite snap" pre 1 1 1 deb
-assert_linux_package_method "numbered prerelease uses deb despite snap" v0.1.0-pre.3 1 1 1 deb
-assert_linux_package_method "pre uses rpm despite snap" pre 1 0 1 rpm
-assert_linux_package_method "pinned stable uses deb despite snap" v1.2.3 1 1 1 deb
-assert_linux_package_method "pinned stable uses rpm despite snap" v1.2.3 1 0 1 rpm
-assert_linux_package_method "deb is selected without snap" "" 0 1 1 deb
-assert_linux_package_method "dev uses deb without snap" dev 0 1 1 deb
-assert_linux_package_method "rpm is selected without snap or deb" "" 0 0 1 rpm
+assert_linux_package_method "deb is the default despite snap" "" "" 1 1 1 deb
+assert_linux_package_method "rpm is the default despite snap" "" "" 1 0 1 rpm
+assert_linux_package_method "dev uses deb despite snap" "" dev 1 1 1 deb
+assert_linux_package_method "snap is opt-in" snap "" 1 1 1 snap
+assert_linux_package_method "snap opt-in with dev" snap dev 1 1 1 snap
+assert_linux_package_method "explicit deb" deb "" installed 0 1 deb
+assert_linux_package_method "explicit rpm" rpm "" 1 1 1 rpm
+assert_linux_package_method "existing snap install keeps refreshing" "" "" installed 1 1 snap
+assert_linux_package_method "existing snap install keeps refreshing dev" "" dev installed 1 1 snap
+assert_linux_package_method "pre uses deb despite existing snap" "" pre installed 1 1 deb
+assert_linux_package_method "numbered prerelease uses deb despite existing snap" "" v0.1.0-pre.3 installed 1 1 deb
+assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1.2.3 installed 0 1 rpm
+assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
+assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
+
+if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
+  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD should be rejected" >&2
+  exit 1
+fi
+if ! grep -Fq "unsupported OPENSHELL_INSTALL_METHOD=flatpak" "$err"; then
+  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
 
 if ! (
   find_existing_native_openshell_bin() { return 1; }
@@ -251,7 +271,7 @@ assert_snap_install_flow() {
   local expected=$5
   local calls
 
-  calls="$(
+  (
     has_cmd() {
       case "$1" in
         snap) return 0 ;;
@@ -269,7 +289,6 @@ assert_snap_install_flow() {
     as_root() { printf 'root:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
     wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
-    ensure_snap_gateway_config() { printf '%s\n' "ensure:gateway-config"; }
     register_snap_gateway() { printf '%s\n' "register:gateway"; }
     wait_for_snap_gateway_listener() { printf '%s\n' "wait:gateway-listener"; }
     wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
@@ -277,7 +296,8 @@ assert_snap_install_flow() {
     export TARGET_USER=test-user
     export OPENSHELL_VERSION="$requested_version"
     install_linux_snap
-  )"
+  ) >"$out"
+  calls="$(cat "$out")"
   if [ "$calls" != "$expected" ]; then
     echo "FAIL: ${name}: unexpected command sequence" >&2
     echo "Expected:" >&2
@@ -293,10 +313,9 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:docker
 root:snap install openshell --channel=latest/stable
-ensure:gateway-config
 root:snap restart openshell.gateway
-register:gateway
 wait:gateway-listener
+register:gateway
 wait:gateway-status"
 
 assert_snap_install_flow \
@@ -304,10 +323,9 @@ assert_snap_install_flow \
   1 1 "" \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
-ensure:gateway-config
 root:snap restart openshell.gateway
-register:gateway
 wait:gateway-listener
+register:gateway
 wait:gateway-status"
 
 assert_snap_install_rejected() {
@@ -362,34 +380,6 @@ assert_snap_install_rejected \
   "Docker snap" \
   1 1 \
   "the Docker snap is not currently compatible with OpenShell"
-
-snap_config_dir="${tmpdir}/snap-config"
-snap_config="${snap_config_dir}/gateway.toml"
-if ! (as_root() { "$@"; }; ensure_snap_gateway_config "$snap_config"); then
-  echo "FAIL: Snap gateway config bootstrap should create a missing config" >&2
-  exit 1
-fi
-if ! grep -Fq 'allow_unauthenticated_users = true' "$snap_config"; then
-  echo "FAIL: Snap gateway config must permit the plaintext local CLI" >&2
-  exit 1
-fi
-if [[ -z $(find "$snap_config" -perm 600) ]]; then
-  echo "FAIL: Snap gateway config must be mode 0600" >&2
-  exit 1
-fi
-
-printf '\noperator setting = true\n' >>"$snap_config"
-cp "$snap_config" "${tmpdir}/snap-config-before"
-(as_root() { "$@"; }; ensure_snap_gateway_config "$snap_config")
-cmp -s "${tmpdir}/snap-config-before" "$snap_config"
-
-broken_config="${tmpdir}/broken-gateway.toml"
-ln -s "${tmpdir}/missing-gateway.toml" "$broken_config"
-(as_root() { "$@"; }; ensure_snap_gateway_config "$broken_config")
-if [[ $(readlink "$broken_config") != "${tmpdir}/missing-gateway.toml" ]]; then
-  echo "FAIL: Snap gateway config bootstrap replaced a broken operator symlink" >&2
-  exit 1
-fi
 
 attempts_file="${tmpdir}/docker-attempts"
 root_probes_file="${tmpdir}/docker-root-probes"
@@ -450,7 +440,11 @@ registration_calls_file="${tmpdir}/registration-calls"
 : >"$registration_calls_file"
 if ! (
   as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
   print_gateway_add_output() { :; }
+  info() { :; }
+  TARGET_USER=test-user
+  snap_gateway_uses_mtls() { return 0; }
   register_snap_gateway
 ) >"$out" 2>"$err"; then
   echo "FAIL: Snap gateway registration should succeed" >&2
@@ -458,9 +452,181 @@ if ! (
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
-if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: Snap gateway registration must use the Snap CLI as the target user" >&2
+if [ "$registration_calls" != "copy:client-bundle
+target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]; then
+  echo "FAIL: mTLS Snap gateway registration must copy the client bundle and use HTTPS" >&2
   printf '%s\n' "$registration_calls" >&2
+  exit 1
+fi
+
+: >"$registration_calls_file"
+if ! (
+  as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
+  print_gateway_add_output() { :; }
+  snap_gateway_uses_mtls() { return 1; }
+  register_snap_gateway
+) >"$out" 2>"$err"; then
+  echo "FAIL: legacy plaintext Snap gateway registration should succeed" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+registration_calls="$(cat "$registration_calls_file")"
+if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
+  echo "FAIL: legacy Snap gateway registration must use HTTP without copying certificates" >&2
+  printf '%s\n' "$registration_calls" >&2
+  exit 1
+fi
+if ! grep -Fq "without client authentication" "$err"; then
+  echo "FAIL: legacy Snap gateway registration must warn about unauthenticated access" >&2
+  exit 1
+fi
+
+assert_snap_listener_probe() {
+  local name=$1
+  local uses_mtls=$2
+  local expected=$3
+  local actual
+
+  actual="$(
+    as_root() { printf 'root:'; "$@"; }
+    curl() { printf '%s\n' "$*"; }
+    snap_gateway_uses_mtls() { [ "$uses_mtls" = "1" ]; }
+    info() { :; }
+    OPENSHELL_SNAP_TLS_DIR=/tls
+    wait_for_snap_gateway_listener >/dev/null
+    printf '%s\n' "$_last_output"
+  )"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_snap_listener_probe "mTLS snap probes HTTPS with the client bundle as root" 1 \
+  "root:-sS --max-time 2 --cacert /tls/ca.crt --cert /tls/client/tls.crt --key /tls/client/tls.key -o /dev/null https://127.0.0.1:17670/"
+assert_snap_listener_probe "legacy snap probes plaintext HTTP" 0 \
+  "-sS --max-time 2 -o /dev/null http://127.0.0.1:17670/"
+
+snap_tls_src="${tmpdir}/snap-tls"
+mkdir -p "${snap_tls_src}/client"
+printf 'ca\n' >"${snap_tls_src}/ca.crt"
+printf 'cert\n' >"${snap_tls_src}/client/tls.crt"
+printf 'key\n' >"${snap_tls_src}/client/tls.key"
+snap_user_home="${tmpdir}/snap-user-home"
+mkdir -p "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client"
+printf 'old key\n' >"${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
+chmod 644 "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
+(
+  as_root() { "$@"; }
+  as_target_user() { "$@"; }
+  TARGET_HOME="$snap_user_home"
+  OPENSHELL_SNAP_TLS_DIR="$snap_tls_src" copy_snap_client_bundle
+)
+snap_user_tls="${snap_user_home}/snap/openshell/common/.local/state/openshell/tls"
+for file in ca.crt client/tls.crt client/tls.key; do
+  if ! cmp -s "${snap_tls_src}/${file}" "${snap_user_tls}/${file}"; then
+    echo "FAIL: Snap client bundle copy missing ${file}" >&2
+    exit 1
+  fi
+  if [[ -z $(find "${snap_user_tls}/${file}" -perm 600) ]]; then
+    echo "FAIL: Snap client bundle ${file} must be mode 0600" >&2
+    exit 1
+  fi
+done
+if [[ -z $(find "$snap_user_tls" -maxdepth 0 -perm 700) ]]; then
+  echo "FAIL: Snap client bundle directory must be mode 0700" >&2
+  exit 1
+fi
+
+assert_user_gateway_service_failed() {
+  local name=$1
+  local unit_state=$2
+  local expected=$3
+  local actual=0
+
+  (
+    as_target_user() { printf '%s\n' "$unit_state"; }
+    user_gateway_service_failed
+  ) >/dev/null || actual=$?
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected status ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_user_gateway_service_failed "failed unit" $'ActiveState=failed\nSubState=failed' 0
+assert_user_gateway_service_failed "unit restarting after a failure" $'ActiveState=activating\nSubState=auto-restart' 0
+assert_user_gateway_service_failed "unit starting after a failure" $'ActiveState=activating\nSubState=start' 1
+assert_user_gateway_service_failed "running unit" $'ActiveState=active\nSubState=running' 1
+if (
+  as_target_user() { return 1; }
+  user_gateway_service_failed
+); then
+  echo "FAIL: unreachable user systemd must not count as a failed unit" >&2
+  exit 1
+fi
+
+# Runs the listener wait against an unreachable gateway and prints the number
+# of one second waits. The wait is expected to fail.
+run_listener_wait() {
+  local unit_state=$1
+  local sleeps_file="${tmpdir}/listener-sleeps"
+  shift
+
+  : >"$sleeps_file"
+  (
+    as_target_user() {
+      case "$1" in
+        systemctl) printf '%s\n' "$unit_state" ;;
+        *) return 7 ;;
+      esac
+    }
+    sleep() { printf '.' >>"$sleeps_file"; }
+    info() { :; }
+    dump_local_gateway_diagnostics() { echo "gateway diagnostics" >&2; }
+    TARGET_HOME="${tmpdir}/listener-home"
+    PLATFORM=linux
+    OPENSHELL_INSTALL_GATEWAY_TIMEOUT=5 wait_for_local_gateway_listener "$@"
+  ) >"$out" 2>"$err" && return 1
+  wc -c <"$sleeps_file" | tr -d ' '
+}
+
+listener_mtls_dir="${tmpdir}/listener-home/.config/openshell/gateways/openshell/mtls"
+mkdir -p "$listener_mtls_dir"
+: >"${listener_mtls_dir}/ca.crt"
+: >"${listener_mtls_dir}/tls.crt"
+: >"${listener_mtls_dir}/tls.key"
+
+restarting_unit=$'ActiveState=activating\nSubState=auto-restart'
+running_unit=$'ActiveState=active\nSubState=running'
+
+if [ "$(run_listener_wait "$restarting_unit" user_gateway_service_failed)" != "0" ]; then
+  echo "FAIL: a failed gateway service must stop the listener wait immediately" >&2
+  exit 1
+fi
+if [ "$(tail -n 1 "$err")" != "openshell: error: the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway" ]; then
+  echo "FAIL: a failed gateway service must end with the service error" >&2
+  cat "$err" >&2
+  exit 1
+fi
+if ! grep -Fq "gateway diagnostics" "$err"; then
+  echo "FAIL: a failed gateway service must dump diagnostics" >&2
+  exit 1
+fi
+
+if [ "$(run_listener_wait "$running_unit" user_gateway_service_failed)" != "5" ]; then
+  echo "FAIL: a running gateway service must not stop the listener wait" >&2
+  exit 1
+fi
+if ! grep -Fq "did not become reachable" "$err"; then
+  echo "FAIL: a running gateway service must end with the listener timeout" >&2
+  cat "$err" >&2
+  exit 1
+fi
+
+if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
+  echo "FAIL: the listener wait must ignore the service state without a check" >&2
   exit 1
 fi
 

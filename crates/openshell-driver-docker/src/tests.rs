@@ -20,8 +20,34 @@ use openshell_core::proto::compute::v1::{
     ResourceRequirements, WorkloadIdentityRequest,
 };
 use std::fs;
+use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
+
+#[test]
+fn startup_error_log_tails_fit_grpc_header_budget() {
+    // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
+    // percent encoding. Preserve the supervisor's final diagnostic.
+    let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
+    let message = format!(
+        "Docker supervisor exited before becoming ready{}",
+        format_log_tail(&logs),
+    );
+    assert_eq!(message.matches("[truncated]").count(), 1);
+    assert_eq!(message.matches("startup timed out").count(), 1);
+    let response = Status::unavailable(message).into_http::<()>();
+    let header_bytes: usize = response
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    assert!(
+        header_bytes < 16 * 1024,
+        "status headers: {header_bytes} bytes"
+    );
+    assert_eq!(format_log_tail("small error"), "; log tail: small error");
+    assert!(format_log_tail("").is_empty());
+}
 
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
@@ -37,6 +63,7 @@ fn test_launch_authentication() -> Vec<u8> {
             gateway_expires_at: i64::MAX,
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
+            ssh_host_private_key: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -184,11 +211,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        supervisor_otlp_endpoint: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
-            cert: PathBuf::from("/tmp/tls.crt"),
-            key: PathBuf::from("/tmp/tls.key"),
         }),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
@@ -197,9 +223,172 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
+        proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
+}
+
+fn write_test_proxy_ca_bundle(directory: &TempDir) -> PathBuf {
+    let tls = generate_sandbox_tls_material(openshell_core::SandboxSessionId::new())
+        .expect("generate test proxy CA");
+    let path = directory.path().join("proxy-ca.pem");
+    fs::write(&path, tls.trust_anchor_pem).expect("write test proxy CA");
+    path
+}
+
+#[test]
+fn docker_config_parses_operator_proxy_ca_bundle() {
+    let config: DockerComputeConfig = toml::from_str(
+        r#"
+https_proxy = "https://proxy.corp.example:8443"
+proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
+"#,
+    )
+    .expect("parse Docker proxy CA configuration");
+
+    assert_eq!(
+        config.proxy_ca_bundle,
+        Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem"))
+    );
+}
+
+#[test]
+fn docker_proxy_ca_bundle_validation_is_fail_closed() {
+    let directory = TempDir::new().expect("create CA directory");
+    let ca_bundle = write_test_proxy_ca_bundle(&directory);
+    let gateway_bind_address = "127.0.0.1:17670".parse().unwrap();
+
+    let mut valid = DockerComputeConfig::default();
+    valid.upstream_proxy.https_proxy = Some("http://proxy.corp.example:8080".to_string());
+    valid.proxy_ca_bundle = Some(ca_bundle);
+    valid
+        .validate_configuration(gateway_bind_address)
+        .expect("a valid CA bundle is accepted with an HTTP interception proxy");
+
+    let mut without_proxy = valid.clone();
+    without_proxy.upstream_proxy.https_proxy = None;
+    let error = without_proxy
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a CA bundle without a proxy must fail");
+    assert!(error.to_string().contains("proxy_ca_bundle"), "{error}");
+    assert!(error.to_string().contains("https_proxy"), "{error}");
+
+    let mut empty_path = valid.clone();
+    empty_path.proxy_ca_bundle = Some(PathBuf::new());
+    let error = empty_path
+        .validate_configuration(gateway_bind_address)
+        .expect_err("an empty CA bundle path must fail");
+    assert!(error.to_string().contains("must not be empty"), "{error}");
+
+    let mut missing = valid.clone();
+    missing.proxy_ca_bundle = Some(directory.path().join("missing.pem"));
+    let error = missing
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a missing CA bundle must fail");
+    assert!(error.to_string().contains("could not be read"), "{error}");
+
+    let malformed_path = directory.path().join("malformed.pem");
+    fs::write(&malformed_path, "not a certificate\n").unwrap();
+    let mut malformed = valid;
+    malformed.proxy_ca_bundle = Some(malformed_path);
+    let error = malformed
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a certificate-free CA bundle must fail");
+    assert!(error.to_string().contains("no PEM certificate"), "{error}");
+}
+
+#[tokio::test]
+async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
+    let directory = TempDir::new().expect("create CA directory");
+    let mut config = DockerComputeConfig {
+        socket_path: Some(directory.path().join("unused-docker.sock")),
+        proxy_ca_bundle: Some(write_test_proxy_ca_bundle(&directory)),
+        ..DockerComputeConfig::default()
+    };
+    config.upstream_proxy.https_proxy = None;
+
+    let Err(error) =
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+    else {
+        panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
+    };
+
+    assert!(error.to_string().contains("proxy_ca_bundle"), "{error}");
+    assert!(error.to_string().contains("https_proxy"), "{error}");
+}
+
+#[test]
+fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
+    let proxy = UpstreamProxyConfig {
+        https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+        ..UpstreamProxyConfig::default()
+    };
+
+    let args = docker_upstream_proxy_cli_args(&proxy, true);
+    let option = args
+        .iter()
+        .position(|arg| arg == "--upstream-proxy-ca-bundle")
+        .expect("proxy CA option");
+    assert_eq!(
+        args.get(option + 1).map(String::as_str),
+        Some(SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH)
+    );
+    assert!(
+        !args.iter().any(|arg| arg.contains("/etc/openshell/tls")),
+        "gateway-host paths must not appear in supervisor argv: {args:?}"
+    );
+
+    let args = docker_upstream_proxy_cli_args(&proxy, false);
+    assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
+}
+
+#[test]
+fn docker_proxy_ca_bundle_is_staged_in_supervisor_archive() {
+    let directory = TempDir::new().expect("create CA directory");
+    let ca_bundle = write_test_proxy_ca_bundle(&directory);
+    let expected = fs::read_to_string(&ca_bundle).unwrap();
+    let mut builder = tar::Builder::new(Vec::new());
+
+    append_docker_proxy_ca_bundle(&mut builder, Some(&ca_bundle)).expect("append proxy CA bundle");
+    let archive = builder.into_inner().expect("finish proxy CA archive");
+    let mut archive = tar::Archive::new(archive.as_slice());
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().expect("proxy CA entry").unwrap();
+
+    assert_eq!(
+        entry.path().unwrap().as_ref(),
+        Path::new("upstream-proxy-ca-bundle.pem")
+    );
+    assert_eq!(entry.header().uid().unwrap(), u64::from(SUPERVISOR_UID));
+    assert_eq!(entry.header().gid().unwrap(), u64::from(SUPERVISOR_GID));
+    assert_eq!(entry.header().mode().unwrap(), 0o644);
+    let mut actual = String::new();
+    entry.read_to_string(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    assert!(entries.next().is_none());
+}
+
+#[test]
+fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "proxy_ca_bundle": "/workload/controlled-ca.pem"
+    })));
+
+    let error = DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect_err("sandbox driver config must not accept proxy_ca_bundle");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("unknown field"), "{error}");
+    assert!(error.message().contains("proxy_ca_bundle"), "{error}");
 }
 
 fn test_workload_identity() -> ResolvedWorkloadIdentity {
@@ -1203,6 +1392,21 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
+fn supervisor_tracing_environment_requires_an_endpoint() {
+    let mut config = runtime_config();
+    assert!(supervisor_tracing_environment(&config).is_empty());
+
+    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    assert_eq!(
+        supervisor_tracing_environment(&config),
+        [format!(
+            "{}=http://127.0.0.1:4317",
+            openshell_core::sandbox_env::OTLP_ENDPOINT
+        )]
+    );
+}
+
+#[test]
 fn boundary_environment_contains_only_driver_owned_values() {
     let env = build_boundary_environment(&test_sandbox(), &runtime_config());
 
@@ -1278,6 +1482,7 @@ fn container_creation_uses_inspected_immutable_image() {
     );
     assert_eq!(host.network_mode.as_deref(), Some("none"));
     assert_eq!(host.dns, Some(vec!["127.0.0.53".to_string()]));
+    assert_eq!(host.dns_search, Some(vec![".".to_string()]));
 }
 
 #[test]
@@ -2316,6 +2521,23 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 }
 
 #[test]
+fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+    for field in ["sandbox_runtime_image", "supervisor_image"] {
+        let template = DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                (field): "registry.example.com/openshell/runtime:untrusted"
+            }))),
+            ..Default::default()
+        };
+
+        let error = DockerSandboxDriverConfig::from_template(&template)
+            .expect_err("sandbox requests must not select trusted runtime images");
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;
@@ -2496,6 +2718,91 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
             .and_then(|host_config| host_config.device_requests.as_ref())
             .is_none()
     );
+}
+
+#[test]
+fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in ["example.com/gpu=0", "intel.com/gpu=0", "amd.com/gpu=0"] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit = build_container_create_body(&sandbox, &config).unwrap();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap();
+        for body in [explicit, resolved] {
+            let requests = body.host_config.unwrap().device_requests.unwrap();
+            assert_eq!(requests[0].driver.as_deref(), Some("cdi"));
+            assert_eq!(
+                requests[0].device_ids.as_ref().unwrap(),
+                &[device.to_string()]
+            );
+        }
+    }
+}
+
+#[test]
+fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in [
+        "/dev/sda",
+        "/dev",
+        "/dev/sda:/dev/sda:rwm",
+        "vendor/gpu=0/1",
+    ] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit_error = build_container_create_body(&sandbox, &config).unwrap_err();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved_error = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap_err();
+        for error in [explicit_error, resolved_error] {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("CDI qualified names"));
+        }
+    }
 }
 
 #[test]
@@ -2714,6 +3021,11 @@ fn build_container_create_body_disables_docker_networking() {
     );
     assert_eq!(host_config.extra_hosts, None);
     assert_eq!(host_config.dns, Some(vec!["127.0.0.53".to_string()]));
+    assert_eq!(
+        host_config.dns_search,
+        Some(vec![".".to_string()]),
+        "host search domains must not expand workload names before policy DNS"
+    );
 }
 
 #[test]
@@ -3067,18 +3379,19 @@ fn workload_mounts_only_the_shared_channel_volume() {
 }
 
 #[test]
-fn docker_guest_tls_paths_require_all_files_for_https() {
+fn docker_guest_tls_paths_accept_ca_only_for_https() {
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(&DockerComputeConfig {
+    let paths = docker_guest_tls_paths(&DockerComputeConfig {
         grpc_endpoint: "https://localhost:8443".to_string(),
-        guest_tls_ca: Some(ca),
+        guest_tls_ca: Some(ca.clone()),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(err.to_string().contains("guest_tls_cert"));
+    .unwrap()
+    .expect("CA-only TLS paths");
+    assert_eq!(paths.ca, ca.canonicalize().unwrap());
 }
 
 #[test]
@@ -3493,4 +3806,33 @@ fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
     ));
     assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
     assert_eq!(lookup.message, "inspect docker volume failed");
+}
+
+#[test]
+fn normalize_pull_reference_appends_latest_only_when_untagged() {
+    // A bare repository reference must resolve to a single tag so the daemon
+    // does not pull every tag in the repository (issue #4029).
+    assert_eq!(
+        normalize_pull_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    // An explicit tag is preserved untouched.
+    assert_eq!(normalize_pull_reference("foo:1.2"), "foo:1.2");
+    // A digest-pinned reference already names an exact image.
+    assert_eq!(
+        normalize_pull_reference(
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    // A registry port is not a tag, so `:latest` is still appended.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app"),
+        "registry:5000/team/app:latest"
+    );
+    // A registry port combined with an explicit tag is left unchanged.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app:v1"),
+        "registry:5000/team/app:v1"
+    );
 }

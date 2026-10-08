@@ -117,6 +117,7 @@ impl LocalBoundaryExec {
             stdout: Box::new(stdout),
             stderr: Some(Box::new(stderr)),
             terminal: None,
+            output_status: None,
         })
     }
 
@@ -167,7 +168,7 @@ impl LocalBoundaryExec {
             command.env("SHELL", shell);
         }
         for (key, value) in &self.user_environment {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }
@@ -183,7 +184,7 @@ impl LocalBoundaryExec {
         }
         crate::process::strip_proxy_env_std(&mut command);
         for (key, value) in &spec.env {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }
@@ -290,6 +291,7 @@ impl LocalBoundaryExec {
                 stdout,
                 stderr,
                 terminal: None,
+                output_status: None,
             }),
             process,
             armed: true,
@@ -386,6 +388,7 @@ impl LocalBoundaryExec {
                 stdout: Box::new(tokio::fs::File::from_std(output)),
                 stderr: None,
                 terminal: Some(terminal),
+                output_status: None,
             }),
             process,
             armed: true,
@@ -685,7 +688,17 @@ mod tests {
             .expect("start test workload launcher");
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
-                let _ = listener.respond_errno(notification.id, libc::EPERM);
+                let syscall = i64::from(notification.syscall);
+                if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                    let _ = listener.respond_continue(notification.id);
+                } else {
+                    #[cfg(target_arch = "x86_64")]
+                    if syscall == libc::SYS_open {
+                        let _ = listener.respond_continue(notification.id);
+                        continue;
+                    }
+                    let _ = listener.respond_errno(notification.id, libc::EPERM);
+                }
             }
         });
         LocalBoundaryExec::new(

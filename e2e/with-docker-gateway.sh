@@ -526,6 +526,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
 fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
+export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
 ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
 echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
@@ -605,8 +606,6 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 2\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n'
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n\n'      "$(toml_string "${PKI_DIR}/client/tls.key")"
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
     e2e_write_gateway_mtls_auth_config
@@ -638,8 +637,6 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-    printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-    printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
     printf 'enable_bind_mounts = true\n'
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
@@ -662,6 +659,8 @@ GATEWAY_ARGS=(
   --compute-driver docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
+  # edge_tunnel_e2e exercises the opt-in WebSocket tunnel.
+  --enable-websocket-tunnel true
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
 

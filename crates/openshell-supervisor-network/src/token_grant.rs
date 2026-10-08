@@ -421,12 +421,11 @@ fn supervisor_sandbox_id_from_env() -> Result<String> {
 }
 
 fn parse_provider_credential_key(key: &str) -> Result<(&str, &str)> {
-    let provider_and_credential = key
-        .rsplit_once('\t')
-        .map_or(key, |(_, provider_and_credential)| provider_and_credential);
-    provider_and_credential.split_once(':').ok_or_else(|| {
-        miette::miette!("dynamic token grant key is missing provider credential identity")
-    })
+    openshell_core::dynamic_credential_key::credential_identity(key)
+        .and_then(|identity| identity.split_once(':'))
+        .ok_or_else(|| {
+            miette::miette!("dynamic token grant key is missing provider credential identity")
+        })
 }
 
 struct TokenCacheKeyInput<'a> {
@@ -461,6 +460,151 @@ fn current_time_ms() -> i64 {
         .unwrap_or(Duration::from_secs(0))
         .as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+pub mod test_support {
+    //! Relay fixtures using the production token cache.
+    //!
+    //! Each resolver owns its cache. Only acquisition is synthetic: no SPIFFE
+    //! socket or OAuth service is contacted, and no process-wide cache is used.
+
+    use super::*;
+    use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
+    use std::collections::HashSet;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// One actual acquisition, excluding requests served from the cache.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CacheAcquisition {
+        pub(crate) provider_key: String,
+        pub(crate) audience: String,
+    }
+
+    struct RecordedAcquisition {
+        request: CacheAcquisition,
+        cache_key: String,
+    }
+
+    /// A private production cache with deterministic synthetic token acquisition.
+    ///
+    /// Misses return `inert-{audience}-{acquisition ordinal}`. The ordinal makes
+    /// reacquisition observable even when the provider and audience stay the same.
+    pub struct CachedTokenGrantResolver {
+        cache: TokenCache,
+        acquisitions: Mutex<Vec<RecordedAcquisition>>,
+    }
+
+    impl CachedTokenGrantResolver {
+        pub(crate) fn new() -> Self {
+            Self {
+                cache: TokenCache::new(),
+                acquisitions: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn acquisitions(&self) -> Vec<CacheAcquisition> {
+            self.acquisitions
+                .lock()
+                .expect("cached resolver acquisitions lock")
+                .iter()
+                .map(|acquisition| acquisition.request.clone())
+                .collect()
+        }
+
+        /// Expire acquired entries for `provider:credential` and audience.
+        ///
+        /// This changes only the timestamp, preserving the cached value so the
+        /// next request must pass the production expiry check to obtain a new
+        /// token. The returned count proves an entry was present; no sleep or
+        /// modification of the shared production cache is needed.
+        pub(crate) fn expire(&self, provider_identity: &str, audience: &str) -> usize {
+            let acquisitions = self
+                .acquisitions
+                .lock()
+                .expect("cached resolver acquisitions lock");
+            let keys = acquisitions
+                .iter()
+                .filter(|acquisition| {
+                    openshell_core::dynamic_credential_key::credential_identity(
+                        &acquisition.request.provider_key,
+                    ) == Some(provider_identity)
+                        && acquisition.request.audience == audience
+                })
+                .map(|acquisition| acquisition.cache_key.as_str())
+                .collect::<HashSet<_>>();
+            let mut cached = self.cache.tokens.write().expect("test token cache lock");
+            let mut expired = 0;
+            for key in keys {
+                if let Some(token) = cached.get_mut(key) {
+                    token.expires_at_ms = 0;
+                    expired += 1;
+                }
+            }
+            expired
+        }
+    }
+
+    impl TokenGrantResolver for CachedTokenGrantResolver {
+        fn obtain<'a>(
+            &'a self,
+            request: TokenGrantRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
+                    .map_err(|_| miette::miette!("unknown test token grant type"))?;
+                obtain_provider_token_with_grant(
+                    ObtainProviderTokenInput {
+                        cache: &self.cache,
+                        provider_name: request.provider_key,
+                        token_endpoint: request.token_endpoint,
+                        jwt_svid_audience: request.jwt_svid_audience,
+                        client_assertion_type: request.client_assertion_type,
+                        audience: request.audience,
+                        scopes: request.scopes,
+                        cache_ttl_override: request.cache_ttl,
+                        grant_type,
+                        requested_token_type: request.requested_token_type,
+                    },
+                    |jwt_audience| async move {
+                        let cache_key = token_cache_key(TokenCacheKeyInput {
+                            provider_name: request.provider_key,
+                            token_endpoint: request.token_endpoint,
+                            jwt_svid_audience: &jwt_audience,
+                            client_assertion_type: effective_client_assertion_type(
+                                request.client_assertion_type,
+                            ),
+                            audience: request.audience,
+                            scopes: request.scopes,
+                            grant_type,
+                            requested_token_type: effective_token_type(
+                                request.requested_token_type,
+                            ),
+                        });
+                        let mut acquisitions = self
+                            .acquisitions
+                            .lock()
+                            .expect("cached resolver acquisitions lock");
+                        let ordinal = acquisitions.len() + 1;
+                        acquisitions.push(RecordedAcquisition {
+                            request: CacheAcquisition {
+                                provider_key: request.provider_key.to_owned(),
+                                audience: request.audience.to_owned(),
+                            },
+                            cache_key,
+                        });
+                        Ok(OAuthTokenResponse {
+                            access_token: format!("inert-{}-{ordinal}", request.audience),
+                            token_type: "Bearer".to_owned(),
+                            expires_in: MAX_TOKEN_EXPIRES_IN_SECONDS,
+                        })
+                    },
+                )
+                .await
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -845,13 +989,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_credential_key_parser_ignores_revision_segment() {
+    fn provider_credential_key_parser_preserves_identity_and_rejects_extra_fields() {
         assert_eq!(
             parse_provider_credential_key(
                 "api.example.test\t443\t/v1/**\trev:42\tprovider:access_token"
             )
             .expect("parse provider credential key"),
             ("provider", "access_token")
+        );
+        assert!(
+            parse_provider_credential_key(
+                "api.example.test\t443\t/v1/**\towner\tprovider:a\tother:access_token"
+            )
+            .is_err()
         );
     }
 
@@ -898,6 +1048,69 @@ mod tests {
                     .unwrap()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn multiple_credentials_cache_and_expire_independently() {
+        let cache = TokenCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scopes = vec!["read".to_string()];
+        let service = "api.example.test\t443\t/v1/**\trev:1\tprovider:service";
+        let identity = "api.example.test\t443\t/v1/**\trev:1\tprovider:identity";
+        for (key, expected) in [(service, "token-1"), (identity, "token-2")] {
+            let token = obtain_counted_test_token(CountedTokenGrantInput {
+                cache: &cache,
+                provider_name: key,
+                token_endpoint: "https://auth.example.com/token",
+                jwt_svid_audience: "https://auth.example.com",
+                audience: "api://resource",
+                scopes: &scopes,
+                cache_ttl_override: None,
+                expires_in: 120,
+                grant_calls: calls.clone(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(token, expected);
+        }
+        let identity_cache_key = token_cache_key(TokenCacheKeyInput {
+            provider_name: identity,
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "api://resource",
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: ACCESS_TOKEN_TYPE,
+        });
+        cache.set(identity_cache_key, "expired".into(), current_time_ms() - 1);
+        let service_token = obtain_token_without_grant_call(
+            &cache,
+            service,
+            "https://auth.example.com/token",
+            "https://auth.example.com",
+            "api://resource",
+            &scopes,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(service_token, "token-1");
+        let identity_token = obtain_counted_test_token(CountedTokenGrantInput {
+            cache: &cache,
+            provider_name: identity,
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: None,
+            expires_in: 120,
+            grant_calls: calls.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(identity_token, "token-3");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

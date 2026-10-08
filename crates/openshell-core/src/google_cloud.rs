@@ -14,9 +14,14 @@
 /// Hostname served by the GCE metadata emulator via proxy interception.
 pub const METADATA_HOST: &str = "gcp.metadata.openshell.internal";
 
-/// Loopback address for the GCE metadata server inside sandbox namespaces.
+/// Reserved loopback destination relayed to the supervisor metadata emulator.
 /// Go's metadata client dials this directly (bypasses `HTTP_PROXY`).
 pub const METADATA_LOOPBACK_ADDR: &str = "127.0.0.1:8174";
+
+/// Match only the reserved metadata service, never a host cloud metadata IP.
+pub fn is_metadata_destination(destination: std::net::SocketAddr) -> bool {
+    destination == std::net::SocketAddr::from(([127, 0, 0, 1], 8174))
+}
 
 // ── Env var alias arrays ────────────────────────────────────────────────────
 
@@ -84,6 +89,21 @@ pub const STATIC_CONFIG_KEYS: &[&str] = &[
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn metadata_destination_matches_only_reserved_loopback_endpoint() {
+        assert!(is_metadata_destination(
+            METADATA_LOOPBACK_ADDR.parse().unwrap()
+        ));
+        for address in [
+            "127.0.0.1:8175",
+            "127.0.0.2:8174",
+            "169.254.169.254:80",
+            "[::1]:8174",
+        ] {
+            assert!(!is_metadata_destination(address.parse().unwrap()));
+        }
+    }
 
     #[test]
     fn static_config_keys_matches_alias_arrays_and_vertex_vars() {

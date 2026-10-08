@@ -29,7 +29,7 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -354,52 +354,149 @@ struct SessionConfig {
 }
 
 async fn run_session_loop(config: SessionConfig) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::new();
     let mut attempt: u64 = 0;
+
+    // The gateway may hand this sandbox to the replica that should own it. We
+    // dial `target` for the next attempt and mark it as redirected so that
+    // replica serves us rather than redirecting again. Any failure sends us
+    // back to the configured address, which load-balances across replicas.
+    let mut target = config.endpoint.clone();
+    let mut redirected = false;
 
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config, attempt).await;
+        let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
         match result {
-            Ok(()) => {
+            Ok(SessionOutcome::Closed) => {
                 config.ready_tx.send_replace(false);
-                let event = session_closed_event(
-                    openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
-                    &config.sandbox_id,
-                );
+                let event =
+                    session_closed_event(openshell_ocsf::ctx::ctx(), &target, &config.sandbox_id);
                 ocsf_emit!(event);
                 break;
             }
+            Ok(SessionOutcome::Redirect {
+                peer_endpoint,
+                owner_replica_id,
+            }) => {
+                backoff.on_redirect(config.ready_tx.send_replace(false));
+                info!(
+                    sandbox_id = %config.sandbox_id,
+                    owner_replica_id = %owner_replica_id,
+                    peer_endpoint = %peer_endpoint,
+                    "supervisor session: following gateway redirect"
+                );
+                target = peer_endpoint;
+                redirected = true;
+                // No backoff: this is an expected handoff, not a failure.
+            }
             Err(e) => {
-                config.ready_tx.send_replace(false);
+                let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
+                    &target,
                     attempt,
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                // Fall back to the configured gateway address so a redirect
+                // to a replica that is going away cannot strand the sandbox.
+                let failed_redirect_target = target != config.endpoint && !accepted;
+                target.clone_from(&config.endpoint);
+                redirected = redirect_survives_failure(redirected, accepted);
+                if let Some(delay) = backoff.on_failure(accepted, failed_redirect_target) {
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
     }
 }
 
+/// Reconnect delays for the supervisor session loop.
+///
+/// Delays double up to [`MAX_BACKOFF`] while reconnects keep failing. A session
+/// the gateway accepted proves the path works again, so its loss starts the
+/// delays over. Without that reset, every gateway restart over the sandbox's
+/// lifetime would compound until each reconnect waited the full maximum.
+#[derive(Debug)]
+struct ReconnectBackoff {
+    delay: Duration,
+    skipped_since_accept: bool,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            delay: INITIAL_BACKOFF,
+            skipped_since_accept: false,
+        }
+    }
+
+    /// Record a gateway redirect. Following it is an expected handoff, so the
+    /// supervisor reconnects without waiting.
+    fn on_redirect(&mut self, accepted: bool) {
+        if accepted {
+            *self = Self::new();
+        }
+    }
+
+    /// Record a failed or dropped session and return how long to wait before
+    /// the next attempt, or `None` to reconnect at once.
+    fn on_failure(&mut self, accepted: bool, failed_redirect_target: bool) -> Option<Duration> {
+        if accepted {
+            *self = Self::new();
+        }
+        if skip_backoff(failed_redirect_target, self.skipped_since_accept) {
+            self.skipped_since_accept = true;
+            return None;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(MAX_BACKOFF);
+        Some(delay)
+    }
+}
+
+/// Keep asking not to be redirected when a redirected attempt never got a
+/// session, so a stale ring pointing at a dead replica cannot bounce us back
+/// to it. A session that was accepted and later dropped starts placement over.
+fn redirect_survives_failure(redirected: bool, accepted: bool) -> bool {
+    redirected && !accepted
+}
+
+/// A failed redirect target goes straight back to the configured endpoint, but
+/// only once until a session is accepted, so a draining gateway and a dead
+/// target cannot bounce the supervisor without backing off.
+fn skip_backoff(failed_redirect_target: bool, skipped_since_accept: bool) -> bool {
+    failed_redirect_target && !skipped_since_accept
+}
+
+/// How a session ended, when it ended without an error.
+enum SessionOutcome {
+    /// The gateway closed the session normally.
+    Closed,
+    /// The gateway declined to own this sandbox and named the replica that
+    /// should. The caller reconnects there once.
+    Redirect {
+        peer_endpoint: String,
+        owner_replica_id: String,
+    },
+}
+
 async fn run_single_session(
     config: &SessionConfig,
+    target: &str,
+    redirected: bool,
     connection_epoch: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let channel = grpc_client::connect_channel_pub(target)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -415,6 +512,8 @@ async fn run_single_session(
             instance_id: config.instance_id.clone(),
             connection_epoch,
             supports_provider_readiness: true,
+            redirected,
+            supports_session_redirect: true,
         })),
     })
     .await
@@ -438,6 +537,12 @@ async fn run_single_session(
         Some(gateway_message::Payload::SessionRejected(r)) => {
             return Err(format!("session rejected: {}", r.reason).into());
         }
+        Some(gateway_message::Payload::SessionRedirect(r)) => {
+            return Ok(SessionOutcome::Redirect {
+                peer_endpoint: r.peer_endpoint,
+                owner_replica_id: r.owner_replica_id,
+            });
+        }
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
@@ -451,7 +556,7 @@ async fn run_single_session(
     }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        &config.endpoint,
+        target,
         &accepted.session_id,
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
@@ -471,8 +576,19 @@ async fn run_single_session(
                     &config.terminating,
                 )? {
                     SessionStreamMessage::Message(msg) => msg,
-                    SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
+                    SessionStreamMessage::ExpectedShutdownClose => {
+                        return Ok(SessionOutcome::Closed);
+                    }
                 };
+                if let Some(gateway_message::Payload::SessionRedirect(r)) = &msg.payload {
+                    if supervisor_is_terminating(&config.terminating) {
+                        return Ok(SessionOutcome::Closed);
+                    }
+                    return Ok(SessionOutcome::Redirect {
+                        peer_endpoint: r.peer_endpoint.clone(),
+                        owner_replica_id: r.owner_replica_id.clone(),
+                    });
+                }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
@@ -520,6 +636,22 @@ pub async fn report_main_process_exit(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn test_bridge_ssh_relay(
+    target: tokio::net::UnixStream,
+    inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
+    out_tx: mpsc::Sender<RelayFrame>,
+) {
+    let _ = bridge_relay(
+        Box::new(target),
+        tokio_stream::wrappers::ReceiverStream::new(inbound),
+        out_tx,
+        "half-open-test".into(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
 }
 
 /// Confirm terminal delivery and permit ephemeral cleanup.
@@ -687,18 +819,67 @@ async fn handle_relay_open(
         }
         Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
     };
-    let mut inbound = response.into_inner();
+    bridge_relay(
+        target,
+        response.into_inner(),
+        out_tx,
+        channel_id,
+        terminating,
+    )
+    .await
+}
 
+/// Forward the relay's data frames without interpreting the target protocol.
+async fn bridge_relay(
+    target: Box<dyn TargetStream>,
+    inbound: impl tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    channel_id: String,
+    terminating: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the local SSH daemon on its Unix socket.
-    let (mut target_r, mut target_w) = tokio::io::split(target);
+    let (target_r, target_w) = tokio::io::split(target);
 
     debug!(
         channel_id = %channel_id,
         "relay bridge: connected to local target"
     );
 
+    bridge_relay_bytes(
+        &channel_id,
+        target_r,
+        target_w,
+        out_tx,
+        inbound,
+        &terminating,
+    )
+    .await
+}
+
+/// Bridge bytes between a local target socket and an inbound `RelayFrame`
+/// stream, sending target bytes out through `out_tx`.
+///
+/// `out_tx` is moved into the target-reading task rather than cloned. A
+/// clone would let the sender-side task's copy be dropped on target EOF
+/// while this function's own copy stayed alive until `inbound` also ended,
+/// which keeps the outbound gRPC stream open indefinitely after the target
+/// closes. Moving it in means the outbound stream (and therefore the
+/// client's view of the connection) closes as soon as the target does,
+/// regardless of whether the client side has sent anything else.
+async fn bridge_relay_bytes<S>(
+    channel_id: &str,
+    mut target_r: impl AsyncRead + Unpin + Send + 'static,
+    mut target_w: impl AsyncWrite + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    mut inbound: S,
+    terminating: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+{
     // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
-    let out_tx_writer = out_tx.clone();
+    // `out_tx` is owned by this task, so dropping it on target EOF ends the
+    // outbound stream immediately, without waiting on the inbound side.
     let target_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
@@ -710,7 +891,7 @@ async fn handle_relay_open(
                             buf[..n].to_vec(),
                         )),
                     };
-                    if out_tx_writer.send(chunk).await.is_err() {
+                    if out_tx.send(chunk).await.is_err() {
                         break;
                     }
                 }
@@ -737,7 +918,7 @@ async fn handle_relay_open(
                 }
             }
             Err(e) => {
-                if expected_transport_close_during_shutdown(&e, &terminating) {
+                if expected_transport_close_during_shutdown(&e, terminating) {
                     debug!(
                         channel_id = %channel_id,
                         error = %e,
@@ -753,10 +934,6 @@ async fn handle_relay_open(
 
     // Half-close the target socket's write side so the service sees EOF.
     let _ = target_w.shutdown().await;
-
-    // Dropping out_tx closes the outbound gRPC stream, letting the gateway
-    // observe EOF on its side too.
-    drop(out_tx);
     let _ = target_to_grpc.await;
 
     if let Some(e) = inbound_err {
@@ -939,6 +1116,7 @@ mod ocsf_event_tests {
             product_version: "0.0.1".into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         }
     }
 
@@ -1164,6 +1342,58 @@ mod ocsf_event_tests {
         assert!(err.to_string().contains("policy evaluation failed"));
     }
 
+    #[test]
+    fn failed_redirect_is_served_on_the_next_attempt() {
+        assert!(redirect_survives_failure(true, false));
+        assert!(!redirect_survives_failure(true, true));
+        assert!(!redirect_survives_failure(false, false));
+        assert!(!redirect_survives_failure(false, true));
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_a_session_is_accepted() {
+        let mut backoff = ReconnectBackoff::new();
+        let delays: Vec<_> = (0..7)
+            .map(|_| backoff.on_failure(false, false).unwrap())
+            .collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs).to_vec()
+        );
+
+        // Losing an accepted session starts over instead of waiting the maximum.
+        assert_eq!(backoff.on_failure(true, false), Some(INITIAL_BACKOFF));
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF * 2));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_when_an_accepted_session_redirects() {
+        let mut backoff = ReconnectBackoff::new();
+        for _ in 0..5 {
+            backoff.on_failure(false, false);
+        }
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn reconnect_backoff_skips_one_failed_redirect_target_per_accepted_session() {
+        let mut backoff = ReconnectBackoff::new();
+        assert_eq!(backoff.on_failure(false, true), None);
+        assert_eq!(backoff.on_failure(false, true), Some(INITIAL_BACKOFF));
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, true), None);
+    }
+
+    #[test]
+    fn backoff_is_skipped_once_per_accepted_session() {
+        assert!(skip_backoff(true, false));
+        assert!(!skip_backoff(true, true));
+        assert!(!skip_backoff(false, false));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ssh_target_requires_authenticated_supervisor_peer_pid() {
@@ -1199,5 +1429,137 @@ mod ocsf_event_tests {
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();
+    }
+
+    /// Regression test for #3724: when the target closes after sending
+    /// data, the outbound relay stream must close too, even though the
+    /// inbound (client) side is still open. Before the fix, `out_tx` was
+    /// cloned into the target-reading task, so the function's own copy kept
+    /// the outbound stream alive until `inbound` also ended.
+    #[tokio::test]
+    async fn bridge_closes_outbound_when_target_closes_first() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+
+        // Inbound stream the client never closes during this test.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-1", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"hello").await.unwrap();
+        remote.shutdown().await.unwrap();
+
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"hello".to_vec()
+            ))
+        );
+
+        // The outbound stream must end here, without the inbound side (still
+        // held open by `inbound_tx`) ending first.
+        assert!(
+            out_rx.recv().await.is_none(),
+            "outbound stream should close once the target closes"
+        );
+
+        drop(inbound_tx);
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly when target closes first");
+    }
+
+    /// A target that half-closes its output must still receive client data.
+    #[tokio::test]
+    async fn bridge_forwards_client_data_after_target_half_close() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-3", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"ready").await.unwrap();
+        remote.shutdown().await.unwrap();
+        assert!(out_rx.recv().await.is_some(), "greeting frame expected");
+        assert!(out_rx.recv().await.is_none(), "outbound should close");
+
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"upload".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 6];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"upload");
+
+        drop(inbound_tx);
+        bridge.await.unwrap().expect("bridge should finish cleanly");
+    }
+
+    /// A well-behaved round trip: bytes flow both directions and the bridge
+    /// ends cleanly when the client closes its side.
+    #[tokio::test]
+    async fn bridge_round_trips_bytes_until_client_closes() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-2", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        // Client -> target.
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"ping".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Target -> client.
+        remote.write_all(b"pong").await.unwrap();
+        let frame = out_rx.recv().await.expect("data frame expected");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::relay_frame::Payload::Data(
+                b"pong".to_vec()
+            ))
+        );
+
+        // Client closes its side first; the bridge should still complete
+        // once the target also closes.
+        drop(inbound_tx);
+        remote.shutdown().await.unwrap();
+
+        bridge
+            .await
+            .unwrap()
+            .expect("bridge should finish cleanly on an ordinary round trip");
     }
 }

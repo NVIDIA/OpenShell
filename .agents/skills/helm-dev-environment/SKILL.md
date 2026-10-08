@@ -38,8 +38,8 @@ and preloads the default sandbox image into k3d so the first sandbox create
 does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
-current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
-`openshell-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
+current git branch (e.g. branch `chore/1234-local-dev/octocat` → cluster
+`openshell-dev-octocat`). Each worktree therefore gets its own isolated cluster and its
 own `kubeconfig` file. Override with `HELM_K3S_CLUSTER_NAME` to force a specific name
 or share one cluster across worktrees.
 
@@ -83,7 +83,10 @@ capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
 workload Pod. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. The default Skaffold values export
+generates gateway and CLI TLS secrets on first install. Supervisor Pods project
+only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
+client certificates and private keys remain outside supervisor and workload Pods.
+The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 
@@ -446,6 +449,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |

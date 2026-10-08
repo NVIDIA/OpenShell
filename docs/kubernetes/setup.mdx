@@ -9,10 +9,6 @@ position: 1
 ---
 
 <Warning>
-The OpenShell Helm chart is experimental and under active development. Templates, values, and defaults can change between releases. Do not use it in production.
-</Warning>
-
-<Warning>
 Your cluster MUST use a CNI that enforces Kubernetes `NetworkPolicy` for both
 ingress and egress in every sandbox namespace. OpenShell creates the policies,
 but Kubernetes accepts them even when no CNI enforces them. Without enforcement,
@@ -20,7 +16,21 @@ sandbox workloads may reach the network directly and bypass supervisor policy.
 Verify CNI support before installing OpenShell.
 </Warning>
 
-Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart handles PKI bootstrap, RBAC, sandbox namespace setup, and the gateway workload. It uses a StatefulSet by default for the SQLite database, and can render a Deployment when `server.externalDbSecret` points at an external database.
+![OpenShell on Kubernetes: the gateway provisions a Sandbox resource, separate supervisor and workload Pods, a boundary Service, NetworkPolicy, and a workspace PVC.](../images/openshell-kubernetes-runtime.svg)
+
+The gateway's Kubernetes compute driver creates a `Sandbox` resource and a
+separate supervisor Pod. The Agent Sandbox controller creates the workload Pod
+from that resource. A Service gives the supervisor a stable address for the
+workload's authenticated TLS boundary, and a PVC preserves `/sandbox` across
+Pod restarts. The gateway can run in the same namespace as these resources or
+in a separate namespace.
+
+The supervisor opens the boundary connection and maintains an outbound session
+to the gateway. A `NetworkPolicy` allows only supervisor ingress to the
+workload's boundary port and denies new workload-initiated connections. Agent
+network requests return on the established channel; the supervisor evaluates
+policy and opens approved upstream connections. For the trust boundaries and
+request flow, see [Architecture](/about/architecture).
 
 ## Prerequisites
 
@@ -163,7 +173,7 @@ helm upgrade --install openshell \
 The driver stores every credential in that namespace, in every workspace mode.
 The gateway receives Secret permissions through a Role in that namespace only. For
 the full set of options, refer to the
-[gateway configuration reference](/reference/gateway-config#credential-drivers).
+[gateway configuration reference](/how-it-works/gateways/configuration#credential-drivers).
 
 ## Wait for the gateway to be ready
 
@@ -220,6 +230,41 @@ openshell status
 
 ## Configure Chart Values
 
+The Helm chart renders `gatewayConfig` into the mounted `gateway.toml`
+ConfigMap. Each top-level key names a TOML table, and its fields use the names
+in the [gateway configuration reference](/how-it-works/gateways/configuration).
+For example, set the gateway log level with:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set 'gatewayConfig.openshell\.gateway.log_level=debug'
+```
+
+Keep credentials, database URLs, and private keys in Kubernetes Secrets,
+using the chart's environment-variable, file, or volume wiring. The chart
+rejects `database_url`, inline URL credentials, and PEM private keys in
+`gatewayConfig`, but it does not detect every possible secret.
+
+Helm values for Services, probes, TLS certificates, Secret references, RBAC,
+NetworkPolicies, and mounts still control those Kubernetes resources. The
+chart derives their corresponding runtime settings to keep the gateway
+configuration aligned with the deployed resources.
+
+YAML scalar values retain their types, scalar lists become TOML arrays, and
+nested maps become inline tables. Top-level lists become arrays of tables and
+preserve item order. Null fields are omitted; null array elements are invalid.
+Helm template expressions in strings are not evaluated.
+
+Existing application values remain supported as deprecated aliases. Explicit
+`gatewayConfig` fields take precedence, including resource-admission settings
+and the Kubernetes Secrets credential namespace. The global image pull policy
+applies to runtime and supervisor images. Leave `image_pull_policy` and
+`sandbox.image.pullPolicy` unset to use Kubernetes defaults for the workload
+image.
+
 The most commonly changed values are:
 
 | Value | Purpose |
@@ -229,6 +274,7 @@ The most commonly changed values are:
 | `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
+| `autoscaling.enabled` / `autoscaling.minReplicas` / `autoscaling.maxReplicas` | Render a HorizontalPodAutoscaler instead of a fixed `replicaCount`. Refer to [High Availability](/kubernetes/high-availability#scale-the-gateway). |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
@@ -244,12 +290,6 @@ The most commonly changed values are:
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
-
-### Run multiple gateway replicas
-
-Use a Deployment and shared PostgreSQL to run more than one gateway replica.
-Refer to [High Availability](/kubernetes/high-availability) for the database
-Secret, Helm values, pod placement, verification, and failover behavior.
 
 Use a values file for repeatable deployments:
 
@@ -316,7 +356,10 @@ The chart creates the following RBAC resources in the release namespace:
 | ServiceAccount | Namespace | `openshell` |
 | ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
 | Role + RoleBinding | Namespace | `openshell-sandbox` |
-| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader` |
+| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader-<release namespace>` |
+
+Every other object the chart creates is namespaced. The `ClusterRole` and
+`ClusterRoleBinding` in the last row are the only cluster-scoped objects.
 
 When the Kubernetes Secrets credential driver is enabled, the chart also creates
 an `openshell-credential-secrets` Role and RoleBinding in the credential
@@ -359,6 +402,118 @@ helm upgrade --install openshell \
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
 
+### Installing without cluster-admin
+
+By default the release creates the `ClusterRole` and `ClusterRoleBinding`, so
+the installer needs cluster-scoped permissions. When cluster-scoped RBAC is
+owned by a different team, or the installer is a namespace-admin GitOps
+controller, split the install into a cluster-admin step and a namespace-admin
+step.
+
+A cluster-admin applies the cluster-scoped objects once per gateway
+ServiceAccount. Render them from the same values the release uses, so the rules
+match the configured workspace mode and credential driver:
+
+```shell
+helm template openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
+```
+
+A namespace-admin then installs and upgrades the chart with cluster-scoped
+objects omitted. The release renders only namespaced objects and needs no
+permission on `clusterroles` or `clusterrolebindings`:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.clusterScoped.create=false
+```
+
+The gateway ServiceAccount name and namespace are unchanged by this flag, so
+the pre-created `ClusterRoleBinding` still binds the ServiceAccount the
+namespaced release creates. The same holds with `serviceAccount.create=false`:
+the binding subject follows `serviceAccount.name`, so pass the same values to
+both steps.
+
+#### Migrating an existing release
+
+Helm deletes objects that leave a release manifest, so setting
+`rbac.clusterScoped.create=false` on a release that already owns the
+`ClusterRole` and `ClusterRoleBinding` deletes them. The gateway then loses
+TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
+cluster-admin, so nothing is deleted:
+
+```shell
+kubectl annotate clusterrole "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+```
+
+The objects then survive the upgrade that sets the flag, and the cluster-admin
+owns them from that point on. Fresh installs need no such step.
+
+`rbac.clusterScoped.create` is independent of the workspace mode. `managed` and
+`operator` modes change what the `ClusterRole` grants, but they never require a
+namespace-admin to apply it. Re-run the cluster-admin step after changing any
+value that affects the `ClusterRole` rules.
+
+Set `rbac.clusterScoped.clusterRoleName` and
+`rbac.clusterScoped.clusterRoleBindingName` when the cluster-admin owns the
+naming.
+
+#### Which flag the installer needs
+
+In the default `shared` workspace mode the release also creates a namespaced
+sandbox `Role` granting Agent Sandbox (`agents.x-k8s.io`) permissions.
+Kubernetes forbids granting permissions you do not hold, and the built-in
+`admin` ClusterRole does not cover that CRD, so an installer holding only
+`admin` cannot create it. `rbac.clusterScoped.create=false` alone is then not
+enough, and the install fails with `attempting to grant RBAC permissions not
+currently held`.
+
+| Workspace mode | Installer holds | Use |
+|---|---|---|
+| `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
+| `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+
+`managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
+is needed there.
+
+With `rbac.create=false`, the cluster-admin applies the namespaced RBAC in the
+same step by adding it to the render:
+
+```shell
+helm template openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml \
+  --show-only templates/role.yaml \
+  --show-only templates/rolebinding.yaml \
+  --show-only templates/peer-role.yaml | kubectl apply -f -
+```
+
+To grant the installer the sandbox permissions instead, bind it to a Role
+carrying the same rules as the chart's `openshell-sandbox` Role.
+
 ## Probes
 
 The gateway exposes `/healthz` for process liveness and `/readyz` for dependency-aware readiness on the health port. The Helm chart wires both into Kubernetes probes:
@@ -366,11 +521,12 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 - `startupProbe` and `livenessProbe` use `/healthz`.
 - `readinessProbe` uses `/readyz`, which reflects the latest result of an in-process background database check.
 
+Each sandbox supervisor Pod uses a `tcpSocket` readiness probe on port 5501. The supervisor accepts connections on that port only while its gateway session is ready. If you add a default-deny ingress policy to sandbox namespaces, allow TCP port 5501 from the node so kubelet can reach supervisor Pods.
+
 ## Next Steps
 
-- Kubernetes sandboxes use separate workload and directly managed supervisor Pods; refer to [Sandbox runtime](/kubernetes/sandbox-runtime).
 - To run multiple gateway replicas, refer to [High Availability](/kubernetes/high-availability).
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally without port-forwarding, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC or reverse-proxy authentication, refer to [Access Control](/kubernetes/access-control).
-- To create your first sandbox, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
+- To create your first sandbox, refer to [Manage Sandboxes](/how-it-works/sandboxes/overview).

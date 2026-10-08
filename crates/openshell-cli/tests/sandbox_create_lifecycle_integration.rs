@@ -27,8 +27,9 @@ use openshell_core::proto::{
     ReportEndpointStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
     SandboxCondition, SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus,
     SandboxStreamEvent, SandboxTemplateResponse, SandboxWorkloadTemplate, ServiceStatus,
-    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event,
+    SettingValue, SupervisorMessage, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event, tcp_forward_frame,
+    tcp_forward_init,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -70,12 +71,20 @@ struct SandboxState {
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    ready_before_create_returns: Arc<AtomicBool>,
     terminal_before_relay: Arc<AtomicBool>,
     terminal_after_provisional_container_exit: Arc<AtomicBool>,
     provisional_container_exit_without_result: Arc<AtomicBool>,
     provisional_container_exit_sent: Arc<Notify>,
     ssh_session_failures_remaining: Arc<AtomicUsize>,
     ssh_session_requests: Arc<AtomicUsize>,
+    ssh_session_revocations: Arc<AtomicUsize>,
+    /// Reject token-less `ForwardTcp` inits the way a gateway that predates
+    /// principal-authorized TCP forwards does.
+    forward_requires_session_token: Arc<AtomicBool>,
+    /// Every `TcpForwardInit` received, including rejected ones.
+    forward_inits: Arc<Mutex<Vec<TcpForwardInit>>>,
+    forward_token_rejections: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
     providers: Arc<Mutex<Vec<Provider>>>,
@@ -194,7 +203,17 @@ impl OpenShell for TestOpenShell {
             }),
             ..Sandbox::default()
         };
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox.set_phase(
+            if self
+                .state
+                .ready_before_create_returns
+                .load(Ordering::SeqCst)
+            {
+                SandboxPhase::Ready as i32
+            } else {
+                SandboxPhase::Provisioning as i32
+            },
+        );
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
@@ -508,6 +527,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
+        self.state
+            .ssh_session_revocations
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
@@ -677,6 +699,10 @@ impl OpenShell for TestOpenShell {
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let ready_before_create_returns = self
+            .state
+            .ready_before_create_returns
+            .load(Ordering::SeqCst);
         let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
         let terminal_after_provisional_container_exit = self
             .state
@@ -723,6 +749,18 @@ impl OpenShell for TestOpenShell {
             }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            if ready_before_create_returns {
+                // A watch starts with the current snapshot. Keep it open so
+                // stream closure cannot hide a client that ignores Ready.
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
+                    }))
+                    .await;
+                tx.closed().await;
+                return;
+            }
             let mut completed = provisioning.clone();
             completed.status = Some(SandboxStatus {
                 exit_code: Some(0),
@@ -1064,15 +1102,60 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::TcpForwardFrame, Status>,
-    >;
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<Result<TcpForwardFrame, Status>>;
 
+    /// Echo relay: validates the init frame like the gateway does, then sends
+    /// every `Data` frame straight back.
     async fn forward_tcp(
         &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+        request: tonic::Request<tonic::Streaming<TcpForwardFrame>>,
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let mut inbound = request.into_inner();
+        let Some(TcpForwardFrame {
+            payload: Some(tcp_forward_frame::Payload::Init(init)),
+        }) = inbound.message().await?
+        else {
+            return Err(Status::invalid_argument(
+                "first TcpForwardFrame must be init",
+            ));
+        };
+        self.state.forward_inits.lock().await.push(init.clone());
+        if init.authorization_token.is_empty() {
+            if self
+                .state
+                .forward_requires_session_token
+                .load(Ordering::SeqCst)
+            {
+                self.state
+                    .forward_token_rejections
+                    .fetch_add(1, Ordering::SeqCst);
+                // Verbatim status of a gateway that still requires a session
+                // token for every ForwardTcp stream.
+                return Err(Status::unauthenticated(
+                    "authorization_token is required for ForwardTcp",
+                ));
+            }
+        } else if init.authorization_token != "test-token" {
+            return Err(Status::unauthenticated("SSH session token not found"));
+        }
+
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = inbound.message().await {
+                let Some(tcp_forward_frame::Payload::Data(data)) = frame.payload else {
+                    continue;
+                };
+                let echo = TcpForwardFrame {
+                    payload: Some(tcp_forward_frame::Payload::Data(data)),
+                };
+                if tx.send(Ok(echo)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn create_workspace(
@@ -2373,6 +2456,55 @@ async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
 }
 
 #[tokio::test]
+async fn sandbox_create_accepts_ready_before_create_returns() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .ready_before_create_returns
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("already-ready"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        ),
+    )
+    .await
+    .expect("creation must finish while the watch remains open")
+    .expect("an already-Ready sandbox must not wait for a new provisioning transition");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        1,
+        "the initial Ready snapshot must allow the command to attach"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
     let server = run_server().await;
     server
@@ -2784,6 +2916,8 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
             name: Some("sandbox"),
             keep: false,
             expose: Some(4500),
+            expose_authorization_mode:
+                openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
             detach: true,
             ..test_config()
         },
@@ -2799,7 +2933,36 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
     assert_eq!(create_requests[0].service_exposures.len(), 1);
     assert_eq!(create_requests[0].service_exposures[0].service, "");
     assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+    assert_eq!(
+        create_requests[0].service_exposures[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
     assert!(expose_service_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn service_expose_forwards_bearer_passthrough_mode() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::service_expose(
+        &server.endpoint,
+        "sandbox",
+        "codex",
+        4500,
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        "default",
+        &tls,
+    )
+    .await
+    .expect("service expose should succeed");
+
+    let requests = expose_service_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
 }
 
 #[tokio::test]
@@ -3062,6 +3225,122 @@ async fn run_cli_sandbox_create(
     let xdg_dir = tempfile::tempdir().unwrap();
     prepare_cli_xdg(server, &xdg_dir);
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_is_rejected_before_provisioning_when_planning_fails() {
+    let server = run_server().await;
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("runs")).unwrap();
+    fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
+    fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+    let plain = tempfile::tempdir().unwrap();
+    fs::write(plain.path().join("ok.txt"), "ok").unwrap();
+
+    // A broken repository must not be mistaken for a non-repository source.
+    fs::create_dir(source.path().join(".git")).unwrap();
+    let path = source.path().join("runs");
+    let args = ["--detach", "--upload", path.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-no-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("Git filtering failed"), "{stderr}");
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(!stderr.contains("was created"), "{stderr}");
+
+    fs::remove_dir(source.path().join(".git")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = run_cli_sandbox_create(&server, "upload-empty-selection", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+    assert!(
+        stderr.contains("Git returned 0 uploadable paths"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(!stderr.contains("was created"), "{stderr}");
+
+    // A valid earlier upload must not get through when a later one is rejected.
+    let args = [
+        "--detach",
+        "--upload",
+        plain.path().to_str().unwrap(),
+        "--upload",
+        path.to_str().unwrap(),
+    ];
+    let result = run_cli_sandbox_create(&server, "upload-later-rejected", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+
+    let missing = plain.path().join("missing");
+    let args = ["--detach", "--upload", missing.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-missing", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("local path does not exist"), "{stderr}");
+
+    assert_eq!(
+        create_requests(&server).await.len(),
+        0,
+        "a rejected upload plan must not provision a sandbox",
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0,
+        "a rejected upload plan must not open an SSH session",
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("marker.txt"), "dummy content").unwrap();
+    let args = ["--detach", "--upload", source.path().to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-non-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // The fake SSH transport fails; preflight must still let it try.
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("outside a Git work tree"), "{stderr}");
+    assert!(
+        stderr.contains(".gitignore rules are not applied"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+    // A transfer failure after provisioning keeps the sandbox and says so.
+    assert!(
+        stderr.contains("Sandbox 'upload-non-repository' was created and still exists"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst)
+            > 0,
+        "an upload outside a repository must reach the SSH transport",
+    );
 }
 
 async fn run_cli_sandbox_template_create(
@@ -3364,4 +3643,168 @@ async fn sandbox_template_create_suppresses_credential_env_warnings() {
 
     let requests = template_create_requests(&server).await;
     assert_eq!(requests.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// `openshell forward service` (`run::service_forward_tcp`)
+// ---------------------------------------------------------------------------
+
+/// Pick a free loopback port for the forward to bind.
+fn reserve_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn spawn_service_forward(
+    server: &TestServer,
+    sandbox: &str,
+    port: u16,
+) -> tokio::task::JoinHandle<Result<(), miette::Report>> {
+    let endpoint = server.endpoint.clone();
+    let tls = test_tls(server);
+    let sandbox = sandbox.to_string();
+    tokio::spawn(async move {
+        run::service_forward_tcp(
+            &endpoint,
+            &sandbox,
+            Some(&format!("127.0.0.1:{port}")),
+            "127.0.0.1",
+            8080,
+            &tls,
+            "default",
+        )
+        .await
+    })
+}
+
+/// Send `payload` through the local forward, expect the mock gateway to echo it
+/// back, then close the local connection.
+async fn echo_through_local_forward<T>(
+    forward: &tokio::task::JoinHandle<T>,
+    port: u16,
+    payload: &[u8],
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        assert!(
+            !forward.is_finished(),
+            "service forward exited before the local listener opened"
+        );
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "local forward on 127.0.0.1:{port} never opened: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    stream.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+        .await
+        .expect("echo through the forward timed out")
+        .expect("echo through the forward failed");
+    assert_eq!(echoed, payload);
+}
+
+async fn wait_for_count(counter: &AtomicUsize, expected: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < expected {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), expected, "{what}");
+}
+
+fn forward_tokens(inits: &[TcpForwardInit]) -> Vec<&str> {
+    inits
+        .iter()
+        .map(|init| init.authorization_token.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn service_forward_omits_session_tokens_when_the_gateway_authorizes_the_principal() {
+    let server = run_server().await;
+    let state = &server.openshell.state;
+    let port = reserve_local_port();
+    let forward = spawn_service_forward(&server, "svc-sandbox", port);
+
+    echo_through_local_forward(&forward, port, b"first connection").await;
+    echo_through_local_forward(&forward, port, b"second connection").await;
+
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(inits.len(), 2, "one ForwardTcp stream per local connection");
+    for init in &inits {
+        assert!(
+            init.authorization_token.is_empty(),
+            "TCP forwards carry no session token"
+        );
+        assert_eq!(init.sandbox, "svc-sandbox");
+        assert_eq!(init.workspace, "default");
+        assert_eq!(
+            init.service_id,
+            "service-forward:svc-sandbox:127.0.0.1:8080"
+        );
+        assert_eq!(
+            init.target,
+            Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            }))
+        );
+    }
+    assert_eq!(
+        state.ssh_session_requests.load(Ordering::SeqCst),
+        0,
+        "no CreateSshSession per forwarded connection"
+    );
+    assert_eq!(
+        state.ssh_session_revocations.load(Ordering::SeqCst),
+        0,
+        "nothing to revoke"
+    );
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 0);
+    forward.abort();
+}
+
+#[tokio::test]
+async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway() {
+    let server = run_server().await;
+    let state = &server.openshell.state;
+    state
+        .forward_requires_session_token
+        .store(true, Ordering::SeqCst);
+    let port = reserve_local_port();
+    let forward = spawn_service_forward(&server, "svc-sandbox", port);
+
+    // First connection: the token-less open is rejected once, the CLI mints a
+    // session, retries on the same local socket, and data still flows.
+    echo_through_local_forward(&forward, port, b"first connection").await;
+    wait_for_count(&state.ssh_session_revocations, 1, "revocation").await;
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(forward_tokens(&inits), vec!["", "test-token"]);
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 1);
+
+    // Second connection on the same forward: straight to token mode, no
+    // second rejection, one more create/revoke pair.
+    echo_through_local_forward(&forward, port, b"second connection").await;
+    wait_for_count(&state.ssh_session_revocations, 2, "revocations").await;
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(forward_tokens(&inits), vec!["", "test-token", "test-token"]);
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        inits
+            .iter()
+            .all(|init| matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))))
+    );
+    forward.abort();
 }

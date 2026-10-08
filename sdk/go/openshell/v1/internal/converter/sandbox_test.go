@@ -51,6 +51,7 @@ func TestSandboxFromProto(t *testing.T) {
 	gpuCount := uint32(2)
 	exitCode := int32(0)
 	proto := &pb.Sandbox{
+		HostKeyFingerprint: "SHA256:expected",
 		Metadata: &dm.ObjectMeta{
 			Id:              "sb-1",
 			Name:            "my-sandbox",
@@ -87,21 +88,25 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
-			Command: []string{"/opt/agent", "--serve"},
-			Tty:     false,
+			Command:       []string{"/opt/agent", "--serve"},
+			Tty:           false,
+			RestartPolicy: pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE,
 		},
 		CreatedFromWorkloadTemplate: &pb.SandboxWorkloadTemplateProvenance{
 			Name:            "gpu-kata",
 			ResourceVersion: "7",
 		},
 		Status: &pb.SandboxStatus{
-			AgentPod:              "agent-pod-xyz",
-			AgentFd:               "fd-agent",
-			SandboxFd:             "fd-sandbox",
-			Phase:                 pb.SandboxPhase_SANDBOX_PHASE_READY,
-			CurrentPolicyVersion:  7,
-			MainProcessInstanceId: "instance-1",
-			ExitCode:              &exitCode,
+			AgentPod:               "agent-pod-xyz",
+			AgentFd:                "fd-agent",
+			SandboxFd:              "fd-sandbox",
+			Phase:                  pb.SandboxPhase_SANDBOX_PHASE_READY,
+			CurrentPolicyVersion:   7,
+			MainProcessInstanceId:  "instance-1",
+			ExitCode:               &exitCode,
+			RestartCount:           3,
+			NextRestartTime:        TimestampFromMillis(1700000070000),
+			MainProcessStartedTime: TimestampFromMillis(1700000010000),
 			Conditions: []*pb.SandboxCondition{
 				{
 					Type:           "Ready",
@@ -115,6 +120,7 @@ func TestSandboxFromProto(t *testing.T) {
 	}
 
 	s := SandboxFromProto(proto)
+	assert.Equal(t, "SHA256:expected", s.HostKeyFingerprint)
 
 	require.NotNil(t, s)
 	assert.Equal(t, "sb-1", s.ID)
@@ -139,6 +145,7 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
 	assert.False(t, s.Spec.TTY)
+	assert.Equal(t, v1.SandboxRestartOnFailure, s.Spec.RestartPolicy)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -170,6 +177,9 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
 	require.NotNil(t, s.Status.ExitCode)
 	assert.Equal(t, int32(0), *s.Status.ExitCode)
+	assert.Equal(t, uint32(3), s.Status.RestartCount)
+	assert.Equal(t, int64(1700000070000), s.Status.NextRestartAtMs)
+	assert.Equal(t, int64(1700000010000), s.Status.MainProcessStartedAtMs)
 }
 
 func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {

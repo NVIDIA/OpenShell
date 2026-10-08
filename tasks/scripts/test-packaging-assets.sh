@@ -40,10 +40,20 @@ assert_file_exists() {
 service="${ROOT}/deploy/deb/openshell-gateway.service"
 control="${ROOT}/deploy/deb/control.in"
 spec="${ROOT}/openshell.spec"
+package_qualification="${ROOT}/tests/ansible/roles/openshell_packaged_gateway/tasks/main.yaml"
+tmachine_gateway_service="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway.service.j2"
+tmachine_docker_config="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway-docker.toml.j2"
+tmachine_podman_config="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway-podman.toml.j2"
+development_gateway="${ROOT}/nix/test-guest/provisioners/roles/gateway-podman/tasks/development-gateway.yml"
 
 assert_file_exists "$service"
 assert_file_exists "$control"
 assert_file_exists "$spec"
+assert_file_exists "$package_qualification"
+assert_file_exists "$tmachine_gateway_service"
+assert_file_exists "$tmachine_docker_config"
+assert_file_exists "$tmachine_podman_config"
+assert_file_exists "$development_gateway"
 
 # Debian control files are RFC822-style metadata. Older dpkg-deb releases
 # reject comment lines as malformed fields, so keep SPDX metadata in the
@@ -60,6 +70,8 @@ fi
 assert_contains \
   "$service" \
   'Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls'
+assert_contains "$service" 'EnvironmentFile=-%E/openshell/gateway.env'
+assert_contains "$service" 'ExecStart=/usr/bin/openshell-gateway'
 assert_contains \
   "$service" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
@@ -68,6 +80,8 @@ assert_not_contains "$service" '%S/openshell/tls'
 assert_contains \
   "$spec" \
   'Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls'
+assert_contains "$spec" 'EnvironmentFile=-%%E/openshell/gateway.env'
+assert_contains "$spec" 'ExecStart=/usr/bin/openshell-gateway'
 assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
@@ -77,22 +91,44 @@ assert_contains "$spec" '%files prover'
 assert_contains "$spec" '%{_bindir}/%{name}-prover'
 assert_not_contains "$spec" '%%S/openshell/tls'
 
+# Installed-package qualification must select the candidate trusted runtime
+# images through the same environment file consumed by preflight and startup,
+# without generating operator-owned gateway TOML.
+assert_contains "$package_qualification" 'dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"'
+assert_contains "$package_qualification" 'OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}'
+assert_contains "$package_qualification" 'OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine'
+assert_contains "$package_qualification" 'OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine'
+assert_not_contains "$package_qualification" 'OPENSHELL_GATEWAY_CONFIG='
+assert_not_contains "$package_qualification" '/var/lib/openshell-qualification/gateway.toml'
+
+# Direct tmachine gateway services select trusted runtime images through the
+# process environment. Driver TOML remains available for settings that do not
+# have a gateway startup environment variable.
+assert_contains "$tmachine_gateway_service" 'Environment=OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine'
+assert_contains "$tmachine_gateway_service" 'Environment=OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine'
+assert_not_contains "$tmachine_docker_config" 'sandbox_runtime_image ='
+assert_not_contains "$tmachine_docker_config" 'supervisor_image ='
+assert_not_contains "$tmachine_podman_config" 'sandbox_runtime_image ='
+assert_not_contains "$tmachine_podman_config" 'supervisor_image ='
+assert_contains "$development_gateway" 'Environment=OPENSHELL_SUPERVISOR_IMAGE={{ openshell_supervisor_image }}'
+assert_not_contains "$development_gateway" 'supervisor_image = "{{ openshell_supervisor_image }}"'
+
 # Schema-v2 package startup wiring.
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"
 snapcraft="${ROOT}/snapcraft.yaml"
+snap_workflow="${ROOT}/.github/workflows/snap-package.yml"
 snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
 snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
-snap_docker_hook="${ROOT}/snap/hooks/connect-plug-docker"
-snap_install_hook="${ROOT}/snap/hooks/install"
+snap_post_refresh_hook="${ROOT}/snap/hooks/post-refresh"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
 assert_file_exists "$snapcraft"
+assert_file_exists "$snap_workflow"
 assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
 assert_file_exists "$snap_repro"
-assert_file_exists "$snap_docker_hook"
-assert_file_exists "$snap_install_hook"
+assert_file_exists "$snap_post_refresh_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
@@ -114,25 +150,57 @@ for snap_file in \
   "$snap_install_docs" \
   "$snap_canary" \
   "$snap_repro" \
-  "$snap_docker_hook" \
-  "$snap_install_hook"; do
+  "$snap_post_refresh_hook"; do
   assert_not_contains "$snap_file" "docker:docker-daemon"
   assert_not_contains "$snap_file" "default-provider: docker"
 done
-if [[ ! -x "$snap_install_hook" ]]; then
-  echo "FAIL: Snap install hook must be executable" >&2
+if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
+  echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
   exit 1
 fi
-assert_contains "$snap_install_hook" 'allow_unauthenticated_users = true'
-bash "$ROOT/tasks/scripts/test-snap-install-hook.sh" "$snap_install_hook"
+if [[ -e "${ROOT}/snap/hooks/install" ]]; then
+  echo "FAIL: obsolete Snap install hook must not exist" >&2
+  exit 1
+fi
+assert_contains "$snapcraft" 'refresh-mode: endure'
+if [[ ! -x "$snap_post_refresh_hook" ]]; then
+  echo "FAIL: Snap post-refresh hook must be executable" >&2
+  exit 1
+fi
+assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
+bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_hook"
+assert_contains "$snap_workflow" 'name: openshell-prover-${{ matrix.rust_arch }}-unknown-linux-musl'
+assert_contains "$snap_workflow" 'chmod +x prebuilt/prover/openshell-prover'
+assert_contains "$snap_workflow" 'cp prebuilt/prover/openshell-prover snap/prebuilt/openshell-prover'
+assert_contains "$snapcraft" 'for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do'
+assert_contains "$snapcraft" '"$CRAFT_PART_INSTALL/bin/openshell-prover"'
+if ! awk '
+  /^  prover:$/ { in_prover = 1; next }
+  in_prover && /^  [[:alnum:]_-]+:$/ { finished = 1; exit }
+  in_prover && /command: bin\/openshell-prover/ { command = 1 }
+  in_prover && /- openshell-prover/ { alias = 1 }
+  in_prover && /^    plugs:$/ { in_plugs = 1; next }
+  in_prover && in_plugs && /^      - / {
+    plug_count++
+    if ($0 == "      - home") home = 1
+  }
+  END { exit !(in_prover && finished && command && alias && home && plug_count == 1) }
+' "$snapcraft"; then
+  echo "FAIL: Snap prover app must expose the openshell-prover alias with only home access" >&2
+  exit 1
+fi
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
+assert_contains "$snap_install_docs" "systemctl reset-failed snap.openshell.gateway.service"
+assert_contains "$snap_install_docs" "snap restart openshell.gateway"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
-assert_contains "$snap_repro" 'OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_canary" "openshell.prover check"
+assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_repro" "/snap/bin/openshell.prover check"
 assert_contains "$snap_repro" "system-docker"
 assert_contains "$snap_repro" "missing-docker"
 assert_contains "$snap_repro" "docker-snap"

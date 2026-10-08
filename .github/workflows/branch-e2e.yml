@@ -1,8 +1,6 @@
 name: Branch E2E Checks
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -50,15 +48,6 @@ jobs:
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               ;;
-            merge_group)
-              # Merge groups have no PR labels. When GPU E2E is required as documented
-              # in CI.md, skipping it leaves the gate pending until the queue times out
-              # and ejects the PR. HA stays off until stable.
-              run_core_e2e=true
-              run_gpu_e2e=true
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
-              ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
@@ -89,6 +78,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       cargo: ${{ steps.version.outputs.cargo }}
+      deb_version: ${{ steps.version.outputs.deb_version }}
+      rpm_version: ${{ steps.version.outputs.rpm_version }}
+      rpm_release: ${{ steps.version.outputs.rpm_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,7 +91,15 @@ jobs:
         id: version
         run: |
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
-          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+          deb_version="$(python3 tasks/scripts/release.py get-version --dev --deb)"
+          rpm_version="$(python3 tasks/scripts/release.py get-version --dev --rpm-version)"
+          rpm_release="$(python3 tasks/scripts/release.py get-version --dev --rpm-release)"
+          {
+            echo "cargo=$cargo"
+            echo "deb_version=$deb_version"
+            echo "rpm_version=$rpm_version"
+            echo "rpm_release=$rpm_release"
+          } >> "$GITHUB_OUTPUT"
 
   build-binaries:
     needs: version
@@ -133,6 +133,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
@@ -173,6 +174,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
@@ -200,14 +202,43 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-images.yml
 
+  build-deb:
+    name: Build Debian packages
+    needs: [pr_metadata, version, build-binaries, build-vm-driver]
+    if: needs.pr_metadata.outputs.run_integration == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      deb-version: ${{ needs.version.outputs.deb_version }}
+
+  build-rpm:
+    name: Build RPM packages
+    needs: [pr_metadata, version, build-binaries]
+    if: needs.pr_metadata.outputs.run_integration == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      rpm-version: ${{ needs.version.outputs.rpm_version }}
+      rpm-release: ${{ needs.version.outputs.rpm_release }}
+      cargo-version: ${{ needs.version.outputs.cargo }}
+
   prepare-integration:
-    needs: [pr_metadata, build-binaries, build-images]
+    needs: [pr_metadata, build-binaries, build-images, build-deb, build-rpm]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
 
   # Run driver-independent conformance tests.
   conformance-integration:
@@ -223,9 +254,10 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
         ]
 
   # Run feature-specific integration tests:
@@ -242,11 +274,13 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
         ]
 
   # Run driver-specific integration tests:
+  # These suites require the binary installer's CLI path, local HTTP gateway,
+  # and system service configuration for their Podman user-namespace fixtures.
   driver-specific-integration:
     needs: prepare-integration
     permissions:
@@ -260,6 +294,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"driver-podman"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 

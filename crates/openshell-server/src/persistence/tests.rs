@@ -35,7 +35,6 @@ async fn failed_store_calls_are_marked_on_the_span() {
 /// the span must stay clean — otherwise every lease a replica does not win, and
 /// every gateway restart, exports as a failure.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn expected_conflicts_leave_the_span_unmarked() {
     use crate::otel_tracing::test_exporter;
 
@@ -66,6 +65,7 @@ async fn expected_conflicts_leave_the_span_unmarked() {
         .await
         .expect_err("the name is already taken");
 
+    traced.wait_for_span("store.put_if").await;
     let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
 
     assert_eq!(
@@ -79,7 +79,6 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 /// Span names stay low-cardinality so they group across object types; what
 /// each call touched is carried as attributes.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_spans_record_what_they_touched_as_attributes() {
     use crate::otel_tracing::test_exporter;
 
@@ -97,6 +96,13 @@ async fn store_spans_record_what_they_touched_as_attributes() {
         .unwrap();
     store.list("sandbox", "default", 10, 0).await.unwrap();
 
+    traced
+        .wait_for_spans(|spans| {
+            ["store.get", "store.get_by_name", "store.list"]
+                .iter()
+                .all(|name| spans.iter().any(|span| &span.name == name))
+        })
+        .await;
     let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
     assert_eq!(
         test_exporter::attribute(&by_name, "object_type").as_deref(),
@@ -2237,6 +2243,61 @@ async fn cas_update_message_cas_succeeds() {
 }
 
 #[tokio::test]
+async fn cas_update_message_cas_internal_updates_survive_concurrent_writers() {
+    use openshell_core::proto::Sandbox;
+    use std::sync::Arc;
+
+    let store = Arc::new(test_store().await);
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+            annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_time: None,
+        }),
+        ..Sandbox::default()
+    };
+    store.put_message(&sandbox).await.unwrap();
+
+    let handles: Vec<_> = (0..5)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .update_message_cas::<Sandbox, _>("test-id", 0, move |s| {
+                        s.metadata
+                            .as_mut()
+                            .unwrap()
+                            .annotations
+                            .insert(format!("writer-{i}"), "done".to_string());
+                    })
+                    .await
+            })
+        })
+        .collect();
+    for result in futures::future::join_all(handles).await {
+        result
+            .unwrap()
+            .expect("internal update must not surface a conflict");
+    }
+
+    let stored = store
+        .get_message::<Sandbox>("test-id")
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata = stored.metadata.unwrap();
+    assert_eq!(metadata.resource_version, 6);
+    for i in 0..5 {
+        assert_eq!(metadata.annotations[&format!("writer-{i}")], "done");
+    }
+}
+
+#[tokio::test]
 async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
     use openshell_core::proto::Sandbox;
     use std::sync::Arc;
@@ -2752,7 +2813,6 @@ async fn membership_selector_escapes_adversarial_label_key() {
 /// so a trace decomposes an RPC into the storage work it did rather than
 /// bottoming out at the request boundary.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_operations_export_spans_with_parents() {
     use tracing::Instrument as _;
 
@@ -2772,7 +2832,7 @@ async fn store_operations_export_spans_with_parents() {
     .await;
     drop(request_span);
 
-    let root = traced.span_named("request");
+    let root = traced.wait_for_span("request").await;
     let spans = traced.finished_spans();
     let child = spans
         .iter()

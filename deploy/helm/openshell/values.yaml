@@ -141,6 +141,26 @@ sandboxServiceAccount:
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
 
+# RBAC objects created for the gateway ServiceAccount. Cluster-scoped objects
+# can be omitted so a cluster-admin applies them once and a namespace-admin
+# installs and upgrades the gateway release without cluster-scoped permissions.
+rbac:
+  # -- Create the RBAC objects that grant the gateway ServiceAccount access.
+  # Disable to supply the namespaced sandbox and peer Role/RoleBinding and the
+  # cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook
+  # and credential driver RBAC keep their own flags.
+  create: true
+  clusterScoped:
+    # -- Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable
+    # for a namespace-admin install where a cluster-admin applies them
+    # separately; the gateway ServiceAccount name and namespace are unchanged,
+    # so a pre-created ClusterRoleBinding still matches.
+    create: true
+    # -- Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleName: ""
+    # -- Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleBindingName: ""
+
 # Namespace-scoped resources needed to run sandboxes. Disable this when the
 # gateway and workspace prerequisites are managed as separate Helm releases
 # using the openshell-workspace chart.
@@ -192,8 +212,53 @@ agentSandbox:
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
-  # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
-  terminationGracePeriodSeconds: 5
+  # -- Maximum time, in seconds, Kubernetes waits for the gateway to exit before
+  # killing it. The gateway exits as soon as shutdown completes; the limit
+  # covers supervisor session cleanup and draining queued OCSF records.
+  terminationGracePeriodSeconds: 30
+
+# Optional HorizontalPodAutoscaler (autoscaling/v2) for the gateway workload.
+# When enabled, the Deployment or StatefulSet omits spec.replicas and the HPA
+# owns the replica count; replicaCount is ignored. Multi-replica limits
+# (server.externalDbSecret, and workload.allowMultiReplicaStatefulSet for a
+# StatefulSet) apply to maxReplicas. Scaling out does not move established
+# supervisor sessions; read the High Availability guide before choosing metrics.
+# The workload can drop to one replica when you enable this on an existing
+# release, until the HPA scales it back up; read the chart README before you
+# upgrade.
+autoscaling:
+  # -- Render a HorizontalPodAutoscaler and stop rendering spec.replicas.
+  enabled: false
+  # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
+  minReplicas: 2
+  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
+  # connection pool; size the database for rollouts at this count, as the High
+  # Availability guide describes.
+  maxReplicas: 4
+  # -- Target average CPU utilization, as a percentage of
+  # resources.requests.cpu. Set to null to disable. Requires
+  # resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies
+  # into the request.
+  targetCPUUtilizationPercentage: 80
+  # -- (int) Target average memory utilization, as a percentage of
+  # resources.requests.memory. Null disables it. Requires
+  # resources.requests.memory, or resources.limits.memory, which Kubernetes
+  # copies into the request.
+  targetMemoryUtilizationPercentage: null
+  # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
+  # Pods metrics served by prometheus-adapter.
+  metrics: []
+  # -- HPA scaling behavior. Scale-down hands the removed pod's supervisor
+  # sessions to the remaining replicas, so the default removes at most one
+  # replica every two minutes after a five-minute stabilization window. Helm
+  # merges maps: set autoscaling.behavior.scaleDown to null to drop the default.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
 
 probes:
   startup:
@@ -234,6 +299,14 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- Non-secret gateway application configuration. Top-level keys name TOML
+# tables and are rendered into the mounted gateway.toml file. Kubernetes
+# resource inputs remain outside this map; template expressions derive the
+# corresponding runtime values from their resource owner.
+gatewayConfig:
+  openshell:
+    version: 2
+
 # Server configuration
 server:
   # -- Operator-facing gateway name. Defaults to the chart fullname so all
@@ -248,6 +321,31 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
+  # Gateway-native OCSF JSONL output.
+  ocsfLog:
+    # -- Write gateway OCSF events as JSONL.
+    enabled: false
+    # -- OCSF JSONL path. The default is writable in the gateway container but
+    # does not persist across restarts. To keep records, mount a volume with
+    # server.extraVolumes and server.extraVolumeMounts and set a path on it.
+    # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
+    # on the mount so each replica writes its own file.
+    path: /tmp/gateway-ocsf.jsonl
+    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
+    # Supported values: "1.1", "1.3".
+    schemaVersion: ""
+    # -- Rotate the active file daily in UTC, or never.
+    rotation: daily
+    # -- Rotated files retained when rotation is daily.
+    maxFiles: 7
+    # -- Maximum records waiting for the file writer.
+    queueCapacity: 10000
+    # -- Maximum encoded bytes waiting for the file writer.
+    queueMaxBytes: 16777216
+  # -- Additional volumes for the gateway pod.
+  extraVolumes: []
+  # -- Additional volume mounts for the gateway container.
+  extraVolumeMounts: []
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -281,6 +379,13 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
+  # SCC namespace annotation if present, otherwise the driver default. Must be
+  # an integer between 1 and 4294967294.
+  sandboxUid: ""
+  # -- GID for sandbox pods (`sandbox_gid`). Empty (default) = same as
+  # sandboxUid. Must be an integer between 1 and 4294967294.
+  sandboxGid: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
@@ -328,6 +433,9 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
+  # authenticated edge proxy. Leave disabled for direct gateway installs.
+  enableWebsocketTunnel: false
   # -- Posture when a candidate sandbox policy fails validation. `fail_closed`
   # deactivates the previous policy; `retain_last_valid` keeps it active.
   policyValidationFailureMode: fail_closed
@@ -483,6 +591,14 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
+# Kubernetes resource references for external credential drivers. Runtime
+# driver settings remain in gatewayConfig.
+credentialDrivers:
+  vault:
+    # -- ConfigMap containing the private Vault/OpenBao CA certificate under
+    # the ca.crt key. Helm mounts it only when the Vault driver is selected.
+    caConfigMapName: ""
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,
@@ -614,6 +730,14 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  replicaRouting:
+    # -- Route requests carrying an `x-openshell-replica` header straight to
+    # that gateway replica. The CLI sets the header on long-lived sandbox
+    # connections (SSH, port forwards, exec) using the owner the gateway
+    # reports, so they skip the relay through a peer replica. Renders one
+    # Service per replica. Requires workload.kind=statefulset,
+    # workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas.
+    enabled: false
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates
   # client-facing TLS at the listener and re-encrypts when connecting to the

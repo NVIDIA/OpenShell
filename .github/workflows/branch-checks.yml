@@ -30,11 +30,32 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
+      base_sha: ${{ steps.gate.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
         uses: ./.github/actions/pr-gate
+
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
+                || github.event.merge_group.base_sha
+                || needs.pr_metadata.outputs.base_sha }}
 
   mise-lockfile:
     name: mise Lockfile
@@ -43,7 +64,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -68,7 +89,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -93,14 +114,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: ./.github/actions/setup-nix
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          prepare-shell: "true"
+          shell-installable: .#devShells.x86_64-linux.default
 
       - name: Check dependencies
         run: cargo deny check licenses bans sources
@@ -116,6 +134,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Format
@@ -137,6 +156,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Verify Cargo lockfiles
@@ -164,6 +184,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -200,6 +221,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -236,6 +258,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -285,6 +308,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -309,6 +333,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -335,6 +360,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -360,7 +386,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -389,6 +415,9 @@ jobs:
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
+
+      - name: Test release qualification summary
+        run: mise run test:qualification-summary
   go:
     name: Go SDK
     needs: pr_metadata
@@ -396,7 +425,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -416,7 +445,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -436,7 +465,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

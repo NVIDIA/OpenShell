@@ -121,14 +121,23 @@ fn resolve_linux_process(
             paths
         });
 
-    let (executable_identity, pending_cache_entry) =
-        resolve_open_executable(&snapshot, &mut executable, cache)?;
-    let mut pending_cache_entries = pending_cache_entry.into_iter().collect::<Vec<_>>();
+    // Digests computed during this call. They reach the shared cache only after
+    // every snapshot validates, but later processes in the chain reuse them.
+    let mut pending_cache_entries = HashMap::new();
+    let executable_identity = resolve_open_executable(
+        &snapshot,
+        &mut executable,
+        cache,
+        &mut pending_cache_entries,
+    )?;
     let mut ancestors = Vec::with_capacity(ancestor_processes.len());
     for (ancestor, executable) in &mut ancestor_processes {
-        let (identity, pending_cache_entry) = resolve_open_executable(ancestor, executable, cache)?;
-        ancestors.push(identity);
-        pending_cache_entries.extend(pending_cache_entry);
+        ancestors.push(resolve_open_executable(
+            ancestor,
+            executable,
+            cache,
+            &mut pending_cache_entries,
+        )?);
     }
 
     validate_process_snapshot(pid, &snapshot)?;
@@ -151,23 +160,21 @@ fn resolve_open_executable(
     snapshot: &ProcessSnapshot,
     executable: &mut std::fs::File,
     cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
-) -> Result<
-    (
-        ExecutableIdentity,
-        Option<(ExecutableCacheKey, Sha256Digest)>,
-    ),
-    ResolveError,
-> {
+    pending: &mut HashMap<ExecutableCacheKey, Sha256Digest>,
+) -> Result<ExecutableIdentity, ResolveError> {
     let key = snapshot.executable_cache_key();
-    let cached_digest = cached_executable_digest(cache, key);
-    let digest = cached_digest.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
-    Ok((
-        ExecutableIdentity {
-            path: snapshot.binary_path.clone(),
-            digest: Some(digest),
-        },
-        cached_digest.is_none().then_some((key, digest)),
-    ))
+    let known = pending
+        .get(&key)
+        .copied()
+        .or_else(|| cached_executable_digest(cache, key));
+    let digest = known.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
+    if known.is_none() {
+        pending.insert(key, digest);
+    }
+    Ok(ExecutableIdentity {
+        path: snapshot.binary_path.clone(),
+        digest: Some(digest),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -462,6 +469,8 @@ fn cmdline_absolute_paths(cmdline: &[u8]) -> Vec<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    const IDENTITY_HELPER_READY: &str = "identity helper ready\n";
+
     struct ChildGuard(std::process::Child);
 
     impl Drop for ChildGuard {
@@ -474,20 +483,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn resolver_cache_is_owned_and_only_explicit_clones_share_it() {
-        let first = ProcfsIdentityResolver::for_pid_namespace();
+        let pid = std::process::id();
+        let first = ProcfsIdentityResolver::for_process_tree(pid);
         let shared = first.clone();
-        let separate = ProcfsIdentityResolver::for_pid_namespace();
+        let separate = ProcfsIdentityResolver::for_process_tree(pid);
         assert!(Arc::ptr_eq(&first.cache, &shared.cache));
         assert!(!Arc::ptr_eq(&first.cache, &separate.cache));
-        first.resolve(std::process::id()).unwrap();
+        first.resolve(pid).unwrap();
         assert!(!shared.cache.lock().unwrap().is_empty());
         assert!(separate.cache.lock().unwrap().is_empty());
     }
 
     #[test]
     fn resolves_current_process_from_live_executable() {
-        let identity = ProcfsIdentityResolver::for_pid_namespace()
-            .resolve(std::process::id())
+        let pid = std::process::id();
+        let identity = ProcfsIdentityResolver::for_process_tree(pid)
+            .resolve(pid)
             .expect("resolve current process");
 
         assert!(identity.executable.path.is_absolute());
@@ -497,16 +508,37 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture for executable identity tests"]
     fn identity_helper_process() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        let mut stdout = std::io::stdout();
+        std::io::Write::write_all(&mut stdout, IDENTITY_HELPER_READY.as_bytes())
+            .expect("signal helper readiness");
+        std::io::Write::flush(&mut stdout).expect("flush helper readiness");
+
+        // Stay alive until the parent closes stdin or ChildGuard terminates us.
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8]);
     }
 
     #[test]
     fn resolves_child_and_hashes_ancestor_chain() {
         let parent_pid = std::process::id();
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "tests::identity_helper_process"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn child");
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut line = String::new();
+        // Wait until the helper has entered the test before taking the
+        // fail-closed procfs snapshot of the newly spawned process.
+        loop {
+            line.clear();
+            let bytes_read = std::io::BufRead::read_line(&mut child_stdout, &mut line)
+                .expect("read child readiness");
+            assert_ne!(bytes_read, 0, "child exited before signaling readiness");
+            if line == IDENTITY_HELPER_READY {
+                break;
+            }
+        }
         let child = ChildGuard(child);
 
         let identity = ProcfsIdentityResolver::for_process_tree(parent_pid)
@@ -518,6 +550,27 @@ mod tests {
         let parent = identity.ancestors.last().expect("process-tree root");
         assert_eq!(parent.path, std::env::current_exe().unwrap());
         assert!(parent.digest.is_some());
+    }
+
+    #[test]
+    fn executable_is_hashed_once_per_resolution() {
+        let pid = std::process::id();
+        let (snapshot, mut executable) = open_process_snapshot(pid).unwrap();
+        let cache = Mutex::new(HashMap::new());
+        let mut pending = HashMap::new();
+
+        let hashed =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // A sentinel proves a pending digest is reused instead of rehashed.
+        let sentinel: Sha256Digest = "ab".repeat(32).parse().unwrap();
+        assert_ne!(hashed.digest, Some(sentinel));
+        pending.insert(snapshot.executable_cache_key(), sentinel);
+        let reused =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(reused.digest, Some(sentinel));
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]

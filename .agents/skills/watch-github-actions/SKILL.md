@@ -125,12 +125,60 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
+scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
+the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+scan failure. It contains fixed status values, aggregate coverage counts, and
+disk space before, after, and the minimum sampled every five seconds. Missing
+coverage or manifest documents indicate no readable final report was available;
+deferred items or surfaces needing follow-up can explain partial coverage.
+Sampling cannot rule out a disk spike between samples.
+
+Artifacts and logs in this public repository are public. Never upload the raw
+scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
+logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
+The public diagnostic intentionally omits them; detailed review needs an
+approved private destination. Helpers must come from the workflow revision,
+not from the candidate under scan.
+
+`setup-nix` retries development-shell preparation once when `prepare-shell`
+is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
+shell has already been prepared. Cargo, lint, and test commands are not retried.
+Direct Nix builds and app dependency preparation also retry once; apps run
+once after preparation succeeds. Skipped dependent E2E suites indicate blocked
+coverage.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
 not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
+
+For `Protobuf Compatibility`, check the logged train and comparison baseline.
+Branch Checks compares the prospective merge tree with its target; Release Tag
+compares the tagged candidate with the previous stable release. Both use
+the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
+During `0.x`, a minor train permits compatibility findings
+as warnings; a patch train or no active train rejects them. Compare the current
+train's version with the latest stable release; commit messages are irrelevant.
+Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
+the `release-tag-v1` qualification profile. Both tagged pre-release and stable
+publication require this profile to pass. Failed, cancelled, or skipped suites
+block publication; build artifacts and qualification evidence remain in Actions
+storage for diagnosis. Source-SHA images are staging inputs for qualification.
+Snap builds run in parallel with qualification, but tagged stable Store uploads
+consume those built artifacts only after qualification passes.
+
+For `Codex Compatibility Review`, inspect its job summary and the
+`compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
+candidate and baseline SHAs before interpreting findings. `complete` describes
+execution and coverage, not compatibility: also read the assessment and findings.
+An `error`, incomplete coverage, or missing artifact means no clean review is
+available. The job is advisory and independent of publication gates; the
+qualification summary points to it without waiting for completion. Do not
+rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
+with an existing candidate tag; that path does not publish release artifacts.
 
 View logs for a specific run:
 

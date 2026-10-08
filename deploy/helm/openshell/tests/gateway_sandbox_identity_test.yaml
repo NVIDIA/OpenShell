@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: sandbox UID and GID
+templates:
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: omits sandbox_uid and sandbox_gid by default
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_uid|sandbox_gid'
+
+  - it: renders sandbox_uid and sandbox_gid as integers
+    set:
+      server.sandboxUid: 1500
+      server.sandboxGid: 2000
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_uid\s*=\s*1500$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_gid\s*=\s*2000$'
+
+  - it: renders sandbox_uid alone
+    set:
+      server.sandboxUid: 1500
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_uid\s*=\s*1500$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_gid'
+
+  - it: renders large IDs without scientific notation
+    set:
+      server.sandboxUid: 1000680000
+      server.sandboxGid: 4294967294
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_uid\s*=\s*1000680000$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_gid\s*=\s*4294967294$'
+
+  - it: rejects a zero sandbox UID
+    set:
+      server.sandboxUid: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a sandbox GID above the allowed range
+    set:
+      server.sandboxGid: 4294967295
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxGid must be an integer between 1 and 4294967294"
+
+  - it: rejects a non-numeric sandbox UID
+    set:
+      server.sandboxUid: abc
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a fractional sandbox UID
+    set:
+      server.sandboxUid: 1500.5
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a boolean sandbox UID
+    set:
+      server.sandboxUid: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a boolean sandbox GID
+    set:
+      server.sandboxGid: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxGid must be an integer between 1 and 4294967294"

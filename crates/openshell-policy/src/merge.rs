@@ -54,10 +54,11 @@ pub fn canonicalize_advisor_add_rule(
         .cloned()
         .map(|mut endpoint| {
             // Provenance does not change the endpoint contract. The gateway
-            // derives the credential marker, and the advisor marker records
-            // where a persisted endpoint came from.
+            // derives credential markers and token owners; the advisor marker
+            // records where a persisted endpoint came from.
             endpoint.provider_credentialed = false;
             endpoint.advisor_proposed = false;
+            endpoint.token_grant_owner.clear();
             // A denial observes one binary-to-port authorization. Preserve the
             // existing inspection contract, but never copy sibling ports from
             // a multi-port endpoint into the proposal.
@@ -93,6 +94,7 @@ pub fn canonicalize_advisor_add_rule(
                 let mut normalized = endpoint.clone();
                 normalized.provider_credentialed = false;
                 normalized.advisor_proposed = false;
+                normalized.token_grant_owner.clear();
                 normalize_endpoint(&mut normalized);
                 normalized == contract
             }) && incoming_rule
@@ -114,6 +116,7 @@ pub fn canonicalize_advisor_add_rule(
                     let mut normalized = (*endpoint).clone();
                     normalized.provider_credentialed = false;
                     normalized.advisor_proposed = false;
+                    normalized.token_grant_owner.clear();
                     normalize_endpoint(&mut normalized);
                     normalized == contract
                 })
@@ -871,6 +874,10 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
         && flag_covers(
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
+        )
+        && flag_covers(
+            loaded.allow_uninspected_credentials,
+            proposed.allow_uninspected_credentials,
         )
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
@@ -2607,6 +2614,7 @@ mod tests {
     fn canonicalize_advisor_preserves_existing_advisor_endpoint_provenance() {
         let mut advisor_endpoint = endpoint("index.crates.io", 443);
         advisor_endpoint.advisor_proposed = true;
+        advisor_endpoint.token_grant_owner = "copied-advisor-owner".to_string();
         let mut base = SandboxPolicy::default();
         base.network_policies.insert(
             "advisor_index".to_string(),
@@ -2633,6 +2641,7 @@ mod tests {
 
         assert_eq!(rule_name, "advisor_index");
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
     }
 
     #[test]
@@ -2643,6 +2652,7 @@ mod tests {
         provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
+        provider_endpoint.token_grant_owner = "derived-provider-owner".to_string();
         let mut effective = SandboxPolicy::default();
         effective.network_policies.insert(
             "_provider_example".to_string(),
@@ -2674,6 +2684,7 @@ mod tests {
         );
         assert!(!canonical.endpoints[0].provider_credentialed);
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint
@@ -2687,10 +2698,12 @@ mod tests {
         provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
+        provider_endpoint.token_grant_owner = "derived-provider-owner".to_string();
 
         let mut advisor_endpoint = provider_endpoint.clone();
         advisor_endpoint.provider_credentialed = false;
         advisor_endpoint.advisor_proposed = true;
+        advisor_endpoint.token_grant_owner = "copied-advisor-owner".to_string();
 
         let mut base = SandboxPolicy::default();
         base.network_policies.insert(
@@ -2734,6 +2747,7 @@ mod tests {
             NetworkAccessPreset::ReadOnly as i32
         );
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
     }
 
     #[test]
@@ -3119,6 +3133,8 @@ mod tests {
         for versions in [
             &["2025-03-26"][..],
             &["2025-03-26", DEFAULT_MCP_VERSION][..],
+            &["2026-07-28"][..],
+            &[DEFAULT_MCP_VERSION, "2026-07-28"][..],
         ] {
             let existing = rule_with_authorizations(
                 "existing",
@@ -3164,6 +3180,7 @@ mod tests {
         let existing = rule_with_authorizations(
             "existing",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -3175,6 +3192,7 @@ mod tests {
             vec![mcp_endpoint_with_versions(&[
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
                 "2025-03-26",
             ])],
             &["/usr/bin/new"],
@@ -3197,7 +3215,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3208,6 +3226,7 @@ mod tests {
             rule_with_authorizations(
                 "mcp",
                 vec![mcp_endpoint_with_versions(&[
+                    "2026-07-28",
                     "2025-11-25",
                     "2025-03-26",
                     "2025-06-18",
@@ -3225,7 +3244,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3237,6 +3256,7 @@ mod tests {
                 "2025-03-26",
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
             ])],
             &["/usr/bin/client"],
         );
@@ -3251,6 +3271,7 @@ mod tests {
         let equivalent = rule_with_authorizations(
             "proposed",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -5061,6 +5082,74 @@ mod tests {
                 ..
             }) if undeclared_binaries == ["/usr/bin/curl"]
         ));
+    }
+
+    /// An endpoint flag applies to every binary on the rule, so an update that
+    /// turns one on must declare the rule's whole binary scope.
+    #[test]
+    fn enabling_an_endpoint_flag_requires_the_whole_binary_scope() {
+        let base = endpoint("api.example.com", 443);
+        for flag in [
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "allow_uninspected_credentials",
+        ] {
+            let mut widened = base.clone();
+            match flag {
+                "allow_encoded_slash" => widened.allow_encoded_slash = true,
+                "websocket_credential_rewrite" => widened.websocket_credential_rewrite = true,
+                "request_body_credential_rewrite" => widened.request_body_credential_rewrite = true,
+                _ => widened.allow_uninspected_credentials = true,
+            }
+            let existing = rule_with_authorizations(
+                "realtime",
+                vec![base.clone()],
+                &["/usr/bin/tool-a", "/usr/bin/tool-b"],
+            );
+            let merge = |binaries: &[&str]| {
+                merge_policy(
+                    policy_with_rule("realtime", existing.clone()),
+                    &[PolicyMergeOp::AddRule {
+                        rule_name: "realtime".to_string(),
+                        rule: rule_with_authorizations("realtime", vec![widened.clone()], binaries),
+                    }],
+                )
+            };
+
+            assert!(
+                matches!(
+                    merge(&["/usr/bin/tool-a"]),
+                    Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                        undeclared_binaries,
+                        ..
+                    }) if undeclared_binaries == ["/usr/bin/tool-b"]
+                ),
+                "{flag}: tool-b would inherit the flag undeclared"
+            );
+            assert!(
+                merge(&["/usr/bin/tool-a", "/usr/bin/tool-b"]).is_ok(),
+                "{flag}: naming every binary must succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_requires_a_proposed_uninspected_credentials_exception() {
+        let loaded = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/client"],
+            ),
+        );
+        let mut proposed_endpoint = endpoint("api.example.com", 443);
+        proposed_endpoint.allow_uninspected_credentials = true;
+        let proposed =
+            rule_with_authorizations("realtime", vec![proposed_endpoint], &["/usr/bin/client"]);
+
+        assert!(!policy_covers_rule(&loaded, &proposed));
     }
 
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {

@@ -8,10 +8,11 @@ use std::path::Path;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
-    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, KeyToPath,
+    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
     LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
-    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -38,8 +39,6 @@ pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// which is the sandbox's own generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
-pub const CLIENT_TLS_CERTIFICATE_KEY: &str = "client-tls.crt";
-pub const CLIENT_TLS_PRIVATE_KEY: &str = "client-tls.key";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
@@ -55,22 +54,21 @@ pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key
 /// without a dedicated volume or mount.
 pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
 pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
-pub const CLIENT_TLS_CERTIFICATE_PATH: &str = "/.openshell/supervisor/client-tls.crt";
-pub const CLIENT_TLS_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/client-tls.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
+/// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
+/// process in every sandbox on every period.
+pub const CONTROL_HEALTH_PORT: u16 = 5501;
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
 
-/// Gateway client TLS material staged into the supervisor bootstrap Secret.
+/// Gateway CA material staged into the supervisor bootstrap Secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientTlsMaterial {
     pub ca_certificate: Vec<u8>,
-    pub certificate: Vec<u8>,
-    pub private_key: Vec<u8>,
 }
 
-/// Where the supervisor reads its gateway client TLS material.
+/// Where the supervisor reads the gateway CA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupervisorClientTls<'a> {
     Disabled,
@@ -235,6 +233,7 @@ pub fn supervisor_pod(
     upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
+    tracing_environment: &[(&str, String)],
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -271,6 +270,17 @@ pub fn supervisor_pod(
             "",
         ),
     ];
+    environment.extend(
+        tracing_environment
+            .iter()
+            .map(|(name, value)| env_var(name, value)),
+    );
+    if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
+        environment.push(env_var(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+            &server_name,
+        ));
+    }
     let mut volume_mounts = vec![
         volume_mount("bootstrap", "/.openshell/supervisor", true),
         volume_mount("sa-token", "/var/run/secrets/openshell", true),
@@ -300,29 +310,28 @@ pub fn supervisor_pod(
     match client_tls {
         SupervisorClientTls::Disabled => {}
         SupervisorClientTls::Secret(secret_name) => {
-            environment.extend([
-                env_var("OPENSHELL_TLS_CA", "/var/run/secrets/openshell-tls/ca.crt"),
-                env_var(
-                    "OPENSHELL_TLS_CERT",
-                    "/var/run/secrets/openshell-tls/tls.crt",
-                ),
-                env_var(
-                    "OPENSHELL_TLS_KEY",
-                    "/var/run/secrets/openshell-tls/tls.key",
-                ),
-            ]);
+            environment.push(env_var(
+                "OPENSHELL_TLS_CA",
+                "/var/run/secrets/openshell-tls/ca.crt",
+            ));
             volume_mounts.push(volume_mount(
                 "client-tls",
                 "/var/run/secrets/openshell-tls",
                 true,
             ));
-            volumes.push(secret_volume("client-tls", secret_name, None));
+            volumes.push(secret_volume(
+                "client-tls",
+                secret_name,
+                Some(KeyToPath {
+                    key: "ca.crt".to_string(),
+                    path: "ca.crt".to_string(),
+                    ..Default::default()
+                }),
+            ));
         }
-        SupervisorClientTls::Bootstrap => environment.extend([
-            env_var("OPENSHELL_TLS_CA", CLIENT_TLS_CA_PATH),
-            env_var("OPENSHELL_TLS_CERT", CLIENT_TLS_CERTIFICATE_PATH),
-            env_var("OPENSHELL_TLS_KEY", CLIENT_TLS_PRIVATE_KEY_PATH),
-        ]),
+        SupervisorClientTls::Bootstrap => {
+            environment.push(env_var("OPENSHELL_TLS_CA", CLIENT_TLS_CA_PATH));
+        }
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
@@ -334,6 +343,8 @@ pub fn supervisor_pod(
         "/sandbox".to_string(),
         "--health-socket-path".to_string(),
         CONTROL_HEALTH_SOCKET_PATH.to_string(),
+        "--health-port".to_string(),
+        CONTROL_HEALTH_PORT.to_string(),
     ];
     if let Some(url) = https_proxy {
         command.extend(["--upstream-proxy".to_string(), url.to_string()]);
@@ -411,13 +422,9 @@ pub fn supervisor_pod(
         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
         env: Some(environment),
         readiness_probe: Some(Probe {
-            exec: Some(ExecAction {
-                command: Some(vec![
-                    "/openshell-supervisor".to_string(),
-                    "health".to_string(),
-                    "--socket".to_string(),
-                    CONTROL_HEALTH_SOCKET_PATH.to_string(),
-                ]),
+            tcp_socket: Some(TCPSocketAction {
+                port: IntOrString::Int(i32::from(CONTROL_HEALTH_PORT)),
+                ..Default::default()
             }),
             period_seconds: Some(1),
             failure_threshold: Some(3),
@@ -558,20 +565,10 @@ pub fn supervisor_bootstrap_secret(
         data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
     }
     if let Some(tls) = client_tls {
-        data.extend([
-            (
-                CLIENT_TLS_CA_KEY.to_string(),
-                ByteString(tls.ca_certificate),
-            ),
-            (
-                CLIENT_TLS_CERTIFICATE_KEY.to_string(),
-                ByteString(tls.certificate),
-            ),
-            (
-                CLIENT_TLS_PRIVATE_KEY.to_string(),
-                ByteString(tls.private_key),
-            ),
-        ]);
+        data.insert(
+            CLIENT_TLS_CA_KEY.to_string(),
+            ByteString(tls.ca_certificate),
+        );
     }
     Secret {
         metadata: ObjectMeta {
@@ -666,6 +663,18 @@ fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String
         gateway_id.to_string(),
     );
     labels
+}
+
+/// The gateway may redirect the supervisor to a specific replica by pod
+/// address, which the server certificate does not name. Verifying every dial
+/// against the configured endpoint's host keeps those redirects valid.
+fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
+    let uri = grpc_endpoint.parse::<tonic::transport::Uri>().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn env_var(name: &str, value: &str) -> EnvVar {
@@ -791,15 +800,13 @@ mod tests {
             None,
             Some(ClientTlsMaterial {
                 ca_certificate: b"ca".to_vec(),
-                certificate: b"cert".to_vec(),
-                private_key: b"key".to_vec(),
             }),
             owner(),
         );
         let data = secret.data.expect("Secret data");
         assert_eq!(data[CLIENT_TLS_CA_KEY].0, b"ca");
-        assert_eq!(data[CLIENT_TLS_CERTIFICATE_KEY].0, b"cert");
-        assert_eq!(data[CLIENT_TLS_PRIVATE_KEY].0, b"key");
+        assert!(!data.contains_key("client-tls.crt"));
+        assert!(!data.contains_key("client-tls.key"));
     }
 
     fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
@@ -828,6 +835,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }
@@ -858,13 +866,65 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_pod_carries_tracing_environment() {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let client_tls = SupervisorClientTls::Disabled;
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            client_tls,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            owner(),
+            &[
+                (
+                    "OPENSHELL_OTLP_ENDPOINT",
+                    "http://collector:4317".to_string(),
+                ),
+                ("TRACEPARENT", TRACEPARENT.to_string()),
+            ],
+        )
+        .expect("render supervisor Pod");
+        let environment = pod.spec.expect("Pod spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment["OPENSHELL_OTLP_ENDPOINT"],
+            "http://collector:4317"
+        );
+        assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
+    }
+
+    #[test]
     fn supervisor_pod_reads_client_tls_from_the_bootstrap_secret() {
         let (env, volumes) = tls_env_and_volumes(&supervisor_pod_with_client_tls(
             SupervisorClientTls::Bootstrap,
         ));
         assert_eq!(env["OPENSHELL_TLS_CA"], CLIENT_TLS_CA_PATH);
-        assert_eq!(env["OPENSHELL_TLS_CERT"], CLIENT_TLS_CERTIFICATE_PATH);
-        assert_eq!(env["OPENSHELL_TLS_KEY"], CLIENT_TLS_PRIVATE_KEY_PATH);
+        assert!(!env.contains_key("OPENSHELL_TLS_CERT"));
+        assert!(!env.contains_key("OPENSHELL_TLS_KEY"));
         assert!(CLIENT_TLS_CA_PATH.starts_with("/.openshell/supervisor/"));
         assert!(!volumes.contains(&"client-tls".to_string()));
     }
@@ -877,6 +937,21 @@ mod tests {
             env["OPENSHELL_TLS_CA"],
             "/var/run/secrets/openshell-tls/ca.crt"
         );
+        assert!(!env.contains_key("OPENSHELL_TLS_CERT"));
+        assert!(!env.contains_key("OPENSHELL_TLS_KEY"));
+        let tls_volume = pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.name == "client-tls")
+            .unwrap();
+        let items = tls_volume.secret.as_ref().unwrap().items.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "ca.crt");
         assert!(volumes.contains(&"client-tls".to_string()));
     }
 
@@ -887,6 +962,29 @@ mod tests {
         ));
         assert!(env.is_empty());
         assert!(!volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
+    fn supervisor_verifies_redirected_dials_against_the_configured_host() {
+        let pod = supervisor_pod_with_client_tls(SupervisorClientTls::Disabled);
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let server_name = env
+            .iter()
+            .find(|variable| variable.name == "OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .and_then(|variable| variable.value.as_deref());
+        assert_eq!(server_name, Some("gateway"));
+
+        assert_eq!(
+            gateway_tls_server_name("https://openshell.openshell.svc.cluster.local:8080")
+                .as_deref(),
+            Some("openshell.openshell.svc.cluster.local")
+        );
+        assert_eq!(
+            gateway_tls_server_name("https://[fd00::1]:8080").as_deref(),
+            Some("fd00::1")
+        );
+        assert_eq!(gateway_tls_server_name("http://gateway:8080"), None);
+        assert_eq!(gateway_tls_server_name("not a uri"), None);
     }
 
     #[test]
@@ -922,6 +1020,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -934,6 +1033,31 @@ mod tests {
             None
         );
         let container = &pod_spec.containers[0];
+        let environment = container.env.as_ref().expect("supervisor environment");
+        assert!(
+            environment
+                .iter()
+                .any(|entry| entry.name == "OPENSHELL_TLS_CA")
+        );
+        assert!(!environment.iter().any(|entry| matches!(
+            entry.name.as_str(),
+            "OPENSHELL_TLS_CERT" | "OPENSHELL_TLS_KEY"
+        )));
+        let gateway_tls = pod_spec
+            .volumes
+            .as_ref()
+            .expect("supervisor volumes")
+            .iter()
+            .find(|volume| volume.name == "client-tls")
+            .and_then(|volume| volume.secret.as_ref())
+            .expect("gateway CA secret");
+        let items = gateway_tls
+            .items
+            .as_ref()
+            .expect("CA-only secret projection");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "ca.crt");
+        assert_eq!(items[0].path, "ca.crt");
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
@@ -984,24 +1108,26 @@ mod tests {
                 .and_then(|capabilities| capabilities.drop.as_ref()),
             Some(&vec!["ALL".to_string()])
         );
+        let probe = container.readiness_probe.as_ref().expect("readiness probe");
+        assert!(
+            probe.exec.is_none(),
+            "exec probes spawn a process per period"
+        );
         assert_eq!(
-            container
-                .readiness_probe
-                .as_ref()
-                .and_then(|probe| probe.exec.as_ref())
-                .and_then(|exec| exec.command.as_ref()),
-            Some(&vec![
-                "/openshell-supervisor".to_string(),
-                "health".to_string(),
-                "--socket".to_string(),
-                CONTROL_HEALTH_SOCKET_PATH.to_string(),
-            ])
+            probe.tcp_socket.as_ref().map(|tcp| &tcp.port),
+            Some(&IntOrString::Int(i32::from(CONTROL_HEALTH_PORT)))
         );
         let command = container.command.as_ref().unwrap();
         assert!(
             command
                 .windows(2)
                 .any(|args| args == ["--health-socket-path", CONTROL_HEALTH_SOCKET_PATH])
+        );
+        let health_port = CONTROL_HEALTH_PORT.to_string();
+        assert!(
+            command
+                .windows(2)
+                .any(|args| args == ["--health-port", health_port.as_str()])
         );
         let env = container.env.as_ref().unwrap();
         let env_value = |name: &str| {
@@ -1152,6 +1278,7 @@ mod tests {
             staged,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }

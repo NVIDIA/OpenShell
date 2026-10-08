@@ -91,11 +91,19 @@ func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxSer
 	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
 	for _, exposure := range exposures {
 		result = append(result, &pb.SandboxServiceExposure{
-			Service:    exposure.Service,
-			TargetPort: exposure.TargetPort,
+			Service:           exposure.Service,
+			TargetPort:        exposure.TargetPort,
+			AuthorizationMode: serviceAuthorizationModeToProto(exposure.AuthorizationMode),
 		})
 	}
 	return result
+}
+
+func serviceAuthorizationModeToProto(mode types.ServiceAuthorizationMode) pb.ServiceAuthorizationMode {
+	if mode == 0 {
+		return pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP
+	}
+	return pb.ServiceAuthorizationMode(mode)
 }
 
 func validateTemplateCreateSpec(spec *SandboxSpec) error {

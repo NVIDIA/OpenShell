@@ -318,7 +318,11 @@ func TestSandboxCreate(t *testing.T) {
 		labels,
 		CreateOptions{ServiceExposures: []ServiceExposure{
 			{TargetPort: 4500},
-			{Service: "metrics", TargetPort: 9090},
+			{
+				Service:           "metrics",
+				TargetPort:        9090,
+				AuthorizationMode: ServiceAuthorizationModeBearerPassthrough,
+			},
 		}},
 	)
 
@@ -334,7 +338,9 @@ func TestSandboxCreate(t *testing.T) {
 	}, result.ServiceURLs)
 	require.Len(t, mock.createRequest.GetServiceExposures(), 2)
 	assert.Equal(t, uint32(4500), mock.createRequest.GetServiceExposures()[0].GetTargetPort())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())
 	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
 }
 
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {

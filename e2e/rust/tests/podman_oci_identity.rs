@@ -10,7 +10,8 @@
 //! sandbox from its mutable tag, and verifies both the child identity and the
 //! image ID recorded on the real sandbox container. This exercises the Podman
 //! API inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries.
+//! serialization boundaries. Workspace behavior shared with Docker is covered
+//! by the `oci-image` feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
@@ -54,7 +55,16 @@ impl ImageGuard {
         let containerfile = context.path().join("Containerfile");
         std::fs::write(
             &containerfile,
-            format!("FROM {BASE_IMAGE}\nUSER {OCI_UID}:{OCI_GID}\n"),
+            format!(
+                r"FROM {BASE_IMAGE}
+USER 0:0
+RUN mkdir -p /home/app/project && \
+    chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
+    chmod 0700 /home/app /home/app/project
+WORKDIR /home/app/project
+USER {OCI_UID}:{OCI_GID}
+"
+            ),
         )
         .map_err(|err| format!("write Containerfile: {err}"))?;
 
@@ -244,6 +254,23 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         "Podman sandbox must launch the immutable image ID inspected before creation"
     );
 
+    let workspace_output = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            "set -eu; test \"$(pwd -P)\" = /home/app/project; test ! -e /sandbox; stat -c 'workspace-owner=%u:%g' .; touch probe; rm probe; echo podman-workspace-write-ok",
+        ])
+        .await
+        .expect("OCI workload should be able to write to its image workspace");
+    assert!(
+        workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
+        "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"
+    );
+    assert!(
+        workspace_output.contains("podman-workspace-write-ok"),
+        "expected workspace write marker:\n{workspace_output}"
+    );
+
     assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
 }
@@ -258,8 +285,9 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     )
     .unwrap();
     assert_eq!(
-        workload_user, "0:0",
-        "the trusted rootless boundary starts as container root before dropping to the OCI identity"
+        workload_user,
+        format!("{OCI_UID}:{OCI_GID}"),
+        "a custom OCI workspace must start directly as the final identity"
     );
     let supervisor_user = run_engine(
         &image.engine,
@@ -299,6 +327,8 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     .unwrap();
     assert!(!mounts.contains("/etc/openshell/tls"));
     assert!(!mounts.contains("/.openshell/supervisor"));
+    assert!(!mounts.lines().any(|path| path == "/home/app/project"));
+    assert!(!mounts.lines().any(|path| path == "/sandbox"));
     let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
     assert!(posture.contains("0000000000000000"));
 }

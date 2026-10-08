@@ -20,7 +20,18 @@ socket and negotiates its protocol version and capabilities before serving
 requests.
 
 For built-in driver configuration and behavior, refer to
-[Runtimes](/reference/sandbox-compute-drivers).
+[Runtimes](/how-it-works/sandboxes/runtimes). For implementation details, refer
+to each driver crate:
+
+| Driver | Crate |
+|---|---|
+| Docker | [`openshell-driver-docker`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md) |
+| Podman | [`openshell-driver-podman`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) |
+| MicroVM | [`openshell-driver-vm`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md) |
+| Kubernetes | [`openshell-driver-kubernetes`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md) |
+| Windows MXC | [`openshell-driver-mxc`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-mxc/README.md) |
+
+External compute drivers implement [`compute_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/compute_driver.proto).
 
 ## Credential Drivers
 
@@ -30,11 +41,20 @@ the secret value in the provider record. OpenShell includes database,
 Kubernetes Secret, and Vault-compatible credential drivers.
 
 Configure the active credential driver in the
-[Gateway Configuration](/reference/gateway-config#credential-drivers).
+[Gateway Configuration](/how-it-works/gateways/configuration#credential-drivers).
+For implementation details, refer to each driver crate:
+
+| Driver | Crate |
+|---|---|
+| Database | [`openshell-driver-db-credstore`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-db-credstore) |
+| Kubernetes Secrets | [`openshell-driver-kubernetes-secrets`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-kubernetes-secrets) |
+| Vault | [`openshell-driver-vault`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-vault) |
+
+External credential drivers implement [`credential_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/credential_driver.proto).
 
 ## Compatibility
 
 Drivers exchange peer metadata with the gateway and advertise their extension
 family capability. Upgrade both peers together when the protocol version
-changes. Refer to [Extension Protocol Negotiation](/extensibility/extension-negotiation)
+changes. Refer to [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation)
 for the negotiation contract.

@@ -49,7 +49,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 indicatif = "0.17"
 owo-colors = "4"
-ratatui = "0.26"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 crossterm = "0.28"
 terminal-colorsaurus = "1.0"
 
@@ -85,10 +85,11 @@ socket2 = "0.6"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }
 toml = "0.8"
 apollo-parser = "0.8.5"
-tower-mcp-types = "0.12.0"
+tower-mcp-types = "=0.22.2"
 regex = "1"
 
 # HTTP client
@@ -128,6 +129,7 @@ tokio-stream = "0.1"
 protoc-bin-vendored = "3.2.0"
 url = "2"
 indexmap = "2"
+shell-words = "1.1.1"
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "sqlite", "migrate", "macros"] }
@@ -143,7 +145,7 @@ k8s-openapi = { version = "0.24", features = ["v1_29"] }
 uuid = { version = "1.10", features = ["v4"] }
 signal-hook = "0.3"
 
-# SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
+# SMT solver (system libz3 by default; opt into vendored source or a prebuilt release)
 z3 = "0.21"
 
 [workspace.lints.rust]
@@ -181,3 +183,8 @@ strip = true
 [profile.dev]
 # Faster compile times for dev builds
 debug = 1
+
+# Executable identity hashes the (100+ MiB) test binary. Unoptimized SHA-256
+# is ~10x slower, which times out broker tests.
+[profile.dev.package.sha2]
+opt-level = 3

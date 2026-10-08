@@ -1,11 +1,20 @@
+{{- if include "openshell.clusterRbacCreate" . }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{ $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" }}
+{{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
+{{- $managedSshIngressEnabled := .Values.networkPolicy.enabled -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $managedSshIngress := get $gatewayConfig "openshell.drivers.kubernetes.managed_ssh_ingress" | default dict -}}
+{{- if hasKey $managedSshIngress "enabled" -}}
+{{- $managedSshIngressEnabled = get $managedSshIngress "enabled" -}}
+{{- end -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "openshell.fullname" . }}-node-reader-{{ .Release.Namespace }}
+  name: {{ include "openshell.clusterRoleName" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
@@ -15,7 +24,7 @@ rules:
   - apiGroups: ["scheduling.k8s.io"]
     resources: ["priorityclasses"]
     verbs: ["get"]
-  {{- if and (ne $workspaceMode "shared") .Values.server.drivers.kubernetes.allowDriverConfig }}
+  {{- if and (ne $workspaceMode "shared") $allowDriverConfig }}
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]
@@ -98,15 +107,11 @@ rules:
     verbs: ["create", "get"]
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
-  # Operator-mode namespaces receive Secret permissions from the openshell-workspace
-  # chart Role instead.
+  # Operator-mode namespaces receive Secret permissions from the
+  # openshell-workspace chart Role instead.
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap and image-pull Secrets are generation-scoped. Recovery deletes
-    # them by exact name.
     verbs: ["create", "delete"]
-  {{- end }}
-  {{- if eq $workspaceMode "managed" }}
   # ServiceAccount creation in managed namespaces.
   - apiGroups:
       - ""
@@ -115,7 +120,7 @@ rules:
     verbs:
       - create
       - get
-  {{- if .Values.networkPolicy.enabled }}
+  {{- if $managedSshIngressEnabled }}
   # Apply gateway-only SSH ingress isolation in managed namespaces.
   - apiGroups:
       - networking.k8s.io
@@ -128,3 +133,4 @@ rules:
       - update
   {{- end }}
   {{- end }}
+{{- end }}

@@ -18,7 +18,7 @@ administrator-controlled approval labels; bind and supplemental image mounts
 are denied under enforcement. Private-volume names alone do not prove
 ownership. GPU devices are temporarily exempt. Admission runs before launch,
 restart, and periodically for running workloads.
-See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
 | Property | Workload | Supervisor |
 |---|---|---|
@@ -43,7 +43,9 @@ stopped Podman container does not populate nested named volumes. Restart restore
 only the channel bootstrap into the existing channel volume, preserving the
 workspace. The workload starts before the supervisor so its user namespace exists
 when the supervisor joins it; a stopped supervisor resolves that namespace again
-on its next start.
+on its next start. The driver creates the managed workspace volume owned by
+the workload's final UID and GID, so the workload never starts as root. Custom
+image workspaces have no workspace volume or upload.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
@@ -69,8 +71,9 @@ Landlock denies agent access to the top-level `/.openshell` control hierarchy.
 The driver verifies Podman's reported `network=none` fence before launch and
 restart. Host networking applies to the supervisor, not the agent.
 
-Gateway sessions use the existing sandbox JWT and optional configured mTLS
-bundle. The sandbox/supervisor channel always uses its separate, per-sandbox
+Gateway sessions use the sandbox JWT and optional server-authenticated TLS.
+Only the gateway CA is delivered to the supervisor; user client certificates
+and private keys are not mounted into either container. The sandbox/supervisor channel always uses its separate, per-sandbox
 mutual TLS material. These are distinct authentication relationships.
 
 ## Identity and trusted binaries
@@ -89,6 +92,24 @@ workload; user-namespace modes that cannot use image volumes retain the trusted
 binary extraction path. `supervisor_image` supplies the dynamically linked
 glibc `/openshell-supervisor` binary outside the workload. Image and request
 environment belong to agent children, never the supervisor process.
+
+## OCI working directory
+
+OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
+`/sandbox`, OpenShell uses its managed `/sandbox` workspace volume. A custom
+path must be absolute and normalized, and cannot overlap `/proc`, `/sys`,
+`/dev`, OpenShell-reserved paths, or the workload's private control and CA
+mounts. Image volumes and driver mounts cannot cover it; mounts nested below it
+remain valid.
+
+A custom path stays in the image's container filesystem with its ownership and
+permissions. The workload starts as the final non-root user, which must be able
+to reach and write the directory. Agent commands use the path as their working
+directory.
+
+Custom workspace contents survive stop/start of the same workload container,
+but are removed with that container. They do not live in a managed named volume
+and are not copied to a replacement container.
 
 ## Lifecycle and readiness
 
@@ -119,7 +140,7 @@ image mounts also require disabled admission. Driver JSON requires
 `allow_driver_config = true`. Reserved control paths and the workspace
 root cannot be replaced. User-owned volumes are never created or deleted.
 
-See [gateway configuration](../../docs/reference/gateway-config.mdx) for
+See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
 Omit `health_check_interval_secs` to disable Podman's periodic health command.

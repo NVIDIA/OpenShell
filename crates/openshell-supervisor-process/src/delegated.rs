@@ -87,6 +87,7 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -106,6 +107,7 @@ pub async fn start_boundary_access(
         .await
         .map_err(|error| miette::miette!(error.to_string()))?;
     let main_session = crate::main_session::MainSession::from_boundary(attachment, agent);
+    let host_key = host_key.ok_or_else(|| miette::miette!("sandbox SSH host key is missing"))?;
 
     let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
     let listen_path = ssh_socket_path.clone();
@@ -120,6 +122,7 @@ pub async fn start_boundary_access(
             ssh_port_forward,
             boundary_exec,
             Some(ssh_main_session),
+            host_key,
         )
         .await
         {
@@ -156,7 +159,7 @@ pub async fn start_boundary_access(
 
     let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
         (Some(endpoint), Some(id)) => {
-            let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
+            let (task, accepted) = crate::supervisor_session::spawn_with_readiness(
                 endpoint.to_string(),
                 id.to_string(),
                 ssh_socket_path,
@@ -168,25 +171,10 @@ pub async fn start_boundary_access(
                     session_id_updates: supervisor_session_updates,
                 },
             );
-            let accepted_result =
-                tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))
-                    .await
-                    .map(|result| result.map(|_| ()));
-            match accepted_result {
-                Ok(Ok(())) => (Some(task), Some(accepted)),
-                Ok(Err(_)) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "supervisor session ended before gateway acceptance"
-                    ));
-                }
-                Err(_) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "gateway did not accept supervisor session within 10 seconds"
-                    ));
-                }
-            }
+            // Session establishment retries through gateway restarts. The
+            // readiness socket remains absent until the gateway accepts the
+            // session, so a transient delay cannot kill the supervisor.
+            (Some(task), Some(accepted))
         }
         _ => (None, None),
     };

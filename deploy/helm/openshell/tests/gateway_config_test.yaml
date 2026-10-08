@@ -13,6 +13,22 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel\s*=\s*false$'
+
+  - it: enables the WebSocket tunnel when requested
+    template: templates/gateway-config.yaml
+    set:
+      server.enableWebsocketTunnel: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:
@@ -287,6 +303,166 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.otlp\]'
 
+  - it: omits OCSF JSONL output by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.ocsf_log\]'
+
+  - it: treats a null OCSF log map as disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.ocsf_log\]'
+
+  - it: omits OCSF JSONL output when a path is set without enabling it
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.ocsf_log\]'
+
+  - it: writes OCSF JSONL to the default container path when enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?path\s*=\s*"/tmp/gateway-ocsf\.jsonl"'
+
+  - it: rejects enabled OCSF JSONL output without a path
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.path must be set when server.ocsfLog.enabled is true"
+
+  - it: renders OCSF JSONL output when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
+      server.ocsfLog.schemaVersion: "1.3"
+      server.ocsfLog.rotation: daily
+      server.ocsfLog.maxFiles: 14
+      server.ocsfLog.queueCapacity: 20000
+      server.ocsfLog.queueMaxBytes: 33554432
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*14.*?path\s*=\s*"/var/openshell/gateway-ocsf\.jsonl".*?queue_capacity\s*=\s*20000.*?queue_max_bytes\s*=\s*33554432.*?rotation\s*=\s*"daily".*?schema_version\s*=\s*"1\.3"'
+
+  - it: omits OCSF retention when rotation is disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
+      server.ocsfLog.rotation: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?rotation\s*=\s*"never"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'max_files\s*='
+
+  - it: rejects an unsupported OCSF rotation mode
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
+      server.ocsfLog.rotation: hourly
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.rotation must be daily or never"
+
+  - it: rejects a zero OCSF queueCapacity
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.queueCapacity: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.queueCapacity and queueMaxBytes must be positive"
+
+  - it: rejects a zero OCSF queueMaxBytes
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.queueMaxBytes: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.queueCapacity and queueMaxBytes must be positive"
+
+  - it: rejects a zero OCSF maxFiles
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.maxFiles: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.maxFiles must be positive when rotation is daily"
+
+  - it: uses default OCSF limits when they are null
+    template: templates/gateway-config.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.queueCapacity: null
+      server.ocsfLog.queueMaxBytes: null
+      server.ocsfLog.maxFiles: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*7.*?queue_capacity\s*=\s*10000.*?queue_max_bytes\s*=\s*16777216'
+
+  - it: rejects an unsupported OCSF schema version
+    template: templates/statefulset.yaml
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/openshell/gateway-ocsf.jsonl
+      server.ocsfLog.schemaVersion: "1.8"
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3"
+
+  - it: mounts extra gateway volumes for OCSF output in a Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/log/openshell/gateway-ocsf.jsonl
+      server.extraVolumes:
+        - name: ocsf-log
+          persistentVolumeClaim:
+            claimName: openshell-ocsf-log
+      server.extraVolumeMounts:
+        - name: ocsf-log
+          mountPath: /var/log/openshell
+          subPathExpr: $(OPENSHELL_POD_NAME)
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: ocsf-log
+            persistentVolumeClaim:
+              claimName: openshell-ocsf-log
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: ocsf-log
+            mountPath: /var/log/openshell
+            subPathExpr: $(OPENSHELL_POD_NAME)
+
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
     set:
@@ -326,7 +502,10 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)supervisor_image_pull_policy\s*=\s*"if_not_present".*?sandbox_runtime_image_pull_policy\s*=\s*"if_not_present"'
+          pattern: '(?m)^supervisor_image_pull_policy\s*=\s*"if_not_present"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime_image_pull_policy\s*=\s*"if_not_present"$'
 
   - it: renders canonical image pull policies in the Kubernetes driver table
     template: templates/gateway-config.yaml
@@ -373,7 +552,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace".*?default_image\s*=.*?supervisor_image\s*=.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?client_tls_secret_name\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?enable_user_namespaces\s*=\s*true.*?sa_token_ttl_secs\s*='
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=.*?default_image\s*=.*?enable_user_namespaces\s*=\s*true.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?namespace\s*=\s*"my-namespace".*?sa_token_ttl_secs\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?supervisor_image\s*='
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
@@ -793,6 +972,17 @@ tests:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
 
+  - it: preserves pkiInitJob serverDnsNames as the runtime SAN fallback
+    set:
+      certManager.enabled: false
+      pkiInitJob.serverDnsNames:
+        - "*.apps.example.com"
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'server_sans\s*=\s*\["\*\.apps\.example\.com"\]'
+
   - it: passes sqlite db-url via --db-url arg by default
     template: templates/statefulset.yaml
     asserts:
@@ -1144,7 +1334,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: "(?ms)name\\s*=\\s*\\\"openshell\\\".*?\\[openshell\\.drivers\\.kubernetes\\].*?namespace\\s*=\\s*\\\"my-namespace\\\".*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\""
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\".*?namespace\\s*=\\s*\\\"my-namespace\\\""
 
   - it: uses an explicit server grpc endpoint verbatim
     template: templates/gateway-config.yaml
@@ -1226,3 +1416,19 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""
+
+  - it: gives the gateway time to finish shutdown by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+
+  - it: keeps an explicit termination grace period
+    template: templates/statefulset.yaml
+    set:
+      podLifecycle.terminationGracePeriodSeconds: 3
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 3

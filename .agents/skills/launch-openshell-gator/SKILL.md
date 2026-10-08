@@ -80,6 +80,8 @@ jq -e '.tokens.access_token and .tokens.refresh_token and .tokens.account_id' "$
 
 If this fails, run the local Codex login flow outside the gator launch. If Codex was recently reauthenticated and gateway refresh fails later, relaunch with `--reset-refresh` once.
 
+The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.
@@ -158,7 +160,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the supervisor exits. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match the gateway driver.
 
 The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
@@ -217,7 +219,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test for the current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test with the full 40-character current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
 ```
 
 ## Model Or Image Experiments
@@ -280,6 +282,10 @@ The launcher streams image-build and provisioning output to the terminal. Import
 - `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
 - `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
+- Large PRs use local Git trees for patch identity instead of GitHub's
+  size-limited full-diff endpoint. An unavailable patch ID alone does not block
+  the ledger; it disables rebase-equivalence shortcuts. Reviewers should inspect
+  oversized changes file-by-file locally.
 
 ### Inspect Active Sandboxes
 

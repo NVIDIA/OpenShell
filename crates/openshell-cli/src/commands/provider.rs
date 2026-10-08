@@ -1702,10 +1702,11 @@ pub async fn provider_profile_import(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -1792,10 +1793,11 @@ pub async fn provider_profile_lint(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -2137,6 +2139,92 @@ fn load_profile_import_items(
     Ok((items, diagnostics))
 }
 
+const MAX_REMOTE_PROFILE_BYTES: usize = 1024 * 1024;
+
+async fn load_profile_import_items_with_url(
+    file: Option<&Path>,
+    from: Option<&Path>,
+    url: Option<&str>,
+) -> Result<(
+    Vec<ProviderProfileImportItem>,
+    Vec<ProviderProfileDiagnostic>,
+)> {
+    let Some(source) = url else {
+        return load_profile_import_items(file, from);
+    };
+    let parsed = reqwest::Url::parse(source)
+        .into_diagnostic()
+        .wrap_err("invalid provider profile URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(miette!("provider profile URL must use http or https"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(miette!("provider profile URL must not contain userinfo"));
+    }
+    let mut display_url = parsed.clone();
+    display_url.set_query(None);
+    display_url.set_fragment(None);
+    let path = parsed.path().to_owned();
+    let format = Path::new(&path).extension().and_then(|ext| ext.to_str());
+    if !matches!(format, Some("yaml" | "yml" | "json")) {
+        return Err(miette!(
+            "provider profile URL must end in .yaml, .yml, or .json"
+        ));
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .into_diagnostic()?;
+    let mut response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?
+        .error_for_status()
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_REMOTE_PROFILE_BYTES as u64)
+    {
+        return Err(miette!(
+            "provider profile at {display_url} exceeds the 1 MiB download limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        miette!(
+            "failed to read provider profile from {display_url}: {}",
+            err.without_url()
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_PROFILE_BYTES {
+            return Err(miette!(
+                "provider profile at {display_url} exceeds the 1 MiB download limit"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let input = std::str::from_utf8(&bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("provider profile at {display_url} is not UTF-8"))?;
+    let item = parse_profile_import_item(display_url.as_str(), input, format);
+    Ok(match item {
+        Ok(item) => (vec![item], Vec::new()),
+        Err(diagnostic) => (Vec::new(), vec![diagnostic]),
+    })
+}
+
 fn profile_source_paths(file: Option<&Path>, from: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Some(file) = file {
         return Ok(vec![file.to_path_buf()]);
@@ -2176,19 +2264,31 @@ fn load_profile_import_item(
             format!("failed to read provider profile file: {err}"),
         )
     })?;
-    let profile = match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => parse_profile_yaml(&input),
-        Some("json") => parse_profile_json(&input),
+    parse_profile_import_item(
+        &source,
+        &input,
+        path.extension().and_then(|ext| ext.to_str()),
+    )
+}
+
+fn parse_profile_import_item(
+    source: &str,
+    input: &str,
+    format: Option<&str>,
+) -> Result<ProviderProfileImportItem, ProviderProfileDiagnostic> {
+    let profile = match format {
+        Some("yaml" | "yml") => parse_profile_yaml(input),
+        Some("json") => parse_profile_json(input),
         _ => {
             return Err(profile_file_diagnostic(
-                &source,
+                source,
                 "unsupported provider profile file format".to_string(),
             ));
         }
     }
-    .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
+    .map_err(|err| profile_file_diagnostic(source, err.to_string()))?;
 
-    let pre_lower = profile.validate_before_lowering(&source);
+    let pre_lower = profile.validate_before_lowering(source);
     if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
         return Err(ProviderProfileDiagnostic {
             source: diag.source,
@@ -2201,7 +2301,7 @@ fn load_profile_import_item(
 
     Ok(ProviderProfileImportItem {
         profile: Some(profile.to_proto()),
-        source,
+        source: source.to_string(),
     })
 }
 
@@ -2466,7 +2566,8 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
         let access = match network_access_preset_to_str(endpoint.access) {
             Some("") if !endpoint.rules.is_empty() => "custom rules".to_string(),
             Some("") if is_mcp && allow_all_known_mcp_methods == Some(true) => {
-                "all known MCP methods (subject to tool and deny rules)".to_string()
+                "core MCP methods for the selected revision (subject to tool and deny rules)"
+                    .to_string()
             }
             Some("") => "not specified".to_string(),
             Some(access) => access.to_string(),
@@ -2501,9 +2602,26 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
                     || "not specified".to_string(),
                     |options| options.versions.join(", "),
                 );
-            let _ = writeln!(rendered, "    Allow all known MCP methods: {methods}");
+            let _ = writeln!(
+                rendered,
+                "    Allow core MCP methods for the selected revision: {methods}"
+            );
+            if allow_all_known_mcp_methods == Some(true) {
+                rendered
+                    .push_str("      Tool restrictions still apply; deny rules take precedence.\n");
+                rendered.push_str(
+                    "      Without tool-specific allow rules, all tool names are allowed.\n",
+                );
+            }
+            rendered.push_str("    Extension methods: require an exact allow rule\n");
             let _ = writeln!(rendered, "    Strict MCP tool names: {strict_names}");
             let _ = writeln!(rendered, "    MCP versions (declared): {versions}");
+            rendered.push_str(
+                "    Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n",
+            );
+            rendered.push_str(
+                "      Legacy initialize requests negotiate their revision in the body.\n",
+            );
         }
         if !endpoint.allowed_ips.is_empty() {
             let _ = writeln!(
@@ -3043,11 +3161,39 @@ binaries: [/usr/bin/curl]
             let rendered = format_provider_profile_details(&proto);
             assert!(
                 rendered
-                    .contains("Access: all known MCP methods (subject to tool and deny rules)\n")
+                    .contains("Access: core MCP methods for the selected revision (subject to tool and deny rules)\n")
             );
-            assert!(rendered.contains("Allow all known MCP methods: true\n"));
+            assert!(rendered.contains("Allow core MCP methods for the selected revision: true\n"));
+            assert!(
+                rendered.contains("Tool restrictions still apply; deny rules take precedence.")
+            );
+            assert!(
+                rendered.contains("Without tool-specific allow rules, all tool names are allowed.")
+            );
+            assert!(rendered.contains("Extension methods: require an exact allow rule\n"));
             assert!(rendered.contains("Strict MCP tool names: true (default)\n"));
             assert!(rendered.contains("MCP versions (declared): 2025-11-25\n"));
+            assert!(rendered.contains(
+                "Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n"
+            ));
+            assert!(
+                rendered
+                    .contains("Legacy initialize requests negotiate their revision in the body.\n")
+            );
+
+            for output in ["json", "yaml"] {
+                let structured = format_provider_profile_description(&proto, output)
+                    .expect("structured description renders");
+                let roundtrip = if output == "json" {
+                    parse_profile_json(&structured)
+                } else {
+                    parse_profile_yaml(&structured)
+                }
+                .expect("structured description is a full profile document");
+                assert_eq!(roundtrip, ProviderTypeProfile::from_proto(&proto));
+                assert!(structured.contains("allow_all_known_mcp_methods"));
+                assert!(!structured.contains("Allow core MCP methods"));
+            }
 
             // Explicit rules remain relevant when the method default is enabled,
             // and independent tool-name validation must not disappear from view.
@@ -3063,7 +3209,13 @@ binaries: [/usr/bin/curl]
                 options.strict_tool_names = Some(false);
                 let rendered = format_provider_profile_details(&proto);
                 assert!(rendered.contains("Access: custom rules\n    Rules: 1 allow, 0 deny\n"));
-                assert!(rendered.contains(&format!("Allow all known MCP methods: {allow_all}\n")));
+                assert!(rendered.contains(&format!(
+                    "Allow core MCP methods for the selected revision: {allow_all}\n"
+                )));
+                assert_eq!(
+                    rendered.contains("Tool restrictions still apply"),
+                    allow_all
+                );
                 assert!(rendered.contains("Strict MCP tool names: false\n"));
             }
         }

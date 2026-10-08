@@ -11,7 +11,7 @@
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -232,6 +232,7 @@ impl SandboxSessionJwtAuthority {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: None,
             },
             gateway_id: self.gateway_id.clone(),
             verification_keys: self.verification_keys.clone(),
@@ -276,11 +277,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
+        let Some(token) = bearer_credential(headers) else {
             return Ok(None);
         };
         let Ok(header) = decode_header(token) else {

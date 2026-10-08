@@ -223,28 +223,44 @@ egress_authorization := {
 
 default allow_request = false
 
-# Per-policy helper: true when this single policy has at least one endpoint
-# matching the L4 request whose L7 rules also permit the specific request.
+# Per-policy helper: endpoints whose selectors and L7 rules permit the request.
 # Isolating the endpoint iteration inside a function avoids the regorus
 # "duplicated definition of local variable" error that occurs when the
 # outer `some name` iterates over multiple policies that share a host:port.
-_policy_allows_l7(policy) if {
+_policy_allowed_l7_endpoints(policy) := [ep |
 	some ep
 	ep := policy.endpoints[_]
 	endpoint_matches_l7_request(ep, input.network, input.request)
 	request_allowed_for_endpoint(input.request, ep)
-}
+]
 
-# L7 request allowed if any matching L4 policy also allows the L7 request
-# AND no deny rule blocks it. Deny rules take precedence over allow rules.
-allow_request if {
+# Forwarding and credential selection share endpoint admission. A deny rule
+# on any matching endpoint removes every otherwise admitted endpoint.
+_admitted_l7_endpoints := {ep |
 	some name
 	policy := data.network_policies[name]
-	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
-	_policy_allows_l7(policy)
+	eps := _policy_allowed_l7_endpoints(policy)
+	ep := eps[_]
 	not deny_request
 }
+
+allow_request if {
+	count(_admitted_l7_endpoints) > 0
+}
+
+# Credentials require the admission of their own endpoint. A sibling endpoint's
+# allow can authorize forwarding, but cannot authorize this endpoint's grant.
+# Keep every admitting owner so overlapping allows retain union semantics, and
+# preserve the global deny decision before any caller selects a credential.
+# Missing owner metadata grants no credential authority. Sorting a set gives
+# consumers a deterministic array without duplicate owner identifiers.
+allowed_token_grant_owners := sort({owner |
+	some endpoint in _admitted_l7_endpoints
+	owner := object.get(endpoint, "token_grant_owner", "")
+	is_string(owner)
+	owner != ""
+})
 
 # --- L7 deny rules ---
 #
@@ -424,11 +440,66 @@ request_deny_reason := reason if {
 	reason := "JSON-RPC response frames are not permitted from client to server"
 }
 
+# Explain only parsed MCP calls on an endpoint that matches this request path.
+# The relay evaluates batch members separately. Response frames and protocol
+# errors keep their own diagnostics, and a sibling endpoint must not select
+# the explanation merely because it shares the connection's host and port.
+mcp_policy_request if {
+	input.request.method == "POST"
+	not is_object(object.get(input.request, "graphql", null))
+	not jsonrpc_response_frame_present(input.request)
+	jsonrpc := object.get(input.request, "jsonrpc", null)
+	is_object(jsonrpc)
+	jsonrpc_no_parse_error(jsonrpc)
+	method := object.get(jsonrpc, "method", "")
+	is_string(method)
+	method != ""
+	object.get(jsonrpc, "mcp_method_classification", "") in {"available", "extension"}
+	endpoint := _matching_endpoint_configs[_]
+	endpoint.protocol == "mcp"
+	endpoint_path_matches_request(endpoint, input.request)
+}
+
+# These reasons use fixed text because method names and tool parameters can
+# contain caller data. Deny rules take precedence over missing allow rules.
+request_deny_reason := reason if {
+	mcp_policy_request
+	deny_request
+	reason := "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors"
+}
+
+request_deny_reason := reason if {
+	mcp_policy_request
+	not deny_request
+	not allow_request
+	input.request.jsonrpc.mcp_method_classification == "extension"
+	reason := "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions"
+}
+
+request_deny_reason := reason if {
+	mcp_policy_request
+	not deny_request
+	not allow_request
+	input.request.jsonrpc.mcp_method_classification == "available"
+	input.request.jsonrpc.method == "tools/call"
+	reason := "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors"
+}
+
+request_deny_reason := reason if {
+	mcp_policy_request
+	not deny_request
+	not allow_request
+	input.request.jsonrpc.mcp_method_classification == "available"
+	input.request.jsonrpc.method != "tools/call"
+	reason := "MCP core method is not permitted by policy; ask the policy owner to review rules for this method in the selected MCP revision"
+}
+
 request_deny_reason := reason if {
 	input.request
 	deny_request
 	not graphql_request_has_operations(input.request)
 	not jsonrpc_response_frame_present(input.request)
+	not mcp_policy_request
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
 }
 
@@ -438,6 +509,7 @@ request_deny_reason := reason if {
 	not allow_request
 	not graphql_request_has_operations(input.request)
 	not jsonrpc_response_frame_present(input.request)
+	not mcp_policy_request
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
@@ -472,6 +544,10 @@ request_allowed_for_endpoint(request, endpoint) if {
 	rule.allow.method
 	not jsonrpc_response_frame_present(request)
 	jsonrpc_rule_matches(request, endpoint, rule.allow)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	method := object.get(jsonrpc, "method", "")
+	rule_method := object.get(rule.allow, "method", "")
+	jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, method, rule_method)
 }
 
 # MCP can allow the method layer by endpoint option while still using
@@ -487,6 +563,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	method := object.get(jsonrpc, "method", "")
 	is_string(method)
 	method != ""
+	object.get(jsonrpc, "mcp_method_classification", "") == "available"
 	not mcp_tool_call_narrowed_by_policy(endpoint, method)
 }
 
@@ -772,6 +849,23 @@ jsonrpc_rule_matches(request, endpoint, rule) if {
 	rule_method != ""
 	jsonrpc_rule_method_matches(endpoint, method, rule_method)
 	jsonrpc_rule_params_match_for_protocol(jsonrpc, endpoint, rule)
+}
+
+jsonrpc_allow_rule_classification_allowed(_, endpoint, _, _) if {
+	endpoint.protocol == "json-rpc"
+}
+
+jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, _, _) if {
+	endpoint.protocol == "mcp"
+	object.get(jsonrpc, "mcp_method_classification", "") == "available"
+}
+
+# Extension methods remain addressable, but only by an exact policy literal.
+# A wildcard must not silently authorize methods outside the selected core profile.
+jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, method, rule_method) if {
+	endpoint.protocol == "mcp"
+	object.get(jsonrpc, "mcp_method_classification", "") == "extension"
+	rule_method == method
 }
 
 jsonrpc_rule_method_matches(endpoint, _, rule_method) if {

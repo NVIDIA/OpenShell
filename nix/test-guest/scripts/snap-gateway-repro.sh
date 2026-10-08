@@ -99,7 +99,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	echo "==> install.sh Snap ${mode} reproduction attempt ${attempt}/${attempts}"
 	if [ "${mode}" != system-docker ]; then
 		output=$(mktemp)
-		if OPENSHELL_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
+		if OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
 			echo "install.sh unexpectedly succeeded in ${mode} mode" >&2
 			cat "${output}" >&2
 			rm -f "${output}"
@@ -127,20 +127,39 @@ for attempt in $(seq 1 "${attempts}"); do
 	fi
 
 	sandbox="snap-${attempt}-$$"
-	if ! OPENSHELL_VERSION=dev sh "${install_script}" ||
+	prover_dir=$(mktemp -d "$HOME/openshell-prover-repro.XXXXXX")
+	cat >"${prover_dir}/boundary.yaml" <<'EOF'
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+    - /etc
+EOF
+	cat >"${prover_dir}/candidate.yaml" <<'EOF'
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+EOF
+	if ! OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" ||
 		! sudo snap list openshell >/dev/null ||
 		! snap info openshell | grep -Eq '^tracking: +latest/edge$' ||
 		! docker_is_ready ||
 		! sudo snap connections openshell | grep -Eq '^docker +openshell:docker +:docker +' ||
 		! /snap/bin/openshell status ||
+		! /snap/bin/openshell.prover --version ||
+		! /snap/bin/openshell.prover check "${prover_dir}/candidate.yaml" \
+			--boundary "${prover_dir}/boundary.yaml" | grep -q '^result: within_boundary$' ||
 		! /snap/bin/openshell sandbox create --name "${sandbox}" --detach ||
 		! /snap/bin/openshell sandbox exec --name "${sandbox}" --no-tty -- true ||
 		! /snap/bin/openshell sandbox delete "${sandbox}"; then
 		echo "install.sh Snap reproduction failed" >&2
 		diagnostics "${attempt}"
 		failures=$((failures + 1))
+		rm -rf "${prover_dir}"
 		continue
 	fi
+	rm -rf "${prover_dir}"
 
 	if sudo snap list docker >/dev/null 2>&1; then
 		echo "install.sh unexpectedly installed the Docker snap" >&2

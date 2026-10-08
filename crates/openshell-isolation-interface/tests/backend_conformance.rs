@@ -193,6 +193,7 @@ impl BoundaryExec for MockExec {
             stdout: Box::new(out_r),
             stderr: (!spec.pty).then_some(stderr),
             terminal: spec.pty.then_some(terminal),
+            output_status: None,
         })
     }
 }

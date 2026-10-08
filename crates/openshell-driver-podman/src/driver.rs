@@ -18,7 +18,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
-    effective_driver_gpu_count, validate_specific_gpu_device_request,
+    effective_driver_gpu_count, validate_cdi_gpu_device_request,
 };
 use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
@@ -77,6 +77,36 @@ fn select_grpc_endpoint(
     )
 }
 
+/// Point a loopback collector endpoint at the desktop host on Podman Machine,
+/// where supervisor loopback is the VM's.
+fn select_supervisor_otlp_endpoint(
+    config: &PodmanComputeConfig,
+    environment: PodmanEndpointEnvironment,
+) -> Option<String> {
+    let endpoint = config.supervisor_otlp_endpoint.as_deref()?;
+    if environment == PodmanEndpointEnvironment::LinuxHost {
+        return Some(endpoint.to_string());
+    }
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return Some(endpoint.to_string());
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !loopback || url.set_host(Some(environment.gateway_host())).is_err() {
+        return Some(endpoint.to_string());
+    }
+    let rewritten = String::from(url);
+    if endpoint.ends_with('/') {
+        Some(rewritten)
+    } else {
+        Some(rewritten.trim_end_matches('/').to_string())
+    }
+}
+
 fn decode_launch_authentication(
     encoded: &[u8],
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
@@ -110,8 +140,6 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
-    /// Whether Podman's service is running without root privileges.
-    rootless: bool,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
@@ -123,7 +151,6 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
-            .field("rootless", &self.rootless)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
             .finish()
     }
@@ -143,6 +170,12 @@ fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDr
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+/// Parse a numeric `uid:gid` container user.
+fn numeric_user(user: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = user.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
 }
 
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
@@ -297,13 +330,9 @@ async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &
 async fn create_tls_secrets(
     client: &PodmanClient,
     config: &PodmanComputeConfig,
-    names: &[String; 3],
+    names: &[String; 1],
 ) -> Result<(), ComputeDriverError> {
-    let paths = [
-        config.guest_tls_ca.as_deref(),
-        config.guest_tls_cert.as_deref(),
-        config.guest_tls_key.as_deref(),
-    ];
+    let paths = [config.guest_tls_ca.as_deref()];
     let mut created = 0usize;
     for (name, path) in names.iter().zip(paths.iter()) {
         let Some(p) = path else { continue };
@@ -328,7 +357,7 @@ async fn create_tls_secrets(
     Ok(())
 }
 
-async fn cleanup_tls_secrets(client: &PodmanClient, names: &[String; 3]) {
+async fn cleanup_tls_secrets(client: &PodmanClient, names: &[String]) {
     for name in names {
         if let Err(err) = client.remove_secret(name).await {
             warn!(
@@ -468,7 +497,7 @@ impl PodmanComputeDriver {
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        let rootless = match client.system_info().await {
+        match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -490,14 +519,13 @@ impl PodmanComputeDriver {
                     apparmor_enabled = info.host.security.apparmor_enabled,
                     "Connected to Podman"
                 );
-                info.host.security.rootless
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        };
+        }
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
@@ -511,6 +539,8 @@ impl PodmanComputeDriver {
         // standard desktop-host alias.
         let endpoint_was_selected = config.grpc_endpoint.is_empty();
         config.grpc_endpoint = select_grpc_endpoint(&config, PodmanEndpointEnvironment::current());
+        config.supervisor_otlp_endpoint =
+            select_supervisor_otlp_endpoint(&config, PodmanEndpointEnvironment::current());
         if endpoint_was_selected {
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -533,7 +563,6 @@ impl PodmanComputeDriver {
         let driver = Self {
             client,
             config,
-            rootless,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -638,7 +667,7 @@ impl PodmanComputeDriver {
         let _ = effective_driver_gpu_count(gpu_requirements)
             .map_err(ComputeDriverError::InvalidArgument)?;
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -664,7 +693,7 @@ impl PodmanComputeDriver {
         ) -> Result<Vec<String>, CdiGpuSelectionError>,
     ) -> Result<Option<Vec<String>>, ComputeDriverError> {
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -779,14 +808,22 @@ impl PodmanComputeDriver {
                     if volume.name != name {
                         return Err(missing());
                     }
-                    if name == container::volume_name(sandbox_id)
-                        || name == crate::isolation::channel_volume_name(sandbox_id)
+                    let workspace_volume = name == container::volume_name(sandbox_id);
+                    if workspace_volume || name == crate::isolation::channel_volume_name(sandbox_id)
                     {
                         let owned = volume.labels.as_ref().is_some_and(|labels| {
                             labels.get(LABEL_SANDBOX_ID) == Some(sandbox_id)
                                 && labels.get(container::LABEL_SANDBOX_WORKSPACE) == Some(workspace)
                         });
-                        if !owned || volume.driver != "local" || !volume.options.is_empty() {
+                        // The channel volume has no options. The managed
+                        // workspace is owned by the container's final identity,
+                        // or has no options when an older gateway created it.
+                        let options_ok = volume.options.is_empty()
+                            || (workspace_volume
+                                && numeric_user(&inspect.config.user).is_some_and(|owner| {
+                                    volume.options_match_requested_owner(Some(owner))
+                                }));
+                        if !owned || volume.driver != "local" || !options_ok {
                             return Err(missing());
                         }
                     } else {
@@ -905,7 +942,7 @@ impl PodmanComputeDriver {
             "Creating sandbox container"
         );
 
-        let (image, immutable_image_id, image_user, image_env) = async {
+        let resolved_image = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 // The sandbox runtime is shipped in a standalone OCI image.
@@ -963,10 +1000,8 @@ impl PodmanComputeDriver {
                         "podman image '{image}' inspection did not return an immutable image ID"
                     )));
                 }
-                let image_user = inspected_image
-                    .config
-                    .as_ref()
-                    .map_or_else(String::new, |config| config.user.clone());
+                let resolved_image =
+                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?;
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
@@ -981,8 +1016,7 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?;
                 }
 
-                let image_env = inspected_image.config.as_ref().map_or_else(Vec::new, |config| config.env.clone());
-                Ok((image.to_string(), inspected_image.id, image_user, image_env))
+                Ok(resolved_image)
             }
             .await;
             phase_status.finish(result)
@@ -993,6 +1027,7 @@ impl PodmanComputeDriver {
             otel.status_code = tracing::field::Empty,
         ))
         .await?;
+        let managed_workspace = resolved_image.uses_managed_workspace();
 
         // Fail closed on a missing/unreadable corporate proxy CA bundle before
         // creating any resources, so the operator gets a clear error
@@ -1006,7 +1041,7 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)?;
 
         let identity = self
-            .resolve_workload_identity(sandbox, &immutable_image_id, &image_user)
+            .resolve_workload_identity(sandbox, &resolved_image.id, &resolved_image.oci_user)
             .await?;
         let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
         let mut runtime_config = self.config.clone();
@@ -1031,14 +1066,21 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Create the workspace volume and per-sandbox runtime files.
+        // Create the managed workspace volume, if needed, and runtime files.
         let (resolver_secret_name, token_secret_name, proxy_auth_secret_name) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                self.client
-                    .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
+                if managed_workspace {
+                    self.client
+                        .create_owned_volume(
+                            &vol_name,
+                            &sandbox.id,
+                            &sandbox.workspace,
+                            Some((identity.uid, identity.gid)),
+                        )
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                }
                 let resolver_secret_name =
                     match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
                         Ok(name) => name,
@@ -1157,14 +1199,10 @@ impl PodmanComputeDriver {
                     token_secret: token_secret_name.as_deref(),
                     resolver_secret: &resolver_secret_name,
                     gpu_devices: gpu_devices.as_deref(),
-                    requested_image: &image,
-                    image_id: &immutable_image_id,
-                    image_user: &image_user,
-                    image_env: &image_env,
+                    image: &resolved_image,
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),
                     identity: &identity,
-                    rootless: self.rootless,
                 });
                 let mut specs = match specs {
                     Ok(spec) => spec,
@@ -1179,14 +1217,14 @@ impl PodmanComputeDriver {
                     let identities = self.validate_user_volume_mounts_available(sandbox).await?;
                     specs.record_resource_identities(&identities)?;
                     self.client
-                        .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace)
+                        .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace, None)
                         .await?;
                     channel_owned.store(true, std::sync::atomic::Ordering::Relaxed);
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
-                    let child_env = podman_child_environment(sandbox, &image_env);
+                    let child_env = podman_child_environment(sandbox, &resolved_image.environment);
                     let launch_authentication = sandbox
                         .spec
                         .as_ref()
@@ -1222,9 +1260,11 @@ impl PodmanComputeDriver {
                             archives.channel,
                         )
                         .await?;
-                    self.client
-                        .copy_to_container(&workload_id, "/sandbox", archives.workspace)
-                        .await?;
+                    if managed_workspace {
+                        self.client
+                            .copy_to_container(&workload_id, "/sandbox", archives.workspace)
+                            .await?;
+                    }
                     let supervisor_id = self
                         .client
                         .create_typed_container(&specs.supervisor)
@@ -1810,7 +1850,6 @@ impl PodmanComputeDriver {
         Self {
             client,
             config,
-            rootless: false,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -2066,6 +2105,7 @@ mod tests {
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
+                ssh_host_private_key: None,
             },
             gateway_id: "gateway-test".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -2687,8 +2727,6 @@ mod tests {
         let cfg = PodmanComputeConfig {
             gateway_port: 8080,
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         assert_eq!(
@@ -2697,27 +2735,76 @@ mod tests {
         );
     }
 
+    fn otlp_config(endpoint: Option<&str>) -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            supervisor_otlp_endpoint: endpoint.map(str::to_string),
+            ..PodmanComputeConfig::default()
+        }
+    }
+
     #[test]
-    fn partial_tls_config_returns_error() {
+    fn supervisor_otlp_endpoint_stays_unset_without_gateway_export() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(None),
+                PodmanEndpointEnvironment::PodmanMachine
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_keeps_loopback_on_linux() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(Some("http://127.0.0.1:4317")),
+                PodmanEndpointEnvironment::LinuxHost
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4317")
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_uses_host_alias_for_loopback_on_podman_machine() {
+        for endpoint in [
+            "http://127.0.0.1:4317",
+            "http://localhost:4317",
+            "http://[::1]:4317",
+        ] {
+            assert_eq!(
+                select_supervisor_otlp_endpoint(
+                    &otlp_config(Some(endpoint)),
+                    PodmanEndpointEnvironment::PodmanMachine
+                )
+                .as_deref(),
+                Some("http://host.containers.internal:4317"),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_keeps_routable_hosts_on_podman_machine() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(Some("https://collector.example.com:4317")),
+                PodmanEndpointEnvironment::PodmanMachine
+            )
+            .as_deref(),
+            Some("https://collector.example.com:4317")
+        );
+    }
+
+    #[test]
+    fn ca_only_tls_config_is_enabled() {
         let cfg = PodmanComputeConfig {
             gateway_port: 8080,
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            // guest_tls_cert and guest_tls_key not set — incomplete TLS config.
             ..PodmanComputeConfig::default()
         };
-        assert!(!cfg.tls_enabled());
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("partial TLS config should be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OPENSHELL_PODMAN_TLS_CERT"),
-            "error should name the missing cert: {msg}"
-        );
-        assert!(
-            msg.contains("OPENSHELL_PODMAN_TLS_KEY"),
-            "error should name the missing key: {msg}"
-        );
+        assert!(cfg.tls_enabled());
+        cfg.validate_tls_config().expect("CA-only TLS is valid");
     }
 
     #[test]
@@ -2859,6 +2946,32 @@ mod tests {
         let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
 
         assert!(err.to_string().contains("nvidia.com/gpu=all"));
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_host_device_paths() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        });
+        for device in ["/dev/sda", "/dev", "/dev/sda:/dev/sda:rwm"] {
+            let sandbox = DriverSandbox {
+                spec: Some(DriverSandboxSpec {
+                    resource_requirements: Some(gpu_resources(None)),
+                    template: Some(DriverSandboxTemplate {
+                        driver_config: Some(cdi_devices_config(&[device])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+            assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+            assert!(err.to_string().contains("CDI qualified names"));
+        }
     }
 
     #[tokio::test]
@@ -3040,7 +3153,7 @@ mod tests {
         assert!(
             driver
                 .client
-                .create_owned_volume("private-collision", "sandbox-123", "team-a")
+                .create_owned_volume("private-collision", "sandbox-123", "team-a", None)
                 .await
                 .is_err()
         );
@@ -3093,6 +3206,80 @@ mod tests {
                     .iter()
                     .all(|request| request.starts_with("GET "))
             );
+            let _ = fs::remove_file(socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_accepts_workspace_volume_owned_by_workload_identity() {
+        let owned = serde_json::json!({"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"});
+        for (workspace_options, channel_options, allowed) in [
+            (owned.clone(), serde_json::json!({}), true),
+            // Created by a gateway that did not set volume ownership.
+            (serde_json::json!({}), serde_json::json!({}), true),
+            (
+                serde_json::json!({"o":"uid=0,gid=0","UID":"0","GID":"0"}),
+                serde_json::json!({}),
+                false,
+            ),
+            (owned.clone(), owned.clone(), false),
+        ] {
+            let sandbox_id = "sandbox-owned";
+            let workspace_volume = container::volume_name(sandbox_id);
+            let channel_volume = crate::isolation::channel_volume_name(sandbox_id);
+            let volume = |name: &str, options: &serde_json::Value| {
+                StubResponse::new(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "Name": name, "Driver": "local", "Options": options,
+                        "Labels": {LABEL_SANDBOX_ID: sandbox_id, container::LABEL_SANDBOX_WORKSPACE: "team-a"}
+                    })
+                    .to_string(),
+                )
+            };
+            let container = serde_json::json!({
+                "Id": "workload", "Name": "workload", "State": {"Status": "created", "Running": false},
+                "Config": {
+                    "User": "1234:1235",
+                    "Labels": {
+                        LABEL_SANDBOX_ID: sandbox_id,
+                        container::LABEL_SANDBOX_WORKSPACE: "team-a",
+                        openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
+                        openshell_core::resource_admission::IDENTITIES_LABEL: "{}",
+                    }
+                },
+                "Mounts": [
+                    {"Type": "volume", "Name": workspace_volume},
+                    {"Type": "volume", "Name": channel_volume},
+                ]
+            });
+            let (socket, _, handle) = spawn_podman_stub(
+                "admission-owned",
+                vec![
+                    StubResponse::new(StatusCode::OK, container.to_string()),
+                    volume(&workspace_volume, &workspace_options),
+                    volume(&channel_volume, &channel_options),
+                ],
+            );
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                socket_path: Some(socket.clone()),
+                resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let result = driver.admit_container_resources("workload").await;
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "workspace {workspace_options}, channel {channel_options}: {result:?}"
+            );
+            if allowed {
+                handle.await.unwrap();
+            } else {
+                handle.abort();
+            }
             let _ = fs::remove_file(socket);
         }
     }
@@ -3556,7 +3743,11 @@ mod tests {
             image_response("sha256:supervisor"),
             StubResponse::new(StatusCode::NOT_FOUND, ""), // no existing private workspace
             StubResponse::new(StatusCode::CREATED, "{}"), // workspace volume
-            owned_volume_response(&container::volume_name(sandbox_id), sandbox_id),
+            owned_volume_response(
+                &container::volume_name(sandbox_id),
+                sandbox_id,
+                Some((1234, 1235)), // the stub image's OCI user
+            ),
             StubResponse::new(StatusCode::CREATED, "{}"), // resolver secret
         ];
         if proxy_secret {
@@ -3573,15 +3764,30 @@ mod tests {
         responses.push(owned_volume_response(
             &crate::isolation::channel_volume_name(sandbox_id),
             sandbox_id,
+            None,
         ));
         responses
     }
 
-    fn owned_volume_response(name: &str, sandbox_id: &str) -> StubResponse {
+    fn owned_volume_response(
+        name: &str,
+        sandbox_id: &str,
+        owner: Option<(u32, u32)>,
+    ) -> StubResponse {
+        let options = owner.map_or_else(
+            || serde_json::json!({}),
+            |(uid, gid)| {
+                serde_json::json!({
+                    "o": format!("uid={uid},gid={gid}"),
+                    "UID": uid.to_string(),
+                    "GID": gid.to_string(),
+                })
+            },
+        );
         StubResponse::new(
             StatusCode::OK,
             serde_json::json!({
-                "Name": name, "Driver": "local", "Options": {},
+                "Name": name, "Driver": "local", "Options": options,
                 "Labels": {LABEL_SANDBOX_ID: sandbox_id, container::LABEL_SANDBOX_WORKSPACE: ""}
             })
             .to_string(),

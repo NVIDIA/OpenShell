@@ -34,7 +34,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -152,14 +152,16 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
-    needs: [compute-versions, build-binaries, build-deb, build-images]
+    needs: [compute-versions, build-binaries, build-deb, build-images, build-rpm]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
+      source-sha: ${{ needs.compute-versions.outputs.source_sha }}
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
 
   conformance-integration:
     needs: prepare-integration
@@ -172,6 +174,13 @@ jobs:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
 
   feature-specific-integration:
     needs: prepare-integration
@@ -186,8 +195,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
         ]
 
   docker-e2e:
@@ -214,11 +223,40 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    needs: compute-versions
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+  compatibility-review:
+    name: Compatibility Review (advisory)
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/codex-compatibility.yml
+    with:
+      candidate_ref: ${{ inputs.tag || github.ref_name }}
+      source_sha: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
   qualification-result:
     name: Release Qualification
     if: always()
     needs:
       - compute-versions
+      - protobuf-compatibility
       - security
       - conformance-integration
       - feature-specific-integration
@@ -244,6 +282,7 @@ jobs:
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
           VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
@@ -268,11 +307,15 @@ jobs:
             echo
             echo "| Suite | Result |"
             echo "| --- | --- |"
+            echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
             echo "| Security | ${SECURITY_RESULT} |"
             echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
             echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
             echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
             echo "| VM E2E | ${VM_E2E_RESULT} |"
+            echo
+            echo "Advisory compatibility review runs independently and does not gate publication."
+            echo "See the Compatibility Review job and compatibility-review-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT} artifact in [this run](${run_url})."
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload qualification result
@@ -283,10 +326,10 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Require current qualification profile for stable releases
-        if: needs.compute-versions.outputs.is_prerelease != 'true' && steps.summary.outputs.current-profile-passed != 'true'
+      - name: Require current qualification profile before publication
+        if: steps.summary.outputs.current-profile-passed != 'true'
         run: |
-          echo "Stable release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
           exit 1
 
   build-python-wheel:
@@ -295,7 +338,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -342,11 +385,6 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-      upload-channel: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
-      github-environment: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
-      publish: ${{ needs.compute-versions.outputs.is_prerelease != 'true' }}
-    secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
@@ -358,11 +396,23 @@ jobs:
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  publish-snap:
+    name: Publish Snap
+    needs: [compute-versions, release, qualification-result]
+    if: needs.compute-versions.outputs.is_prerelease != 'true' && needs.qualification-result.outputs.current-profile-passed == 'true'
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/stable
+      github-environment: latest/stable
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
   # ---------------------------------------------------------------------------
-  # Assemble release artifacts. Stable publication remains qualification-gated.
+  # Assemble release artifacts after the current qualification profile passes.
   # ---------------------------------------------------------------------------
   release:
     name: Release
+    if: needs.qualification-result.outputs.current-profile-passed == 'true'
     needs:
       - compute-versions
       - package-binaries
@@ -712,9 +762,10 @@ jobs:
   publish-qualification:
     name: Publish Qualification Summary (OCI)
     if: >-
-      always()
+      !cancelled()
       && needs.release.result == 'success'
       && needs.qualification-result.result == 'success'
+      && needs.qualification-result.outputs.current-profile-passed == 'true'
     needs: [compute-versions, qualification-result, release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -749,6 +800,36 @@ jobs:
 
           echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
 
+  notify-prerelease-failure:
+    name: Notify Prerelease Failure
+    needs: [release-helm, publish-qualification]
+    if: failure() && contains(inputs.tag || github.ref_name, '-pre.')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          if [[ -n "${SLACK_MENTION}" ]]; then
+            message+=" ${SLACK_MENTION}"
+          fi
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
+            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"
+
   publish-fern-docs:
     name: Sync and Publish Fern Docs
     needs: [compute-versions, release, publish-sdk-typescript, release-helm, trigger-wheel-publish]
@@ -758,9 +839,10 @@ jobs:
     uses: ./.github/workflows/sync-docs.yml
     with:
       operation: sync
-      channel: latest
+      channel: stable
       source_ref: ${{ needs.compute-versions.outputs.source_sha }}
       release_version: ${{ needs.compute-versions.outputs.semver }}
+      version_slug: v${{ needs.compute-versions.outputs.semver }}
       display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
       publish: true
     secrets:
@@ -776,7 +858,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

@@ -27,7 +27,6 @@ mod linux {
 
     use crate::boundary_io::BoundaryRuntimeState;
     use crate::delegated::{AgentSignaler, spawn_workload};
-    use crate::identity::{DriverIdentity, resolve_process_identity};
     use crate::main_session::{MainOutput, MainSession};
     use crate::network_broker::NetworkBroker;
     use crate::process::ProcessStatus;
@@ -66,7 +65,8 @@ mod linux {
         ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
         STREAM_EXIT, STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED,
         STREAM_STDOUT, SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame,
-        read_frame, read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
+        read_frame, read_stream_frame, unix_time_millis, validate_resource_claims, write_frame,
+        write_stream_frame,
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,16 +86,15 @@ mod linux {
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
-    // CUDA opens device nodes read-write and writes thread names through
-    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
-    // to the launcher's inodes, not those of its workload children.
+    // CUDA opens device nodes read-write. Its thread-name writes through
+    // /proc/<pid>/task/<tid>/comm are served by open mediation, so /proc
+    // stays read-only.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
         "/dev/nvidia-uvm-tools",
         "/dev/nvidia-modeset",
         "/dev/dxg",
-        "/proc",
     ];
 
     fn duration_micros(duration: Duration) -> u64 {
@@ -154,13 +153,7 @@ mod linux {
                 continue;
             }
             if policy.filesystem.read_only.contains(&path) {
-                if path != Path::new("/proc") {
-                    continue;
-                }
-                policy
-                    .filesystem
-                    .read_only
-                    .retain(|allowed| allowed != &path);
+                continue;
             }
             policy.filesystem.read_write.push(path);
             modified = true;
@@ -223,10 +216,15 @@ mod linux {
         }
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
-        if nix::unistd::getpid().as_raw() == 1 {
-            crate::managed_children::start_orphan_reaper()
-                .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
+        // Keep orphaned workload descendants in this process tree so
+        // termination can find and kill them, then reap the adopted ones.
+        // PID 1 already receives orphans; elsewhere become a child subreaper.
+        if nix::unistd::getpid().as_raw() != 1 {
+            rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+                .map_err(|error| format!("become child subreaper: {error}"))?;
         }
+        crate::managed_children::start_orphan_reaper()
+            .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
@@ -343,6 +341,16 @@ mod linux {
                         .to_string(),
                 );
             }
+            // Workload sockets share the loopback interface with a loopback
+            // listener.
+            BoundaryListenerConfig::TlsTcp { address, .. }
+                if address.ip().to_canonical().is_loopback() =>
+            {
+                return Err(
+                    "boundary TLS listener must not bind a loopback address; workloads share the loopback interface"
+                        .to_string(),
+                );
+            }
             BoundaryListenerConfig::Vsock {
                 control_port: 0, ..
             } => {
@@ -354,6 +362,34 @@ mod linux {
         }
         if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
             return Err("sandbox workload UID and GID must be nonzero".to_string());
+        }
+        Ok(())
+    }
+
+    /// VM selectors assert the protected overlay owner; they cannot choose a
+    /// replacement identity. Guest init maps `sandbox` to that owner before
+    /// launching this boundary, so no account lookup or privilege change belongs here.
+    fn validate_vm_policy_identity(
+        config: &BoundaryConfig,
+        policy: &SandboxPolicyWire,
+    ) -> Result<(), String> {
+        if !config.resource_claims.contains_key("vm.generation") {
+            return Ok(());
+        }
+        let identity = &config.workload_identity;
+        for (field, selector, expected) in [
+            ("run_as_user", policy.run_as_user.as_deref(), identity.uid),
+            ("run_as_group", policy.run_as_group.as_deref(), identity.gid),
+        ] {
+            let Some(selector) = selector.filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if selector != "sandbox" && selector.parse::<u32>() != Ok(expected) {
+                return Err(format!(
+                    "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+                    identity.uid, identity.gid
+                ));
+            }
         }
         Ok(())
     }
@@ -542,7 +578,15 @@ mod linux {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                // A refused or already-dead peer must not stop the listener.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1111,20 +1155,24 @@ mod linux {
                 .map_err(|error| format!("write boundary termination response: {error}"));
             }
             Request::Exec { spec } => {
-                let started =
-                    match runtime.start_exec(&request.request_id, &request.payload_digest, spec) {
-                        Ok(started) => started,
-                        Err(response) => {
-                            return write_frame(
-                                &mut stream,
-                                &ResponseEnvelope {
-                                    request_id: request.request_id,
-                                    response,
-                                },
-                            )
-                            .map_err(|error| format!("write exec error response: {error}"));
-                        }
-                    };
+                let started = match runtime.start_exec(
+                    &request.request_id,
+                    &request.payload_digest,
+                    request.exec_expires_at_unix_ms,
+                    spec,
+                ) {
+                    Ok(started) => started,
+                    Err(response) => {
+                        return write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response,
+                            },
+                        )
+                        .map_err(|error| format!("write exec error response: {error}"));
+                    }
+                };
                 if let Err(error) = write_frame(
                     &mut stream,
                     &ResponseEnvelope {
@@ -1329,10 +1377,9 @@ mod linux {
         mediation_active: tokio::sync::Mutex<()>,
         next_mediation_stream_id: AtomicU64,
         exec_handles: Mutex<std::collections::HashMap<String, ExecHandle>>,
-        /// Never evicted within a boundary generation. Reclaiming process I/O
-        /// must not make an old command executable again. At capacity, reject
-        /// new commands instead of silently weakening at-most-once execution.
-        exec_requests: Mutex<std::collections::HashSet<String>>,
+        /// Keep exec tombstones through their admission deadline. Afterwards,
+        /// even a delayed first attempt is rejected without retaining its ID.
+        exec_requests: Mutex<ExecRequestLedger>,
         replay_ledger: Mutex<ReplayLedger>,
         network_broker: NetworkBroker,
         workload_launcher:
@@ -1351,25 +1398,58 @@ mod linux {
         status: Arc<Mutex<Option<ExitStatusWire>>>,
     }
 
-    #[allow(clippy::result_large_err)]
-    fn reserve_exec_request(
-        requests: &mut std::collections::HashSet<String>,
-        request_id: &str,
-    ) -> Result<(), Response> {
-        if requests.contains(request_id) {
-            return Err(guest_error(
-                BoundaryErrorKind::Denied,
-                "exec request has expired; it cannot be executed again",
-            ));
+    #[derive(Default)]
+    struct ExecRequestLedger {
+        requests: std::collections::HashSet<String>,
+        expirations: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>>,
+        /// A backwards wall-clock adjustment must not admit a request whose
+        /// tombstone has already been removed.
+        last_unix_ms: u64,
+    }
+
+    impl ExecRequestLedger {
+        #[allow(clippy::result_large_err)]
+        fn validate_deadline(
+            &mut self,
+            expires_at_unix_ms: Option<u64>,
+            now_unix_ms: u64,
+        ) -> Result<u64, Response> {
+            self.last_unix_ms = self.last_unix_ms.max(now_unix_ms);
+            while let Some(std::cmp::Reverse((expires_at, _))) = self.expirations.peek() {
+                if *expires_at > self.last_unix_ms {
+                    break;
+                }
+                if let Some(std::cmp::Reverse((_, request_id))) = self.expirations.pop() {
+                    self.requests.remove(&request_id);
+                }
+            }
+            let expires_at = expires_at_unix_ms.ok_or_else(|| {
+                guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "exec request requires an expiration deadline",
+                )
+            })?;
+            if expires_at <= self.last_unix_ms {
+                return Err(guest_error(
+                    BoundaryErrorKind::Denied,
+                    "exec request deadline expired; execution outcome may be unknown",
+                ));
+            }
+            Ok(expires_at)
         }
-        if requests.len() >= MAX_REPLAY_LEDGER_ENTRIES {
-            return Err(guest_error(
-                BoundaryErrorKind::Unavailable,
-                "boundary generation exec request limit reached",
-            ));
+
+        #[allow(clippy::result_large_err)]
+        fn reserve(&mut self, request_id: &str, expires_at: u64) -> Result<(), Response> {
+            if !self.requests.insert(request_id.to_owned()) {
+                return Err(guest_error(
+                    BoundaryErrorKind::Denied,
+                    "exec request is no longer retained; it cannot be executed again",
+                ));
+            }
+            self.expirations
+                .push(std::cmp::Reverse((expires_at, request_id.to_owned())));
+            Ok(())
         }
-        requests.insert(request_id.to_owned());
-        Ok(())
     }
 
     struct StartedExec {
@@ -1420,6 +1500,7 @@ mod linux {
         ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        provider_files: std::collections::HashMap<String, String>,
     }
 
     impl StartedAgent {
@@ -1448,6 +1529,9 @@ mod linux {
 
     impl MainAttachment {
         fn exit_status(&self, fallback_code: i32) -> ExitStatusWire {
+            if self.session.output_failed() {
+                return ExitStatusWire::Exited(74);
+            }
             match &self.status {
                 AttachmentStatus::Main(process) => process
                     .exit_status()
@@ -1568,7 +1652,7 @@ mod linux {
                 mediation_active: tokio::sync::Mutex::new(()),
                 next_mediation_stream_id: AtomicU64::new(1),
                 exec_handles: Mutex::new(std::collections::HashMap::new()),
-                exec_requests: Mutex::new(std::collections::HashSet::new()),
+                exec_requests: Mutex::new(ExecRequestLedger::default()),
                 replay_ledger: Mutex::new(ReplayLedger::default()),
                 network_broker,
                 workload_launcher,
@@ -1696,6 +1780,7 @@ mod linux {
                             "frozen workload could not be resumed".to_string(),
                         ));
                     }
+                    self.network_broker.set_workload_frozen(false);
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
                         "Sandbox Protocol connection recovered; workload resumed"
@@ -1752,6 +1837,7 @@ mod linux {
                     return;
                 }
                 if let Some(process) = &process {
+                    self.network_broker.set_workload_frozen(true);
                     let _ = process.boundary_runtime.freeze();
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
@@ -1878,12 +1964,12 @@ mod linux {
 
         async fn wait_for_process_tree_exit(process: &ManagedProcess, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
-            while process.boundary_runtime.has_registered_processes()
+            while process.boundary_runtime.has_owned_processes()
                 && tokio::time::Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            !process.boundary_runtime.has_registered_processes()
+            !process.boundary_runtime.has_owned_processes()
         }
 
         fn shutdown(&self) {
@@ -1942,6 +2028,10 @@ mod linux {
                     }
                 }
                 Request::Confirm => self.confirm(),
+                Request::ProbeProviderFiles => self.network_broker.confirm_healthy().map_or_else(
+                    |error| guest_error(BoundaryErrorKind::Unavailable, error.to_string()),
+                    |()| Response::ProviderFilesSupported,
+                ),
                 Request::StartAgent {
                     sandbox_id,
                     spec,
@@ -1950,6 +2040,7 @@ mod linux {
                     ca_bundle,
                     provider_env_revision,
                     provider_env,
+                    provider_files,
                 } => self.start_agent(
                     sandbox_id,
                     spec,
@@ -1958,12 +2049,19 @@ mod linux {
                     ca_bundle,
                     provider_env_revision,
                     provider_env,
+                    provider_files,
                 ),
                 Request::UpdateProviderEnvironment {
                     generation,
                     revision,
                     provider_env,
-                } => self.update_provider_environment(generation, revision, provider_env),
+                    provider_files,
+                } => self.update_provider_environment(
+                    generation,
+                    revision,
+                    provider_env,
+                    provider_files,
+                ),
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
@@ -2006,6 +2104,7 @@ mod linux {
             &self,
             request_id: &str,
             payload_digest: &str,
+            expires_at_unix_ms: Option<u64>,
             spec: ExecSpecWire,
         ) -> Result<StartedExec, Response> {
             let executor = {
@@ -2019,6 +2118,10 @@ mod linux {
                 process.boundary_exec()
             };
             let mut handles = lock(&self.exec_handles);
+            let mut requests = lock(&self.exec_requests);
+            let now_unix_ms = unix_time_millis()
+                .map_err(|error| guest_error(BoundaryErrorKind::Unavailable, error.to_string()))?;
+            let expires_at = requests.validate_deadline(expires_at_unix_ms, now_unix_ms)?;
             if let Some((process_id, handle)) = handles
                 .iter()
                 .find(|(_, handle)| handle.request_id == request_id)
@@ -2057,10 +2160,8 @@ mod linux {
                     ));
                 }
             }
-            {
-                let mut requests = lock(&self.exec_requests);
-                reserve_exec_request(&mut requests, request_id)?;
-            }
+            requests.reserve(request_id, expires_at)?;
+            drop(requests);
             let session = self
                 .process_runtime
                 .block_on(executor.exec(spec.into()))
@@ -2076,6 +2177,7 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
+                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -2231,6 +2333,11 @@ mod linux {
         }
 
         fn attach(&self, policy: SandboxPolicyWire) -> Response {
+            // Reject a conflicting request before establishing the boundary
+            // or retaining the caller's policy for later replay.
+            if let Err(error) = validate_vm_policy_identity(&self.config, &policy) {
+                return guest_error(BoundaryErrorKind::Denied, error);
+            }
             let mut state = lock(&self.state);
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
@@ -2390,6 +2497,7 @@ mod linux {
                 tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
+                socket_loopback_confinement: self.qualification.socket_loopback_confinement,
             };
             // The boundary reports mechanism evidence; the authenticated host
             // backend validates it before constructing a ConfirmedBoundary.
@@ -2421,7 +2529,13 @@ mod linux {
             ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
+            provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // Check the supplied launch policy before installing materials or
+            // replacing its selectors with the measured driver's numeric pair.
+            if let Err(error) = validate_vm_policy_identity(&self.config, &policy) {
+                return guest_error(BoundaryErrorKind::Denied, error);
+            }
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
@@ -2435,6 +2549,7 @@ mod linux {
                 ca_bundle: ca_bundle.clone(),
                 provider_env_revision,
                 provider_env: provider_env.clone(),
+                provider_files: provider_files.clone(),
             };
             if let RuntimeState::Running(process) = &*state {
                 return if lock(&self.started_agent)
@@ -2479,13 +2594,8 @@ mod linux {
                         .build()
                 );
             }
-            let driver_identity = DriverIdentity::Resolved {
-                uid: self.config.workload_identity.uid,
-                gid: self.config.workload_identity.gid,
-            };
-            if let Err(error) = resolve_process_identity(&mut policy, &driver_identity) {
-                return guest_error(BoundaryErrorKind::Process, error.to_string());
-            }
+            policy.process.run_as_user = Some(self.config.workload_identity.uid.to_string());
+            policy.process.run_as_group = Some(self.config.workload_identity.gid.to_string());
             let launch = ManagedProcessLaunch {
                 process_id: format!("{}:main:0", self.config.generation),
                 spec,
@@ -2494,6 +2604,13 @@ mod linux {
                 provider_env,
                 ca_file_paths,
             };
+            let provider_file_count = provider_files.len();
+            if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Process,
+                    format!("install provider files: {error}"),
+                );
+            }
             let process = match ManagedProcess::spawn(
                 &self.process_runtime,
                 &self.workload_launcher,
@@ -2506,6 +2623,15 @@ mod linux {
             let process_id = process.process_id();
             *lock(&self.started_agent) = Some(requested);
             *state = RuntimeState::Running(process);
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .message(format!(
+                        "Provider file snapshot loaded [file_count:{provider_file_count}]"
+                    ))
+                    .build()
+            );
             Response::Started {
                 process_id,
                 provider_env_revision,
@@ -2518,6 +2644,7 @@ mod linux {
             generation: u64,
             revision: u64,
             provider_env: std::collections::HashMap<String, String>,
+            provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
             let process = {
                 let state = lock(&self.state);
@@ -2544,6 +2671,13 @@ mod linux {
                     applied: false,
                 };
             }
+            if let Err(error) = crate::provider_files::ProviderFiles::validate(&provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    format!("invalid provider files: {error}"),
+                );
+            }
+            let requested_revision = revision;
             let revision = match process
                 .provider_credentials
                 .compare_and_install_child_env_snapshot(current.revision, revision, provider_env)
@@ -2551,7 +2685,29 @@ mod linux {
                 Ok(revision) => revision,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error.to_string()),
             };
+            if revision != requested_revision {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "provider environment changed during update",
+                );
+            }
+            let provider_file_count = provider_files.len();
+            if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Process,
+                    format!("install provider files: {error}"),
+                );
+            }
             *installed_generation = generation;
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .message(format!(
+                        "Provider file snapshot updated [file_count:{provider_file_count}]"
+                    ))
+                    .build()
+            );
             Response::ProviderEnvironmentUpdated {
                 revision,
                 generation,
@@ -3002,15 +3158,14 @@ mod linux {
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
-                        let Some(input) = input.as_ref() else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "main process stdin already closed",
-                            ));
-                        };
-                        input.send(payload).await.map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "main process stdin closed")
-                        })?;
+                        // A process may close stdin before the client has
+                        // finished sending it. Keep relaying stdout, stderr,
+                        // and the final status after that write fails.
+                        if let Some(sender) = input.as_ref()
+                            && sender.send(payload).await.is_err()
+                        {
+                            input.take();
+                        }
                     }
                     // Keep reading after stdin closes so transport EOF still
                     // releases this control process's attachment lease.
@@ -3052,6 +3207,21 @@ mod linux {
                         .map_err(|error| format!("write main process exit: {error}"));
                 }
                 Err(error) => {
+                    if matches!(&attachment.status, AttachmentStatus::Exec(_)) {
+                        tracing::warn!(
+                            skipped_chunks = error.skipped,
+                            "exec output could not be delivered intact"
+                        );
+                        let message = b"openshell: exec output could not be delivered intact\n";
+                        let _ =
+                            write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
+                                .await;
+                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
+                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
+                            .await
+                            .map_err(|error| format!("write exec output failure: {error}"));
+                    }
                     tracing::warn!(
                         skipped_chunks = error.skipped,
                         "main process attachment resumed after dropping retained output"
@@ -3115,6 +3285,7 @@ mod linux {
         Tcp {
             listener: std::net::TcpListener,
             server_config: Arc<rustls::ServerConfig>,
+            reject_local_peers: bool,
         },
     }
 
@@ -3143,15 +3314,34 @@ mod linux {
                     })
                 }
                 BoundaryListenerConfig::TlsTcp { address, tls } => {
-                    let listener = std::net::TcpListener::bind(address)?;
+                    let (listener, reject_local_peers) = Self::bind_tcp(*address)?;
                     listener.set_nonblocking(true)?;
                     let server_config = Arc::new(load_tls_server_config(tls)?);
                     Ok(Self::Tcp {
                         listener,
                         server_config,
+                        reject_local_peers,
                     })
                 }
             }
+        }
+
+        /// Bind the TCP control listener without privileged socket filters.
+        /// Production configuration rejects loopback bind addresses; only tests
+        /// use them to exercise TLS without the local-peer check. All production
+        /// TCP listeners reject local peers in `accept`, before TLS processing.
+        fn bind_tcp(address: std::net::SocketAddr) -> io::Result<(std::net::TcpListener, bool)> {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_cloexec(true)?;
+            socket.set_reuse_address(true)?;
+            let reject_local_peers = !address.ip().is_loopback();
+            socket.bind(&address.into())?;
+            socket.listen(128)?;
+            Ok((socket.into(), reject_local_peers))
         }
 
         fn bind_vsock(port: u32) -> io::Result<OwnedFd> {
@@ -3244,8 +3434,12 @@ mod linux {
                 Self::Tcp {
                     listener,
                     server_config,
+                    reject_local_peers,
                 } => {
-                    let (stream, _) = listener.accept()?;
+                    let (stream, peer) = listener.accept()?;
+                    if *reject_local_peers {
+                        reject_workload_tcp_peer(&stream, peer)?;
+                    }
                     if let Err(error) = stream.set_nodelay(true) {
                         tracing::debug!(%error, "Failed to set boundary TCP_NODELAY");
                     }
@@ -3256,6 +3450,28 @@ mod linux {
                 }
             }
         }
+    }
+
+    // Traffic the workload can reach the listener with arrives over `lo`, so one
+    // end is loopback or the two ends share an address. A supervisor runs in
+    // another pod and presents a different address. The peer comes from `accept`
+    // because `getpeername` fails once that peer has reset.
+    fn reject_workload_tcp_peer(
+        stream: &std::net::TcpStream,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<()> {
+        let denied = || io::Error::from_raw_os_error(libc::EACCES);
+        let local = stream.local_addr().map_err(|_| denied())?;
+        if is_local_control_peer(peer.ip(), local.ip()) {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn is_local_control_peer(peer: std::net::IpAddr, local: std::net::IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        let local = local.to_canonical();
+        peer.is_loopback() || local.is_loopback() || peer == local
     }
 
     fn reject_workload_unix_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
@@ -3605,18 +3821,45 @@ mod linux {
         use rcgen::{KeyPair, PKCS_ED25519};
 
         #[test]
-        fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
-            let mut requests = std::collections::HashSet::new();
-            reserve_exec_request(&mut requests, "first").unwrap();
-            // Process/I/O retention is deliberately not consulted by this
-            // ledger: dropping all handles cannot make this ID executable.
-            assert!(reserve_exec_request(&mut requests, "first").is_err());
-            for index in 1..MAX_REPLAY_LEDGER_ENTRIES {
-                reserve_exec_request(&mut requests, &format!("request-{index}")).unwrap();
+        fn exec_tombstones_expire_without_a_lifetime_limit() {
+            let mut ledger = ExecRequestLedger::default();
+            // More than the old 4,096 limit can be admitted in one window.
+            for index in 0..10_000 {
+                let deadline = ledger.validate_deadline(Some(30_000), 0).unwrap();
+                ledger
+                    .reserve(&format!("request-{index}"), deadline)
+                    .unwrap();
             }
-            assert!(reserve_exec_request(&mut requests, "overflow").is_err());
-            assert!(requests.contains("first"));
-            assert_eq!(requests.len(), MAX_REPLAY_LEDGER_ENTRIES);
+            assert_eq!(ledger.requests.len(), 10_000);
+            assert!(ledger.reserve("request-0", 30_000).is_err());
+            // Expiration clears the IDs but never lets an old envelope run again.
+            assert!(ledger.validate_deadline(Some(30_000), 30_000).is_err());
+            assert!(ledger.requests.is_empty());
+            assert!(ledger.expirations.is_empty());
+            let deadline = ledger.validate_deadline(Some(60_000), 30_000).unwrap();
+            ledger.reserve("next-request", deadline).unwrap();
+            assert_eq!(ledger.requests.len(), 1);
+        }
+
+        #[test]
+        fn exec_deadlines_reject_missing_expired_and_delayed_first_attempts() {
+            let mut ledger = ExecRequestLedger::default();
+            assert!(ledger.validate_deadline(None, 10_000).is_err());
+            assert!(ledger.validate_deadline(Some(10_000), 10_000).is_err());
+            assert!(ledger.validate_deadline(Some(9_999), 10_000).is_err());
+            // A backwards clock change cannot resurrect expired requests.
+            assert!(ledger.validate_deadline(Some(10_000), 0).is_err());
+        }
+
+        #[test]
+        fn exec_tombstones_expire_in_deadline_order() {
+            let mut ledger = ExecRequestLedger::default();
+            ledger.reserve("later", 30_000).unwrap();
+            ledger.reserve("earlier", 20_000).unwrap();
+            ledger.validate_deadline(Some(30_000), 20_000).unwrap();
+            assert!(!ledger.requests.contains("earlier"));
+            assert!(ledger.requests.contains("later"));
+            assert!(ledger.reserve("later", 30_000).is_err());
         }
 
         #[test]
@@ -4428,9 +4671,6 @@ mod linux {
                     retained_socket_operation: true,
                     proc_fd_identity: true,
                     task_memory_read: true,
-                    task_memory_write: true,
-                    cancellation: true,
-                    task_memory_writes_disabled: false,
                 },
                 landlock_abi: 6,
                 landlock_allow_deny: true,
@@ -4438,6 +4678,7 @@ mod linux {
                 tcp_dns_round_trip: true,
                 tcp_allow_round_trip: true,
                 tcp_deny_round_trip: true,
+                socket_loopback_confinement: true,
             }
         }
 
@@ -4570,6 +4811,240 @@ mod linux {
 
             validate_config(&config).unwrap();
             validate_running_identity(&config.workload_identity, false).unwrap();
+            let mut wrong_user = config.workload_identity.clone();
+            wrong_user.uid = if wrong_user.uid == 10000 {
+                10001
+            } else {
+                10000
+            };
+            assert!(validate_running_identity(&wrong_user, false).is_err());
+            let mut wrong_group = config.workload_identity;
+            wrong_group.gid = if wrong_group.gid == 10000 {
+                10001
+            } else {
+                10000
+            };
+            assert!(validate_running_identity(&wrong_group, false).is_err());
+        }
+
+        fn vm_identity_test_runtime() -> (tokio::runtime::Runtime, Arc<BoundaryRuntime>) {
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let mut boundary = {
+                let _entered = process_runtime.enter();
+                availability_test_runtime().0
+            };
+            let config = &mut Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config;
+            config
+                .resource_claims
+                .insert("vm.generation".to_string(), config.generation.clone());
+            (process_runtime, boundary)
+        }
+
+        fn vm_identity_test_policy(user: Option<&str>, group: Option<&str>) -> SandboxPolicyWire {
+            SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy {
+                    run_as_user: user.map(str::to_string),
+                    run_as_group: group.map(str::to_string),
+                },
+            })
+        }
+
+        #[test]
+        fn vm_policy_identity_checks_independent_selectors() {
+            let (_runtime, mut boundary) = vm_identity_test_runtime();
+            let uid = boundary.config.workload_identity.uid.to_string();
+            let gid = boundary.config.workload_identity.gid.to_string();
+            for (user, group) in [
+                (None, None),
+                (Some(""), Some("")),
+                (Some(uid.as_str()), None),
+                (None, Some(gid.as_str())),
+                (Some(uid.as_str()), Some(gid.as_str())),
+                (Some("sandbox"), Some(gid.as_str())),
+                (Some(uid.as_str()), Some("sandbox")),
+                (Some("sandbox"), Some("sandbox")),
+            ] {
+                validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect("matching or omitted VM selectors");
+            }
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
+            for (user, group, field) in [
+                (Some(wrong_user), None, "run_as_user"),
+                (None, Some(wrong_group), "run_as_group"),
+                (Some(uid.as_str()), Some(wrong_group), "run_as_group"),
+                (Some(wrong_user), Some(gid.as_str()), "run_as_user"),
+                (Some(wrong_user), Some(wrong_group), "run_as_user"),
+            ] {
+                let error = validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect_err("either mismatched selector must fail");
+                assert!(error.contains(field), "{error}");
+                assert!(error.contains(&format!("{uid}:{gid}")), "{error}");
+            }
+            for malformed in [
+                "root",
+                "-1",
+                "4294967296",
+                "1000:1000",
+                " sandbox",
+                "sandbox\n",
+            ] {
+                for (user, group) in [(Some(malformed), None), (None, Some(malformed))] {
+                    assert!(
+                        validate_vm_policy_identity(
+                            &boundary.config,
+                            &vm_identity_test_policy(user, group),
+                        )
+                        .is_err(),
+                        "invalid selector {malformed:?} must fail"
+                    );
+                }
+            }
+            Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config
+                .resource_claims
+                .remove("vm.generation");
+            validate_vm_policy_identity(
+                &boundary.config,
+                &vm_identity_test_policy(Some(wrong_user), Some("image-user")),
+            )
+            .expect("non-VM identity behavior is unchanged");
+        }
+
+        #[test]
+        fn vm_attach_rejects_conflicting_identity_without_binding() {
+            let (_runtime, boundary) = vm_identity_test_runtime();
+            let identity = &boundary.config.workload_identity;
+            let uid = identity.uid.to_string();
+            let gid = identity.gid.to_string();
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
+            for (user, group, field, requested) in [
+                (Some(wrong_user), None, "run_as_user", wrong_user),
+                (None, Some(wrong_group), "run_as_group", wrong_group),
+            ] {
+                let response = boundary.attach(vm_identity_test_policy(user, group));
+                let Response::Error { kind, message } = response else {
+                    panic!("conflicting identity was attached: {response:?}");
+                };
+                assert_eq!(kind, BoundaryErrorKind::Denied);
+                assert!(
+                    message.contains(&format!("{field} '{requested}'")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{uid}:{gid}")), "{message}");
+                assert!(matches!(
+                    *lock(&boundary.state),
+                    RuntimeState::AwaitingAttach
+                ));
+                assert!(lock(&boundary.attached_policy).is_none());
+            }
+            assert!(matches!(
+                boundary.attach(vm_identity_test_policy(Some("sandbox"), Some("sandbox"))),
+                Response::Attached { .. }
+            ));
+        }
+
+        #[test]
+        fn vm_start_rejects_conflicting_identity_without_launch() {
+            let (_runtime, boundary) = vm_identity_test_runtime();
+            let identity = &boundary.config.workload_identity;
+            let uid = identity.uid.to_string();
+            let gid = identity.gid.to_string();
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
+            *lock(&boundary.state) = RuntimeState::Ready(PreparedBoundary {
+                network_broker: boundary.network_broker.clone(),
+            });
+            for (user, group, field, requested) in [
+                (Some(wrong_user), None, "run_as_user", wrong_user),
+                (None, Some(wrong_group), "run_as_group", wrong_group),
+            ] {
+                let response = boundary.start_agent(
+                    boundary.config.boundary_id.clone(),
+                    AgentSpecWire {
+                        program: "/bin/true".to_string(),
+                        args: Vec::new(),
+                        workdir: None,
+                        timeout_secs: 5,
+                        interactive: false,
+                    },
+                    vm_identity_test_policy(user, group),
+                    None,
+                    None,
+                    0,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                );
+                let Response::Error { kind, message } = response else {
+                    panic!("conflicting identity reached process start: {response:?}");
+                };
+                assert_eq!(kind, BoundaryErrorKind::Denied);
+                assert!(
+                    message.contains(&format!("{field} '{requested}'")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{uid}:{gid}")), "{message}");
+                assert!(matches!(*lock(&boundary.state), RuntimeState::Ready(_)));
+                assert!(lock(&boundary.started_agent).is_none());
+            }
+        }
+
+        #[test]
+        fn tcp_control_listener_rejects_loopback_addresses() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "validate");
+            let config = |address: &str| BoundaryConfig {
+                boundary_id: "sandbox-1".to_string(),
+                generation: "generation-1".to_string(),
+                session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_id: "test-gateway".to_string(),
+                verification_keys: vec![test_verification_key()],
+                listener: BoundaryListenerConfig::TlsTcp {
+                    address: address.parse().expect("valid address"),
+                    tls: server_tls.clone(),
+                },
+                resource_claims: std::collections::BTreeMap::new(),
+                resource_claim_files: std::collections::BTreeMap::new(),
+                workload_identity: test_workload_identity(),
+                outer_fence: test_outer_fence(),
+                child_env: std::collections::HashMap::new(),
+            };
+            for address in [
+                "127.0.0.1:5500",
+                "127.0.0.2:5500",
+                "[::1]:5500",
+                "[::ffff:127.0.0.1]:5500",
+            ] {
+                assert!(
+                    validate_config(&config(address)).is_err(),
+                    "{address} must be rejected"
+                );
+            }
+            for address in ["0.0.0.0:5500", "[::]:5500", "10.42.0.7:5500"] {
+                validate_config(&config(address))
+                    .unwrap_or_else(|error| panic!("{address} must be accepted: {error}"));
+            }
         }
 
         #[test]
@@ -4692,6 +5167,134 @@ mod linux {
                     .expect("decode logical response");
             assert!(matches!(response.response, Response::Attached { .. }));
             server.abort();
+        }
+
+        #[test]
+        fn pod_control_listener_rejects_loopback_peers_before_tls() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "loopback");
+            let listener = ControlListener::bind(&BoundaryListenerConfig::TlsTcp {
+                address: "0.0.0.0:0".parse().expect("valid address"),
+                tls: server_tls,
+            })
+            .expect("bind TLS listener");
+            let port = listener
+                .tcp_local_addr()
+                .expect("TLS listener address")
+                .port();
+            let _client = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(300),
+            )
+            .expect("TCP handshake succeeds without a packet filter");
+            assert_eq!(
+                accept_pending(&listener)
+                    .expect_err("local peer refused")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        #[test]
+        fn control_peer_address_rules_cover_pod_and_loopback_addresses() {
+            for (peer, local, denied) in [
+                ("127.0.0.2", "10.42.0.8", true),
+                ("10.42.0.8", "127.0.0.1", true),
+                ("10.42.0.8", "10.42.0.8", true),
+                ("10.42.0.9", "10.42.0.8", false),
+                ("::1", "fd00::8", true),
+                ("fd00::8", "::1", true),
+                ("fd00::8", "fd00::8", true),
+                ("fd00::9", "fd00::8", false),
+                ("::ffff:127.0.0.2", "10.42.0.8", true),
+                ("10.42.0.8", "::ffff:127.0.0.1", true),
+                ("::ffff:10.42.0.8", "10.42.0.8", true),
+                ("10.42.0.8", "::ffff:10.42.0.8", true),
+                ("::ffff:10.42.0.9", "::ffff:10.42.0.8", false),
+            ] {
+                assert_eq!(
+                    is_local_control_peer(peer.parse().unwrap(), local.parse().unwrap()),
+                    denied,
+                    "peer={peer}, local={local}"
+                );
+            }
+        }
+
+        /// A control listener in accept-time mode, bound to loopback so a test
+        /// client can actually reach it.
+        fn accept_time_control_listener(
+            directory: &Path,
+            name: &str,
+        ) -> (ControlListener, std::net::SocketAddr) {
+            let (server_tls, _client_tls) = stage_test_tls(directory, name);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let address = listener.local_addr().expect("listener address");
+            let server_config =
+                Arc::new(load_tls_server_config(&server_tls).expect("TLS server config"));
+            (
+                ControlListener::Tcp {
+                    listener,
+                    server_config,
+                    reject_local_peers: true,
+                },
+                address,
+            )
+        }
+
+        fn accept_pending(listener: &ControlListener) -> io::Result<()> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    other => return other.map(|_| ()),
+                }
+            }
+        }
+
+        #[test]
+        fn accept_refuses_a_same_host_control_peer() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (listener, address) = accept_time_control_listener(directory.path(), "local-peer");
+            let _client = std::net::TcpStream::connect(address).expect("connect loopback client");
+            let error = accept_pending(&listener).expect_err("loopback peer refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn accept_survives_a_control_peer_that_resets_before_it_is_accepted() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (listener, address) = accept_time_control_listener(directory.path(), "reset");
+            let client = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .expect("client socket");
+            client.connect(&address.into()).expect("connect");
+            // Zero linger makes the close an RST while the connection is still
+            // queued, which is what makes `getpeername` fail with ENOTCONN.
+            client
+                .set_linger(Some(Duration::ZERO))
+                .expect("zero linger");
+            drop(client);
+            let kind = accept_pending(&listener)
+                .expect_err("reset peer refused")
+                .kind();
+            assert!(
+                matches!(
+                    kind,
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+                ),
+                "reset peer produced a listener-fatal error: {kind:?}"
+            );
         }
 
         #[test]
@@ -4853,6 +5456,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 )
             };
             let Response::Started {
@@ -4865,6 +5469,7 @@ mod linux {
             };
 
             let update = RequestEnvelope::new(Request::UpdateProviderEnvironment {
+                provider_files: std::collections::HashMap::new(),
                 generation: 1,
                 revision: 7,
                 provider_env: std::collections::HashMap::from([(
@@ -4950,6 +5555,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
@@ -4958,7 +5564,12 @@ mod linux {
             // fingerprint. Distinct publications must still replace the map,
             // while a delayed older clear must never undo the repair.
             assert_eq!(
-                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
+                boundary.update_provider_environment(
+                    2,
+                    7,
+                    std::collections::HashMap::default(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 2,
@@ -4972,7 +5583,8 @@ mod linux {
                     std::collections::HashMap::from([(
                         "REPLAY_TEST".to_string(),
                         "reconnected".to_string()
-                    ),])
+                    ),]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
@@ -4981,7 +5593,12 @@ mod linux {
                 }
             );
             assert_eq!(
-                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
+                boundary.update_provider_environment(
+                    2,
+                    7,
+                    std::collections::HashMap::default(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 3,
@@ -5006,6 +5623,7 @@ mod linux {
                 .start_exec(
                     &exec_request.request_id,
                     &exec_request.payload_digest,
+                    exec_request.exec_expires_at_unix_ms,
                     exec_spec,
                 )
                 .expect("exec after reconnect");
@@ -5147,6 +5765,7 @@ mod linux {
             *lock(&boundary.state) = RuntimeState::Running(process.clone());
             *lock(&boundary.attached_policy) = Some(wire_policy.clone());
             *lock(&boundary.started_agent) = Some(StartedAgent {
+                provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-retained".to_string(),
                 spec: agent_spec.clone(),
                 policy: wire_policy.clone(),
@@ -5172,6 +5791,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Started {
                     process_id: process.process_id(),
@@ -5188,6 +5808,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "refreshed".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 2,
@@ -5203,6 +5824,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "stale".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 2,
@@ -5211,7 +5833,12 @@ mod linux {
                 }
             );
             assert_eq!(
-                boundary.update_provider_environment(2, 1, std::collections::HashMap::new()),
+                boundary.update_provider_environment(
+                    2,
+                    1,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
                     generation: 2,
@@ -5227,6 +5854,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "out-of-order".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
@@ -5236,7 +5864,12 @@ mod linux {
                 "a stale publication must not overwrite current state"
             );
             assert_eq!(
-                boundary.update_provider_environment(1, 1, std::collections::HashMap::new()),
+                boundary.update_provider_environment(
+                    1,
+                    1,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
                     generation: 2,
@@ -5262,6 +5895,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "replacement-control-snapshot".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Started {
                     process_id: process.process_id(),
@@ -5284,10 +5918,38 @@ mod linux {
                 spec: sleep_spec.clone(),
             })
             .expect("build retained exec request");
+            for deadline in [None, Some(0)] {
+                assert!(
+                    boundary
+                        .start_exec(
+                            &sleep_request.request_id,
+                            &sleep_request.payload_digest,
+                            deadline,
+                            sleep_spec.clone(),
+                        )
+                        .is_err(),
+                    "missing or expired deadlines must not start a process"
+                );
+                assert!(lock(&boundary.exec_handles).is_empty());
+            }
+            // Completed exec IDs must not impose the former lifetime limit on
+            // a real process launch or recovery of its lost start response.
+            {
+                let mut requests = lock(&boundary.exec_requests);
+                for index in 0..4096 {
+                    requests
+                        .reserve(
+                            &format!("completed-request-{index}"),
+                            sleep_request.exec_expires_at_unix_ms.unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
             let started = boundary
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
+                    sleep_request.exec_expires_at_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("start exec whose response is disconnected");
@@ -5297,6 +5959,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
+                    sleep_request.exec_expires_at_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("reattach exec after response loss");
@@ -5322,6 +5985,7 @@ mod linux {
                     .start_exec(
                         &sleep_request.request_id,
                         &sleep_request.payload_digest,
+                        sleep_request.exec_expires_at_unix_ms,
                         sleep_spec,
                     )
                     .is_err(),
@@ -5352,7 +6016,12 @@ mod linux {
                 let request = RequestEnvelope::new(Request::Exec { spec: spec.clone() })
                     .expect("build exec status request");
                 let exec = boundary
-                    .start_exec(&request.request_id, &request.payload_digest, spec)
+                    .start_exec(
+                        &request.request_id,
+                        &request.payload_digest,
+                        request.exec_expires_at_unix_ms,
+                        spec,
+                    )
                     .expect("start exec after canonical exit");
                 for _ in 0..2 {
                     assert_eq!(

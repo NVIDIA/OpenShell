@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Remove insecure gateway configs on refresh, then restart the gateway so the
+# default config takes effect even when the previous revision used
+# refresh-mode: endure and kept its plaintext gateway running.
+
+set -eu
+
+config_file="${SNAP_COMMON}/gateway.toml"
+insecure='^[[:space:]]*(allow_unauthenticated_users|disable_tls)[[:space:]]*=[[:space:]]*true([[:space:]#]|$)'
+
+# Keep secure operator configs, symlinks, and directories. Remove a config
+# that explicitly allows plaintext or anonymous access, even if it has other
+# edits.
+if [ ! -e "$config_file" ]; then
+	exit 0
+elif [ -L "$config_file" ]; then
+	exit 0
+elif [ -f "$config_file" ]; then
+	grep -Eq "$insecure" "$config_file" || exit 0
+	echo "openshell: removing insecure gateway config to use the mTLS default" >&2
+elif [ -e "$config_file" ]; then
+	exit 0
+fi
+
+rm -f "$config_file"
+
+snapctl restart "${SNAP_INSTANCE_NAME}.gateway"

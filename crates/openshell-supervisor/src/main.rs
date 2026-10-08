@@ -10,14 +10,16 @@ use std::sync::atomic::AtomicBool;
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
-use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+mod logging;
+
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
+const SERVICE_NAME: &str = "openshell-supervisor";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum SupervisorRole {
@@ -80,9 +82,17 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
+    /// OTLP/gRPC collector endpoint for supervisor trace export.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_ENDPOINT)]
+    otlp_endpoint: Option<String>,
+
     /// Create the private readiness socket after boundary and gateway attach.
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
     health_socket_path: Option<PathBuf>,
+
+    /// TCP port that accepts connections only while the supervisor is ready.
+    #[arg(long, env = "OPENSHELL_HEALTH_PORT")]
+    health_port: Option<u16>,
 
     #[arg(long)]
     upstream_proxy: Option<String>,
@@ -234,6 +244,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                 || args.openshell_endpoint.is_some()
                 || args.ssh_socket_path.is_some()
                 || args.health_socket_path.is_some()
+                || args.health_port.is_some()
                 || args.main_exit_marker.is_some()
                 || args.parent_liveness_fd.is_some()
             {
@@ -305,23 +316,28 @@ fn main() -> Result<()> {
         None
     };
 
-    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openshell")
-        .filename_suffix("log")
-        .max_log_files(3)
-        .build("/var/log")
-        .ok()
-        .map(|roller| {
-            let (writer, guard) = tracing_appender::non_blocking(roller);
-            (writer, guard)
-        });
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .into_diagnostic()?;
+    // The tonic exporter must be created inside the runtime that drives it.
+    let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
+        openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(|endpoint| {
+            openshell_otel::OtlpTraceConfig {
+                endpoint,
+                service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+                service_version: Some(openshell_core::VERSION),
+                resource_attributes: args
+                    .sandbox_id
+                    .iter()
+                    .map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.clone()))
+                    .collect(),
+            }
+        }))
+    });
+    let otlp_layer_provider = otlp_provider.clone();
 
     let exit_code = runtime.block_on(async move {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -343,50 +359,31 @@ fn main() -> Result<()> {
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
         let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
-        let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer)
-                        .with_enabled_flag(ocsf_enabled.clone())
-                        .with_target_version(ocsf_schema_version.clone());
-                    (layer, guard)
-                });
-            let (jsonl_layer, jsonl_guard) =
-                jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(
-                    OcsfShorthandLayer::new(file_writer)
-                        .with_non_ocsf(true)
-                        .with_filter(EnvFilter::new("info")),
-                )
-                .with(jsonl_layer.with_filter(LevelFilter::INFO))
-                .with(push_layer.clone())
-                .init();
-            (Some(file_guard), jsonl_guard)
-        } else {
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(push_layer)
-                .init();
+        let (logging_layers, _logging_guards, file_available) = logging::layers(
+            std::io::stderr(),
+            Path::new("/var/log"),
+            console_filter,
+            ocsf_enabled.clone(),
+            ocsf_schema_version.clone(),
+        );
+        tracing_subscriber::registry()
+            .with(logging_layers)
+            .with(push_layer)
+            .with(
+                otlp_layer_provider
+                    .as_ref()
+                    .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
+                    .with_filter(otlp_span_filter(&args.log_level)),
+            )
+            .init();
+        if !file_available {
             warn!("Could not open /var/log for log rotation; using stderr-only logging");
-            (None, None)
-        };
+        }
+        if let Some(error) = otlp_setup_error {
+            warn!(%error, "OTLP exporting could not be started; continuing without it");
+        } else if let Some(endpoint) = &args.otlp_endpoint {
+            info!(endpoint, "OTLP exporting enabled");
+        }
 
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
@@ -439,6 +436,7 @@ fn main() -> Result<()> {
                     args.policy_data,
                     args.ssh_socket_path,
                     args.health_socket_path,
+                    args.health_port,
                     ocsf_enabled,
                     ocsf_schema_version,
                     upstream_proxy_args,
@@ -467,14 +465,39 @@ fn main() -> Result<()> {
                 .await
             }
         }
-    })?;
+    });
+    // Flush spans before `process::exit` skips destructors.
+    if let Some(provider) = otlp_provider
+        && let Err(error) = provider.shutdown()
+    {
+        warn!(%error, "OTLP tracer provider shutdown failed");
+    }
 
-    std::process::exit(exit_code);
+    std::process::exit(exit_code?);
+}
+
+/// A more verbose log level raises `openshell*` spans; dependency spans stay at
+/// INFO so they do not flood the exporter queue.
+fn otlp_span_filter(log_level: &str) -> EnvFilter {
+    let level = log_level
+        .parse::<LevelFilter>()
+        .unwrap_or(LevelFilter::INFO)
+        .max(LevelFilter::INFO);
+    EnvFilter::new(format!("info,openshell={level}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otlp_span_filter_raises_only_openshell_targets() {
+        let directives = |log_level: &str| otlp_span_filter(log_level).to_string();
+        assert_eq!(directives("warn"), "openshell=info,info");
+        assert_eq!(directives("info"), "openshell=info,info");
+        assert_eq!(directives("debug"), "openshell=debug,info");
+        assert_eq!(directives("info,h2=debug"), "openshell=info,info");
+    }
 
     #[test]
     fn isolation_backend_is_the_default_role() {

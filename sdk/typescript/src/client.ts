@@ -22,7 +22,9 @@ import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './g
 import {
   type ExecSandboxInputSchema,
   OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
+  SandboxRestartPolicy,
   type SandboxSpecSchema,
   type SandboxWorkloadTemplateSchema,
   ServiceStatus,
@@ -84,6 +86,9 @@ export type SandboxPhaseName =
   | 'starting'
   | 'completed';
 
+/** Restart behavior after the canonical main process exits. */
+export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
+
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
 
@@ -141,6 +146,8 @@ export interface SandboxSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Restart behavior after the canonical main process exits. */
+  restartPolicy?: SandboxRestartPolicyName;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -162,6 +169,23 @@ export interface ServiceExposure {
   service?: string;
   /** Loopback TCP port inside the sandbox. */
   targetPort: number;
+  /** Handling for an incoming application Authorization header. */
+  authorizationMode?: ServiceAuthorizationMode;
+}
+
+export enum ServiceAuthorizationMode {
+  Strip = 'strip',
+  BearerPassthrough = 'bearer_passthrough',
+}
+
+function serviceAuthorizationModeToProto(mode: ServiceAuthorizationMode | undefined): ProtoServiceAuthorizationMode {
+  switch (mode) {
+    case ServiceAuthorizationMode.BearerPassthrough:
+      return ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH;
+    case ServiceAuthorizationMode.Strip:
+    case undefined:
+      return ProtoServiceAuthorizationMode.STRIP;
+  }
 }
 
 export interface SandboxFromTemplateSpec {
@@ -192,11 +216,16 @@ export interface SandboxRef {
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
+  /** Stable SSH host identity; absent on older runtimes. */
+  hostKeyFingerprint?: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
+  restartCount: number;
+  nextRestartAtMs?: number;
+  mainProcessStartedAtMs?: number;
 }
 
 export interface SandboxWorkloadTemplateProvenance {
@@ -472,6 +501,17 @@ export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
 function phaseName(p: SandboxPhase): SandboxPhaseName {
   return PHASE_NAMES[p] ?? 'unspecified';
 }
+
+function restartPolicyValue(policy: SandboxRestartPolicyName | undefined): SandboxRestartPolicy {
+  switch (policy) {
+    case 'on-failure':
+      return SandboxRestartPolicy.ON_FAILURE;
+    case 'always':
+      return SandboxRestartPolicy.ALWAYS;
+    default:
+      return SandboxRestartPolicy.NEVER;
+  }
+}
 function statusName(s: ServiceStatus): HealthStatus {
   return STATUS_NAMES[s] ?? 'unspecified';
 }
@@ -488,6 +528,8 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
+  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -495,6 +537,7 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
+    hostKeyFingerprint: sandbox.hostKeyFingerprint || undefined,
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
     createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate
@@ -504,6 +547,9 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
         }
       : undefined,
     serviceUrls,
+    restartCount: sandbox.status?.restartCount ?? 0,
+    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
+    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
   };
 }
 
@@ -985,6 +1031,7 @@ export class SandboxClient {
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,
+        restartPolicy: restartPolicyValue(spec.restartPolicy),
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
@@ -997,6 +1044,7 @@ export class SandboxClient {
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
@@ -1023,6 +1071,7 @@ export class SandboxClient {
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);

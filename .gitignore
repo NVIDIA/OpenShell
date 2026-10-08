@@ -223,6 +223,7 @@ artifacts/
 mise.local.toml
 
 # Ignore plans for now
+/plans
 architecture/plans
 
 rfc.md

@@ -801,7 +801,12 @@ HARNESS_ENV_ARGS=(
 
 case "$HARNESS" in
     codex)
+        # Codex compares account IDs locally during workspace discovery. Unlike
+        # bearer tokens, this non-secret identifier must not be a placeholder.
+        [[ -n "${CODEX_AUTH_ACCOUNT_ID:-}" ]] || fail "missing Codex account ID"
+        [[ "$CODEX_AUTH_ACCOUNT_ID" != openshell:resolve:* ]] || fail "Codex account ID must be a literal identifier"
         HARNESS_ENV_ARGS+=(
+            "CODEX_ACCOUNT_ID=$CODEX_AUTH_ACCOUNT_ID"
             "CODEX_MODEL=${CODEX_MODEL:-$HARNESS_MODEL}"
             "CODEX_REASONING=${CODEX_REASONING:-$HARNESS_REASONING}"
         )

@@ -244,6 +244,10 @@ pub struct KubernetesComputeConfig {
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
@@ -312,6 +316,9 @@ pub(crate) const DEFAULT_SANDBOX_UID: u32 = 10001;
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_UID_RANGE: &str = "openshift.io/sa.scc.uid-range";
 
+/// The annotation key for the `OpenShift` MCS label allocated to a namespace.
+pub const ANNOTATION_SCC_MCS: &str = "openshift.io/sa.scc.mcs";
+
 /// The annotation key for the `OpenShift` `ServiceAccount` supplemental groups.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supplemental-groups";
@@ -349,6 +356,7 @@ impl Default for KubernetesComputeConfig {
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
@@ -624,7 +632,7 @@ impl KubernetesComputeConfig {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
     }
 
-    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// Where supervisor Pods read the gateway CA. Outside
     /// shared mode it is staged into each generation's bootstrap Secret.
     #[must_use]
     pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
@@ -847,7 +855,7 @@ mod tests {
 
     #[test]
     fn published_kubernetes_example_is_valid_toml() {
-        let docs = include_str!("../../../docs/reference/gateway-config.mdx");
+        let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
         let section = docs
             .split_once("### Kubernetes")
             .expect("Kubernetes documentation section")

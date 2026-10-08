@@ -22,7 +22,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -102,7 +102,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   prepare-integration:
-    needs: [build-binaries, build-deb, build-images]
+    needs: [build-binaries, build-deb, build-images, build-rpm]
     permissions:
       actions: read
       contents: read
@@ -110,6 +110,7 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
 
   conformance-integration:
     needs: prepare-integration
@@ -122,6 +123,13 @@ jobs:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
 
   feature-specific-integration:
     needs: prepare-integration
@@ -136,8 +144,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
         ]
 
   docker-e2e:
@@ -193,7 +201,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -241,10 +249,6 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
-      upload-channel: latest/edge
-      github-environment: latest/edge
-    secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
@@ -255,6 +259,16 @@ jobs:
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
+  publish-snap:
+    name: Publish Snap
+    needs: build-snap
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/edge
+      github-environment: latest/edge
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
@@ -271,7 +285,7 @@ jobs:
       - vm-e2e
       - build-deb
       - build-rpm
-      - build-snap
+      - publish-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -577,7 +591,6 @@ jobs:
       source_ref: ${{ github.sha }}
       release_version: ${{ needs.compute-versions.outputs.docs_version }}
       display_name: Dev
-      availability: beta
       publish: true
     secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}

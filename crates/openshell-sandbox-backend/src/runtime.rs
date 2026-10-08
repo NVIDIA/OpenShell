@@ -35,11 +35,11 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request,
-    RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
-    STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
-    read_stream_frame, validate_resource_claims, write_stream_frame,
+    AgentSpecWire, DnsQueryResultWire, EXEC_REQUEST_RETRY_WINDOW, ExecSpecWire, ExitStatusWire,
+    MAX_CONTROL_FRAME_BYTES, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
+    STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire,
+    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame,
+    encode_frame, read_stream_frame, validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
@@ -396,12 +396,26 @@ impl ReadyBoundary for RemoteReady {
         } else {
             (None, None)
         };
-        let (provider_env_revision, provider_env) = self
+        let provider_snapshot = self
             .provider_credentials
-            .child_env_snapshot_with_gcp_resolved()
+            .child_environment_snapshot()
             .map_err(|error| {
                 BackendError::Process(format!("snapshot provider environment: {error}"))
             })?;
+        if !provider_snapshot.files.is_empty() {
+            let response = self
+                .client
+                .call_idempotent(Request::ProbeProviderFiles)
+                .await
+                .map_err(|error| {
+                    BackendError::Process(format!("provider file capability probe failed: {error}"))
+                })?;
+            if !matches!(response, Response::ProviderFilesSupported) {
+                return Err(BackendError::Process(
+                    "sandbox boundary does not support provider files".to_string(),
+                ));
+            }
+        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -410,8 +424,9 @@ impl ReadyBoundary for RemoteReady {
                 policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
-                provider_env_revision,
-                provider_env,
+                provider_env_revision: provider_snapshot.revision,
+                provider_env: provider_snapshot.environment,
+                provider_files: provider_snapshot.files,
             })
             .await?;
         let Response::Started {
@@ -549,6 +564,7 @@ async fn open_process_attachment(
         network_reader,
         stdout_pump,
         stderr_pump,
+        None,
     ));
     let terminal: Option<Arc<dyn BoundaryTerminal>> = if has_terminal {
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(RemoteTerminal { client, process_id });
@@ -574,22 +590,29 @@ async fn pump_process_responses(
     mut network: tokio::io::ReadHalf<BoundaryDuplexStream>,
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
+    completion: Option<tokio::sync::oneshot::Sender<BoundaryExitStatus>>,
 ) {
-    loop {
+    let status = loop {
         match read_stream_frame(&mut network).await {
             Ok(Some((STREAM_STDOUT, payload))) => {
                 if stdout.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
             Ok(Some((STREAM_STDERR, payload))) => {
                 if stderr.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
-            Ok(Some((STREAM_EXIT, _)) | None) | Err(_) => return,
-            Ok(Some((_channel, _))) => return,
+            Ok(Some((STREAM_EXIT, payload))) => {
+                break serde_json::from_slice::<ExitStatusWire>(&payload)
+                    .map_or(BoundaryExitStatus::Exited(74), Into::into);
+            }
+            Ok(None | Some(_)) | Err(_) => break BoundaryExitStatus::Exited(74),
         }
+    };
+    if let Some(completion) = completion {
+        let _ = completion.send(status);
     }
 }
 
@@ -613,6 +636,22 @@ impl RemoteExec {
                 .map_err(|error| {
                     BackendError::Process(format!("snapshot provider environment: {error}"))
                 })?;
+            if !snapshot.files.is_empty() {
+                let response = self
+                    .client
+                    .call_idempotent(Request::ProbeProviderFiles)
+                    .await
+                    .map_err(|error| {
+                        BackendError::Process(format!(
+                            "provider file capability probe failed: {error}"
+                        ))
+                    })?;
+                if !matches!(response, Response::ProviderFilesSupported) {
+                    return Err(BackendError::Process(
+                        "sandbox boundary does not support provider files".to_string(),
+                    ));
+                }
+            }
             *generation = generation.checked_add(1).ok_or_else(|| {
                 BackendError::Process("provider environment publication exhausted".to_string())
             })?;
@@ -623,6 +662,7 @@ impl RemoteExec {
                     generation: requested_generation,
                     revision: snapshot.revision,
                     provider_env: snapshot.environment,
+                    provider_files: snapshot.files,
                 })
                 .await?;
             let Response::ProviderEnvironmentUpdated {
@@ -770,11 +810,13 @@ async fn open_exec_session(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
+    let (output_status_tx, output_status_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(pump_exec_input(stdin_pump, network_writer));
     tokio::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
+        Some(output_status_tx),
     ));
 
     let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
@@ -795,6 +837,7 @@ async fn open_exec_session(
         stdout,
         stderr,
         terminal,
+        output_status: Some(output_status_rx),
     })
 }
 
@@ -1355,7 +1398,7 @@ impl BoundaryClient {
         request: Request,
     ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let envelope = Self::prepare_request(request)?;
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tokio::time::timeout(EXEC_REQUEST_RETRY_WINDOW, async {
             loop {
                 let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
@@ -1372,7 +1415,10 @@ impl BoundaryClient {
         })
         .await
         .map_err(|_| {
-            BackendError::Unavailable("boundary idempotent stream request timed out".to_string())
+            BackendError::Unavailable(
+                "exec startup recovery deadline expired; execution outcome may be unknown"
+                    .to_string(),
+            )
         })?
     }
 
@@ -2275,6 +2321,7 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
+                            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
@@ -2862,9 +2909,6 @@ mod tests {
                 retained_socket_operation: true,
                 proc_fd_identity: true,
                 task_memory_read: true,
-                task_memory_write: true,
-                cancellation: true,
-                task_memory_writes_disabled: false,
             },
             landlock_abi: 3,
             landlock_allow_deny: true,
@@ -2872,6 +2916,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         };
         openshell_isolation_interface::contract::BoundaryConfirmation {
             generation: "test-generation".to_string(),
@@ -3139,7 +3184,7 @@ mod tests {
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         ));
-        let session = open_exec_session(
+        let mut session = open_exec_session(
             client,
             ExecSpec {
                 program: "/bin/true".to_string(),
@@ -3155,9 +3200,15 @@ mod tests {
         .unwrap();
         // The test peer closes its I/O stream without an exit frame. Neither
         // that loss nor a dropped reader can invalidate the process handle.
+        let output_status = session.output_status.take().unwrap();
         drop(session.stdin);
         drop(session.stdout);
         drop(session.stderr);
+        assert_eq!(
+            output_status.await.unwrap(),
+            BoundaryExitStatus::Exited(74),
+            "missing stream exit must fail even when the process exits cleanly"
+        );
         let attachment = session.process.attach().await.unwrap();
         drop(attachment);
         for _ in 0..2 {
@@ -3167,6 +3218,34 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_output_completion_preserves_failure_status() {
+        let (network, mut peer) = tokio::io::duplex(1024);
+        let network: BoundaryDuplexStream = Box::new(network);
+        let (reader, _writer) = tokio::io::split(network);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, _error_output) = tokio::io::duplex(1024);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_process_responses(
+            reader,
+            stdout,
+            stderr,
+            Some(completion_tx),
+        ));
+        write_stream_frame(&mut peer, STREAM_STDOUT, b"hello")
+            .await
+            .unwrap();
+        let status = serde_json::to_vec(&ExitStatusWire::Exited(74)).unwrap();
+        write_stream_frame(&mut peer, STREAM_EXIT, &status)
+            .await
+            .unwrap();
+        let mut bytes = [0; 5];
+        output.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"hello");
+        assert_eq!(completion_rx.await.unwrap(), BoundaryExitStatus::Exited(74));
+        pump.await.unwrap();
     }
 
     struct TestTlsIo(BoundaryDuplexStream);
@@ -3407,6 +3486,7 @@ mod tests {
         assert!(matches!(
             client
                 .exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
@@ -3466,6 +3546,7 @@ mod tests {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 client.exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),

@@ -23,8 +23,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -1083,7 +1083,7 @@ async fn handle_exec_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &mut EventHandler,
     sandbox_name: &str,
-    command: &str,
+    command: &[String],
     workspace: &str,
 ) -> Result<()> {
     let session = {
@@ -1135,13 +1135,9 @@ async fn handle_exec_command(
     );
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
-    // the user's command appended.  Each word is escaped individually so the
+    // the parsed command appended. Each argument is escaped individually so the
     // remote shell parses it correctly.
-    let command_str = command
-        .split_whitespace()
-        .map(shell_escape)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command_str = build_exec_command(command);
     let mut ssh = std::process::Command::new("ssh");
     ssh.arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
@@ -1216,6 +1212,14 @@ use openshell_core::forward::{
     build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response,
 };
+
+fn build_exec_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -1400,12 +1404,10 @@ fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
 fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
-    let Some((name, image, command, selected_providers, ports)) = app.create_form_data() else {
+    let Some((name, image, selected_providers, ports)) = app.create_form_data() else {
         return;
     };
 
-    // Stash command so we can exec after sandbox creation + Ready.
-    app.pending_exec_command = command;
     // Stash ports so we can include them in the status text.
     app.pending_forward_ports.clone_from(&ports);
 
@@ -2720,7 +2722,12 @@ fn sandbox_notes_for_view(
         } else {
             "compute cleanup pending"
         };
-        let mut notes = format!("Provisioning timed out; {cleanup}");
+        let mut notes =
+            if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                format!("Image preparation timed out; {cleanup}")
+            } else {
+                format!("Provisioning timed out; {cleanup}")
+            };
         if !forwards.is_empty() {
             notes.push_str("; ");
             notes.push_str(&forwards);
@@ -2767,6 +2774,41 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(|s| s.object_name().to_string())
         .collect();
     app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_restart_policies = sandboxes
+        .iter()
+        .map(|s| {
+            match s
+                .spec
+                .as_ref()
+                .and_then(|spec| SandboxRestartPolicy::try_from(spec.restart_policy).ok())
+            {
+                Some(SandboxRestartPolicy::OnFailure) => "on-failure",
+                Some(SandboxRestartPolicy::Always) => "always",
+                _ => "never",
+            }
+            .to_string()
+        })
+        .collect();
+    app.sandbox_restart_counts = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().map_or(0, |status| status.restart_count))
+        .collect();
+    app.sandbox_exit_codes = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().and_then(|status| status.exit_code))
+        .collect();
+    app.sandbox_next_restart_at = sandboxes
+        .iter()
+        .map(|s| {
+            format_timestamp(
+                s.status
+                    .as_ref()
+                    .and_then(|status| status.next_restart_time.as_ref())
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
     app.sandbox_images = sandboxes
         .iter()
         .map(|s| {
@@ -3095,6 +3137,46 @@ fn format_age(epoch_ms: i64) -> String {
     }
 }
 
+#[cfg(all(test, unix))]
+mod exec_command_tests {
+    use super::build_exec_command;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn run_command(command: &str, stdin: &[u8]) -> std::process::Output {
+        let args = shell_words::split(command).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &build_exec_command(&args)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn quoted_script_runs_and_reads_stdin() {
+        let output = run_command(r#"/bin/sh -c "echo GOOD; read x; echo $x""#, b"entered\n");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"GOOD\nentered\n");
+    }
+
+    #[test]
+    fn arguments_remain_literal_at_remote_shell_boundary() {
+        let output = run_command(
+            r#"printf '%s\n' 'hello world' "" "it's" a\ b $HOME '$(echo BAD)' ';' '|' '>' '*.txt'"#,
+            b"",
+        );
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
+        );
+    }
+}
+
 #[cfg(test)]
 mod draft_approve_all_message_tests {
     use super::*;
@@ -3302,6 +3384,26 @@ mod sandbox_notes_tests {
         assert_eq!(
             sandbox_notes(&sandbox, String::new()),
             "Provisioning timed out; compute reclaimed"
+        );
+    }
+
+    #[test]
+    fn preparation_timeout_notes_identify_the_expired_phase() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(openshell_core::proto::SandboxProvisioning {
+                    preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000)
+                        .ok(),
+                    timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Image preparation timed out; compute cleanup pending"
         );
     }
 
