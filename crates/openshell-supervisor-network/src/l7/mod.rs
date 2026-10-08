@@ -1919,6 +1919,9 @@ fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
 }
 
 #[cfg(test)]
+mod middleware_compat_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -3,6 +3,8 @@
 
 //! Supervisor middleware registration and chain execution.
 
+#[cfg(test)]
+mod compat_tests;
 pub mod headers;
 mod remote;
 mod response;

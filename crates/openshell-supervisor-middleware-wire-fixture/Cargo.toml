@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-supervisor-middleware-wire-fixture"
+description = "Test-only supervisor middleware gRPC service built from the released v0.1.2 schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -48,6 +48,26 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### Legacy supervisor middleware compatibility
+
+The 0.1.x HTTP middleware protocol stays supported until 0.2.0. Three layers
+pin its released behavior:
+
+- `crates/openshell-supervisor-middleware-wire-fixture` serves a scriptable
+  middleware generated from the `v0.1.2` copies of
+  `proto/supervisor_middleware.proto` and `proto/extension.proto`. The
+  `compat_tests` suites in `openshell-supervisor-middleware` and the
+  `l7::middleware_compat_tests` module in `openshell-supervisor-network`
+  drive the current registry and relay against it. They run with
+  `mise run test`.
+- `mise run e2e:middleware-legacy` builds the content-guard example from the
+  `v0.1.2` tag and runs it against the current gateway and Docker supervisor.
+- `mise run proto:breaking` checks the working tree's legacy middleware protos
+  against `v0.1.2`.
+
+When a change intentionally alters legacy behavior, update the expectation in
+the compatibility suite in the same change and explain why.
+
 ### Native Windows validation
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
@@ -223,6 +243,10 @@ Suites:
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- Legacy middleware suite (`mise run e2e:middleware-legacy`) - runs the
+  supervisor middleware content-guard example built at `v0.1.2` against the
+  current gateway and Docker supervisor. The Docker suite skips this test
+  unless `OPENSHELL_E2E_LEGACY_CONTENT_GUARD_BIN` is set.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
@@ -511,6 +535,8 @@ The harness (`e2e/rust/src/harness/`) provides:
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
 | `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
 | `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
+| `OPENSHELL_E2E_LEGACY_CONTENT_GUARD_BIN` | Content-guard binary built at `v0.1.2` for the legacy middleware e2e test |
+| `OPENSHELL_E2E_REQUIRE_LEGACY_MIDDLEWARE` | Set to `1` to fail, rather than skip, the legacy middleware e2e test without that binary |
 | `OPENSHELL_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |
 | `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for Kubernetes e2e (skips ephemeral k3d) |
 | `OPENSHELL_E2E_KUBE_TEST` | Scope Kubernetes e2e to a single test by name |

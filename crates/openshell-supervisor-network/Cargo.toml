@@ -65,6 +65,7 @@ bundled-ca-roots = ["dep:webpki-roots"]
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
+openshell-supervisor-middleware-wire-fixture = { path = "../openshell-supervisor-middleware-wire-fixture" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tonic = { workspace = true }
 temp-env = "0.3"

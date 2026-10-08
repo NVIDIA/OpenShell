@@ -55,6 +55,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
+| `crates/openshell-supervisor-middleware-wire-fixture/` | Middleware wire fixture | Test-only legacy middleware gRPC service generated from the v0.1.2 protos |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |

@@ -84,6 +84,11 @@ path = "tests/docker_corporate_proxy.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "supervisor_middleware_legacy"
+path = "tests/supervisor_middleware_legacy.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "driver_config_volume"
 path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]

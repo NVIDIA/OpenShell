@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Protobuf contract checks
+
+["proto:breaking"]
+description = "Check pinned protobuf contracts, such as the legacy supervisor middleware protocol, against their release baselines"
+run = "uv run --no-project python tasks/scripts/check_proto_compatibility.py --pinned"

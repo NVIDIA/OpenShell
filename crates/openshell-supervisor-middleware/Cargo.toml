@@ -24,6 +24,7 @@ tonic = { workspace = true, features = ["channel", "server", "tls-native-roots"]
 
 [dev-dependencies]
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
+openshell-supervisor-middleware-wire-fixture = { path = "../openshell-supervisor-middleware-wire-fixture" }
 tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]

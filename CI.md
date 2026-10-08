@@ -66,6 +66,23 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
+The same action then checks pinned contracts, which must stay compatible with
+a fixed release whatever the train permits. `PINNED_CONTRACTS` in
+`tasks/scripts/check_proto_compatibility.py` lists them. The legacy supervisor
+middleware protocol, `proto/supervisor_middleware.proto`, is pinned to `v0.1.2`
+until 0.2.0 removes it. `proto/extension.proto` is pinned with it because the
+legacy messages embed `PeerMetadata`; that pin applies to every extension
+family until the entry is removed. Every finding fails, including renames that
+keep field numbers. Run the check on the working tree with:
+
+```shell
+git fetch origin tag v0.1.2
+mise run proto:breaking
+```
+
+Remove a pinned entry only in the change that deliberately retires that
+contract.
+
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.

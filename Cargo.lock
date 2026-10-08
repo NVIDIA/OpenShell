@@ -5049,6 +5049,7 @@ dependencies = [
  "openshell-core",
  "openshell-extension-core",
  "openshell-supervisor-middleware-builtins",
+ "openshell-supervisor-middleware-wire-fixture",
  "prost",
  "prost-types",
  "tokio",
@@ -5070,6 +5071,21 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "openshell-supervisor-middleware-wire-fixture"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -5102,6 +5118,7 @@ dependencies = [
  "openshell-policy-schema",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "openshell-supervisor-middleware-wire-fixture",
  "opentelemetry_sdk",
  "prost-types",
  "rcgen",
