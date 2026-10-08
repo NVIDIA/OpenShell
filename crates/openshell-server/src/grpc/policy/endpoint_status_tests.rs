@@ -1560,6 +1560,67 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
 }
 
 #[tokio::test]
+async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
+    let sandbox_id = "endpoint-replacement-reset-retry";
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    // X(workspace) times out the reset and every retry of it, but not the
+    // demotion, which takes only S(global) X(sandbox).
+    let hold = crate::persistence::lock_order::branch(
+        state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default")),
+    )
+    .await
+    .expect("hold the sandbox's workspace guard");
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+    let hello = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: "instance-b".to_string(),
+            connection_epoch: 1,
+            supports_provider_readiness: false,
+            redirected: false,
+            supports_session_redirect: false,
+        })),
+    };
+    let error = gateway_client(Arc::clone(&state))
+        .await
+        .connect_supervisor(tokio_stream::iter([hello]))
+        .await
+        .expect_err("the replacement's endpoint reset times out on the held guard");
+    assert_eq!(error.code(), Code::Unavailable);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = stored_sandbox(&state, sandbox_id)
+                .await
+                .status
+                .expect("sandbox status");
+            if status.phase == SandboxPhase::Provisioning as i32 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the failed replacement demotes the sandbox");
+
+    // The retry is still timing out on the held guard. Shutdown waits for
+    // the demotion only.
+    let shutdown = state
+        .supervisor_sessions
+        .shutdown(std::time::Duration::from_millis(500))
+        .await;
+    assert!(
+        shutdown.is_ok(),
+        "the endpoint-status retry must not hold gateway shutdown: {shutdown:?}"
+    );
+    drop(hold);
+}
+
+#[tokio::test]
 async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
     let state = test_server_state().await;
     let sandbox_id = "endpoint-session";

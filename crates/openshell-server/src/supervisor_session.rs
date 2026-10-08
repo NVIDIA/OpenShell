@@ -2243,7 +2243,6 @@ async fn establish_supervisor_session(
             let state = Arc::clone(&state);
             let sandbox_id = sandbox_id.clone();
             tokio::spawn(async move {
-                let _session_lifetime = session_lifetime;
                 // Lifecycle demotion takes an unbounded local lock. Keep it
                 // off this failure path so a timed-out reset returns promptly.
                 if let Err(err) = state
@@ -2253,6 +2252,9 @@ async fn establish_supervisor_session(
                 {
                     warn!(sandbox_id, error = %err, "supervisor session: failed to mark sandbox disconnected after endpoint status initialization failure");
                 }
+                // Shutdown waits for the demotion, like other session cleanup,
+                // but not for the retry, which runs until the reset is durable.
+                drop(session_lifetime);
                 crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
                     state, sandbox_id,
                 )
