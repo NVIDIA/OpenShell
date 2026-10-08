@@ -590,7 +590,8 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
 
 /// Probe the MXC capability required by `OpenShell`'s loopback CONNECT proxy.
 ///
-/// RC3 reports this independently from basic `ProcessContainer` availability.
+/// MXC 1.0.0 reports this independently from basic `ProcessContainer`
+/// availability.
 /// AppContainer+DACL fallback hosts can run ordinary one-shot workloads while
 /// correctly rejecting `ingress.hostLoopback = "allow"` during dry-run.
 fn probe_processcontainer_host_loopback(wxc: &Path) -> Result<(), String> {

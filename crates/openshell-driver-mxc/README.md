@@ -179,7 +179,7 @@ host proxy and reach the child only as placeholders.
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26340.9212 for `isolation_session`
-- MXC 1.0.0 RC3 or a newer binary compatible with the stable 1.0.0 schema
+- MXC 1.0.0 or a newer binary compatible with the stable 1.0.0 schema
 - `IsoSessionApp.dll` present and registered
 - `wxc-exec.exe` built with `--features isolation_session`
 - Any enforced App Control policy allows both `openshell-gateway.exe` and

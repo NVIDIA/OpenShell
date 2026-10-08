@@ -20,7 +20,7 @@
 #     opens a real window: Node.js touches user32/gdi32 during its own
 #     startup and dies with STATUS_DLL_INIT_FAILED under the Win32k
 #     lockdown that applies by default when a policy has no `ui:` section,
-#     confirmed empirically against mxc-release-binaries-v1.0.0-rc3.
+#     confirmed empirically against mxc-release-binaries-v1.0.0.
 #
 # The network policy is enforced by the OpenShell host CONNECT proxy. MXC's
 # default-deny egress independently blocks direct Internet bypass attempts.
