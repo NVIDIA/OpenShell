@@ -444,12 +444,15 @@ absent fields so every chart consumer observes the same configuration.
 {{- define "openshell.effectiveKubernetesConfig" -}}
 {{- $gatewayConfig := deepCopy (.Values.gatewayConfig | default dict) -}}
 {{- $kubernetes := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.resource_admission" -}}
+{{- $_ := set $kubernetes "resource_admission" (get $gatewayConfig "openshell.drivers.kubernetes.resource_admission") -}}
+{{- end -}}
 {{- $legacySandbox := .Values.sandboxRuntime.image | default dict -}}
 {{- if and (include "openshell.sandboxRuntimeImageOverrideEnabled" .) (not (hasKey $kubernetes "sandbox_runtime_image")) -}}
 {{- $_ := set $kubernetes "sandbox_runtime_image" (include "openshell.sandboxRuntimeImage" .) -}}
 {{- end -}}
 {{- $legacySandboxImage := .Values.sandbox.image | default dict -}}
-{{- $legacySandboxPullPolicy := get $legacySandboxImage "pullPolicy" | default .Values.global.image.pullPolicy -}}
+{{- $legacySandboxPullPolicy := get $legacySandboxImage "pullPolicy" -}}
 {{- if and $legacySandboxPullPolicy (not (hasKey $kubernetes "image_pull_policy")) -}}
 {{- $_ := set $kubernetes "image_pull_policy" (include "openshell.canonicalImagePullPolicy" $legacySandboxPullPolicy) -}}
 {{- end -}}

@@ -29,6 +29,13 @@ URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
 through the chart's supported environment-variable, file, or volume wiring.
 The normal precedence above still applies to the resulting mounted TOML file.
 
+During Helm values migration, explicit `gatewayConfig` tables take precedence
+over deprecated aliases. This includes the resource-admission table and the
+Kubernetes Secrets credential namespace, even when a legacy alias still enables
+the credential driver. The global Helm image pull policy applies to runtime
+and supervisor images. Leave the workload's `image_pull_policy` and deprecated
+`sandbox.image.pullPolicy` unset to use Kubernetes defaults for the workload image.
+
 The chart rejects the gateway's `database_url` file field and unambiguous
 inline credential or PEM private-key strings before rendering a ConfigMap. It
 validates Secret references as Kubernetes Secret names, but never reads or

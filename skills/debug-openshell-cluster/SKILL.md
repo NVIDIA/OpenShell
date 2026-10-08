@@ -427,6 +427,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When checking a Helm values migration, compare the rendered `gateway.toml`
+with the intended `gatewayConfig` tables. Explicit resource-admission settings
+and the Kubernetes Secrets credential namespace take precedence over deprecated
+aliases. Confirm the credential driver's namespace matches its Role and
+RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
+the global Helm pull policy applies to runtime and supervisor images.
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway

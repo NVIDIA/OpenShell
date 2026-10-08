@@ -302,6 +302,57 @@ tests:
           path: data["gateway.toml"]
           pattern: '"platform.example.com/source" = "legacy"'
 
+  - it: preserves the dotted schema-v2 resource admission table over legacy defaults
+    set:
+      server.drivers.kubernetes.resourceAdmission.enabled: true
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/source: legacy
+      gatewayConfig:
+        openshell.drivers.kubernetes.resource_admission:
+          enabled: false
+          required_labels:
+            platform.example.com/source: schema-v2
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[openshell\.drivers\.kubernetes\.resource_admission\]\nenabled = false\nrequired_labels = \{ "platform\.example\.com/source" = "schema-v2" \}$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "legacy"'
+
+  - it: leaves the workload image pull policy unset when only the global policy is configured
+    set:
+      global.image.pullPolicy: Always
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy ='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime_image_pull_policy = "always"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^supervisor_image_pull_policy = "always"$'
+
+  - it: translates an explicit legacy workload image pull policy
+    set:
+      sandbox.image.pullPolicy: Always
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy = "always"$'
+
+  - it: gives the canonical workload image pull policy precedence over the legacy alias
+    set:
+      sandbox.image.pullPolicy: Always
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          image_pull_policy: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy = "never"$'
+
   - it: renders all supported YAML shapes with deterministic TOML output
     set:
       gatewayConfig:

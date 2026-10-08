@@ -211,7 +211,6 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if and (not $hasConfiguredCredentialDrivers) (eq (len $configuredCredentialDrivers) 0) -}}
 {{- if $legacyKubernetesSecrets.enabled -}}
 {{- $_ := set $gatewayForCredentials "credential_drivers" (list "kubernetes-secrets") -}}
-{{- $_ := set $config "openshell.credential_drivers.kubernetes-secrets" (dict "namespace" (default .Release.Namespace $legacyKubernetesSecrets.namespace)) -}}
 {{- else if $legacyVault.enabled -}}
 {{- $_ := set $gatewayForCredentials "credential_drivers" (list "vault") -}}
 {{- end -}}
