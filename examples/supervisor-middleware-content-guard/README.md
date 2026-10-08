@@ -22,7 +22,7 @@ OpenShell has two HTTP middleware protocols:
 - HTTP protocol 1, the legacy protocol from 0.1, evaluates requests with `SupervisorMiddleware.EvaluateHttpRequest` and responses with `HttpResponsePreReturn.Evaluate`. OpenShell 0.2.0 removes it.
 - HTTP protocol 2 evaluates both directions with `EvaluateHttp`, on `HttpRequestPreCredentials` and `HttpResponsePreReturn`. A gateway or supervisor that runs HTTP protocol 2 advertises the `openshell.supervisor-middleware.http-v2` capability when it calls `Describe`.
 
-A service that serves both keeps working while gateways and supervisors of different versions run side by side. To migrate a service the way this example does:
+A service that serves both keeps working while gateways and supervisors of different versions run side by side. [Migrate Middleware to HTTP Protocol 2](../../docs/extensibility/supervisor-middleware/migrate-http-v2.mdx) covers the protocol differences and the rollout. To migrate a service the way this example does:
 
 1. Advertise `http-v2` as a supported capability, not a required one: pass `[SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()]` as the additional capabilities of `extension_metadata`. Peers without version 2, including OpenShell v0.1.2 and earlier, refuse a service that requires it.
 

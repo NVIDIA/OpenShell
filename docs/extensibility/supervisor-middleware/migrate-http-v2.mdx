@@ -1,0 +1,194 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Migrate Middleware to HTTP Protocol 2"
+sidebar-title: "Migrate to HTTP Protocol 2"
+slug: "extensibility/supervisor-middleware/migrate-http-v2"
+description: "Move a supervisor middleware service from the deprecated HTTP protocol 1 to HTTP protocol 2 without breaking older gateways and supervisors."
+keywords: "Supervisor Middleware, Migration, HTTP Protocol 2, EvaluateHttp, Body Modes, Dual Protocol, Deprecation"
+---
+
+This guide is for authors of middleware services that inspect HTTP requests or responses. It explains how to move a service from HTTP protocol 1, the legacy protocol from 0.1, to HTTP protocol 2, and how to serve both protocols while gateways and sandbox supervisors of different releases run side by side. WebSocket bindings do not change.
+
+## Timeline
+
+OpenShell has two HTTP middleware protocols:
+
+- HTTP protocol 1 (0.1) evaluates a request with the unary `SupervisorMiddleware.EvaluateHttpRequest` RPC and a response with the lockstep `HttpResponsePreReturn.Evaluate` stream. It is deprecated, and OpenShell 0.2.0 removes it.
+- HTTP protocol 2 evaluates both directions with one bidirectional stream: `HttpRequestPreCredentials.EvaluateHttp` for requests and `HttpResponsePreReturn.EvaluateHttp` for responses. [Supported Operations](/extensibility/supervisor-middleware/operations#http) describes it.
+
+| OpenShell release | HTTP protocol 1 bindings | HTTP protocol 2 bindings |
+| --- | --- | --- |
+| 0.1.2 and earlier | Supported. | Not supported. These releases refuse a service that requires `openshell.supervisor-middleware.http-v2`. |
+| Later 0.1.x releases | Supported and deprecated. The gateway logs a warning for each registered service that still describes HTTP protocol 1 bindings. | Supported. Gateways and supervisors advertise `openshell.supervisor-middleware.http-v2` when they call `Describe`. |
+| 0.2.0 | Refused at registration. | Supported. |
+
+Migrate every service before you upgrade to 0.2.0. [Upgrade to OpenShell 0.2.0](/upgrade/0-2-0) describes the operator side of the upgrade, including the `openshell gateway upgrade-check` command.
+
+## What Changes for Your Service
+
+| Area | HTTP protocol 1 | HTTP protocol 2 |
+| --- | --- | --- |
+| Request RPC | `SupervisorMiddleware.EvaluateHttpRequest`, one unary call with the buffered body. | `HttpRequestPreCredentials.EvaluateHttp`, a bidirectional stream on a separate gRPC service. |
+| Response RPC | `HttpResponsePreReturn.Evaluate`, with lockstep body units. | `HttpResponsePreReturn.EvaluateHttp`, on the same gRPC service. |
+| Binding | `http_protocol_version` unset or `0`. | `http_protocol_version: 2`, plus the body modes the binding can select in `supported_http_body_modes`. |
+| Body handling | The request body arrives whole. Responses offer `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES`. | Both directions start with a preflight that continues without the body, rejects, or selects `BUFFERED` or `STREAM`. |
+| Failures | The policy entry's `on_error` decides whether a failure blocks the traffic or skips the middleware. | Every failure blocks the traffic. `on_error` does not apply, and until 0.2.0 the gateway rejects `on_error: fail_open` on middleware that requires HTTP protocol 2. |
+
+## Serve Both Protocols
+
+A service that serves both protocols keeps working with every gateway and supervisor while you upgrade. The gateway and each sandbox supervisor call `Describe` separately, and after a gateway upgrade some sandboxes can keep running a supervisor from an earlier release, so build the manifest for each `Describe` call:
+
+1. Advertise `openshell.supervisor-middleware.http-v2` as a supported capability in the manifest's `extension` metadata, not as a required one. A peer that does not implement version 2 refuses a service that requires it.
+2. Return version 2 HTTP bindings when the caller's `MiddlewareDescribeRequest.gateway.supported_capabilities` contains `openshell.supervisor-middleware.http-v2`, and legacy HTTP bindings otherwise. Rust services can call `peer_supports` from `openshell_core::extension_protocol` to check it.
+3. Implement both RPC sets on one inspection core, and serve the `SupervisorMiddleware`, `HttpRequestPreCredentials`, and `HttpResponsePreReturn` gRPC services from the same endpoint.
+
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) serves both protocols. Its `Describe` handler selects the bindings for each caller:
+
+```rust
+async fn describe(
+    &self,
+    request: Request<MiddlewareDescribeRequest>,
+) -> Result<Response<MiddlewareManifest>, Status> {
+    let caller = request.into_inner().gateway;
+    let http_v2 = caller
+        .as_ref()
+        .is_some_and(|caller| peer_supports(caller, SUPERVISOR_MIDDLEWARE_HTTP_V2));
+    let manifest = manifest(http_v2);
+    validate_gateway_metadata(
+        ExtensionFamily::SupervisorMiddleware,
+        MANIFEST_NAME,
+        manifest.extension.as_ref(),
+        caller,
+    )
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(Response::new(manifest))
+}
+```
+
+A version 2 binding sets `http_protocol_version` and `supported_http_body_modes`. A legacy binding leaves both fields unset, and WebSocket bindings are the same in both manifests:
+
+```rust
+let http_binding = |operation: SupervisorMiddlewareOperation, phase| {
+    let binding = MiddlewareBinding {
+        operation: operation as i32,
+        phase: phase as i32,
+        max_payload_bytes: MAX_PAYLOAD_BYTES,
+        ..Default::default()
+    };
+    if http_v2 {
+        MiddlewareBinding {
+            http_protocol_version: 2,
+            supported_http_body_modes: vec![HttpBodyMode::Buffered as i32],
+            ..binding
+        }
+    } else {
+        binding
+    }
+};
+```
+
+The manifest's `extension` metadata lists the capability as supported:
+
+```rust
+extension: Some(extension_metadata(
+    ExtensionFamily::SupervisorMiddleware,
+    MANIFEST_NAME,
+    openshell_core::VERSION,
+    [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+)),
+```
+
+### Register the Version 2 Request Service
+
+The version 2 request RPC lives on the `HttpRequestPreCredentials` gRPC service, not on `SupervisorMiddleware`. Serve it next to `SupervisorMiddleware` and `HttpResponsePreReturn`. If you forget it, `Describe` still succeeds, and the problem surfaces only when OpenShell calls `EvaluateHttp` and receives `UNIMPLEMENTED`.
+
+OpenShell treats `UNIMPLEMENTED` from any HTTP middleware RPC as a contract failure. The exchange fails closed whatever `on_error` says, OpenShell emits a high-severity `openshell.middleware.contract_failure` finding, and the sandbox supervisor describes its middleware services again at its next policy poll. A dual-protocol build never answers an RPC from its manifest with `UNIMPLEMENTED`, so supervisors that described the service before you deployed it keep working.
+
+## Map Legacy Results to Version 2
+
+A version 2 stage answers the preflight first, then the body lifecycle it selected. The following table maps each legacy result to its version 2 counterpart:
+
+| Legacy result | Version 2 result |
+| --- | --- |
+| Request `DECISION_ALLOW` without a body | Preflight `continue_without_body`, or `HttpBufferedResult` with `unchanged` after inspecting the body. |
+| Request `DECISION_ALLOW` with `has_body` | `HttpBufferedResult` with `replacement`. Present empty bytes delete the body. |
+| Request `DECISION_DENY` | `HttpReject`, at preflight or after the body. |
+| Request `header_mutations` | Preflight `header_mutations`, or late `HttpBufferedResult.header_mutations` after inspecting the body. |
+| Response preflight `skip` | Preflight `continue_without_body`. |
+| Response `HEADERS_ONLY` with header mutations | Preflight `continue_without_body` with `header_mutations`. |
+| Response `WHOLE_BODY_BYTES` | Preflight `inspect` with `buffered`. |
+| Response `STREAM_BYTES` | Preflight `inspect` with `stream`. |
+| Response body `pass_through` | `HttpBufferedResult` with `unchanged`, or in `STREAM` mode the same bytes as `HttpOutputChunk` results. |
+| Response body `transform` | `HttpBufferedResult` with `replacement`, or in `STREAM` mode the replacement bytes as `HttpOutputChunk` results. |
+| Response `block_delivery` | `HttpReject`. |
+| Response body `skip_remaining` | In `STREAM` mode, copy the remaining input to the output. Version 2 has no separate result for it. |
+| Response trailers result | `trailer_mutations` on `HttpBufferedResult` or `HttpFinish`. |
+
+The preflight result, `HttpBufferedResult`, `HttpFinish`, and `HttpReject` carry the reason, reason code, findings, and metadata in one `MiddlewareDiagnostics` message, with the same limits as the legacy fields.
+
+`STREAM` is not a lockstep protocol. Input and output are independent. Your service can hold input across chunks, return output before input ends, and return any number of output chunks, but it must return `HttpOutputStart` before any output chunk and `HttpFinish` only after it receives `HttpInputEnd`. OpenShell keeps no copy of the input after it hands a chunk to a `STREAM` stage, so your service produces every output byte.
+
+## Handle Version 2 Preflight Differences
+
+The preflight carries more than the legacy request evaluation or response preflight, and a few fields work differently.
+
+### No Phase Field
+
+The legacy request evaluation carried a `phase` field. The version 2 preflight has none, because the RPC implies the phase. `HttpRequestPreCredentials` is `PRE_CREDENTIALS`, and `HttpResponsePreReturn` is `PRE_RETURN`. The preflight head carries your `config` and the `middleware_name` from the policy entry.
+
+### Select Body Limits Explicitly
+
+`permitted_body_modes` lists the modes OpenShell offers for this message, and `limits` carries the effective limits. To select `BUFFERED`, set `HttpBufferedMode.max_body_bytes` to a positive value no larger than `limits.max_buffered_body_bytes`, for example the offered limit capped by your service's own limit. OpenShell does not substitute a default for zero. Selecting a mode that is not in `permitted_body_modes`, or a `max_body_bytes` outside that range, fails the stage with `body_mode_not_permitted`.
+
+`declared_input_bytes` is the declared length of the original message. An earlier stage may replace the body, so enforce your limit against the body events you receive.
+
+A `STREAM` stage receives chunks of at most 64 KiB, which fit within default gRPC message limits. A `BUFFERED` stage that accepts bodies near the 4 MiB maximum needs a larger server message limit, as described in [Build Your Middleware Service](/extensibility/supervisor-middleware#build-your-middleware-service).
+
+### Handle Messages Without an Inspectable Body
+
+`unavailable_body_modes` lists each mode your binding supports that the preflight does not offer, with an `HttpBodyUnavailableReason`. Use it to tell a message with nothing to inspect from one you cannot inspect:
+
+- `HTTP_BODY_UNAVAILABLE_REASON_BODYLESS` means the response has no body, such as the answer to a `HEAD` request or a 1xx, 204, or 304 response. A content guard can let it continue.
+- Any other reason, such as `ENCODED`, `PARTIAL`, `OVER_LIMIT`, or `OPEN_ENDED`, means a body exists that your service cannot receive in that mode.
+
+When your service cannot inspect a message, end the stream with gRPC status `FAILED_PRECONDITION`. OpenShell fails the exchange closed with the platform-owned reason `middleware_cannot_inspect` and does not record your status message. Use other status codes, such as `INVALID_ARGUMENT`, for errors like an out-of-order event, so that operators can tell them apart. Use `HttpReject` only to deny the content itself.
+
+The legacy preflight gives no reason, so a legacy handler that requires a body fails bodyless responses too. Version 2 lets the same service pass them.
+
+## Design for Fail-Closed Behavior
+
+Version 2 HTTP bindings always fail closed. A timeout, transport failure, invalid result, or body over the selected limit fails the request or response, and `on_error: fail_open` on the policy entry has no effect on them. Decide what to skip explicitly instead:
+
+- Return `continue_without_body` at preflight for traffic your service does not need to inspect, based on the method, target, headers, or `declared_input_bytes`.
+- Advertise a preflight-only binding, with no body modes, when your service only checks or changes headers. Its failure window is one small exchange.
+- Ask operators to set `on_uninspectable: allow` on the policy entry for traffic no middleware can inspect, such as `tls: skip` endpoints.
+
+A service selected for `STREAM` holds a middleware session for as long as the stream lasts, and external services are shared across sandboxes. Enforce your own maximum stream duration and per-caller concurrency, and end the stream with `HttpReject` or an error when a caller exceeds them.
+
+Your service may close its result stream right after the result that ends its part in the exchange: a preflight `continue_without_body`, `HttpBufferedResult`, `HttpFinish`, or `HttpReject`. It may also keep the stream open until `session_end` or the end of the event stream.
+
+## Test Both Protocols
+
+Test each case through both protocols, in the event order OpenShell uses, and assert the same outcome and diagnostics. The content guard example's `src/protocol_tests.rs` serves the binary's gRPC services on loopback and drives every guard case through both protocols. The `Describe` tests in its `src/main.rs` check that a caller without `openshell.supervisor-middleware.http-v2` receives exactly the bindings a 0.1.2 gateway registers, and that a caller with it receives version 2 bindings.
+
+Choose body modes that keep both protocols equivalent while you serve both. The content guard selects `BUFFERED`, the counterpart of `WHOLE_BODY_BYTES` and the legacy request RPC. A `STREAM` stage would turn a late denial into an aborted response instead of a 403, and would receive response bodies, such as `text/event-stream`, that the legacy protocol never offers whole.
+
+## Roll Out the Migration
+
+1. Deploy a build that serves both protocols, and restart the gateway. The gateway reads middleware manifests only at startup.
+2. Run `openshell gateway upgrade-check --to 0.2`. It reports services that still describe legacy HTTP bindings to the gateway.
+3. Ask operators to remove `on_error: fail_open` from entries that use the service, unless it also has a WebSocket binding that needs it. A build that serves both protocols keeps that `fail_open`, while a build that requires HTTP protocol 2 does not: until 0.2.0, the gateway rejects `fail_open` on its entries. Version 2 HTTP stages ignore it, even while a supervisor cannot reach the service, and OpenShell 0.2.0 rejects it. An entry that omits `on_uninspectable` relies on `fail_open` to let uninspectable traffic through, so set `on_uninspectable` explicitly when you remove it, as described in [Upgrade to OpenShell 0.2.0](/upgrade/0-2-0#set-uninspectable-traffic-handling-explicitly).
+
+Sandbox supervisors keep the manifest they described until the set of middleware services delivered to them changes or a contract failure triggers a new `Describe`. Docker and VM sandboxes receive a new supervisor when the gateway restarts. Sandboxes on other compute drivers, such as Podman and Kubernetes, keep the supervisor they started with until you recreate them. A supervisor from 0.1.2 or earlier receives your legacy bindings from a dual-protocol build and keeps the 0.1.x `on_error` behavior.
+
+## Drop the Legacy Protocol
+
+Once every gateway and supervisor that uses the service runs a release that advertises `openshell.supervisor-middleware.http-v2`, and at the latest before OpenShell 0.2.0, drop the legacy protocol:
+
+1. Return version 2 bindings to every caller.
+2. Require the capability, for example with `extension_metadata_with_requirements` in Rust. Older peers then refuse the service at `Describe` instead of calling RPCs it no longer serves. Until OpenShell 0.2.0, the gateway then rejects `on_error: fail_open` in new and updated policies on every entry that uses the service, including entries that keep it for a WebSocket binding, and the upgrade check reports stored entries as `fail_open_on_http_v2_only`, or as `fail_open_not_applied` when the service has no WebSocket binding. Remove `fail_open` from those entries first.
+3. Answer the legacy RPCs with `UNIMPLEMENTED` until the protobuf definitions remove them.
+4. Restart the gateway, and recreate sandboxes whose supervisors predate HTTP protocol 2.
+
+Do not switch a service to an HTTP protocol 2-only build while sandboxes with supervisors from 0.1.2 or earlier still use it with `on_error: fail_open`. Those supervisors keep their cached HTTP protocol 1 manifest, receive `UNIMPLEMENTED` from the legacy RPC, and skip the middleware under `fail_open`. Recreate those sandboxes first.

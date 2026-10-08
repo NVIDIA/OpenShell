@@ -165,6 +165,7 @@ endpoints:
 - `credential_binding.provider` must name a provider attached to that sandbox. Use it only when the selected provider profile has no endpoints. Endpoint-bearing profiles already define their credential boundary.
 - OpenShell rejects a signed sandbox policy before activation unless the endpoint has a resolvable AWS credential source. An endpoint-bearing profile must declare `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and cover the signed host, port, and path. An endpointless profile must declare those keys and be selected with `credential_binding.provider` on the signed endpoint.
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
+- When [supervisor middleware](/extensibility/supervisor-middleware) inspects the body of a request to a signing endpoint, OpenShell collects the middleware output in memory, up to 4 MiB, and signs the body the middleware produced. Larger output fails the request with `middleware_failed`. When every middleware lets the request continue at preflight, signing works as it does without middleware.
 - The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
 
 ## Use from a Sandbox

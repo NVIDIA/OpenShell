@@ -41,11 +41,11 @@ timeout = "500ms"
 </ParamField>
 
 <ParamField path="max_payload_bytes" type="integer" required={true}>
-  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
+  Largest payload the service inspects. For a complete HTTP body, it limits the body and the replacement separately. For a streamed HTTP body, it limits each chunk, and OpenShell also caps chunks at 64 KiB. For WebSocket, it limits each text message and its replacement. Must be at most 4 MiB and no larger than the service advertises. Set it to `0` only when every binding the service advertises is a version 2 HTTP binding that supports no body modes.
 </ParamField>
 
 <ParamField path="timeout" type="string" default="500ms">
-  Time limit for `Describe`, `ValidateConfig`, and individual evaluations or stream exchanges. Use an integer followed by `ms` or `s`, from `10ms` through `30s`. A binding may advertise a shorter evaluation timeout. Accepted HTTP response and WebSocket streams have no connection-wide deadline.
+  Time limit for `Describe`, `ValidateConfig`, and each middleware exchange. Use an integer followed by `ms` or `s`, from `10ms` through `30s`. A binding may advertise a shorter timeout. For HTTP, it applies to opening a stream and its preflight, and to each complete-body or legacy exchange. For WebSocket, it applies to the preflight, capped at 1 second, and to each message. Chain, body, and stall deadlines apply separately, as listed in [Limits](/extensibility/supervisor-middleware/operations#limits). Streamed HTTP bodies and WebSocket connections have no total deadline.
 </ParamField>
 
 <ParamField path="tls_ca_cert_path" type="string">
@@ -150,7 +150,7 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 </ParamField>
 
 <ParamField path="on_error" type="'fail_closed' | 'fail_open'" default="fail_closed">
-  What happens when the middleware fails. Refer to [Choose Failure Behavior](#choose-failure-behavior).
+  What happens when the middleware fails. Applies to WebSocket bindings and to HTTP bindings that use the deprecated HTTP protocol 1. HTTP bindings that use HTTP protocol 2 always fail closed. Refer to [Choose Failure Behavior](#choose-failure-behavior).
 </ParamField>
 
 <ParamField path="on_uninspectable" type="'deny' | 'allow'" default="deny">
@@ -169,15 +169,28 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 
 ## Choose Failure Behavior
 
-Middleware fails when it cannot complete its check, for example when its service is unavailable, times out, returns an invalid result, or receives a payload over its limit. By default, OpenShell blocks the affected request, response, or WebSocket connection. The `on_error` field on a policy entry controls this behavior.
+Middleware fails when it cannot complete its check, for example when its service is unavailable, times out, returns an invalid result, or receives a payload over its limit. By default, OpenShell blocks the affected request, response, or WebSocket connection.
+
+How OpenShell handles a failure depends on the binding. Each HTTP binding in a service's manifest uses one of two [HTTP protocols](/extensibility/supervisor-middleware/operations#http-protocols):
+
+- HTTP bindings that use HTTP protocol 2 always fail closed. If the middleware fails before OpenShell forwards the request or starts sending the response, the sandbox receives an error response. If it fails after OpenShell has sent part of the request upstream or part of the response to the sandbox, OpenShell aborts the connection. OpenShell never skips a failed version 2 stage, retries it, or recovers the original body.
+- WebSocket bindings, and HTTP bindings that use the deprecated HTTP protocol 1, follow the entry's `on_error` field. `fail_closed`, the default, blocks the traffic. `fail_open` skips the failed middleware and lets the traffic continue.
 
 <Warning>
 
-`fail_open` skips failed middleware and lets the traffic continue. Avoid it unless availability matters more than enforcement for that traffic. Future releases may remove it. OpenShell emits a detection finding each time it skips middleware.
+`fail_open` skips failed middleware and lets the traffic continue. Avoid it unless availability matters more than enforcement for that traffic. OpenShell emits a detection finding each time it skips middleware. OpenShell 0.2.0 removes HTTP protocol 1, so `fail_open` then applies only to WebSocket bindings.
 
 </Warning>
 
-A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
+When you create a sandbox or update a policy, the gateway rejects `on_error: fail_open` on an entry whose middleware requires HTTP protocol 2, whatever its bindings and `on_uninspectable` say. Supervisors that predate HTTP protocol 2 cannot run such a service, so they would skip it for HTTP and WebSocket traffic alike. To keep `fail_open` for a WebSocket binding, deploy a build of the service that serves both HTTP protocols, which does not require HTTP protocol 2. OpenShell 0.2.0, which needs current supervisors, accepts `fail_open` for the WebSocket bindings of such middleware again.
+
+The gateway also rejects `on_error: fail_open` on an entry that sets `on_uninspectable: deny` if its middleware has neither a WebSocket binding nor an HTTP protocol 1 binding, because `fail_open` would have no effect. Otherwise the gateway accepts it in two other cases. When the entry omits `on_uninspectable`, `fail_open` still selects the [deprecated fallback](#handle-uninspectable-traffic) for uninspectable traffic. When the entry sets `on_uninspectable: allow`, `fail_open` matters to supervisors from releases before `on_uninspectable`. A policy stored before its middleware service moved to HTTP protocol 2 also keeps working. The entry's HTTP stages fail closed, and the sandbox supervisor emits a configuration event the first time the entry handles traffic in each direction under each policy version. The event is medium severity when no binding of the middleware honors `fail_open`, and informational when its WebSocket or HTTP protocol 1 bindings still do.
+
+A supervisor learns which protocol each binding uses from the services' `Describe` responses. If any middleware service the supervisor needs is unavailable when it starts, the supervisor runs with built-in middleware only until it can describe every service. Until then, an entry that uses a registered service follows its `on_error` setting, except in each HTTP direction where the gateway described an HTTP protocol 2 binding when it started, which fails closed. The gateway sends those protocols to the supervisor with each service registration.
+
+Some failures block the traffic whatever `on_error` says. If a service answers an HTTP middleware call from its manifest with gRPC status `UNIMPLEMENTED`, sends a message OpenShell cannot decode, or returns an HTTP protocol 2 result OpenShell does not recognize, OpenShell treats it as a contract failure. It fails the exchange closed, emits a high-severity `openshell.middleware.contract_failure` detection finding, and has the sandbox supervisor describe its middleware services again at its next policy poll. The supervisor reports the first contract failure of a service, binding, and kind at once, and summarizes later ones in one finding per policy poll with a `suppressed_count`. This catches a service that changed protocols behind the same endpoint.
+
+A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings. An HTTP protocol 2 middleware can also let traffic it does not need to inspect continue at preflight.
 
 `on_error` applies only to middleware failures. It does not extend what middleware can inspect, and the [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings.
 
@@ -201,9 +214,9 @@ network_middlewares:
 
 <Note>
 
-Earlier releases let uninspectable traffic through only for entries with `on_error: fail_open`. An entry that sets `on_error: fail_open` and omits `on_uninspectable` still allows it, and the sandbox supervisor emits a deprecation event each time it loads the policy. A future release removes this fallback, so set `on_uninspectable` explicitly. An explicit `deny` takes precedence over `fail_open`.
+Earlier releases let uninspectable traffic through only for entries with `on_error: fail_open`. An entry that sets `on_error: fail_open` and omits `on_uninspectable` still allows it, and the sandbox supervisor emits a deprecation event each time it loads the policy. OpenShell 0.2.0 removes this fallback, so set `on_uninspectable` explicitly. An explicit `deny` takes precedence over `fail_open`.
 
-Supervisors from releases before `on_uninspectable` ignore the field and reject a policy where an entry selects a `tls: skip` endpoint without `on_error: fail_open`. Until every sandbox runs a current supervisor, also set `on_error: fail_open` on entries that use `on_uninspectable: allow` for `tls: skip` endpoints.
+Supervisors from releases before `on_uninspectable` ignore the field and reject a policy where an entry selects a `tls: skip` endpoint without `on_error: fail_open`. Until every sandbox runs a current supervisor, also set `on_error: fail_open` on entries that use `on_uninspectable: allow` for `tls: skip` endpoints, unless their middleware requires HTTP protocol 2. The gateway rejects `fail_open` on such middleware, and older supervisors cannot run it, so recreate their sandboxes before you attach it. On middleware with HTTP protocol 1 bindings, this also lets HTTP failures through. Remove it once those sandboxes are recreated, and before you upgrade to OpenShell 0.2.0.
 
 </Note>
 
@@ -215,15 +228,28 @@ Middleware services sit on the request path of every sandbox that uses them. Pla
 - Keep services available when creating or updating policies. The gateway asks the service to validate its `config` before it accepts a policy.
 - Keep services reachable from sandbox supervisors, which call them directly for each request.
 
-When a running sandbox receives a configuration change, its supervisor validates the new middleware setup before using it. If validation fails, the supervisor keeps its previous setup and emits a configuration failure event.
+When a running sandbox receives a configuration change, its supervisor prepares the new middleware setup before using it. If it cannot connect to or describe a required service, it keeps its previous middleware setup and policy, emits a configuration failure event, and retries. If the new policy itself fails validation, the supervisor applies the gateway's [`policy_validation_failure_mode`](/how-it-works/gateways/configuration). The default, `fail_closed`, denies the sandbox's network traffic until a valid policy arrives, and `retain_last_valid` keeps the previous policy active.
+
+### Change a Service's Protocol
+
+The gateway and every sandbox supervisor call `Describe` separately. The gateway does so only at startup. A supervisor does so when it starts, when the set of middleware services it needs changes, and after a contract failure. After you deploy a service build that changes its HTTP protocol, restart the gateway so it reads the new manifest. `openshell gateway upgrade-check --to 0.2` lists registered services that still describe HTTP protocol 1 bindings to the gateway. [Upgrade to OpenShell 0.2.0](/upgrade/0-2-0) describes the check.
+
+After a gateway upgrade, sandboxes can keep running a supervisor from an earlier release. Docker and VM sandboxes receive the new supervisor when the gateway restarts. Sandboxes on other compute drivers, such as Podman and Kubernetes, keep the supervisor they started with until you recreate them. Supervisors from 0.1.2 and earlier support only HTTP protocol 1:
+
+- A service that serves both protocols works with every supervisor. Prefer it while sandboxes with older supervisors remain.
+- Older supervisors refuse a service that requires HTTP protocol 2. Recreate those sandboxes before you switch the service to such a build. Until OpenShell 0.2.0, the gateway also rejects `on_error: fail_open` on entries that use such a service.
+- Do not attach a service you plan to switch to an HTTP protocol 2-only build with `on_error: fail_open` while older supervisors use it. They keep the HTTP protocol 1 manifest they described, and under `fail_open` they skip the service when it no longer answers the HTTP protocol 1 calls.
+
+[Migrate to HTTP Protocol 2](/extensibility/supervisor-middleware/migrate-http-v2) describes the service side of this change.
 
 ## Observe Middleware Decisions
 
 OpenShell records middleware activity in its [OCSF logs](/observability/logging):
 
 - Each invocation records the policy entry, middleware name, decision, whether it changed the traffic, and any failure.
-- Failed middleware emits a detection finding, whether OpenShell blocks the traffic or skips the middleware.
+- Failed middleware emits a detection finding, whether OpenShell blocks the traffic or skips the middleware. A contract failure also emits a high-severity `openshell.middleware.contract_failure` finding, at most once per service, binding, and kind for each policy poll of the sandbox supervisor.
 - Coverage events record traffic that selected middleware could not inspect, such as WebSocket binary messages.
 - Configuration changes emit state-change events on success and failure.
+- Deprecated configuration emits medium-severity state-change events. The gateway reports each registered service that still describes HTTP protocol 1 bindings when it starts. The sandbox supervisor reports entries that rely on the `on_error: fail_open` fallback for uninspectable traffic when it loads a policy, and entries whose `fail_open` no longer applies to an HTTP protocol 2 binding when they first handle traffic. That last event is informational when the middleware's other bindings still honor `fail_open`.
 
 For denials and findings, OpenShell logs the middleware name and a validated reason code or finding label. It does not log free-form text from your service. [OCSF JSON Export](/observability/ocsf-json-export) describes how to send these events to other systems.

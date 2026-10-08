@@ -90,6 +90,8 @@ navigation:
       path: extensibility/supervisor-middleware/configure.mdx
     - page: "Supported Operations"
       path: extensibility/supervisor-middleware/operations.mdx
+    - page: "Migrate to HTTP Protocol 2"
+      path: extensibility/supervisor-middleware/migrate-http-v2.mdx
   - page: "Gateway Interceptors"
     path: extensibility/gateway-interceptors.mdx
   - page: "Drivers"

@@ -590,15 +590,20 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, `fail_open` or `fail_closed` behavior, and `on_uninspectable` handling of traffic middleware cannot inspect
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, `fail_open` or `fail_closed` behavior (HTTP bindings that use HTTP protocol 2 always fail closed), and `on_uninspectable` handling of traffic middleware cannot inspect
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
-messages when the implementation advertises the matching binding. The built-in
-`openshell/regex` supports request bodies and client WebSocket text messages.
-Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
-and `debug-openshell-cluster` to investigate middleware failures.
+messages when the implementation advertises the matching binding. Each HTTP
+binding uses the deprecated HTTP protocol 1, which OpenShell 0.2.0
+removes, or HTTP protocol 2. The built-in `openshell/regex` supports
+request bodies and client WebSocket text messages. Use the
+`generate-sandbox-policy` skill to choose attachments and failure policy, and
+`debug-openshell-cluster` to investigate middleware failures. After a middleware
+service changes its HTTP protocol, restart the gateway, and recreate sandboxes
+that still run a supervisor from an earlier release, such as Podman and
+Kubernetes sandboxes created before a gateway upgrade.
 
 ### Step 5: Push the updated policy
 

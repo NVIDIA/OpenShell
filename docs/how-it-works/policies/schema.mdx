@@ -542,15 +542,22 @@ network rules allow, in ascending `order`.
 | `endpoints.exclude` | list of strings | No | Host patterns to skip. Takes precedence over `include`. |
 | `order` | integer | No | Run order. Lower values run first. Values must be unique. Defaults to `0`. |
 | `config` | object | No | Configuration for the middleware. |
-| `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. |
+| `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Applies to WebSocket bindings and to HTTP bindings that use the deprecated HTTP protocol 1; HTTP bindings that use HTTP protocol 2 always fail closed. Until OpenShell 0.2.0, `fail_open` is rejected on middleware that requires HTTP protocol 2. Defaults to `fail_closed`. |
 | `on_uninspectable` | string | No | `deny` blocks selected traffic that no middleware can inspect, such as `tls: skip` endpoints. `allow` relays it uninspected. Defaults to `deny`. |
 | `name` | string | No | Display name. Defaults to the key. |
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per
 configuration. A configuration with `on_uninspectable: deny` cannot apply to an
 endpoint with `tls: skip`. When `on_uninspectable` is omitted, `on_error:
-fail_open` selects `allow`; this fallback is deprecated. Refer to [Handle
-Uninspectable
+fail_open` selects `allow`; this fallback is deprecated and OpenShell 0.2.0
+removes it. A configuration with `on_error: fail_open` and `on_uninspectable:
+deny` is rejected when its middleware has neither a WebSocket binding nor an
+HTTP protocol 1 binding. Until OpenShell 0.2.0, a configuration with `on_error:
+fail_open` is also rejected when its middleware requires HTTP protocol 2,
+because older supervisors cannot run that middleware and would skip it. Refer to
+[Choose Failure
+Behavior](/extensibility/supervisor-middleware/configure#choose-failure-behavior)
+and [Handle Uninspectable
 Traffic](/extensibility/supervisor-middleware/configure#handle-uninspectable-traffic).
 
 ```yaml showLineNumbers={false}
