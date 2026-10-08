@@ -214,18 +214,29 @@ install_envoy_gateway() {
 }
 
 wait_for_envoy_service() {
+  local gateway_name=""
   local svc_ref=""
   local svc_namespace=""
 
+  gateway_name="$(kctl -n "${NAMESPACE}" get grpcroute \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{.items[0].spec.parentRefs[0].name}' \
+    2>/dev/null || true)"
+  if [ -z "${gateway_name}" ]; then
+    echo "ERROR: could not determine the Gateway referenced by the OpenShell GRPCRoute." >&2
+    kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
+    return 1
+  fi
+
   for _ in $(seq 1 60); do
     svc_ref="$(kctl get svc -A \
-      -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+      -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
       -o jsonpath='{range .items[0]}{.metadata.namespace}{"/"}{.metadata.name}{end}' \
       2>/dev/null || true)"
     if [ -n "${svc_ref}" ]; then
       svc_namespace="${svc_ref%%/*}"
       if kctl -n "${svc_namespace}" wait --for=condition=Ready pod \
-        -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+        -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
         --timeout=5s >/dev/null 2>&1; then
         printf '%s\n' "${svc_ref}"
         return 0
@@ -234,13 +245,13 @@ wait_for_envoy_service() {
     sleep 2
   done
 
-  echo "ERROR: Envoy proxy Service for Gateway ${RELEASE_NAME} was not ready." >&2
+  echo "ERROR: Envoy proxy Service for Gateway ${gateway_name} was not ready." >&2
   kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
   kctl get svc -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
     -o wide >&2 || true
   kctl get pods -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
     -o wide >&2 || true
   return 1
 }
