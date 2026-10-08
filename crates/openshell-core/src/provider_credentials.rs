@@ -416,21 +416,10 @@ impl ProviderCredentialState {
         inner.current = Arc::new(env);
     }
 
-    /// Return `child_env` with explicitly non-secret config vars resolved.
-    ///
-    /// The credential pipeline placeholderizes all env values. Workloads need
-    /// non-secret configuration, including provider file paths, at process
-    /// startup before any HTTP request flows through the proxy. Credential
-    /// values remain placeholders.
-    ///
-    /// Three layers of env var injection:
-    /// 1. **Synthetic vars** (`GCE_METADATA_IP`, `METADATA_SERVER_DETECTION`)
-    ///    — sandbox-internal config not from user
-    ///    input, inserted directly here with real values.
-    /// 2. **Classified non-secret keys** — user-provided config and provider
-    ///    file paths un-placeholderized so workloads can read them at startup.
-    /// 3. Everything else stays as placeholders for proxy-time resolution.
-    pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
+    /// Resolve only environment keys explicitly classified as non-secret by
+    /// the gateway, including provider file paths needed at process startup.
+    /// Credentials remain placeholders for proxy-time resolution.
+    pub fn child_env_with_non_secret_resolved(&self) -> HashMap<String, String> {
         let inner = self
             .inner
             .read()
@@ -445,7 +434,7 @@ impl ProviderCredentialState {
     /// revision must describe the exact environment sent across the boundary,
     /// so callers must not obtain the two values through separate lock
     /// acquisitions.
-    pub fn child_env_snapshot_with_gcp_resolved(
+    pub fn child_env_snapshot_with_non_secret_resolved(
         &self,
     ) -> std::io::Result<(u64, HashMap<String, String>)> {
         let inner = self
@@ -481,47 +470,12 @@ impl ProviderCredentialState {
     fn resolve_child_env_snapshot(
         inner: &ProviderCredentialStateInner,
     ) -> (u64, HashMap<String, String>) {
-        use crate::google_cloud;
-
         let mut env = inner.current.child_env.clone();
-
-        let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST")
-            && inner
-                .non_secret_environment_keys
-                .contains("GCE_METADATA_HOST");
-        if !has_gcp_metadata && inner.non_secret_environment_keys.is_empty() {
-            return (inner.current.revision, env);
-        }
-
-        if has_gcp_metadata {
-            // Synthetic vars: sandbox-internal config that doesn't originate
-            // from user input and was never placeholderized.
-            env.insert(
-                "GCE_METADATA_HOST".to_string(),
-                google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
-            );
-            // Python's google-auth builds its ping URL as http://{GCE_METADATA_IP}
-            // so the value must include the port.
-            env.insert(
-                "GCE_METADATA_IP".to_string(),
-                google_cloud::METADATA_LOOPBACK_ADDR.to_string(),
-            );
-            // Node.js gcp-metadata uses METADATA_SERVER_DETECTION to skip the
-            // runtime ping that otherwise fails in sandboxed environments.
-            env.insert(
-                "METADATA_SERVER_DETECTION".to_string(),
-                "assume-present".to_string(),
-            );
-        }
-
-        // Only explicitly classified non-secret values may be unwrapped.
-        if let Some(ref resolver) = inner.combined_resolver {
+        if let Some(resolver) = &inner.current_resolver {
             for key in &inner.non_secret_environment_keys {
-                if !env.contains_key(key) || (has_gcp_metadata && key == "GCE_METADATA_HOST") {
-                    continue;
-                }
-                let placeholder = crate::secrets::placeholder_for_env_key(key);
-                if let Some(value) = resolver.resolve_placeholder(&placeholder) {
+                if let Some(placeholder) = env.get(key)
+                    && let Some(value) = resolver.resolve_placeholder(placeholder)
+                {
                     env.insert(key.clone(), value.to_string());
                 }
             }
@@ -1045,7 +999,6 @@ fn merge_resolvers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::google_cloud;
 
     #[test]
     fn body_classification_distinguishes_literal_foreign_bound_and_revoked() {
@@ -2150,14 +2103,14 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_without_gcp_returns_unchanged() {
+    fn child_env_with_non_secret_resolved_without_classified_keys_returns_unchanged() {
         let state = ProviderCredentialState::from_environment(
             1,
             HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
             HashMap::new(),
             HashMap::new(),
         );
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_non_secret_resolved();
         assert_eq!(
             env.get("GITHUB_TOKEN").map(String::as_str),
             Some("openshell:resolve:env:v1_GITHUB_TOKEN"),
@@ -2186,7 +2139,7 @@ mod tests {
         )
         .expect("classified provider environment");
 
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_non_secret_resolved();
         assert_eq!(env.get("ACME_CONFIG_FILE").map(String::as_str), Some(path));
         assert_eq!(
             env.get("ACME_TOKEN").map(String::as_str),
@@ -2195,17 +2148,17 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_overrides_gcp_static_vars() {
+    fn child_env_with_non_secret_resolved_resolves_declared_custom_config() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
-                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+                ("CUSTOM_ENDPOINT".to_string(), "marker".to_string()),
                 (
                     "GCP_ADC_ACCESS_TOKEN".to_string(),
                     "ya29.secret".to_string(),
                 ),
-                ("GCP_PROJECT_ID".to_string(), "my-project".to_string()),
-                ("CLOUD_ML_REGION".to_string(), "us-central1".to_string()),
+                ("CUSTOM_PROJECT".to_string(), "my-project".to_string()),
+                ("CUSTOM_REGION".to_string(), "us-central1".to_string()),
             ]),
             HashMap::new(),
             HashMap::new(),
@@ -2214,30 +2167,30 @@ mod tests {
                 binding("oauth2.googleapis.com", 443, "/**"),
             )]),
             vec![
-                "GCE_METADATA_HOST".to_string(),
-                "GCP_PROJECT_ID".to_string(),
-                "CLOUD_ML_REGION".to_string(),
+                "CUSTOM_ENDPOINT".to_string(),
+                "CUSTOM_PROJECT".to_string(),
+                "CUSTOM_REGION".to_string(),
             ],
         )
-        .expect("classified GCP environment");
-        let env = state.child_env_with_gcp_resolved();
+        .expect("classified provider environment");
+        let env = state.child_env_with_non_secret_resolved();
 
         assert_eq!(
-            env.get("GCE_METADATA_HOST").map(String::as_str),
-            Some(google_cloud::METADATA_LOOPBACK_ADDR),
-            "GCE_METADATA_HOST should be the loopback address"
+            env.get("CUSTOM_ENDPOINT").map(String::as_str),
+            Some("marker"),
+            "non-secret values must be preserved without GCP-specific rewriting"
         );
         assert!(
             !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
             "inference-specific vars should not be injected"
         );
         assert_eq!(
-            env.get("GCP_PROJECT_ID").map(String::as_str),
+            env.get("CUSTOM_PROJECT").map(String::as_str),
             Some("my-project"),
             "static config should be resolved to real value"
         );
         assert_eq!(
-            env.get("CLOUD_ML_REGION").map(String::as_str),
+            env.get("CUSTOM_REGION").map(String::as_str),
             Some("us-central1"),
         );
 
@@ -2249,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_handles_missing_config_keys() {
+    fn child_env_with_non_secret_resolved_handles_missing_config_keys() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
@@ -2265,11 +2218,11 @@ mod tests {
             vec!["GCE_METADATA_HOST".to_string()],
         )
         .expect("classified GCP environment");
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_non_secret_resolved();
 
         assert_eq!(
             env.get("GCE_METADATA_HOST").map(String::as_str),
-            Some(google_cloud::METADATA_LOOPBACK_ADDR),
+            Some("marker"),
         );
         assert!(
             !env.contains_key("GCP_PROJECT_ID")
@@ -2384,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_resolves_vertex_vars_without_metadata_host() {
+    fn child_env_with_non_secret_resolved_resolves_vertex_vars_without_metadata_host() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
@@ -2405,7 +2358,7 @@ mod tests {
             ],
         )
         .expect("classified Vertex environment");
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_non_secret_resolved();
         assert_eq!(
             env.get("GOOSE_PROVIDER").map(String::as_str),
             Some("gcp_vertex_ai"),
@@ -2426,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_only_unwraps_explicitly_non_secret_config() {
+    fn child_env_with_non_secret_resolved_only_unwraps_explicitly_non_secret_config() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
@@ -2472,7 +2425,7 @@ mod tests {
             )
             .expect("refreshed GCP environment");
 
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_non_secret_resolved();
         assert_eq!(
             env.get("GCP_PROJECT_ID").map(String::as_str),
             Some("visible-project-config"),
@@ -2671,7 +2624,7 @@ mod tests {
             "opaque revisions may move numerically backwards"
         );
 
-        let (revision, env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
+        let (revision, env) = state.child_env_snapshot_with_non_secret_resolved().unwrap();
         assert_eq!(revision, 2);
         assert!(env.is_empty(), "an empty snapshot must revoke the old env");
     }
@@ -2713,7 +2666,7 @@ mod tests {
                 .compare_and_install_child_env_snapshot(4, 5, HashMap::new())
                 .is_err()
         );
-        assert!(state.child_env_snapshot_with_gcp_resolved().is_err());
+        assert!(state.child_env_snapshot_with_non_secret_resolved().is_err());
     }
 
     #[test]

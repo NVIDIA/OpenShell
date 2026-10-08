@@ -38,13 +38,60 @@ Provider profiles include these user-facing features:
 - `openshell profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from imported profile IDs with `openshell provider create --type <id>`.
 - Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
-- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
+- Profile-backed discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. `discovery.credentials` selects credentials, and `discovery.config_env_vars` selects non-secret configuration variables.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider commands under `openshell sandbox provider list|attach|detach|status`, with an option to wait until the sandbox applies a change.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 - Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile or explicitly bound in sandbox policy for an endpointless profile.
+
+## Declare Environment and Discovery Behavior
+
+The profile ID identifies a definition. Renaming a profile does not activate or
+disable SDK configuration. Declare every non-secret environment default in the
+profile:
+
+```yaml
+environment:
+  config:
+    CUSTOM_PROJECT: CUSTOM_PROJECT
+    CUSTOM_REGION: CUSTOM_REGION
+  fixed:
+    CUSTOM_MODE: native
+discovery:
+  credentials: [api_key]
+  config_env_vars: [CUSTOM_PROJECT, CUSTOM_REGION]
+```
+
+`environment.config` maps each destination environment variable to a provider
+config key. OpenShell trims the config value and skips missing or blank values.
+`environment.fixed` supplies literal values, including an explicitly empty
+string. Sandbox template and create-time environment values, including an
+explicitly empty value, take precedence over these non-secret defaults.
+Provider credential keys remain credential-owned and reach the workload as
+opaque placeholders.
+
+`discovery.config_env_vars` copies nonempty local environment values into
+provider config under the same key. Use that key in `environment.config` if the
+discovered value should become a workload environment default. Discovery does
+not read undeclared keys or infer behavior from the profile ID.
+
+Profiles allow at most 64 environment defaults and 64 discovery config keys.
+Environment names and config keys are limited to 128 bytes; fixed values are
+limited to 4096 bytes. Values do not support interpolation or scripts. Lint
+rejects invalid environment names, duplicate destinations across `config` and
+`fixed`, and collisions with credential `env_vars`. The legacy
+`GOOGLE_SERVICE_ACCOUNT_KEY` cannot be a non-secret default. Attachment accepts
+the same non-secret destination from multiple providers when their values
+match. It rejects differing values and overlapping credential keys. Use
+distinct destination names when providers need different values.
+
+Use `required_platform_adapter` when a profile depends on a named runtime
+capability. Lint rejects unknown adapter names. Import, update, and attachment
+reject a recognized adapter that the deployment cannot provide, with a bounded
+diagnostic. The `gcp-metadata` adapter is available for Linux sandboxes using
+Docker, Podman, Kubernetes, or VM. Windows/MXC does not provide it.
 
 ## Understand Static Credential Endpoint Binding
 
@@ -293,11 +340,18 @@ Import one profile file at platform scope:
 openshell profile import -f providers/github.yaml --global
 ```
 
-Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
+Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory
+of profiles you reviewed and selected:
 
 ```shell
-openshell profile import --from ./providers --global
+mkdir -p selected-profiles
+cp providers/github.yaml providers/openai.yaml selected-profiles/
+openshell profile import --from ./selected-profiles --global
 ```
+
+Include only profiles whose platform requirements the deployment supports.
+Imports are atomic: a batch containing the Google Cloud metadata example fails
+on Windows/MXC because the `gcp-metadata` adapter is unavailable there.
 
 Omit `--global` to import into the current workspace instead.
 

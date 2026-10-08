@@ -32,6 +32,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
 use openshell_policy::ProviderPolicyLayer;
+use openshell_providers::LEGACY_VERTEX_PRIVATE_KEY_ENV;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1134,7 +1135,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
-    let registry = openshell_providers::ProviderRegistry::new();
 
     for record in records {
         let name = &record.name;
@@ -1157,10 +1157,10 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             .as_ref()
             .is_none_or(|profile| provider_profile_endpoints_are_active(profile, provider));
         let profile_proto = profile.as_ref().map(ProviderTypeProfile::to_proto);
-        let broker_only_credential_keys = profile_proto
-            .as_ref()
-            .map(broker_only_provider_credential_keys)
-            .unwrap_or_default();
+        let broker_only_credential_keys = profile_proto.as_ref().map_or_else(
+            reserved_bootstrap_credential_keys,
+            broker_only_provider_credential_keys,
+        );
         let profile_endpoints = profile_proto.as_ref().map(|profile| {
             if !profile_endpoints_are_active {
                 return Vec::new();
@@ -1204,6 +1204,14 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
 
         for (key, value) in &provider.credentials {
+            if broker_only_credential_keys.contains(key) {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping non-injectable provider credential"
+                );
+                continue;
+            }
             if accepted_stored_credential_keys
                 .as_ref()
                 .is_some_and(|accepted| !accepted.contains(key))
@@ -1215,16 +1223,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 );
                 readiness_reason =
                     openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
-                continue;
-            }
-            if is_non_injectable_provider_credential(provider, key)
-                || broker_only_credential_keys.contains(key)
-            {
-                warn!(
-                    provider_name = %name,
-                    key = %key,
-                    "skipping non-injectable provider credential"
-                );
                 continue;
             }
             if is_valid_env_key(key) {
@@ -1296,13 +1294,19 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // Expired handles are removed by the credential runtime before values
         // reach this loop. Preserve omission evidence without exposing handles.
         if provider.credential_handles.keys().any(|key| {
-            !is_non_injectable_provider_credential(provider, key)
-                && !broker_only_credential_keys.contains(key)
-                && !resolved_refs.values.contains_key(key)
+            !broker_only_credential_keys.contains(key) && !resolved_refs.values.contains_key(key)
         }) {
             readiness_reason = openshell_core::proto::ProviderReadinessReason::CredentialExpired;
         }
         for (key, value) in resolved_refs.values {
+            if broker_only_credential_keys.contains(&key) {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping non-injectable provider credential handle"
+                );
+                continue;
+            }
             if accepted_stored_credential_keys
                 .as_ref()
                 .is_some_and(|accepted| !accepted.contains(&key))
@@ -1314,16 +1318,6 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 );
                 readiness_reason =
                     openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
-                continue;
-            }
-            if is_non_injectable_provider_credential(provider, &key)
-                || broker_only_credential_keys.contains(&key)
-            {
-                warn!(
-                    provider_name = %name,
-                    key = %key,
-                    "skipping non-injectable provider credential handle"
-                );
                 continue;
             }
             if is_valid_env_key(&key) {
@@ -1372,7 +1366,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
-        inject_provider_plugin_environment(catalog, provider, &registry, &mut provider_env);
+        inject_provider_profile_environment(catalog, provider, &mut provider_env)?;
         if let Some(profile) = profile.as_ref() {
             if !profile.files.is_empty()
                 && (name.is_empty()
@@ -1877,13 +1871,14 @@ pub async fn validate_provider_profiles_present(
         else {
             continue;
         };
-        if get_provider_type_profile_for_scope(
+        if let Some(profile) = get_provider_type_profile_for_scope(
             catalog,
             &provider.r#type,
             &provider.profile_workspace,
-        )
-        .is_some()
-        {
+        ) {
+            profile
+                .ensure_platform_adapter_available()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
             continue;
         }
         let requested = provider.r#type.trim();
@@ -1990,7 +1985,7 @@ async fn validate_provider_environment_keys_unique_at(
     now_ms: i64,
 ) -> Result<(), Status> {
     let mut seen_credentials = HashMap::<String, String>::new();
-    let mut seen_plugin_config = HashMap::<String, String>::new();
+    let mut seen_profile_config = HashMap::<String, (String, String)>::new();
     let mut dynamic_bindings = Vec::new();
     for name in provider_names {
         let provider = match candidate_provider {
@@ -2006,10 +2001,10 @@ async fn validate_provider_environment_keys_unique_at(
         let provider_name = provider.object_name().to_string();
         validate_provider_environment_key_ownership(
             &mut seen_credentials,
-            &mut seen_plugin_config,
+            &mut seen_profile_config,
             &provider_name,
             active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
-            provider_plugin_environment_keys(catalog, &provider),
+            provider_profile_environment_values(catalog, &provider)?,
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, &provider,
@@ -2026,13 +2021,13 @@ async fn validate_provider_environment_records_unique_at(
     now_ms: i64,
 ) -> Result<(), Status> {
     let mut seen_credentials = HashMap::<String, String>::new();
-    let mut seen_plugin_config = HashMap::<String, String>::new();
+    let mut seen_profile_config = HashMap::<String, (String, String)>::new();
     let mut dynamic_bindings = Vec::new();
     for record in records {
         let provider = &record.provider;
         validate_provider_environment_key_ownership(
             &mut seen_credentials,
-            &mut seen_plugin_config,
+            &mut seen_profile_config,
             &record.name,
             active_provider_environment_keys_for_identity(
                 store,
@@ -2042,7 +2037,7 @@ async fn validate_provider_environment_records_unique_at(
                 now_ms,
             )
             .await?,
-            provider_plugin_environment_keys(catalog, provider),
+            provider_profile_environment_values(catalog, provider)?,
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, provider,
@@ -2052,37 +2047,40 @@ async fn validate_provider_environment_records_unique_at(
     Ok(())
 }
 
-fn provider_plugin_environment_keys(
+fn provider_profile_environment_values(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-) -> Vec<String> {
-    let mut plugin_environment = HashMap::new();
-    let registry = openshell_providers::ProviderRegistry::new();
-    inject_provider_plugin_environment(catalog, provider, &registry, &mut plugin_environment);
-    plugin_environment.into_keys().collect()
+) -> Result<Vec<(String, String)>, Status> {
+    let mut profile_environment = HashMap::new();
+    inject_provider_profile_environment(catalog, provider, &mut profile_environment)?;
+    let mut values: Vec<_> = profile_environment.into_iter().collect();
+    values.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(values)
 }
 
-fn inject_provider_plugin_environment(
+fn inject_provider_profile_environment(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-    registry: &openshell_providers::ProviderRegistry,
     environment: &mut HashMap<String, String>,
-) {
-    // A plugin activates only for a profile the gateway actually resolved. With
-    // no profile there is nothing to project.
+) -> Result<(), Status> {
+    // Only the resolved profile declares non-secret environment defaults.
     if let Some(profile) =
         get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     {
-        registry.inject_env_for_profile_id(provider, &profile.id, environment);
+        profile
+            .ensure_platform_adapter_available()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        profile.environment.inject(&provider.config, environment);
     }
+    Ok(())
 }
 
 fn validate_provider_environment_key_ownership(
     seen_credentials: &mut HashMap<String, String>,
-    seen_plugin_config: &mut HashMap<String, String>,
+    seen_profile_config: &mut HashMap<String, (String, String)>,
     provider_name: &str,
     credential_keys: Vec<String>,
-    plugin_config_keys: Vec<String>,
+    profile_config_values: Vec<(String, String)>,
 ) -> Result<(), Status> {
     for key in credential_keys {
         if let Some(first_provider) = seen_credentials.get(&key) {
@@ -2094,7 +2092,7 @@ fn validate_provider_environment_key_ownership(
         } else {
             seen_credentials.insert(key.clone(), provider_name.to_string());
         }
-        if let Some(config_provider) = seen_plugin_config.get(&key)
+        if let Some((config_provider, _)) = seen_profile_config.get(&key)
             && config_provider != provider_name
         {
             return Err(provider_credential_config_key_collision(
@@ -2105,7 +2103,18 @@ fn validate_provider_environment_key_ownership(
         }
     }
 
-    for key in plugin_config_keys {
+    for (key, value) in profile_config_values {
+        if let Some((config_provider, config_value)) = seen_profile_config.get(&key)
+            && config_provider != provider_name
+            && config_value != &value
+        {
+            let mut providers = [config_provider.as_str(), provider_name];
+            providers.sort_unstable();
+            return Err(Status::failed_precondition(format!(
+                "non-secret env key '{key}' is provided by both provider '{}' and provider '{}'; use provider-specific env names",
+                providers[0], providers[1]
+            )));
+        }
         if let Some(credential_provider) = seen_credentials.get(&key)
             && credential_provider != provider_name
         {
@@ -2115,9 +2124,9 @@ fn validate_provider_environment_key_ownership(
                 provider_name,
             ));
         }
-        seen_plugin_config
+        seen_profile_config
             .entry(key)
-            .or_insert_with(|| provider_name.to_string());
+            .or_insert_with(|| (provider_name.to_string(), value));
     }
     Ok(())
 }
@@ -2347,7 +2356,6 @@ fn active_provider_credential_keys(
     let mut keys: Vec<String> = provider
         .credentials
         .keys()
-        .filter(|key| !is_non_injectable_provider_credential(provider, key))
         .filter(|key| !broker_only_credential_keys.contains(*key))
         .filter(|key| is_valid_env_key(key))
         .filter(|key| provider_credential_not_expired(provider, key, now_ms))
@@ -2357,7 +2365,6 @@ fn active_provider_credential_keys(
         provider
             .credential_handles
             .keys()
-            .filter(|key| !is_non_injectable_provider_credential(provider, key))
             .filter(|key| !broker_only_credential_keys.contains(*key))
             .filter(|key| is_valid_env_key(key))
             .filter(|key| provider_credential_not_expired(provider, key, now_ms))
@@ -2373,12 +2380,13 @@ fn broker_only_provider_credential_keys_for_provider(
     get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
         .as_ref()
         .map(ProviderTypeProfile::to_proto)
-        .map(|profile| broker_only_provider_credential_keys(&profile))
-        .unwrap_or_default()
+        .map_or_else(reserved_bootstrap_credential_keys, |profile| {
+            broker_only_provider_credential_keys(&profile)
+        })
 }
 
 fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<String> {
-    profile
+    let mut keys: HashSet<_> = profile
         .credentials
         .iter()
         .filter_map(|credential| credential.token_grant.as_ref())
@@ -2393,7 +2401,13 @@ fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<St
             let key = subject_token.credential.trim();
             (!key.is_empty()).then(|| key.to_string())
         })
-        .collect()
+        .collect();
+    keys.insert(LEGACY_VERTEX_PRIVATE_KEY_ENV.to_string());
+    keys
+}
+
+fn reserved_bootstrap_credential_keys() -> HashSet<String> {
+    HashSet::from([LEGACY_VERTEX_PRIVATE_KEY_ENV.to_string()])
 }
 
 fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) -> bool {
@@ -2402,11 +2416,6 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
         .get(key)
         .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
         .is_none_or(|expiration_ms| expiration_ms > now_ms)
-}
-
-fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    normalize_profile_id(&provider.r#type).as_deref() == Some("google-vertex-ai")
-        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -2859,6 +2868,8 @@ pub(super) async fn handle_import_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_adapter_diagnostics(&profiles));
+    diagnostics.extend(profile_legacy_credential_diagnostics(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
@@ -2961,6 +2972,8 @@ pub(super) async fn handle_update_provider_profiles(
         .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_adapter_diagnostics(&profiles));
+    diagnostics.extend(profile_legacy_credential_diagnostics(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
     } else {
@@ -3081,6 +3094,7 @@ pub(super) async fn handle_lint_provider_profiles(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(profile_legacy_credential_diagnostics(&profiles));
     let valid = !has_errors(&diagnostics);
 
     Ok(Response::new(LintProviderProfilesResponse {
@@ -3495,6 +3509,48 @@ fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
     })
 }
 
+fn profile_adapter_diagnostics(
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Vec<ProfileValidationDiagnostic> {
+    profiles
+        .iter()
+        .filter_map(|(source, profile)| {
+            profile
+                .ensure_platform_adapter_available()
+                .err()
+                .map(|error| ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile.id.clone(),
+                    field: "required_platform_adapter".to_string(),
+                    message: error.to_string(),
+                    severity: "error".to_string(),
+                })
+        })
+        .collect()
+}
+
+fn profile_legacy_credential_diagnostics(
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Vec<ProfileValidationDiagnostic> {
+    profiles
+        .iter()
+        .filter(|(_, profile)| {
+            profile.credentials.iter().any(|credential| {
+                credential
+                    .accepted_stored_keys()
+                    .contains(&LEGACY_VERTEX_PRIVATE_KEY_ENV)
+            })
+        })
+        .map(|(source, profile)| ProfileValidationDiagnostic {
+            source: source.clone(),
+            profile_id: profile.id.clone(),
+            field: "credentials.env_vars".to_string(),
+            message: "GOOGLE_SERVICE_ACCOUNT_KEY contains legacy service-account private key material and cannot be declared as a provider credential; configure refresh material instead".to_string(),
+            severity: "error".to_string(),
+        })
+        .collect()
+}
+
 fn profiles_from_import_items(
     items: &[ProviderProfileImportItem],
 ) -> (
@@ -3763,7 +3819,7 @@ async fn profile_attached_sandbox_diagnostics(
                 let has_static_credentials = provider
                     .credentials
                     .keys()
-                    .any(|key| !is_non_injectable_provider_credential(&provider, key));
+                    .any(|key| profile.credential_env_vars().contains(&key.as_str()));
                 let has_usable_endpoint = profile.to_proto().endpoints.iter().any(|endpoint| {
                     !endpoint_ports(endpoint.port, &endpoint.ports).is_empty()
                         && !endpoint.host.trim().is_empty()
@@ -5246,6 +5302,15 @@ mod tests {
                 .await
                 .expect("store example provider profile");
         }
+        // Binding tests need generic non-secret config, without a metadata
+        // service. Use an explicit data-only fork for those scenarios.
+        let mut cloud_config = openshell_providers::example_profiles::load("google-cloud");
+        cloud_config.id = "cloud-env-fixture".to_string();
+        cloud_config.required_platform_adapter.clear();
+        store
+            .put_message(&stored_provider_profile(cloud_config.to_proto()))
+            .await
+            .unwrap();
         store
     }
     use openshell_core::proto::{
@@ -5454,6 +5519,7 @@ mod tests {
             discovery: None,
             source: String::new(),
             scope: String::new(),
+            ..Default::default()
         };
 
         let mut dynamic_creds = HashMap::new();
@@ -5514,6 +5580,77 @@ mod tests {
                 result.expect("valid credential key");
                 assert_eq!(dynamic.len(), 1);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn gcp_metadata_platform_adapter_matches_host_capability() {
+        let state = test_server_state_without_provider_profiles().await;
+        let mut profile = custom_profile("requires-adapter");
+        profile.required_platform_adapter = "gcp-metadata".to_string();
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile.clone()),
+                    source: "requires-adapter.yaml".to_string(),
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        if cfg!(windows) {
+            assert!(!response.imported);
+            assert!(response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "required_platform_adapter"
+                    && diagnostic.message.contains("unavailable")
+                    && diagnostic.message.len() < 128
+            }));
+        } else {
+            assert!(response.imported, "{:?}", response.diagnostics);
+        }
+
+        // Existing stored and interceptor-vended profiles must pass the same
+        // capability check at attachment as profiles imported in this build.
+        state
+            .store
+            .put_message(&stored_provider_profile(profile))
+            .await
+            .unwrap();
+        create_empty_token_grant_provider(
+            state.store.as_ref(),
+            "needs-adapter",
+            "requires-adapter",
+        )
+        .await;
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+        let validation = validate_provider_profiles_present(
+            state.store.as_ref(),
+            &catalog,
+            "default",
+            &["needs-adapter".to_string()],
+        )
+        .await;
+        let environment = resolve_provider_environment(
+            state.store.as_ref(),
+            "default",
+            &["needs-adapter".to_string()],
+        )
+        .await;
+        if cfg!(windows) {
+            let error = validation.unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains("gcp-metadata"));
+            assert!(error.message().len() < 128);
+            assert_eq!(environment.unwrap_err().code(), Code::FailedPrecondition);
+        } else {
+            assert!(validation.is_ok());
+            assert!(environment.is_ok());
         }
     }
 
@@ -5589,6 +5726,74 @@ mod tests {
         assert!(private.iter().all(|(_, credential)| {
             credential.token_grant.as_ref().unwrap().audience == "private-resource"
         }));
+    }
+
+    #[tokio::test]
+    async fn import_rejects_legacy_vertex_private_key_declaration() {
+        let state = test_server_state_without_provider_profiles().await;
+        let mut profile = openshell_providers::example_profiles::load("google-vertex-ai");
+        profile.id = "legacy-vertex-export".into();
+        let mut legacy_credential = profile.credentials[0].clone();
+        legacy_credential.name = "legacy_service_account_key".into();
+        legacy_credential.env_vars = vec![LEGACY_VERTEX_PRIVATE_KEY_ENV.into()];
+        legacy_credential.refresh = None;
+        profile.credentials.push(legacy_credential);
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile.to_proto()),
+                    source: "legacy.yaml".into(),
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.imported);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.env_vars"
+                && diagnostic.message.contains(LEGACY_VERTEX_PRIVATE_KEY_ENV)
+        }));
+    }
+
+    #[tokio::test]
+    async fn import_rejects_legacy_vertex_private_key_environment_defaults() {
+        for config_default in [false, true] {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut profile = openshell_providers::example_profiles::load("google-vertex-ai");
+            if config_default {
+                profile
+                    .environment
+                    .config
+                    .insert(LEGACY_VERTEX_PRIVATE_KEY_ENV.into(), "private_key".into());
+            } else {
+                profile
+                    .environment
+                    .fixed
+                    .insert(LEGACY_VERTEX_PRIVATE_KEY_ENV.into(), "private-key".into());
+            }
+            let response = handle_import_provider_profiles(
+                &state,
+                authed_request(ImportProviderProfilesRequest {
+                    profiles: vec![ProviderProfileImportItem {
+                        profile: Some(profile.to_proto()),
+                        source: "legacy.yaml".into(),
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert!(!response.imported);
+            assert!(response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "environment"
+                    && diagnostic.message.contains(LEGACY_VERTEX_PRIVATE_KEY_ENV)
+            }));
+        }
     }
 
     async fn import_token_grant_profile(
@@ -6479,6 +6684,7 @@ mod tests {
             discovery: None,
             source: String::new(),
             scope: String::new(),
+            ..Default::default()
         }
     }
 
@@ -7328,6 +7534,7 @@ mod tests {
                         discovery: None,
                         source: String::new(),
                         scope: String::new(),
+                        ..Default::default()
                     }),
                     source: "advanced-api.yaml".to_string(),
                 }],
@@ -10737,6 +10944,7 @@ mod tests {
                         discovery: None,
                         source: String::new(),
                         scope: String::new(),
+                        ..Default::default()
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),
                 }],
@@ -12431,7 +12639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_environment_rejects_plugin_config_credential_collision_in_both_orders() {
+    async fn provider_environment_rejects_profile_config_credential_collision_in_both_orders() {
         let store = test_store().await;
         create_provider_record(
             &store,
@@ -12447,7 +12655,7 @@ mod tests {
                     workspace: "default".to_string(),
                     deletion_time: None,
                 }),
-                r#type: "google-cloud".to_string(),
+                r#type: "cloud-env-fixture".to_string(),
                 credentials: std::iter::once((
                     "GCP_ACCESS_TOKEN".to_string(),
                     "google-token".to_string(),
@@ -12520,134 +12728,299 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_provider_env_injects_vertex_agent_config() {
+    async fn provider_environment_rejects_non_secret_overlap_in_both_orders() {
         let store = test_store().await;
-        create_provider_record(
-            &store,
-            "default",
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: "vertex-local".to_string(),
-                    created_time: None,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: "default".to_string(),
-                    deletion_time: None,
-                }),
-                r#type: "google-vertex-ai".to_string(),
-                credentials: std::iter::once((
-                    "GOOGLE_VERTEX_AI_TOKEN".to_string(),
-                    "ya29.token".to_string(),
-                ))
-                .collect(),
-                config: [
-                    (
-                        "VERTEX_AI_PROJECT_ID".to_string(),
-                        "my-gcp-project".to_string(),
-                    ),
-                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-                credential_expiration_times: HashMap::new(),
-                profile_workspace: "default".to_string(),
-                credential_handles: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
+        let mut project_profile = openshell_providers::example_profiles::load("google-cloud");
+        project_profile.id = "project-env-fixture".into();
+        project_profile.required_platform_adapter.clear();
+        project_profile.environment.fixed.clear();
+        project_profile
+            .environment
+            .config
+            .retain(|key, _| key == "GCP_PROJECT_ID");
+        store
+            .put_message(&stored_provider_profile(project_profile.to_proto()))
+            .await
+            .unwrap();
+        for (name, project) in [("project-a", "first"), ("project-b", "second")] {
+            create_provider_record(
+                &store,
+                "default",
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: name.to_string(),
+                        created_time: None,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: "default".to_string(),
+                        deletion_time: None,
+                    }),
+                    r#type: "project-env-fixture".to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::from([("project_id".to_string(), project.to_string())]),
+                    credential_expiration_times: HashMap::new(),
+                    profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
 
-        let result = resolve_provider_environment(&store, "default", &["vertex-local".to_string()])
+        let mut messages = Vec::new();
+        for providers in [
+            vec!["project-a".to_string(), "project-b".to_string()],
+            vec!["project-b".to_string(), "project-a".to_string()],
+        ] {
+            let validation_error =
+                validate_provider_environment_keys_unique(&store, "default", &providers)
+                    .await
+                    .unwrap_err();
+            let resolution_error = resolve_provider_environment(&store, "default", &providers)
+                .await
+                .unwrap_err();
+            assert_eq!(validation_error.code(), Code::FailedPrecondition);
+            assert_eq!(validation_error.message(), resolution_error.message());
+            assert!(validation_error.message().contains("GCP_PROJECT_ID"));
+            assert!(validation_error.message().contains("project-a"));
+            assert!(validation_error.message().contains("project-b"));
+            messages.push(validation_error.message().to_string());
+        }
+        assert_eq!(messages[0], messages[1]);
+    }
+
+    #[tokio::test]
+    async fn provider_environment_allows_identical_vertex_defaults_from_two_providers() {
+        let store = test_store().await;
+        let profile = openshell_providers::example_profiles::load("google-vertex-ai");
+        store
+            .put_message(&stored_provider_profile(profile.to_proto()))
+            .await
+            .unwrap();
+        for (name, credential_key, token) in [
+            ("vertex-a", "GOOGLE_VERTEX_AI_TOKEN", "token-a"),
+            (
+                "vertex-b",
+                "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN",
+                "token-b",
+            ),
+        ] {
+            let mut provider =
+                provider_with_credential_value(name, "google-vertex-ai", credential_key, token);
+            provider.config = HashMap::from([
+                ("VERTEX_AI_PROJECT_ID".into(), "shared-project".into()),
+                ("VERTEX_AI_REGION".into(), "us-central1".into()),
+            ]);
+            create_provider_record(&store, "default", provider)
+                .await
+                .unwrap();
+        }
+
+        for names in [
+            ["vertex-a".to_string(), "vertex-b".to_string()],
+            ["vertex-b".to_string(), "vertex-a".to_string()],
+        ] {
+            validate_provider_environment_keys_unique(&store, "default", &names)
+                .await
+                .unwrap();
+            let result = resolve_provider_environment(&store, "default", &names)
+                .await
+                .unwrap();
+            assert_eq!(result.get("GOOSE_PROVIDER"), Some(&"gcp_vertex_ai".into()));
+            assert_eq!(result.get("GCP_PROJECT_ID"), Some(&"shared-project".into()));
+            assert_eq!(
+                result.get("GOOGLE_VERTEX_AI_TOKEN"),
+                Some(&"token-a".into())
+            );
+            assert_eq!(
+                result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+                Some(&"token-b".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_injects_vertex_agent_config() {
+        for profile_id in ["google-vertex-ai", "acme-vertex"] {
+            let store = test_store().await;
+            let mut fork = openshell_providers::example_profiles::load("google-vertex-ai");
+            fork.id = "acme-vertex".to_string();
+            store
+                .put_message(&stored_provider_profile(fork.to_proto()))
+                .await
+                .unwrap();
+            create_provider_record(
+                &store,
+                "default",
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: "vertex-local".to_string(),
+                        created_time: None,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: "default".to_string(),
+                        deletion_time: None,
+                    }),
+                    r#type: profile_id.to_string(),
+                    credentials: std::iter::once((
+                        "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                        "ya29.token".to_string(),
+                    ))
+                    .collect(),
+                    config: [
+                        (
+                            "VERTEX_AI_PROJECT_ID".to_string(),
+                            "my-gcp-project".to_string(),
+                        ),
+                        ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    credential_expiration_times: HashMap::new(),
+                    profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
+                },
+            )
             .await
             .unwrap();
 
-        // Credential still injected.
-        assert_eq!(
-            result.get("GOOGLE_VERTEX_AI_TOKEN"),
-            Some(&"ya29.token".to_string())
-        );
-        // Static flags.
-        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
-        assert_eq!(
-            result.get("GOOSE_PROVIDER"),
-            Some(&"gcp_vertex_ai".to_string())
-        );
-        // Project ID derived vars.
-        assert_eq!(
-            result.get("ANTHROPIC_VERTEX_PROJECT_ID"),
-            Some(&"my-gcp-project".to_string())
-        );
-        assert_eq!(
-            result.get("GCP_PROJECT_ID"),
-            Some(&"my-gcp-project".to_string())
-        );
-        assert_eq!(
-            result.get("GOOGLE_CLOUD_PROJECT"),
-            Some(&"my-gcp-project".to_string())
-        );
-        // Region derived vars.
-        assert_eq!(
-            result.get("CLOUD_ML_REGION"),
-            Some(&"us-central1".to_string())
-        );
-        assert_eq!(result.get("GCP_LOCATION"), Some(&"us-central1".to_string()));
-        assert_eq!(
-            result.get("VERTEX_LOCATION"),
-            Some(&"us-central1".to_string())
-        );
+            let result =
+                resolve_provider_environment(&store, "default", &["vertex-local".to_string()])
+                    .await
+                    .unwrap();
+
+            // Credential still injected.
+            assert_eq!(
+                result.get("GOOGLE_VERTEX_AI_TOKEN"),
+                Some(&"ya29.token".to_string())
+            );
+            // Static flags.
+            assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
+            assert_eq!(
+                result.get("GOOSE_PROVIDER"),
+                Some(&"gcp_vertex_ai".to_string())
+            );
+            // Project ID derived vars.
+            assert_eq!(
+                result.get("ANTHROPIC_VERTEX_PROJECT_ID"),
+                Some(&"my-gcp-project".to_string())
+            );
+            assert_eq!(
+                result.get("GCP_PROJECT_ID"),
+                Some(&"my-gcp-project".to_string())
+            );
+            assert_eq!(
+                result.get("GOOGLE_CLOUD_PROJECT"),
+                Some(&"my-gcp-project".to_string())
+            );
+            // Region derived vars.
+            assert_eq!(
+                result.get("CLOUD_ML_REGION"),
+                Some(&"us-central1".to_string())
+            );
+            assert_eq!(result.get("GCP_LOCATION"), Some(&"us-central1".to_string()));
+            assert_eq!(
+                result.get("VERTEX_LOCATION"),
+                Some(&"us-central1".to_string())
+            );
+        }
     }
 
     #[tokio::test]
     async fn resolve_provider_env_vertex_never_injects_service_account_key() {
-        let store = test_store().await;
-        create_provider_record(
-            &store,
-            "default",
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: "vertex-bootstrap".to_string(),
-                    created_time: None,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: "default".to_string(),
-                    deletion_time: None,
-                }),
-                r#type: "google-vertex-ai".to_string(),
-                credentials: [
-                    (
-                        "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
-                        r#"{"type":"service_account","private_key":"secret"}"#.to_string(),
-                    ),
-                    (
-                        "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
-                        "ya29.short-lived".to_string(),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-                config: HashMap::new(),
-                credential_expiration_times: HashMap::new(),
-                profile_workspace: "default".to_string(),
-                credential_handles: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let result =
-            resolve_provider_environment(&store, "default", &["vertex-bootstrap".to_string()])
+        for (profile_id, declares_legacy_key) in
+            [("google-vertex-ai", false), ("acme-vertex", true)]
+        {
+            let store = test_store().await;
+            let mut fork = openshell_providers::example_profiles::load("google-vertex-ai");
+            fork.id = profile_id.to_string();
+            if declares_legacy_key {
+                let mut legacy_credential = fork.credentials[0].clone();
+                legacy_credential.name = "legacy_service_account_key".into();
+                legacy_credential.env_vars = vec![LEGACY_VERTEX_PRIVATE_KEY_ENV.into()];
+                legacy_credential.refresh = None;
+                fork.credentials.push(legacy_credential);
+            }
+            store
+                .put_message(&stored_provider_profile(fork.to_proto()))
                 .await
                 .unwrap();
+            create_provider_record(
+                &store,
+                "default",
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: "vertex-bootstrap".to_string(),
+                        created_time: None,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: "default".to_string(),
+                        deletion_time: None,
+                    }),
+                    r#type: profile_id.to_string(),
+                    credentials: [
+                        (
+                            "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+                            r#"{"type":"service_account","private_key":"secret"}"#.to_string(),
+                        ),
+                        (
+                            "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                            "ya29.short-lived".to_string(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    config: HashMap::from([
+                        ("VERTEX_AI_PROJECT_ID".to_string(), "my-project".to_string()),
+                        ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                    ]),
+                    credential_expiration_times: HashMap::new(),
+                    profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
 
-        assert!(!result.contains_key("GOOGLE_SERVICE_ACCOUNT_KEY"));
-        assert_eq!(
-            result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
-            Some(&"ya29.short-lived".to_string())
-        );
+            let result =
+                resolve_provider_environment(&store, "default", &["vertex-bootstrap".to_string()])
+                    .await
+                    .unwrap();
+
+            assert!(!result.contains_key("GOOGLE_SERVICE_ACCOUNT_KEY"));
+            assert!(
+                !result
+                    .static_credential_bindings
+                    .contains_key("GOOGLE_SERVICE_ACCOUNT_KEY")
+            );
+            assert!(
+                !result
+                    .static_credential_keys
+                    .contains("GOOGLE_SERVICE_ACCOUNT_KEY")
+            );
+            assert_eq!(
+                result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+                Some(&"ya29.short-lived".to_string())
+            );
+            assert_eq!(
+                result.readiness_reason,
+                openshell_core::proto::ProviderReadinessReason::Unspecified
+            );
+            assert_eq!(
+                result.get("GCP_PROJECT_ID"),
+                Some(&"my-project".to_string())
+            );
+            assert_eq!(
+                result.get("CLOUD_ML_REGION"),
+                Some(&"us-central1".to_string())
+            );
+        }
     }
 
     #[tokio::test]
@@ -12917,7 +13290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_provider_rejects_plugin_config_credential_collision() {
+    async fn update_provider_rejects_profile_config_credential_collision() {
         let store = test_store().await;
         create_provider_record(
             &store,
@@ -12933,7 +13306,7 @@ mod tests {
                     workspace: "default".to_string(),
                     deletion_time: None,
                 }),
-                r#type: "google-cloud".to_string(),
+                r#type: "cloud-env-fixture".to_string(),
                 credentials: std::iter::once((
                     "GCP_ACCESS_TOKEN".to_string(),
                     "google-token".to_string(),
@@ -14560,150 +14933,13 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
-            r#type: "google-cloud".to_string(),
+            r#type: "cloud-env-fixture".to_string(),
             credentials: HashMap::new(),
             config,
             credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn inject_gcp_env_sets_metadata_host() {
-        use openshell_core::google_cloud;
-        let provider = google_cloud_provider(HashMap::new());
-        let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        assert_eq!(
-            env.get("GCE_METADATA_HOST").map(String::as_str),
-            Some(google_cloud::METADATA_HOST),
-        );
-        assert!(
-            !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
-            "CLAUDE_CODE_USE_VERTEX is synthetic, should not be injected here"
-        );
-    }
-
-    #[test]
-    fn inject_gcp_env_propagates_project_id() {
-        use openshell_core::google_cloud;
-        let provider = google_cloud_provider(HashMap::from([(
-            "project_id".to_string(),
-            "my-project".to_string(),
-        )]));
-        let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        for var in google_cloud::PROJECT_ID_ENV_VARS {
-            assert_eq!(
-                env.get(*var).map(String::as_str),
-                Some("my-project"),
-                "{var} should be set to project_id config value"
-            );
-        }
-    }
-
-    #[test]
-    fn inject_gcp_env_propagates_region() {
-        use openshell_core::google_cloud;
-        let provider = google_cloud_provider(HashMap::from([(
-            "region".to_string(),
-            "us-central1".to_string(),
-        )]));
-        let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        for var in google_cloud::REGION_ENV_VARS {
-            assert_eq!(
-                env.get(*var).map(String::as_str),
-                Some("us-central1"),
-                "{var} should be set to region config value"
-            );
-        }
-    }
-
-    #[test]
-    fn inject_gcp_env_propagates_service_account_email() {
-        use openshell_core::google_cloud;
-        let provider = google_cloud_provider(HashMap::from([(
-            "service_account_email".to_string(),
-            "sa@proj.iam.gserviceaccount.com".to_string(),
-        )]));
-        let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        for var in google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
-            assert_eq!(
-                env.get(*var).map(String::as_str),
-                Some("sa@proj.iam.gserviceaccount.com"),
-                "{var} should be set to service_account_email config value"
-            );
-        }
-    }
-
-    #[test]
-    fn inject_gcp_env_does_not_overwrite_existing_values() {
-        let provider = google_cloud_provider(HashMap::from([(
-            "project_id".to_string(),
-            "from-config".to_string(),
-        )]));
-        let mut env = HashMap::from([("GCP_PROJECT_ID".to_string(), "user-override".to_string())]);
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        assert_eq!(
-            env.get("GCP_PROJECT_ID").map(String::as_str),
-            Some("user-override"),
-            "user-provided value should not be overwritten"
-        );
-    }
-
-    #[test]
-    fn inject_non_gcp_provider_does_nothing() {
-        let provider = Provider {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: String::new(),
-                name: "github".to_string(),
-                created_time: None,
-                labels: HashMap::new(),
-                resource_version: 0,
-                annotations: HashMap::new(),
-                workspace: "default".to_string(),
-                deletion_time: None,
-            }),
-            r#type: "github".to_string(),
-            credentials: HashMap::new(),
-            config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
-            credential_expiration_times: HashMap::new(),
-            profile_workspace: "default".to_string(),
-            credential_handles: HashMap::new(),
-        };
-        let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
-            &provider,
-            &provider.r#type,
-            &mut env,
-        );
-        assert!(
-            env.is_empty(),
-            "non-GCP provider should not inject any env vars"
-        );
     }
 
     #[tokio::test]
