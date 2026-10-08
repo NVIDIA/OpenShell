@@ -1017,6 +1017,10 @@ path is never mounted into or exposed to the workload container.
 
 Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.
 
+Caller `cdi_devices` entries must be valid CDI qualified names
+(`<vendor>/<class>=<name>`). Host-device paths are rejected. See
+[GPU selection](/how-it-works/sandboxes/overview#gpu-resources).
+
 ```toml
 [openshell]
 version = 2
