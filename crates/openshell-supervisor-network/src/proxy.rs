@@ -1840,13 +1840,16 @@ impl ForwardMiddlewarePipeline<'_> {
             None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         };
 
+        // The forward proxy writes the request as one buffer, so middleware
+        // output is withheld and inlined.
         self.exchange
-            .apply_request(
+            .apply_request_with_delivery(
                 request,
                 client,
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
+                crate::l7::middleware::RequestBodyDelivery::Withhold,
             )
             .await
     }
@@ -5266,7 +5269,7 @@ async fn inject_token_grant_for_forward_request(
         forward_request_bytes,
     )?;
     if let Some(inspection) = inspection {
-        let (request, prepared_ctx) = crate::l7::relay::prepare_inspected_request(
+        let (request, prepared_ctx, _) = crate::l7::relay::prepare_inspected_request(
             request,
             l7_ctx,
             inspection.engine,
@@ -6287,8 +6290,25 @@ async fn handle_forward_proxy(
             exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client).await? {
+        let middleware_result = pipeline.apply(request, client).await?;
+        forward_request_bytes = match middleware_result {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                return Err(miette::miette!(
+                    "forward proxy request middleware must withhold its output"
+                ));
+            }
+            crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                let response = build_json_error_response(
+                    408,
+                    "Request Timeout",
+                    "request_timeout",
+                    "Request body was not received in time",
+                );
+                respond(client, &response).await?;
+                return Ok(());
+            }
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = denial.as_ref().map_or_else(
@@ -10494,6 +10514,10 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("test middleware work admission must be available")
             }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
+            }
         }
     }
 
@@ -10590,6 +10614,10 @@ network_policies:
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("blocking middleware should already hold admission")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
             }
         };
 

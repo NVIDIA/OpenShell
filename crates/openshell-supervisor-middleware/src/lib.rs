@@ -9,7 +9,11 @@ pub mod headers;
 #[cfg(test)]
 mod http_v2_tests;
 mod legacy;
+mod pipeline;
 mod remote;
+mod request;
+#[cfg(test)]
+mod request_tests;
 mod runtime;
 mod stage;
 mod websocket;
@@ -21,6 +25,15 @@ pub use legacy::response::engine::{
     MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES, is_stale_http_response_integrity_header,
 };
 
+pub use pipeline::{
+    HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput, HttpBodyOutput,
+    HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, HttpStageInvocation,
+    HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES,
+};
+pub use request::{
+    HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
+    MAX_HTTP_REQUEST_WITHHELD_BYTES,
+};
 pub use runtime::{
     ContractFailure, ContractFailureKind, FailOpenNotApplied, MiddlewareRuntimeObserver,
 };
@@ -426,7 +439,7 @@ struct HttpV2Support {
 impl HttpV2Support {
     /// What this build executes.
     const BUILD: Self = Self {
-        request: false,
+        request: true,
         response: false,
     };
 
@@ -1460,8 +1473,8 @@ impl MiddlewareRegistry {
 
     /// Connect services as a peer that executes version 2 HTTP in both
     /// directions, so tests can exercise registration and policy rules before
-    /// this build runs version 2 stages. Version 2 stages fail closed on the
-    /// legacy engines.
+    /// this build runs version 2 response stages, which fail closed on the
+    /// legacy response engine.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn connect_services_with_http_v2(
         in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
@@ -2309,24 +2322,66 @@ impl ChainRunner {
                     }
                 }
             };
-            // This engine speaks only the legacy RPC. A version 2 stage is
-            // never evaluated through it; it fails closed instead.
+            // A version 2 stage runs over the collected body, so stages keep
+            // chain order with the legacy stages around it.
             if entry.http_protocol() == Some(HttpProtocol::V2) {
-                match apply_on_error(entry, "http_v2_stage_not_executable", &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            header_mutations,
-                            findings,
-                            metadata,
-                            applied,
-                            denial: None,
-                        });
-                    }
+                let stage = self
+                    .collect_request_stage(
+                        entry,
+                        &context,
+                        &target,
+                        &headers,
+                        &connection_nominated_headers,
+                        std::mem::take(&mut body),
+                    )
+                    .await;
+                body = stage.body;
+                findings.extend(stage.diagnostics.findings);
+                metadata.extend(stage.diagnostics.metadata);
+                if !stage.allowed {
+                    applied.push(MiddlewareInvocation {
+                        name: entry.entry.name.clone(),
+                        implementation: entry.entry.implementation.clone(),
+                        decision: Decision::Deny,
+                        transformed: false,
+                        failed: stage.denial.is_none(),
+                    });
+                    return Ok(ChainOutcome {
+                        allowed: false,
+                        reason: stage.reason,
+                        body,
+                        header_mutations,
+                        findings,
+                        metadata,
+                        applied,
+                        denial: stage.denial,
+                    });
                 }
+                let headers_transformed = stage.headers != headers;
+                headers = stage.headers;
+                header_mutations.extend(stage.header_mutations);
+                applied.push(MiddlewareInvocation {
+                    name: entry.entry.name.clone(),
+                    implementation: entry.entry.implementation.clone(),
+                    decision: Decision::Allow,
+                    transformed: stage.body_transformed || headers_transformed,
+                    failed: false,
+                });
+                if stage.body_transformed
+                    && let Some(reason) = transformed_body_denial(transformed_body_policy, &body)
+                {
+                    return Ok(ChainOutcome {
+                        allowed: false,
+                        reason,
+                        body,
+                        header_mutations,
+                        findings,
+                        metadata,
+                        applied,
+                        denial: None,
+                    });
+                }
+                continue;
             }
             if body.len() > entry.max_payload_bytes {
                 match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
@@ -2655,6 +2710,21 @@ impl ChainRunner {
             applied,
             denial: None,
         })
+    }
+}
+
+/// Re-check a replaced request body against sandbox policy. Returns the deny
+/// reason, if any.
+fn transformed_body_denial(policy: TransformedBodyPolicy<'_>, body: &[u8]) -> Option<String> {
+    let TransformedBodyPolicy::Reevaluate(validate) = policy else {
+        return None;
+    };
+    match validate(body) {
+        Ok(reason) => reason,
+        Err(error) => Some(format!(
+            "transformed_body_policy_evaluation_failed: {}",
+            safe_reason(&error.to_string())
+        )),
     }
 }
 

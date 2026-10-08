@@ -6,4 +6,5 @@
 //! Code under this module serves only the deprecated HTTP middleware protocol
 //! and is deleted with it.
 
+pub mod hooks;
 pub mod response;

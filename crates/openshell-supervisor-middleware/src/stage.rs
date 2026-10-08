@@ -92,6 +92,16 @@ pub enum StageReport {
     LegacyFailOpen { reason: String },
 }
 
+impl StageReport {
+    /// Reason of a `fail_open` pass-through, if this report is one.
+    #[must_use]
+    pub fn fail_open_reason(&self) -> Option<&str> {
+        match self {
+            Self::LegacyFailOpen { reason } => Some(reason),
+        }
+    }
+}
+
 /// Receives stage reports for one exchange, in the order stages produce them.
 pub trait StageReportSink: Send + Sync {
     /// Record `report` for the policy-local middleware config `config_name`.
@@ -114,6 +124,19 @@ impl StageReports {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Take the reports recorded so far for `config_name`, in arrival order.
+    pub fn take(&self, config_name: &str) -> Vec<StageReport> {
+        let mut reports = self
+            .reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (taken, kept) = std::mem::take(&mut *reports)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(name, _)| name == config_name);
+        *reports = kept;
+        taken.into_iter().map(|(_, report)| report).collect()
     }
 }
 
@@ -173,5 +196,21 @@ mod tests {
             ["first", "second"]
         );
         assert!(reports.drain().is_empty());
+    }
+
+    #[test]
+    fn reports_for_one_stage_are_taken_without_the_others() {
+        let reports = StageReports::default();
+        for name in ["first", "second", "first"] {
+            reports.report(
+                name,
+                StageReport::LegacyFailOpen {
+                    reason: name.into(),
+                },
+            );
+        }
+        assert_eq!(reports.take("first").len(), 2);
+        assert!(reports.take("first").is_empty());
+        assert_eq!(reports.drain().len(), 1);
     }
 }

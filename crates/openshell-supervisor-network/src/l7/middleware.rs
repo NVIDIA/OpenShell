@@ -5,17 +5,34 @@
 
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
-use miette::{Result, miette};
+use miette::{IntoDiagnostic, Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
     ocsf_emit,
 };
+use openshell_supervisor_middleware::{
+    HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
+    HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics, HttpStageOutcome,
+};
 use std::path::PathBuf;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+/// How long the sandbox may stop sending a request body while a STREAM
+/// request middleware session is held. STREAM has no total deadline, so this
+/// bounds a paused upload; it matches the WebSocket message-assembly limit.
+pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
+    /// Request middleware streams the body. `request` holds only the head;
+    /// the relay commits it on the middleware's final `Start`.
+    Streamed {
+        request: crate::l7::provider::L7Request,
+        body: Box<RequestBodyStream>,
+    },
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
@@ -24,6 +41,21 @@ pub enum MiddlewareApplyResult {
     /// This is platform load shedding, not a selected middleware-stage failure,
     /// so callers must not apply a stage's `on_error` policy.
     AdmissionExhausted,
+    /// The sandbox stopped sending the request body. The caller answers 408
+    /// and closes the connection.
+    RequestTimeout,
+}
+
+/// Whether request middleware output may stream to the upstream while the
+/// client uploads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RequestBodyDelivery {
+    #[default]
+    Incremental,
+    /// A later step needs the complete body before upstream contact, so the
+    /// output is withheld and inlined into the request (at most
+    /// [`openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES`]).
+    Withhold,
 }
 
 /// One destination-selected middleware chain shared by an HTTP request and
@@ -63,16 +95,42 @@ impl HttpMiddlewareExchange {
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        apply_middleware_chain_for_scheme_with_request_id(
+        Box::pin(self.apply_request_with_delivery(
             request,
             client,
             ctx,
             scheme,
-            self.chain.clone(),
-            &self.runner,
-            &self.generation_guard,
             transformed_body_policy,
-            &self.request_id,
+            RequestBodyDelivery::Incremental,
+        ))
+        .await
+    }
+
+    pub async fn apply_request_with_delivery<C>(
+        &self,
+        request: crate::l7::provider::L7Request,
+        client: &mut C,
+        ctx: &L7EvalContext,
+        scheme: &str,
+        transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+        delivery: RequestBodyDelivery,
+    ) -> Result<MiddlewareApplyResult>
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        Box::pin(
+            apply_middleware_chain_for_scheme_with_request_id_and_delivery(
+                request,
+                client,
+                ctx,
+                scheme,
+                self.chain.clone(),
+                &self.runner,
+                &self.generation_guard,
+                transformed_body_policy,
+                &self.request_id,
+                delivery,
+            ),
         )
         .await
     }
@@ -122,7 +180,7 @@ pub fn emit_websocket_preflight_events(
         emit_websocket_saturation(ctx);
     }
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx);
+        emit_middleware_session_capacity_exhausted(ctx, "websocket_message");
     }
 }
 
@@ -386,7 +444,7 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
     ocsf_emit!(event);
 }
 
-fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, operation: &str) {
     let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -396,7 +454,7 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
         .evidence_pairs(&[
             ("policy", ctx.policy_name.as_str()),
             ("host", ctx.host.as_str()),
-            ("operation", "websocket_message"),
+            ("operation", operation),
         ])
         .message("Persistent middleware session admission was refused at process capacity")
         .build();
@@ -433,14 +491,55 @@ fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
 /// (`is_resolved() == false`) report a zero limit and are excluded here: they
 /// are handled by their `on_error` policy without inspecting the body.
 /// Returns `None` when no entry resolved, so the caller can skip buffering.
+///
+/// A version 2 stage on this path runs over the collected body: a STREAM stage
+/// can take up to the platform payload maximum, and a preflight-only stage
+/// needs no body.
 pub(super) fn middleware_chain_body_limit(
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
 ) -> Option<usize> {
     chain
         .iter()
         .filter(|entry| entry.is_resolved())
-        .map(openshell_supervisor_middleware::DescribedChainEntry::max_payload_bytes)
+        .map(|entry| {
+            if entry.http_protocol() != Some(openshell_supervisor_middleware::HttpProtocol::V2) {
+                entry.max_payload_bytes()
+            } else if entry.supports_http_body_mode(openshell_core::proto::HttpBodyMode::Stream) {
+                openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES
+            } else if entry.supports_http_body_mode(openshell_core::proto::HttpBodyMode::Buffered) {
+                entry.max_payload_bytes()
+            } else {
+                0
+            }
+        })
         .max()
+}
+
+/// True when the version 2 stage pipeline runs the chain. Chains with legacy
+/// entries, and body-aware protocols whose stages can replace the body, run
+/// on the collector, which re-evaluates policy after every replacement and
+/// runs legacy and version 2 stages in chain order.
+fn uses_request_pipeline(
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+) -> bool {
+    use openshell_supervisor_middleware::HttpProtocol;
+    if chain
+        .iter()
+        .any(|entry| entry.http_protocol() == Some(HttpProtocol::Legacy))
+    {
+        return false;
+    }
+    let has_v2 = chain
+        .iter()
+        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2));
+    has_v2
+        && (matches!(
+            transformed_body_policy,
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant
+        ) || !chain.iter().any(
+            openshell_supervisor_middleware::DescribedChainEntry::supports_http_body_processing,
+        ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -469,6 +568,37 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_with_request_id_and_delivery<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
+    delivery: RequestBodyDelivery,
+) -> Result<MiddlewareApplyResult> {
+    Box::pin(
+        apply_middleware_chain_for_scheme_with_request_id_and_delivery(
+            req,
+            client,
+            ctx,
+            "https",
+            chain,
+            runner,
+            generation_guard,
+            transformed_body_policy,
+            request_id,
+            delivery,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme_with_request_id<
     C: AsyncRead + AsyncWrite + Unpin + Send,
 >(
@@ -482,10 +612,56 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
+    Box::pin(
+        apply_middleware_chain_for_scheme_with_request_id_and_delivery(
+            req,
+            client,
+            ctx,
+            scheme,
+            chain,
+            runner,
+            generation_guard,
+            transformed_body_policy,
+            request_id,
+            RequestBodyDelivery::Incremental,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    scheme: &str,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
+    delivery: RequestBodyDelivery,
+) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    if uses_request_pipeline(&chain, transformed_body_policy) {
+        return Box::pin(apply_pipeline_middleware_chain(
+            req,
+            client,
+            ctx,
+            scheme,
+            chain,
+            runner,
+            generation_guard,
+            request_id,
+            delivery,
+        ))
+        .await;
+    }
     let admission = if chain.is_empty() {
         None
     } else {
@@ -537,14 +713,14 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     // the guard through evaluation bounds aggregate buffered input across HTTP
     // requests and WebSocket messages.
     let admission = admission.expect("resolved middleware chain reserved work admission");
-    let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
+    let buffer_result = crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
         Some(generation_guard),
         max_body_bytes,
     )
-    .await?
-    {
+    .await?;
+    let buffered = match buffer_result {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
             return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
@@ -587,6 +763,575 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         &outcome.header_mutations,
     )?;
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+/// Run a chain of version 2 stages on the stage pipeline.
+#[allow(clippy::too_many_arguments)]
+async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    scheme: &str,
+    chain: Vec<openshell_supervisor_middleware::DescribedChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    request_id: &str,
+    delivery: RequestBodyDelivery,
+) -> Result<MiddlewareApplyResult> {
+    let head = &req.raw_header[..request_header_end(&req.raw_header)];
+    let headers = safe_middleware_headers(head)?;
+    let sandbox = openshell_ocsf::ctx::ctx();
+    let input = HttpRequestPreflightInput {
+        context: openshell_core::proto::RequestContext {
+            request_id: request_id.to_string(),
+            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox: sandbox.sandbox_name.clone(),
+            workspace: ctx.workspace.clone(),
+            originating_process: None,
+        },
+        target: openshell_core::proto::HttpRequestTarget {
+            scheme: scheme.to_string(),
+            host: ctx.host.clone(),
+            port: u32::from(ctx.port),
+            method: req.action.clone(),
+            path: req.target.clone(),
+            query: raw_query_from_request_headers(head)?,
+        },
+        declared_body_length: match req.body_length {
+            crate::l7::provider::BodyLength::ContentLength(length) => Some(length),
+            crate::l7::provider::BodyLength::None => Some(0),
+            crate::l7::provider::BodyLength::Chunked => None,
+        },
+        headers: headers
+            .visible
+            .into_iter()
+            .map(|(name, value)| openshell_core::proto::HttpHeader { name, value })
+            .collect(),
+        connection_nominated_headers: headers.connection_nominated,
+    };
+    let mut preflight = runner
+        .preflight_described_http_request(chain, input)
+        .await?;
+    if preflight.admission_exhausted {
+        emit_middleware_admission_exhausted(ctx);
+        return Ok(MiddlewareApplyResult::AdmissionExhausted);
+    }
+    if preflight.session_capacity_exhausted {
+        emit_middleware_session_capacity_exhausted(ctx, "http_request");
+        return Ok(MiddlewareApplyResult::AdmissionExhausted);
+    }
+    let mut events = RequestEvents {
+        context: ctx.clone(),
+        action: req.action.clone(),
+        target: req.target.clone(),
+        preflight: std::mem::take(&mut preflight.diagnostics),
+        emitted: false,
+    };
+    if !preflight.allowed {
+        events.emit(
+            false,
+            &preflight.reason,
+            preflight.denial.as_ref(),
+            HttpStageDiagnostics::default(),
+        );
+        return Ok(MiddlewareApplyResult::Denied {
+            denial: preflight.denial,
+        });
+    }
+    let Some(session) = preflight.session.take() else {
+        let rebuilt =
+            crate::l7::rest::rebuild_request_headers_only(&req, &preflight.header_mutations)?;
+        events.emit(true, "", None, HttpStageDiagnostics::default());
+        return Ok(MiddlewareApplyResult::Allowed(rebuilt));
+    };
+
+    let (prepared_headers, mut reader) =
+        crate::l7::rest::prepare_request_body_stream(&req, client).await?;
+    if delivery == RequestBodyDelivery::Incremental
+        && !session.withholds_output()
+        && !matches!(req.body_length, crate::l7::provider::BodyLength::None)
+        && request_line_is_http11(head)
+        && !crate::l7::rest::request_has_upgrade_header(head)
+    {
+        let request = crate::l7::rest::rebuild_request_for_live_body(
+            &req,
+            &prepared_headers,
+            &preflight.header_mutations,
+        )?;
+        return Ok(MiddlewareApplyResult::Streamed {
+            request,
+            body: Box::new(RequestBodyStream {
+                reader,
+                session: Some(session),
+                events,
+                generation_guard: generation_guard.clone(),
+                injected_headers: crate::l7::token_grant_injection::InjectedHeaders::default(),
+            }),
+        });
+    }
+
+    let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+    let (output, mut outputs) = mpsc::channel(4);
+    let collect = async move {
+        let mut late = Vec::new();
+        let mut body = Vec::new();
+        while let Some(event) = outputs.recv().await {
+            match event {
+                HttpBodyOutput::Start {
+                    header_mutations, ..
+                } => late = header_mutations,
+                HttpBodyOutput::Chunk(data) => {
+                    if body.len().saturating_add(data.len())
+                        > openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES
+                    {
+                        return None;
+                    }
+                    body.extend_from_slice(&data);
+                }
+                HttpBodyOutput::End { .. } => {}
+            }
+        }
+        Some((late, body))
+    };
+    let run = run_request_body(
+        session,
+        &mut reader,
+        client,
+        generation_guard,
+        progress,
+        output,
+    );
+    let (result, collected) = tokio::join!(run, collect);
+    let (mut finish, (late, body)) = match (result, collected) {
+        (_, None) => {
+            events.emit(
+                false,
+                "middleware_failed: request_output_over_capacity",
+                None,
+                HttpStageDiagnostics::default(),
+            );
+            return Ok(MiddlewareApplyResult::Denied { denial: None });
+        }
+        (Err(error), _) => return events.body_failed(error),
+        (Ok(finish), Some(collected)) => (finish, collected),
+    };
+    generation_guard.ensure_current()?;
+    let mut header_mutations = preflight.header_mutations;
+    header_mutations.extend(late);
+    let rebuilt = crate::l7::rest::rebuild_request_with_middleware_body(
+        &req,
+        &prepared_headers,
+        &body,
+        &finish.trailers,
+        &header_mutations,
+    )?;
+    events.emit(true, "", None, std::mem::take(&mut finish.diagnostics));
+    Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+fn request_header_end(raw_header: &[u8]) -> usize {
+    raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(raw_header.len(), |position| position + 4)
+}
+
+fn request_line_is_http11(head: &[u8]) -> bool {
+    head.split(|byte| *byte == b'\n')
+        .next()
+        .is_some_and(|line| line.trim_ascii_end().ends_with(b" HTTP/1.1"))
+}
+
+/// Why a request body run stopped.
+enum BodyRunError {
+    Middleware(HttpMiddlewareFailure),
+    /// The sandbox sent no body bytes for [`REQUEST_CLIENT_PROGRESS_TIMEOUT`].
+    ClientTimeout,
+    /// Reading the client failed, or the policy generation changed.
+    Client(miette::Report),
+}
+
+/// Feed a request body to `session` while it runs. Dropping the future
+/// cancels every stage.
+async fn run_request_body<C: AsyncRead + Unpin>(
+    session: HttpRequestSession,
+    reader: &mut crate::l7::rest::RequestBodyReader,
+    client: &mut C,
+    generation_guard: &PolicyGenerationGuard,
+    progress: Option<Duration>,
+    output: mpsc::Sender<HttpBodyOutput>,
+) -> std::result::Result<HttpPipelineFinish, BodyRunError> {
+    let limit = session.input_unit_limit();
+    let (input, inputs) = mpsc::channel(4);
+    let run = async {
+        session
+            .run(inputs, output)
+            .await
+            .map_err(BodyRunError::Middleware)
+    };
+    let feed = feed_request_body(reader, client, generation_guard, limit, progress, input);
+    let (finish, ()) = tokio::try_join!(run, feed)?;
+    Ok(finish)
+}
+
+async fn feed_request_body<C: AsyncRead + Unpin>(
+    reader: &mut crate::l7::rest::RequestBodyReader,
+    client: &mut C,
+    generation_guard: &PolicyGenerationGuard,
+    limit: usize,
+    progress: Option<Duration>,
+    input: mpsc::Sender<HttpBodyInput>,
+) -> std::result::Result<(), BodyRunError> {
+    let mut client = ClientProgress::new(client, progress);
+    loop {
+        client.restart();
+        let unit = match reader
+            .next_unit(&mut client, Some(generation_guard), limit)
+            .await
+        {
+            Ok(unit) => unit,
+            Err(_) if client.timed_out => return Err(BodyRunError::ClientTimeout),
+            Err(error) => return Err(BodyRunError::Client(error)),
+        };
+        let Some(unit) = unit else {
+            break;
+        };
+        // A closed input means the pipeline stopped; its result says why.
+        if input.send(HttpBodyInput::Chunk(unit)).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = input
+        .send(HttpBodyInput::End {
+            trailers: reader.take_trailers(),
+        })
+        .await;
+    Ok(())
+}
+
+/// Client reader that fails when the sandbox sends nothing for `idle` while
+/// the reader waits for it. Time spent not reading, such as under middleware
+/// backpressure, does not count.
+struct ClientProgress<'a, C> {
+    inner: &'a mut C,
+    idle: Option<Duration>,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    waiting: bool,
+    timed_out: bool,
+}
+
+impl<'a, C> ClientProgress<'a, C> {
+    fn new(inner: &'a mut C, idle: Option<Duration>) -> Self {
+        Self {
+            inner,
+            idle,
+            deadline: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            waiting: false,
+            timed_out: false,
+        }
+    }
+
+    /// Start the next wait from zero.
+    fn restart(&mut self) {
+        self.waiting = false;
+    }
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for ClientProgress<'_, C> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf);
+        if result.is_ready() {
+            this.waiting = false;
+            return result;
+        }
+        let Some(idle) = this.idle else {
+            return result;
+        };
+        if !this.waiting {
+            this.waiting = true;
+            this.deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + idle);
+        }
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request body client progress timeout",
+            )));
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Terminal OCSF events for one request through the stage pipeline, emitted
+/// once.
+struct RequestEvents {
+    context: L7EvalContext,
+    action: String,
+    target: String,
+    preflight: HttpStageDiagnostics,
+    emitted: bool,
+}
+
+impl RequestEvents {
+    fn emit(
+        &mut self,
+        allowed: bool,
+        reason: &str,
+        denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
+        body: HttpStageDiagnostics,
+    ) {
+        if std::mem::replace(&mut self.emitted, true) {
+            return;
+        }
+        let mut diagnostics = std::mem::take(&mut self.preflight);
+        diagnostics.extend(body);
+        for event in request_middleware_events(
+            &self.context,
+            &self.action,
+            &self.target,
+            allowed,
+            reason,
+            denial,
+            &diagnostics,
+        ) {
+            ocsf_emit!(event);
+        }
+    }
+
+    /// Record a failed body run and return the result the relay acts on.
+    fn body_failed(&mut self, error: BodyRunError) -> Result<MiddlewareApplyResult> {
+        match error {
+            BodyRunError::Middleware(failure) => {
+                self.emit(
+                    false,
+                    &failure.reason,
+                    failure.denial.as_ref(),
+                    *failure.diagnostics,
+                );
+                Ok(MiddlewareApplyResult::Denied {
+                    denial: failure.denial,
+                })
+            }
+            BodyRunError::ClientTimeout => {
+                ocsf_emit!(request_client_timeout_event(
+                    &self.context,
+                    &self.action,
+                    &self.target
+                ));
+                self.emit(
+                    false,
+                    "middleware_cancelled: client_progress_timeout",
+                    None,
+                    HttpStageDiagnostics::default(),
+                );
+                Ok(MiddlewareApplyResult::RequestTimeout)
+            }
+            BodyRunError::Client(error) => {
+                self.emit(
+                    false,
+                    "middleware_cancelled: request_body_read_failed",
+                    None,
+                    HttpStageDiagnostics::default(),
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A request body that request middleware streams to the upstream.
+pub struct RequestBodyStream {
+    reader: crate::l7::rest::RequestBodyReader,
+    session: Option<HttpRequestSession>,
+    events: RequestEvents,
+    generation_guard: PolicyGenerationGuard,
+    injected_headers: crate::l7::token_grant_injection::InjectedHeaders,
+}
+
+impl RequestBodyStream {
+    /// Keep the platform's token grant headers over late header mutations
+    /// when the head commits.
+    pub(crate) fn reapply_injected_headers(
+        &mut self,
+        headers: crate::l7::token_grant_injection::InjectedHeaders,
+    ) {
+        self.injected_headers = headers;
+    }
+
+    pub(crate) fn take_injected_headers(
+        &mut self,
+    ) -> crate::l7::token_grant_injection::InjectedHeaders {
+        std::mem::take(&mut self.injected_headers)
+    }
+
+    /// True when the client's body is chunked and so may end with trailers.
+    pub(crate) fn input_is_chunked(&self) -> bool {
+        matches!(self.reader, crate::l7::rest::RequestBodyReader::Chunked(_))
+    }
+
+    /// Run the middleware over the client's body, sending output to
+    /// `output`. A middleware failure or client timeout is a
+    /// [`crate::l7::rest::LiveRequestFailure`].
+    pub(crate) async fn run_to<C: AsyncRead + Unpin>(
+        &mut self,
+        client: &mut C,
+        output: mpsc::Sender<HttpBodyOutput>,
+    ) -> Result<HttpPipelineFinish> {
+        let session = self
+            .session
+            .take()
+            .ok_or_else(|| miette!("request middleware body already ran"))?;
+        let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+        let error = match run_request_body(
+            session,
+            &mut self.reader,
+            client,
+            &self.generation_guard,
+            progress,
+            output,
+        )
+        .await
+        {
+            Ok(mut finish) => {
+                self.events
+                    .emit(true, "", None, std::mem::take(&mut finish.diagnostics));
+                return Ok(finish);
+            }
+            Err(error) => error,
+        };
+        let failure = match &error {
+            BodyRunError::Middleware(failure) => crate::l7::rest::LiveRequestFailure::Middleware {
+                reason: failure.reason.clone(),
+                denial: failure.denial.clone(),
+            },
+            BodyRunError::ClientTimeout => crate::l7::rest::LiveRequestFailure::ClientTimeout,
+            BodyRunError::Client(_) => {
+                return self.events.body_failed(error).map(|_| unreachable!());
+            }
+        };
+        self.events.body_failed(error)?;
+        Err(miette::Report::new(failure))
+    }
+
+    /// Record that the middleware stages were cancelled for `reason`.
+    pub(crate) fn cancelled(&mut self, reason: &str) {
+        self.events.emit(
+            false,
+            &format!("middleware_cancelled: {reason}"),
+            None,
+            HttpStageDiagnostics::default(),
+        );
+    }
+}
+
+/// OCSF events for one request through the stage pipeline. Separated from
+/// emission so tests can assert on them.
+pub(super) fn request_middleware_events(
+    ctx: &L7EvalContext,
+    action: &str,
+    target: &str,
+    allowed: bool,
+    reason: &str,
+    denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
+    diagnostics: &HttpStageDiagnostics,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut applied = Vec::<openshell_supervisor_middleware::MiddlewareInvocation>::new();
+    for invocation in &diagnostics.invocations {
+        let denied = matches!(
+            invocation.outcome,
+            HttpStageOutcome::Reject | HttpStageOutcome::FailClosed
+        );
+        if let Some(existing) = applied
+            .iter_mut()
+            .find(|existing| existing.name == invocation.config_name)
+        {
+            existing.failed |= invocation.failed;
+            existing.transformed |= invocation.transformed;
+            if denied {
+                existing.decision = openshell_core::proto::Decision::Deny;
+            }
+            continue;
+        }
+        applied.push(openshell_supervisor_middleware::MiddlewareInvocation {
+            name: invocation.config_name.clone(),
+            implementation: invocation.implementation.clone(),
+            decision: if denied {
+                openshell_core::proto::Decision::Deny
+            } else {
+                openshell_core::proto::Decision::Allow
+            },
+            transformed: invocation.transformed,
+            failed: invocation.failed,
+        });
+    }
+    // HTTP protocol 1 (0.1): a fail_open stage reports that it passed its
+    // original input on, which 0.1.x records as a failed-open invocation.
+    for (config_name, report) in &diagnostics.reports {
+        if report.fail_open_reason().is_none() {
+            continue;
+        }
+        if let Some(existing) = applied
+            .iter_mut()
+            .find(|existing| &existing.name == config_name)
+        {
+            existing.failed = true;
+        }
+    }
+    let req = crate::l7::provider::L7Request {
+        action: action.to_string(),
+        target: target.to_string(),
+        query_params: std::collections::HashMap::new(),
+        raw_header: Vec::new(),
+        body_length: crate::l7::provider::BodyLength::None,
+    };
+    middleware_events(
+        ctx,
+        &req,
+        &openshell_supervisor_middleware::ChainOutcome {
+            allowed,
+            reason: reason.to_string(),
+            body: Vec::new(),
+            header_mutations: Vec::new(),
+            findings: diagnostics.findings.clone(),
+            metadata: diagnostics.metadata.clone(),
+            applied,
+            denial: denial.cloned(),
+        },
+    )
+}
+
+/// The sandbox stopped sending a request body that STREAM request
+/// middleware was processing; the request was aborted.
+pub(super) fn request_client_timeout_event(
+    ctx: &L7EvalContext,
+    action: &str,
+    target: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .status_detail("request_client_progress_timeout")
+        .http_request(HttpRequest::new(
+            action,
+            OcsfUrl::new("http", &ctx.host, target, ctx.port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, "middleware")
+        .message(format!(
+            "MIDDLEWARE request body idle for {}s; request aborted",
+            REQUEST_CLIENT_PROGRESS_TIMEOUT.as_secs()
+        ))
+        .build()
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -635,6 +1380,32 @@ pub async fn send_middleware_admission_exhausted_response<
         Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
     )
     .await
+}
+
+/// Answer 408 when the sandbox stops sending a request body that request
+/// middleware is processing.
+pub async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
+    action: &str,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+) -> Result<()> {
+    let req = crate::l7::provider::L7Request {
+        action: action.to_string(),
+        target: redacted_target.to_string(),
+        query_params: std::collections::HashMap::new(),
+        raw_header: Vec::new(),
+        body_length: crate::l7::provider::BodyLength::None,
+    };
+    crate::l7::rest::send_request_timeout_response(
+        &req,
+        &ctx.policy_name,
+        client,
+        Some(redacted_target),
+        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+    )
+    .await?;
+    client.shutdown().await.into_diagnostic()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1309,5 +2080,132 @@ mod tests {
                 "middleware must reject malformed header fields"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod request_event_tests {
+    use openshell_ocsf::SeverityId;
+    use openshell_supervisor_middleware::{
+        HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, StageReport,
+    };
+
+    use super::{request_client_timeout_event, request_middleware_events};
+    use crate::l7::relay::L7EvalContext;
+
+    fn ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            binary_path: "DO_NOT_LOG_BINARY".into(),
+            ..Default::default()
+        }
+    }
+
+    fn invocation(
+        config_name: &str,
+        outcome: HttpStageOutcome,
+        transformed: bool,
+        failed: bool,
+    ) -> HttpStageInvocation {
+        HttpStageInvocation {
+            config_name: config_name.into(),
+            implementation: format!("example/{config_name}"),
+            outcome,
+            input_bytes: 0,
+            output_bytes: None,
+            transformed,
+            failed,
+            reason_code: None,
+            failure_reason: failed.then(|| "middleware_timeout".into()),
+        }
+    }
+
+    #[test]
+    fn client_timeout_event_records_the_abort_without_request_data() {
+        let event = request_client_timeout_event(&ctx(), "POST", "/v1/upload");
+        assert_eq!(event.class_uid(), 4002);
+        assert_eq!(event.base().severity, SeverityId::Low);
+        let serialized = serde_json::to_string(&event).expect("serialize timeout event");
+        assert!(
+            serialized.contains("request_client_progress_timeout"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("api-policy"), "{serialized}");
+        assert!(!serialized.contains("DO_NOT_LOG_BINARY"), "{serialized}");
+    }
+
+    #[test]
+    fn stage_invocations_collapse_to_one_event_per_stage() {
+        let diagnostics = HttpStageDiagnostics {
+            invocations: vec![
+                invocation("stream", HttpStageOutcome::Stream, false, false),
+                invocation("tagger", HttpStageOutcome::Continue, true, false),
+                invocation("stream", HttpStageOutcome::Finish, true, false),
+                invocation("missing", HttpStageOutcome::FailOpen, false, true),
+                invocation("legacy", HttpStageOutcome::Buffered, false, false),
+            ],
+            reports: vec![(
+                "legacy".into(),
+                StageReport::LegacyFailOpen {
+                    reason: "request_body_over_capacity".into(),
+                },
+            )],
+            ..Default::default()
+        };
+        let events =
+            request_middleware_events(&ctx(), "POST", "/v1/upload", true, "", None, &diagnostics);
+        let activity: Vec<String> = events
+            .iter()
+            .filter(|event| event.class_uid() == 4002)
+            .map(|event| serde_json::to_string(event).expect("serialize event"))
+            .collect();
+        assert_eq!(activity.len(), 4, "{activity:#?}");
+        assert!(activity[0].contains("MIDDLEWARE stream example/stream decision=Allow"));
+        assert!(
+            activity[0].contains("\"transformed\":true"),
+            "{}",
+            activity[0]
+        );
+        assert!(
+            activity[1].contains("\"transformed\":true"),
+            "{}",
+            activity[1]
+        );
+        assert!(activity[2].contains("\"failed\":true"), "{}", activity[2]);
+        assert!(activity[3].contains("\"failed\":true"), "{}", activity[3]);
+        // Every stage that passed its input on after a failure is a
+        // failed-open finding, as in 0.1.x.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.class_uid() == 2004)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejected_stage_is_a_denied_invocation() {
+        let diagnostics = HttpStageDiagnostics {
+            invocations: vec![
+                invocation("guard", HttpStageOutcome::Stream, false, false),
+                invocation("guard", HttpStageOutcome::Reject, false, false),
+            ],
+            ..Default::default()
+        };
+        let events = request_middleware_events(
+            &ctx(),
+            "POST",
+            "/v1/upload",
+            false,
+            "middleware_denied:guard",
+            None,
+            &diagnostics,
+        );
+        let serialized = serde_json::to_string(&events).expect("serialize events");
+        assert!(serialized.contains("decision=Deny"), "{serialized}");
+        assert!(!serialized.contains("decision=Allow"), "{serialized}");
     }
 }

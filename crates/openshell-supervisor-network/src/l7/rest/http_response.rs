@@ -267,7 +267,7 @@ where
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
 /// deadlocks clients that are themselves waiting for EOF.
-async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+pub(super) async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
 where
     C: AsyncWrite + Unpin,
 {

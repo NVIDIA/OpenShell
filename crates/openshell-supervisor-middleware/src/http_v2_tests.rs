@@ -675,7 +675,7 @@ async fn version_2_stage_transport_opens_the_services_evaluate_http_streams() {
 }
 
 #[tokio::test]
-async fn legacy_engines_fail_version_2_stages_closed_without_calling_legacy_rpcs() {
+async fn version_2_stages_never_reach_legacy_rpcs() {
     let service = CompatService::new(Build::Dual);
     let (address, _shutdown) = serve(service.clone()).await;
     let runner = ChainRunner::from_registry(
@@ -688,16 +688,15 @@ async fn legacy_engines_fail_version_2_stages_closed_without_calling_legacy_rpcs
     );
     let entries = [entry("guard", "guard-service", OnError::FailOpen)];
 
+    // The request collector runs the stage over EvaluateHttp.
     let outcome = runner
         .evaluate(&entries, request_input())
         .await
         .expect("evaluate");
-    assert!(!outcome.allowed);
-    assert_eq!(
-        outcome.reason,
-        "middleware_failed: http_v2_stage_not_executable"
-    );
+    assert!(outcome.allowed, "{}", outcome.reason);
+    assert!(!outcome.applied[0].failed);
 
+    // The legacy response engine cannot run it and fails it closed.
     let preflight = runner
         .preflight_http_response(&entries, response_input())
         .await
@@ -865,6 +864,15 @@ fn version_2_bindings_wait_for_runtime_support() {
     let error = ensure_http_v2_supported("test service", &manifest, HttpV2Support::BUILD)
         .expect_err("version 2 bindings are rejected until this build runs them");
     assert!(error.to_string().contains("does not support yet"));
+    ensure_http_v2_supported(
+        "test service",
+        &manifest_with(
+            vec![binding(SupervisorMiddlewareOperation::HttpRequest, 2)],
+            legacy_extension(),
+        ),
+        HttpV2Support::BUILD,
+    )
+    .expect("this build runs version 2 request stages");
     ensure_http_v2_supported("test service", &manifest, HttpV2Support::ALL)
         .expect("supported once both directions execute version 2");
 
