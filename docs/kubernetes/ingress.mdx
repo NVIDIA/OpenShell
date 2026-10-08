@@ -125,8 +125,6 @@ helm upgrade --install openshell \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
-Escape the dots in the TOML table name and single-quote the `--set` argument so Helm treats `openshell.gateway.oidc` as one key under `gatewayConfig`.
-
 Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
 
 ### Register over HTTPS

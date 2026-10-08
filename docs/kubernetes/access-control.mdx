@@ -44,8 +44,6 @@ helm upgrade openshell \
   --set server.tls.clientCaSecretName=""
 ```
 
-Escape the dots in the TOML table name and single-quote the `--set` argument so Helm treats `openshell.gateway.oidc` as one key under `gatewayConfig`.
-
 Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `server.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
