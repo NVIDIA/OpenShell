@@ -749,12 +749,27 @@ fn prepare_registry_for_socket(
     // Descriptor use changes after broker startup as control streams and execs
     // come and go. Recompute it for each socket request so retained pre-connect
     // sockets cannot consume the headroom reserved for those control paths.
-    ensure_descriptor_headroom_with_count(
-        registry,
-        descriptor_soft_limit,
-        SOCKET_FD_HEADROOM.saturating_add(1),
-        open_descriptor_count,
-    )
+    prepare_registry_for_socket_with_count(registry, descriptor_soft_limit, open_descriptor_count)
+}
+
+fn prepare_registry_for_socket_with_count(
+    registry: &Mutex<SocketRegistry>,
+    descriptor_soft_limit: usize,
+    mut open_descriptors: impl FnMut() -> io::Result<usize>,
+) -> io::Result<()> {
+    let required = SOCKET_FD_HEADROOM.saturating_add(1);
+    let mut registry = lock(registry);
+    if registry.is_full()
+        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
+    {
+        collect_closed_socket_entries_locked(&mut registry)?;
+    }
+    if registry.is_full()
+        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
+    {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    Ok(())
 }
 
 fn ensure_descriptor_headroom(
@@ -777,14 +792,10 @@ fn ensure_descriptor_headroom_with_count(
     mut open_descriptors: impl FnMut() -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut registry = lock(registry);
-    if registry.is_full()
-        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
-    {
+    if descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required) {
         collect_closed_socket_entries_locked(&mut registry)?;
     }
-    if registry.is_full()
-        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
-    {
+    if descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required) {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
     Ok(())
@@ -1843,7 +1854,7 @@ mod tests {
 
         let registry = Mutex::new(registry);
         let mut observed = std::collections::VecDeque::from([64, 63]);
-        ensure_descriptor_headroom_with_count(&registry, 128, 65, || {
+        prepare_registry_for_socket_with_count(&registry, 128, || {
             observed
                 .pop_front()
                 .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
@@ -1909,7 +1920,7 @@ mod tests {
             nonblocking: false,
             creator_generation: 1,
         };
-        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let mut registry = SocketRegistry::new(1, 1).unwrap();
         let tentative = registry.stage(socket, metadata).unwrap();
         registry
             .commit_with_state(
@@ -1920,10 +1931,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(registry.len(), 1);
+        assert!(registry.is_full());
         assert_eq!(registry.retained_preconnect_count(), 0);
 
         let registry = Mutex::new(registry);
-        ensure_descriptor_headroom_with_count(&registry, 128, 65, || Ok(32)).unwrap();
+        ensure_descriptor_headroom_with_count(&registry, 128, 16, || Ok(32)).unwrap();
 
         assert_eq!(lock(&registry).len(), 1);
     }
