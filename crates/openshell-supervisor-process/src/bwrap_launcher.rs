@@ -4,8 +4,9 @@
 //! Experimental fixed-function Bubblewrap launcher.
 //!
 //! The supervisor starts this helper before installing its inherited seccomp
-//! prelude. Callers submit Python source, never commands, mount options, or
-//! environment variables. Protocol 2 may name the agent's own files directory:
+//! prelude. Protocols 1/2 accept Python source. Protocol 3 accepts shell commands
+//! with fixed computer mounts; no protocol accepts mount options or environment
+//! variables. Protocol 2 may name the agent's own files directory:
 //! the launcher shows it read-only at `/files` and its `code` subdirectory
 //! read-write at `/files/code`, nothing else. Bubblewrap builds the namespace
 //! and a second `OpenShell` invocation installs the final Landlock/seccomp
@@ -20,6 +21,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +39,9 @@ use serde_json::{Value, json};
 const ENABLE_ENV: &str = "OPENSHELL_EXPERIMENTAL_BWRAP_LAUNCHER";
 const PROTOCOL_VERSION: u64 = 1;
 const FILES_PROTOCOL_VERSION: u64 = 2;
+const SHELL_PROTOCOL_VERSION: u64 = 3;
+const SHELL_TIMEOUT_SECONDS: u64 = 900;
+const MAX_CONNECTIONS: usize = 4;
 pub const BWRAP_LAUNCHER_SUBCOMMAND: &str = "experimental-bwrap-launcher";
 pub const BWRAP_CHILD_SUBCOMMAND: &str = "experimental-bwrap-child";
 pub const SOCKET_PATH: &str = "/tmp/openshell-bwrap-launcher.sock";
@@ -74,6 +82,14 @@ pub fn spawn_if_enabled(
         return Err(miette::miette!(
             "experimental Bubblewrap launcher requires a resolved non-root UID and GID"
         ));
+    }
+
+    // A full parent procfs permits a fresh proc mount in the nested PID
+    // namespace. Docker's masked /proc alone cannot satisfy that kernel check.
+    if let Err(error) = prepare_full_proc() {
+        // Preserve protocols 1/2 on containers without mount privileges. A
+        // protocol-3 proc mount still fails closed inside Bubblewrap there.
+        tracing::warn!(%error, "full-shell procfs preparation unavailable");
     }
 
     let socket = PathBuf::from(SOCKET_PATH);
@@ -174,10 +190,29 @@ pub fn serve(socket: &Path) -> Result<()> {
         .wrap_err_with(|| format!("failed to bind {}", socket.display()))?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).into_diagnostic()?;
 
+    let active = Arc::new(AtomicUsize::new(0));
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
-                let _ = serve_connection(stream);
+                if active
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < MAX_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+                let active = Arc::clone(&active);
+                thread::spawn(move || {
+                    struct ConnectionGuard(Arc<AtomicUsize>);
+                    impl Drop for ConnectionGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::Release);
+                        }
+                    }
+                    let _guard = ConnectionGuard(active);
+                    let _ = serve_connection(stream);
+                });
             }
             Err(error) => return Err(error).into_diagnostic(),
         }
@@ -322,9 +357,375 @@ fn check_owned_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)]
+fn prepare_full_proc() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let path = Path::new("/run/openshell-bwrap-proc");
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .into_diagnostic()?;
+    }
+    check_owned_directory(path)?;
+    if fs::symlink_metadata(path).into_diagnostic()?.mode() & 0o077 != 0 {
+        return Err(miette::miette!(
+            "supervisor procfs directory must be root-only"
+        ));
+    }
+    if fs::canonicalize(path).into_diagnostic()? != path {
+        return Err(miette::miette!("supervisor procfs path must be canonical"));
+    }
+    // This root-only mount lives for the sandbox's mount namespace lifetime.
+    // It is never visible in the jail and cannot be unmounted after seccomp.
+    let rc = unsafe {
+        libc::mount(
+            c"proc".as_ptr(),
+            c"/run/openshell-bwrap-proc".as_ptr(),
+            c"proc".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .into_diagnostic()
+            .wrap_err("failed to prepare full supervisor procfs");
+    }
+    Ok(())
+}
+
+struct ShellRequest {
+    command: String,
+    root: PathBuf,
+    socket: PathBuf,
+    scratch: PathBuf,
+    cwd: PathBuf,
+    timeout: Duration,
+}
+
+fn parse_shell_request(request: &Value) -> Result<ShellRequest> {
+    use std::path::Component;
+    let fields = request
+        .as_object()
+        .ok_or_else(|| miette::miette!("request must be an object"))?;
+    let keys = [
+        "protocol_version",
+        "command",
+        "agent_root",
+        "turn_socket",
+        "cwd",
+        "timeout_seconds",
+    ];
+    if fields.len() != keys.len()
+        || !keys.iter().all(|key| fields.contains_key(*key))
+        || request["protocol_version"].as_u64() != Some(SHELL_PROTOCOL_VERSION)
+    {
+        return Err(miette::miette!(
+            "protocol 3 requires only command, agent_root, turn_socket, cwd and timeout_seconds"
+        ));
+    }
+    let string = |key: &str| -> Result<&str> {
+        request[key]
+            .as_str()
+            .filter(|value| !value.contains('\0'))
+            .ok_or_else(|| miette::miette!("{key} must be a string without NUL bytes"))
+    };
+    let root = PathBuf::from(string("agent_root")?);
+    if !root.is_absolute()
+        || root.components().count() < 3
+        || fs::canonicalize(&root).into_diagnostic()? != root
+    {
+        return Err(miette::miette!(
+            "agent_root must be a canonical absolute agent directory"
+        ));
+    }
+    check_owned_directory(&root)?;
+    if fs::symlink_metadata(&root).into_diagnostic()?.mode() & 0o077 != 0 {
+        return Err(miette::miette!(
+            "agent_root must be private to the launcher user"
+        ));
+    }
+    for folder in [
+        "workspace",
+        "agent",
+        "skills",
+        "memory",
+        "run",
+        "run/turns",
+        "run/scratch",
+    ] {
+        check_owned_directory(&root.join(folder))?;
+    }
+    let socket = PathBuf::from(string("turn_socket")?);
+    if socket.parent() != Some(root.join("run/turns").as_path())
+        || fs::canonicalize(&socket).into_diagnostic()? != socket
+    {
+        return Err(miette::miette!(
+            "turn_socket must be directly under the agent's run/turns directory"
+        ));
+    }
+    let metadata = fs::symlink_metadata(&socket).into_diagnostic()?;
+    #[allow(unsafe_code)]
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(miette::miette!(
+            "turn_socket must be a private socket owned by the launcher user"
+        ));
+    }
+    if socket.extension().and_then(|value| value.to_str()) != Some("sock") {
+        return Err(miette::miette!("turn_socket must have a .sock suffix"));
+    }
+    let scratch = root.join("run/scratch").join(socket.file_stem().unwrap());
+    check_owned_directory(&scratch)?;
+    let cwd = Path::new(string("cwd")?);
+    let parts: Vec<_> = cwd.components().collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(miette::miette!(
+            "cwd must be relative without parent traversal"
+        ));
+    }
+    let first = parts[0].as_os_str();
+    let source = match first.to_str() {
+        Some("files") => root.join("workspace"),
+        Some("agent") => root.join("agent"),
+        Some("tmp") => scratch.clone(),
+        _ => {
+            return Err(miette::miette!(
+                "cwd must resolve inside files, agent or tmp"
+            ));
+        }
+    };
+    let source = source.join(parts.iter().skip(1).collect::<PathBuf>());
+    check_owned_directory(&source)?;
+    if fs::canonicalize(&source).into_diagnostic()? != source {
+        return Err(miette::miette!("cwd must not traverse a symlink"));
+    }
+    let timeout = request["timeout_seconds"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| miette::miette!("timeout_seconds must be a positive integer"))?;
+    Ok(ShellRequest {
+        command: string("command")?.to_owned(),
+        root,
+        socket,
+        scratch,
+        cwd: Path::new("/").join(cwd),
+        timeout: Duration::from_secs(timeout.min(SHELL_TIMEOUT_SECONDS)),
+    })
+}
+
+fn capped_output(mut input: impl Read) -> Result<(String, bool)> {
+    let mut bytes = Vec::new();
+    let limit = usize::try_from(MAX_OUTPUT_BYTES).into_diagnostic()?;
+    let mut buffer = [0; 8192];
+    let mut truncated = false;
+    loop {
+        let count = input.read(&mut buffer).into_diagnostic()?;
+        if count == 0 {
+            break;
+        }
+        let retain = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retain]);
+        truncated |= retain < count;
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+fn run_shell(request: ShellRequest) -> Result<Value> {
+    let mut command = Command::new("/usr/bin/bwrap");
+    command.args([
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/local/bin:/usr/bin:/bin",
+        "--setenv",
+        "HOME",
+        "/agent",
+        "--setenv",
+        "TMPDIR",
+        "/tmp",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
+        "--setenv",
+        "LD_LIBRARY_PATH",
+        "/usr/local/lib",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--dir",
+        "/etc",
+        "--dev",
+        "/dev",
+        "--size",
+        "268435456",
+        "--tmpfs",
+        "/dev/shm",
+        "--proc",
+        "/proc",
+    ]);
+    for path in [
+        "/etc/ld.so.cache",
+        "/etc/fonts",
+        "/etc/alternatives",
+        "/etc/libreoffice",
+        "/etc/xdg",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/mime.types",
+    ] {
+        command.args(["--ro-bind-try", path, path]);
+    }
+    for (source, target, writable) in [
+        (request.root.join("workspace"), "/files", true),
+        (request.root.join("agent"), "/agent", true),
+        (request.root.join("skills"), "/skills", false),
+        (request.root.join("memory"), "/memory", false),
+        (request.scratch, "/tmp", true),
+        (request.socket, "/run/tools.sock", true),
+    ] {
+        command
+            .arg(if writable { "--bind" } else { "--ro-bind" })
+            .arg(source)
+            .arg(target);
+    }
+    command
+        .arg("--ro-bind")
+        .arg(std::env::current_exe().into_diagnostic()?)
+        .arg("/openshell-sandbox")
+        .arg("--chdir")
+        .arg(request.cwd)
+        .args(["/openshell-sandbox", BWRAP_CHILD_SUBCOMMAND, "--shell"])
+        .arg(request.command)
+        .env_clear()
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command.spawn().into_diagnostic()?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout = thread::spawn(move || capped_output(stdout));
+    let stderr = thread::spawn(move || capped_output(stderr));
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().into_diagnostic()? {
+            break status;
+        }
+        if started.elapsed() >= request.timeout {
+            timed_out = true;
+            match nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(i32::try_from(child.id()).into_diagnostic()?),
+                nix::sys::signal::Signal::SIGKILL,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(error) => return Err(error).into_diagnostic(),
+            }
+            break child.wait().into_diagnostic()?;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stdout_truncated) = stdout
+        .join()
+        .map_err(|_| miette::miette!("stdout reader failed"))??;
+    let (stderr, stderr_truncated) = stderr
+        .join()
+        .map_err(|_| miette::miette!("stderr reader failed"))??;
+    Ok(json!({"protocol_version": SHELL_PROTOCOL_VERSION,
+        "status": if timed_out { "timed_out" } else if status.success() { "succeeded" } else { "failed" },
+        "exit_code": status.code(), "stdout": stdout, "stderr": stderr,
+        "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+        "duration_ms": started.elapsed().as_millis(), "timed_out": timed_out }))
+}
+
+#[allow(unsafe_code)]
+fn run_shell_child(command: &str) -> Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: 4096,
+        rlim_max: 4096,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).into_diagnostic();
+    }
+    fs::write("/proc/self/oom_score_adj", "1000").into_diagnostic()?;
+    let policy = SandboxPolicy {
+        version: 1,
+        filesystem: FilesystemPolicy {
+            include_workdir: false,
+            read_only: [
+                "/usr",
+                "/etc",
+                "/skills",
+                "/memory",
+                "/proc",
+                "/dev/urandom",
+                "/dev/random",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+            read_write: [
+                "/files",
+                "/agent",
+                "/tmp",
+                "/dev/shm",
+                "/dev/null",
+                "/dev/zero",
+                "/dev/pts",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        },
+        landlock: LandlockPolicy {
+            compatibility: LandlockCompatibility::HardRequirement,
+        },
+        network: NetworkPolicy {
+            mode: NetworkMode::Block,
+            proxy: None,
+        },
+        process: ProcessPolicy::default(),
+    };
+    crate::sandbox::apply(&policy, None)?;
+    // Bubblewrap's cleared environment contains only the fixed values above.
+    let error = Command::new("/bin/bash")
+        .args(["--noprofile", "--norc", "-c", command])
+        .exec();
+    Err(error).into_diagnostic()
+}
+
 fn handle_request(stream: &UnixStream) -> Result<Value> {
     let request = read_request(stream)?;
     let request: Value = serde_json::from_slice(&request).into_diagnostic()?;
+    if request.get("protocol_version").and_then(Value::as_u64) == Some(SHELL_PROTOCOL_VERSION) {
+        return run_shell(parse_shell_request(&request)?);
+    }
+    run_code(request)
+}
+
+fn run_code(request: Value) -> Result<Value> {
     let RunRequest {
         version,
         code,
@@ -471,6 +872,11 @@ fn read_bounded(path: &Path) -> Result<String> {
 }
 
 pub fn run_hardened_child(args: &[String]) -> Result<()> {
+    if let [flag, command] = args
+        && flag == "--shell"
+    {
+        return run_shell_child(command);
+    }
     let files = match args {
         [] => false,
         [flag] if flag == CHILD_FILES_FLAG => true,
@@ -565,6 +971,65 @@ fn apply_resource_limits() -> Result<()> {
 mod tests {
     use super::*;
     use std::net::Shutdown;
+
+    #[test]
+    fn shell_requests_are_closed_and_cannot_select_mounts_or_escape_the_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for folder in [
+            "workspace",
+            "agent",
+            "skills",
+            "memory",
+            "run",
+            "run/turns",
+            "run/scratch",
+            "run/scratch/turn",
+        ] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.path().join(folder))
+                .unwrap();
+        }
+        let socket = root.path().join("run/turns/turn.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let canonical = fs::canonicalize(root.path()).unwrap();
+        let mut request = json!({"protocol_version":3, "command":"sleep 6; echo done",
+            "agent_root":canonical, "turn_socket":socket, "cwd":"files", "timeout_seconds":10000});
+        let parsed = parse_shell_request(&request).unwrap();
+        assert_eq!(parsed.timeout, Duration::from_secs(900));
+        assert_eq!(parsed.cwd, Path::new("/files"));
+        request["timeout_seconds"] = json!(0);
+        assert!(parse_shell_request(&request).is_err());
+        request["timeout_seconds"] = json!(30);
+        request["mounts"] = json!(["/"]);
+        assert!(parse_shell_request(&request).is_err());
+        request.as_object_mut().unwrap().remove("mounts");
+        for cwd in ["/files", "files/../runtime", "skills", "runtime"] {
+            request["cwd"] = json!(cwd);
+            assert!(parse_shell_request(&request).is_err());
+        }
+        request["cwd"] = json!("files");
+        std::os::unix::fs::symlink(
+            root.path().join("agent"),
+            root.path().join("workspace/link"),
+        )
+        .unwrap();
+        request["cwd"] = json!("files/link");
+        assert!(parse_shell_request(&request).is_err());
+        request["cwd"] = json!("files");
+        request["turn_socket"] = json!(root.path().join("run/turns/not-a-socket.sock"));
+        fs::write(
+            root.path().join("run/turns/not-a-socket.sock"),
+            "not a socket",
+        )
+        .unwrap();
+        assert!(parse_shell_request(&request).is_err());
+        request["turn_socket"] = json!(socket);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(parse_shell_request(&request).is_err());
+    }
 
     #[test]
     fn launcher_child_uses_non_root_identity_without_capabilities() {

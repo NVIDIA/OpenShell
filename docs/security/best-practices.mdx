@@ -45,17 +45,28 @@ together before installing Inline Code on an existing agent.
 
 The helper starts before the supervisor's inherited seccomp policy. Ordinary
 agent processes keep their existing restrictions. The helper accepts only
-protocol version 1 and Python source over a same-user, mode-0600 Unix socket;
-callers cannot select commands, mounts, environment variables, or host paths.
+protocol versions 1/2 and Python source over a same-user, mode-0600 Unix socket;
+callers cannot select mounts, environment variables, or arbitrary host paths.
 Each execution receives fresh namespaces, no network, a cleared environment,
 read-only Python libraries, and Landlock and seccomp enforcement. The agent
 workspace, credentials, and launcher socket are absent from the code jail.
 
-Runs are serialized and limited to five seconds of wall time, three seconds of
+Python runs are limited to five seconds of wall time, three seconds of
 CPU time, 512 MiB of address space, and one process and thread. Each scratch
 filesystem is limited to 16 MiB and disappears after the run. Output files are
 bounded to 1 MiB; the plugin applies smaller JSON limits and validates the
 declared output schema. An unavailable launcher fails closed.
+
+Protocol 3 adds full-shell execution for the assistant computer, with at most
+four concurrent connections. It validates a private agent root, its per-turn
+socket and a cwd inside the fixed writable folders. The jail sees user files,
+agent work, read-only skills/memory, turn scratch and one tools socket; it never
+sees runtime code, database or credentials. Commands may fork, run for up to
+15 minutes and use the pod's CPU/memory budget. The child requires Landlock,
+blocks internet sockets and further user namespaces, sets 4096 open files and
+`oom_score_adj=1000`, and caps stdout/stderr at 1 MiB each. The supervisor needs
+root setup with `SYS_ADMIN` to prepare the parent procfs before its normal
+privilege drop. Full-shell setup fails closed if a fresh child procfs is denied.
 
 This integration supports runc. Its namespaces and security filters share the
 host kernel; they do not provide a virtual-machine boundary. Keep the host

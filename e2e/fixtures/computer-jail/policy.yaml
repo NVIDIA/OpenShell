@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+filesystem_policy:
+  include_workdir: false
+  read_only: [/usr, /lib, /etc, /app, /proc, /dev/urandom, /fixture]
+  read_write: [/tmp, /sandbox, /dev/null]
+landlock:
+  compatibility: hard_requirement
+process:
+  run_as_user: '10001'
+  run_as_group: '10001'
+network_policies: {}

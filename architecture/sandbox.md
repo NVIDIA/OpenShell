@@ -50,13 +50,14 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
-## Fixed Python launcher
+## Fixed-function Bubblewrap launcher
 
 The Globster process-supervisor integration can start a non-root Bubblewrap
 launcher before installing the inherited supervisor seccomp prelude. Ordinary
 agent restrictions remain unchanged. The launcher accepts bounded, versioned JSON
-containing Python source through an owner-only Unix socket; callers cannot choose
-commands, mounts, environment variables or network policy. Peer credentials must
+through an owner-only Unix socket. Protocols 1/2 accept Python source; protocol 3
+accepts shell commands with launcher-chosen mounts. Callers cannot choose mount
+options, environment variables or network policy. Peer credentials must
 match the launcher's UID, and the launcher disables process-memory inspection.
 
 Each call creates private namespaces and bounded scratch filesystems. Only `/usr`,
@@ -68,6 +69,27 @@ path-only flag, including for device nodes on nodev mounts. The fixed root also
 includes the amd64 `/lib64` loader link. Setup errors fail closed. The deadline terminates the Bubblewrap process tree;
 scratch mounts disappear with the namespace. Results are bounded stdout/stderr,
 with no file-export interface. See [Sandbox Limits](sandbox-limits.md).
+
+Protocol 3 accepts exactly `protocol_version`, `command`, `agent_root`,
+`turn_socket`, `cwd` and `timeout_seconds`. The root must be canonical, owned by
+the launcher user and mode-private. Its turn socket must be owned, private and
+directly under `run/turns/`; relative cwd values resolve only under `files`,
+`agent` or `tmp`, without symlink traversal. The launcher binds `workspace/` as
+`/files` and `agent/` as `/agent` read-write, `skills/` and `memory/` read-only,
+per-turn scratch as `/tmp`, and that single socket as `/run/tools.sock`. The
+runtime code, database, enclosing workspace and credentials are absent.
+
+Before dropping privileges, the supervisor prepares a full procfs under a
+root-only directory so Bubblewrap can mount a fresh procfs in its child PID
+namespace. Preparation failure preserves protocols 1/2; full-shell setup fails
+closed if the kernel cannot provide procfs. The child sets `oom_score_adj=1000`
+before applying read-only Landlock access to procfs. It permits processes and
+threads, with mandatory Landlock, the existing network-blocking seccomp policy,
+4096 open files and 256 MiB shared memory. Wall time is clamped to 900 seconds;
+timeout kills the namespace process tree. Output is drained concurrently and
+capped at 1 MiB per stream, with explicit truncation, duration and timeout fields.
+The helper admits at most four concurrent connections. The enclosing pod owns
+CPU and memory limits.
 
 This path relies on the enclosing container and node kernel. It does not add a VM
 boundary or protect the agent from trusted plugins already executing in its process.

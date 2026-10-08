@@ -44,7 +44,7 @@ New limits should follow these rules:
 
 | Resource | Bound | Terminal behavior |
 |---|---:|---|
-| Active execution | 1 per launcher | Requests are serviced serially. |
+| Active execution | 4 per launcher, shared with shell execution | Excess connections close before a request is buffered. |
 | Request JSON | 256 KiB | Reject before creating a jail. |
 | Socket read/write | 2 seconds each | Close stalled connections. |
 | Python process/thread count | 1 | Seccomp rejects clone/fork/thread creation. |
@@ -59,6 +59,23 @@ The owning container must retain its normal resource limits. New processes and
 threads are deliberately unsupported so a program cannot multiply the per-process
 address-space/CPU limits. No writable host-directory mount or artifact listing is
 exposed to Python. Temporary files are removed after each execution.
+
+## Full shell launcher (protocol 3)
+
+The full shell shares the launcher's request, socket, admission, and returned
+output bounds. Its process tree runs inside the owning sandbox's cgroup.
+
+| Resource | Bound | Terminal behavior |
+|---|---:|---|
+| Wall time | Requested positive seconds, at most 900 | Kill the namespace process group and reap the jail. |
+| File descriptors | 4,096 | Kernel rejects additional opens. |
+| Shared memory | 256 MiB | Private `/dev/shm` rejects writes when full. |
+| Returned stdout / stderr | 1 MiB each | Drain excess output and report truncation. |
+
+Shell execution permits child processes and threads, so per-process CPU and
+address-space limits would not describe an aggregate budget. The sandbox cgroup
+owns that budget; the launcher sets its shell's OOM score to 1,000 so it is
+preferred over the supervisor under memory pressure.
 
 ## Middleware
 
