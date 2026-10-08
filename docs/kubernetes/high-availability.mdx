@@ -178,8 +178,9 @@ When a non-owner gateway pod stops, Kubernetes removes it from ready Service
 endpoints and new requests go to another replica. Existing requests through the
 stopped pod disconnect and must be retried.
 
-When an owner gateway pod stops gracefully, it redirects its connected
-supervisors to the replicas that now own them. After a crash, supervisors
+When an owner gateway pod stops gracefully, it re-reads gateway membership and
+redirects its connected supervisors to the replicas that now own them,
+including replicas that started moments earlier. After a crash, supervisors
 reconnect through the gateway Service. Either way, they publish new ownership. Other replicas re-read ownership
 while waiting to relay a request. A request fails if no fresh, reachable owner
 appears before its normal deadline.

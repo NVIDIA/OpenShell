@@ -987,6 +987,13 @@ pub(crate) async fn run_server(
     }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // Closing sessions redirect their supervisors through the ring, so pick up
+    // replicas that joined since the last periodic refresh.
+    gateway_members::refresh_ring_for_shutdown(
+        &state,
+        gateway_members::SHUTDOWN_RING_REFRESH_TIMEOUT,
+    )
+    .await;
     // A stopped supervisor may still have a detached task deleting its owner
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
