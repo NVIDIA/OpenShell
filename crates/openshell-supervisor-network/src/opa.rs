@@ -5478,7 +5478,7 @@ process:
     fn token_grant_owner_engine(policies: serde_json::Value) -> OpaEngine {
         // Owner identities are trusted runtime metadata, so these Rego tests
         // load the already-normalized data that follows policy conversion.
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine().expect("register runtime builtins");
         engine
             .add_policy("policy.rego".into(), TEST_POLICY.into())
             .expect("load owner admission policy");
