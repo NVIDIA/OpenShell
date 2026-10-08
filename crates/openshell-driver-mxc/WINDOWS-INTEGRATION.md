@@ -13,6 +13,9 @@ This is a selective port, not a branch merge or a claim of complete demo parity.
   registration in the E2E and OCSF runners.
 - Restore the WebSocket and OpenClaw policy fixtures with their original
   grants, updating comments to the host-supervisor/Windows-boundary architecture.
+- Adaptation found by real E2E: store injected proxy CA files under the already
+  protected/granted boundary runtime directory. Ambient host temporary paths
+  become inaccessible when CLI APPDATA/LOCALAPPDATA is isolated.
 
 Keep the always-present `openshell-windows-sandbox`, authenticated Sandbox
 Protocol, and host isolation-backend supervisor. Do not restore the old relay

@@ -54,6 +54,11 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
     let config: BoundaryConfig = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode boundary config {}: {error}", config_path.display()))?;
     validate_config(&config)?;
+    let runtime_directory = config_path
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "MXC bootstrap requires an absolute runtime directory".to_string())?
+        .to_path_buf();
     std::fs::remove_file(config_path)
         .map_err(|error| format!("consume boundary config {}: {error}", config_path.display()))?;
 
@@ -69,11 +74,8 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
             }
         };
         let tls = Arc::new(load_tls_server_config(&tls)?);
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .map_err(|error| format!("bind MXC boundary listener at {address}: {error}"))?;
-        let boundary = Arc::new(BoundaryRuntime::new(config)?);
-        tracing::info!(%address, "MXC Sandbox Protocol listener ready");
+        let boundary = Arc::new(BoundaryRuntime::new(config, runtime_directory)?);
+        tracing::info!(%address, "MXC Sandbox Protocol reverse control ready");
         loop {
             let (stream, _) = listener
                 .accept()
@@ -445,6 +447,8 @@ enum Lifecycle {
 
 struct BoundaryRuntime {
     config: BoundaryConfig,
+    runtime_directory: PathBuf,
+    proxy_url: String,
     authenticator: SandboxProtocolAuthenticator,
     connections: SandboxConnectionRegistry,
     connection_shutdowns: Mutex<HashMap<SandboxConnectionId, tokio::sync::watch::Sender<()>>>,
@@ -462,7 +466,11 @@ struct BoundaryRuntime {
 }
 
 impl BoundaryRuntime {
-    fn new(config: BoundaryConfig) -> Result<Self, String> {
+    fn new(
+        launch: crate::launch::MxcBoundaryConfig,
+        runtime_directory: PathBuf,
+    ) -> Result<Self, String> {
+        let config = launch.runtime;
         let sandbox_id = SandboxId::parse(config.boundary_id.clone())
             .map_err(|error| format!("validate MXC sandbox ID: {error}"))?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
@@ -491,6 +499,8 @@ impl BoundaryRuntime {
             ),
             connections: SandboxConnectionRegistry::new(config.session_id, config.session_rotation),
             config,
+            runtime_directory,
+            proxy_url: launch.proxy_url,
             connection_shutdowns: Mutex::new(HashMap::new()),
             active_connection: Mutex::new(None),
             lifecycle: Mutex::new(Lifecycle::AwaitingAttach),
@@ -830,6 +840,7 @@ impl BoundaryRuntime {
             }
         }
         let ca_paths = match install_ca_material(
+            &self.runtime_directory,
             &self.config.generation,
             ca_cert.as_deref().map(str::as_bytes),
             ca_bundle.as_deref().map(str::as_bytes),
@@ -1216,6 +1227,7 @@ fn workload_environment(
 }
 
 fn install_ca_material(
+    runtime_directory: &Path,
     generation: &str,
     certificate: Option<&[u8]>,
     bundle: Option<&[u8]>,
@@ -1223,7 +1235,10 @@ fn install_ca_material(
     let (Some(certificate), Some(bundle)) = (certificate, bundle) else {
         return Ok(None);
     };
-    let directory = std::env::temp_dir().join(format!("openshell-ca-{generation}"));
+    // The driver already grants and protects the generation's boundary state.
+    // Host APPDATA/TEMP may be isolated or inaccessible inside ProcessContainer;
+    // never rely on those ambient paths or broaden workload filesystem grants.
+    let directory = runtime_directory.join(format!("openshell-ca-{generation}"));
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("create MXC CA directory: {error}"))?;
     let certificate_path = directory.join("openshell-ca.pem");
@@ -1741,6 +1756,41 @@ mod tests {
             .await
             .expect("new deadline fires")
             .expect("shutdown notification");
+    }
+
+    #[test]
+    fn ca_material_stays_under_the_explicit_boundary_runtime_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "openshell-ca-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = install_ca_material(&root, "test-generation", Some(b"cert"), Some(b"bundle"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            paths.0,
+            root.join("openshell-ca-test-generation/openshell-ca.pem")
+        );
+        assert_eq!(
+            paths.1,
+            root.join("openshell-ca-test-generation/ca-bundle.pem")
+        );
+        assert_eq!(std::fs::read(&paths.0).unwrap(), b"cert");
+        assert_eq!(std::fs::read(&paths.1).unwrap(), b"bundle");
+        assert!(
+            install_ca_material(&root, "unused", None, Some(b"bundle"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.join("openshell-ca-unused").exists());
+        std::fs::remove_file(paths.0).unwrap();
+        std::fs::remove_file(paths.1).unwrap();
+        std::fs::remove_dir(root.join("openshell-ca-test-generation")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

@@ -75,3 +75,8 @@ therefore remains fail-closed, including on an otherwise qualified PSEC host.
 Unit tests exercise real Windows process launch, output retention, and a real
 ephemeral TCP forwarding target. These tests do not qualify MXC enforcement;
 that requires the real-MXC integration and E2E lanes on a supported host.
+
+The bootstrap path must be absolute. Injected proxy CA files are stored beside
+the consumed bootstrap, under the generation's protected boundary-state
+directory already granted by the driver. They do not use ambient host
+APPDATA/TEMP paths, which may be isolated or inaccessible inside MXC.
