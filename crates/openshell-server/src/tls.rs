@@ -98,6 +98,10 @@ impl TlsAcceptor {
     /// Returns `Ok(())` when the new config was built and swapped successfully.
     /// Returns `Err(...)` if cert/key loading fails — the old config is preserved.
     pub fn reload(&self) -> Result<()> {
+        self.reload_for_listener("gateway")
+    }
+
+    fn reload_for_listener(&self, listener: &str) -> Result<()> {
         let new_config = build_server_config(
             &self.cert_path,
             &self.key_path,
@@ -113,7 +117,9 @@ impl TlsAcceptor {
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .state(StateId::Enabled, "reloaded")
-            .message("TLS certificate config reloaded successfully")
+            .message(format!(
+                "{listener} TLS certificate config reloaded successfully"
+            ))
             .build();
         openshell_ocsf::ocsf_emit!(event);
 
@@ -141,10 +147,25 @@ impl TlsAcceptor {
     /// tasks.
     pub fn spawn_reload_worker(
         &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_reload_worker_for_listener(shutdown, "gateway")
+    }
+
+    /// Spawn a certificate reload worker identified by the listener it serves.
+    ///
+    /// This is used when a process owns more than one TLS listener, so reload
+    /// logs and OCSF events identify the certificate trust boundary affected.
+    pub fn spawn_reload_worker_for_listener(
+        &self,
         mut shutdown: watch::Receiver<bool>,
+        listener: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         if self.reload_spawned.swap(true, Ordering::Relaxed) {
-            warn!("TLS certificate reload worker already spawned, ignoring duplicate call");
+            warn!(
+                listener,
+                "TLS certificate reload worker already spawned, ignoring duplicate call"
+            );
             return tokio::spawn(async {});
         }
 
@@ -194,19 +215,19 @@ impl TlsAcceptor {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    warn!(error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
+                    warn!(listener, error = %e, "Failed to start TLS cert file watcher, hot-reload disabled");
                     return;
                 }
             };
 
             for dir in &dirs {
                 if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-                    warn!(error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
+                    warn!(listener, error = %e, dir = %dir.display(), "Failed to watch TLS cert directory, hot-reload disabled");
                     return;
                 }
             }
 
-            info!(?dirs, "TLS certificate file watcher started");
+            info!(listener, ?dirs, "TLS certificate file watcher started");
 
             // Event loop with manual debounce.
             // When the watcher fires, we drain any follow-up events that
@@ -223,7 +244,10 @@ impl TlsAcceptor {
                 };
 
                 if !got_event {
-                    warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                    warn!(
+                        listener,
+                        "TLS cert file watcher disconnected, hot-reload stopping"
+                    );
                     break 'outer;
                 }
 
@@ -232,17 +256,17 @@ impl TlsAcceptor {
                     tokio::select! {
                         () = tokio::time::sleep(debounce) => {
                             // Debounce window elapsed — reload now.
-                            if let Err(e) = this.reload() {
+                            if let Err(e) = this.reload_for_listener(listener) {
                                 let event = ConfigStateChangeBuilder::new(&tls_ocsf_ctx())
                                     .severity(SeverityId::Medium)
                                     .status(StatusId::Failure)
                                     .state(StateId::Enabled, "reload_failed")
                                     .message(format!(
-                                        "TLS certificate reload failed: {e}"
+                                        "{listener} TLS certificate reload failed: {e}"
                                     ))
                                     .build();
                                 openshell_ocsf::ocsf_emit!(event);
-                                warn!(error = %e, "TLS certificate reload failed, keeping existing config");
+                                warn!(listener, error = %e, "TLS certificate reload failed, keeping existing config");
                             }
                             break;
                         }
@@ -251,11 +275,11 @@ impl TlsAcceptor {
                                 // Another event arrived — reset debounce.
                                 continue;
                             }
-                            warn!("TLS cert file watcher disconnected, hot-reload stopping");
+                            warn!(listener, "TLS cert file watcher disconnected, hot-reload stopping");
                             break 'outer;
                         }
                         _ = shutdown.changed() => {
-                            debug!("TLS certificate reload worker stopped");
+                            debug!(listener, "TLS certificate reload worker stopped");
                             break 'outer;
                         }
                     }

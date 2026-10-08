@@ -29,6 +29,113 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
 
+  - it: leaves metrics TLS disabled by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.metrics_tls\]'
+
+  - it: renders metrics mTLS configuration from operator-provided Secret values
+    template: templates/gateway-config.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.certSecretName: metrics-server-tls
+      metrics.tls.clientCaSecretName: metrics-scraper-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.metrics_tls\].*?cert_path\s*=\s*"/etc/openshell-metrics/server/tls\.crt".*?key_path\s*=\s*"/etc/openshell-metrics/server/tls\.key".*?client_ca_path\s*=\s*"/etc/openshell-metrics/client-ca/ca\.crt".*?require_client_auth\s*=\s*true'
+
+  - it: mounts operator-provided metrics mTLS Secrets read-only
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.certSecretName: metrics-server-tls
+      metrics.tls.clientCaSecretName: metrics-scraper-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: metrics-tls-cert
+            mountPath: /etc/openshell-metrics/server
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: metrics-tls-client-ca
+            mountPath: /etc/openshell-metrics/client-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-cert
+            secret:
+              secretName: metrics-server-tls
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-client-ca
+            secret:
+              secretName: metrics-scraper-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+
+  - it: reuses the gateway server Secret for metrics TLS when no separate Secret is set
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: metrics-tls-cert
+            secret:
+              secretName: openshell-server-tls
+
+  - it: rejects metrics mTLS without a dedicated client CA
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName'
+
+  - it: rejects a metrics client CA that reuses the gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: openshell-server-tls
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
+  - it: rejects a metrics client CA that reuses a custom gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: false
+      server.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
+  - it: rejects metrics TLS when the metrics port is disabled
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 0
+      metrics.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.enabled requires service.metricsPort to be non-zero'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:
