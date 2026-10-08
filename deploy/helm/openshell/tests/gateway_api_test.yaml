@@ -10,7 +10,7 @@ release:
   namespace: openshell
 
 tests:
-  - it: gives a chart-created Gateway a non-conflicting default name
+  - it: preserves the chart fullname as the default Gateway name
     template: templates/gateway.yaml
     set:
       grpcRoute.enabled: true
@@ -18,7 +18,7 @@ tests:
     asserts:
       - equal:
           path: metadata.name
-          value: openshell-ingress
+          value: openshell
       - equal:
           path: spec.gatewayClassName
           value: eg
@@ -31,7 +31,7 @@ tests:
     asserts:
       - equal:
           path: spec.parentRefs[0].name
-          value: openshell-ingress
+          value: openshell
       - equal:
           path: spec.parentRefs[0].namespace
           value: openshell
@@ -64,16 +64,27 @@ tests:
           path: spec.gatewayClassName
           value: custom-class
 
-  - it: preserves the ingress suffix for a long chart fullname
+  - it: preserves an explicit Gateway name longer than 63 characters
     template: templates/gateway.yaml
     set:
-      fullnameOverride: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijk
       grpcRoute.enabled: true
       grpcRoute.gateway.create: true
+      grpcRoute.gateway.name: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqr
     asserts:
       - equal:
           path: metadata.name
-          value: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabc-ingress
+          value: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqr
+
+  - it: references an explicit Gateway name longer than 63 characters unchanged
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.name: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqr
+    asserts:
+      - equal:
+          path: spec.parentRefs[0].name
+          value: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqr
 
   - it: attaches to a listener on an existing Gateway
     template: templates/grpcroute.yaml

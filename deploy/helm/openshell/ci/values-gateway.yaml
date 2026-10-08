@@ -11,7 +11,7 @@
 # Service (named envoy-<namespace>-<gateway-name>-*) in the openshell namespace.
 #
 # To reach the gateway from outside a k3d cluster, port-forward to that service:
-#   kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell-ingress
+#   kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
 #   kubectl -n openshell port-forward svc/<envoy-service> 8080:80
 #   # then: grpcurl -plaintext localhost:8080 ...
 

@@ -693,9 +693,10 @@ grpcRoute:
     # by your Gateway API implementation. Envoy Gateway uses "eg" in the
     # OpenShell examples. Ignored when gateway.create is false.
     className: "eg"
-    # -- Name of the Gateway resource. Defaults to `<fullname>-ingress`, which
-    # stays distinct from the OpenShell Service name. When gateway.create is
-    # false, set this to the name of the existing Gateway.
+    # -- Name of the Gateway resource. Defaults to `<fullname>`. Set a distinct
+    # name when the selected controller creates a proxy Service with the
+    # Gateway name. When gateway.create is false, set this to the name of the
+    # existing Gateway.
     name: ""
     # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
     # Defaults to the release namespace. A chart-created Gateway always resides

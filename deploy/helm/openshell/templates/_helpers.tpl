@@ -25,13 +25,11 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
-Name of the Gateway API Gateway referenced by the GRPCRoute. Keep the default
-distinct from the OpenShell Service because some Gateway implementations name
-their generated proxy Service after the Gateway.
+Name of the Gateway API Gateway referenced by the GRPCRoute. Preserve explicit
+names unchanged because Gateway names may be longer than label values.
 */}}
 {{- define "openshell.grpcRouteGatewayName" -}}
-{{- $fullname := include "openshell.fullname" . | trunc 55 | trimSuffix "-" -}}
-{{- default (printf "%s-ingress" $fullname) .Values.grpcRoute.gateway.name | trunc 63 | trimSuffix "-" -}}
+{{- default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name -}}
 {{- end }}
 
 {{/*
