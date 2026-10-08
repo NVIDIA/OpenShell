@@ -28,8 +28,12 @@ pub const MEMBER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Upper bound on replicas read back when building the ring.
 const MEMBER_LIST_LIMIT: u32 = 1024;
 
-/// How long shutdown waits to re-read membership before redirecting sessions.
-pub const SHUTDOWN_RING_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the worker waits on each store call while leaving at shutdown.
+const SHUTDOWN_STORE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long gateway shutdown waits for the membership worker to finish
+/// leaving: one membership read and one deregister.
+pub const SHUTDOWN_MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn member_object_id(replica_id: &str) -> String {
     format!("gateway-member:{replica_id}")
@@ -148,59 +152,6 @@ impl GatewayMemberIndex {
         let ring = GatewayRing::new(members.iter().map(|member| member.replica_id.as_str()));
         Ok((ring, members))
     }
-
-    /// Build the ring and peer endpoints a stopping replica redirects to: the
-    /// live replicas other than `replica_id`.
-    pub async fn ring_without(
-        &self,
-        replica_id: &str,
-    ) -> PersistenceResult<(GatewayRing, HashMap<String, String>)> {
-        let members = self
-            .live_members()
-            .await?
-            .into_iter()
-            .filter(|member| member.replica_id != replica_id)
-            .collect::<Vec<_>>();
-        let ring = GatewayRing::new(members.iter().map(|member| member.replica_id.as_str()));
-        let peers = members
-            .into_iter()
-            .map(|member| (member.replica_id, member.peer_endpoint))
-            .collect();
-        Ok((ring, peers))
-    }
-}
-
-/// Re-read membership just before shutdown redirects supervisor sessions.
-///
-/// The worker refreshes the ring only every [`MEMBER_REFRESH_INTERVAL`]. During
-/// a rolling update the cached ring can miss a replacement that just started
-/// and still name a replica that already left, so redirects built from it send
-/// supervisors nowhere or to a dead pod. The read is bounded by `timeout`; on
-/// failure the cached ring stays in place.
-pub async fn refresh_ring_for_shutdown(state: &crate::ServerState, timeout: Duration) {
-    if state.store.is_single_replica() || state.peer_endpoint.is_none() {
-        return;
-    }
-    let index = GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL);
-    match tokio::time::timeout(timeout, index.ring_without(&state.replica_id)).await {
-        Ok(Ok((ring, peers))) => {
-            if let Ok(mut slot) = state.gateway_ring.write() {
-                *slot = ring;
-            }
-            if let Ok(mut slot) = state.gateway_peers.write() {
-                *slot = peers;
-            }
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "gateway membership: shutdown ring refresh failed");
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout_ms = timeout.as_millis(),
-                "gateway membership: shutdown ring refresh timed out"
-            );
-        }
-    }
 }
 
 /// Keep this replica's membership record fresh and refresh the local ring.
@@ -208,25 +159,28 @@ pub async fn refresh_ring_for_shutdown(state: &crate::ServerState, timeout: Dura
 /// One task does both so the ring is never newer than our own liveness claim.
 /// The ring starts empty, which means "serve locally" — so a store outage
 /// degrades to today's behaviour rather than breaking placement.
+///
+/// Returns the worker task, which finishes after this replica leaves the ring
+/// at shutdown. Shutdown awaits it before redirecting supervisor sessions.
 pub fn spawn_membership_worker(
     state: Arc<crate::ServerState>,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if state.store.is_single_replica() {
-        return;
+        return None;
     }
     let Some(peer_endpoint) = state.peer_endpoint.clone() else {
         // Without a peer endpoint other replicas cannot dial us, so we must
         // not advertise ourselves as a placement target.
         tracing::debug!("gateway membership: no peer endpoint, not joining the ring");
-        return;
+        return None;
     };
 
     let index = GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL);
     let replica_id = state.replica_id.clone();
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_refreshed = tokio::time::Instant::now();
@@ -236,14 +190,7 @@ pub fn spawn_membership_worker(
                 _ = ticker.tick() => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        // Sessions closing during shutdown redirect to the
-                        // replica that owns them once this one is gone.
-                        if let Ok(mut slot) = state.gateway_ring.write() {
-                            *slot = slot.without(&replica_id);
-                        }
-                        if let Err(error) = index.deregister(&replica_id).await {
-                            tracing::warn!(%error, "gateway membership: deregister failed");
-                        }
+                        leave_ring(&state, &index, &replica_id).await;
                         return;
                     }
                     continue;
@@ -276,7 +223,50 @@ pub fn spawn_membership_worker(
                 }
             }
         }
-    });
+    }))
+}
+
+/// Point the ring at the replicas that remain once this one is gone, then
+/// remove this replica's record.
+///
+/// Sessions closing during shutdown redirect to the replica that owns them
+/// next. The periodic refresh can be up to one interval old, and during a
+/// rolling update that ring can miss a replacement that just started and still
+/// name a replica that already left. Redirects built from it send supervisors
+/// nowhere or to a dead pod, so re-read membership first. If the read fails,
+/// keep the cached ring without this replica.
+async fn leave_ring(state: &crate::ServerState, index: &GatewayMemberIndex, replica_id: &str) {
+    match tokio::time::timeout(SHUTDOWN_STORE_TIMEOUT, index.ring()).await {
+        Ok(Ok((ring, members))) => {
+            let peers: HashMap<String, String> = members
+                .into_iter()
+                .map(|member| (member.replica_id, member.peer_endpoint))
+                .collect();
+            if let Ok(mut slot) = state.gateway_ring.write() {
+                *slot = ring.without(replica_id);
+            }
+            if let Ok(mut slot) = state.gateway_peers.write() {
+                *slot = peers;
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "gateway membership: shutdown ring refresh failed");
+            if let Ok(mut slot) = state.gateway_ring.write() {
+                *slot = slot.without(replica_id);
+            }
+        }
+        Err(_) => {
+            tracing::warn!("gateway membership: shutdown ring refresh timed out");
+            if let Ok(mut slot) = state.gateway_ring.write() {
+                *slot = slot.without(replica_id);
+            }
+        }
+    }
+    match tokio::time::timeout(SHUTDOWN_STORE_TIMEOUT, index.deregister(replica_id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "gateway membership: deregister failed"),
+        Err(_) => tracing::warn!("gateway membership: deregister timed out"),
+    }
 }
 
 fn clear_ring_if_stale(state: &crate::ServerState, last_refreshed: tokio::time::Instant) {
@@ -316,25 +306,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_ring_includes_new_replicas_and_excludes_departed_ones() {
-        let index = test_index(MEMBER_TTL).await;
+    async fn leaving_points_ring_at_new_replicas_and_not_departed_ones() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let index = GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL);
         index.register("gw-old", "https://gw-old").await.unwrap();
         index
             .register("gw-stopping", "https://gw-stopping")
             .await
             .unwrap();
+        *state.gateway_ring.write().unwrap() = GatewayRing::new(["gw-old", "gw-stopping"]);
         // A rolling update replaces gw-old after the stopping replica last
         // refreshed its cached ring.
         index.deregister("gw-old").await.unwrap();
         index.register("gw-new", "https://gw-new").await.unwrap();
 
-        let (ring, peers) = index.ring_without("gw-stopping").await.unwrap();
+        leave_ring(&state, &index, "gw-stopping").await;
 
+        let ring = state.gateway_ring.read().unwrap().clone();
         assert_eq!(ring.owner_for("sb-1"), Some("gw-new"));
         assert_eq!(
-            peers,
-            HashMap::from([("gw-new".to_string(), "https://gw-new".to_string())])
+            state
+                .gateway_peers
+                .read()
+                .unwrap()
+                .get("gw-new")
+                .map(String::as_str),
+            Some("https://gw-new")
         );
+        let remaining: Vec<String> = index
+            .live_members()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|member| member.replica_id)
+            .collect();
+        assert_eq!(remaining, vec!["gw-new"]);
     }
 
     #[tokio::test]

@@ -967,7 +967,7 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         );
     }
-    gateway_members::spawn_membership_worker(
+    let membership_worker = gateway_members::spawn_membership_worker(
         state.clone(),
         gateway_members::MEMBER_REFRESH_INTERVAL,
         shutdown_rx.clone(),
@@ -987,13 +987,15 @@ pub(crate) async fn run_server(
     }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
-    // Closing sessions redirect their supervisors through the ring, so pick up
-    // replicas that joined since the last periodic refresh.
-    gateway_members::refresh_ring_for_shutdown(
-        &state,
-        gateway_members::SHUTDOWN_RING_REFRESH_TIMEOUT,
-    )
-    .await;
+    // Closing sessions redirect their supervisors through the ring. Let the
+    // membership worker finish pointing it at the remaining replicas first.
+    if let Some(worker) = membership_worker
+        && tokio::time::timeout(gateway_members::SHUTDOWN_MEMBERSHIP_TIMEOUT, worker)
+            .await
+            .is_err()
+    {
+        warn!("Gateway membership worker did not finish leaving the ring before session shutdown");
+    }
     // A stopped supervisor may still have a detached task deleting its owner
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
