@@ -13,8 +13,6 @@ out of the CLI and gateway control flow.
 - Discover local credentials from environment variables and known config files.
 - Normalize discovered data into provider records.
 - Keep provider-specific parsing rules in provider modules.
-- Preserve exact protobuf durations and their quoted canonical YAML spelling
-  when exporting provider profiles, including profile collections.
 - Avoid logging credential values.
 
 ## Non-Responsibilities

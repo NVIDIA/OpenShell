@@ -1982,48 +1982,7 @@ pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileErr
 }
 
 pub fn profile_to_yaml(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
-    profile_yaml_with_quoted_durations(serde_yml::to_string(profile)?, &[("", profile)])
-}
-
-/// Keep canonical protobuf durations quoted independently of the YAML emitter's
-/// automatic scalar style. Resolve field spans structurally so descriptions and
-/// other user-authored strings cannot be mistaken for duration fields.
-fn profile_yaml_with_quoted_durations(
-    mut yaml: String,
-    profiles: &[(&str, &ProviderTypeProfile)],
-) -> Result<String, ProfileError> {
-    let document = serde_yml::cst::parse_document(&yaml)?;
-    let mut replacements = Vec::new();
-    for (prefix, profile) in profiles {
-        for (index, credential) in profile.credentials.iter().enumerate() {
-            let mut durations = Vec::new();
-            if let Some(refresh) = &credential.refresh {
-                durations.push(("refresh.refresh_before", refresh.refresh_before_wkt));
-                durations.push(("refresh.max_lifetime", refresh.max_lifetime_wkt));
-            }
-            if let Some(grant) = &credential.token_grant {
-                durations.push(("token_grant.cache_ttl", grant.cache_ttl_wkt));
-            }
-            for (field, duration) in durations {
-                if let ProfileDurationWkt::Present(duration) = duration {
-                    let path = format!("{prefix}credentials[{index}].{field}");
-                    let (start, end) = document.span_at(&path).ok_or_else(|| {
-                        serde_yml::Error::Parse(format!(
-                            "serialized duration field missing: {path}"
-                        ))
-                    })?;
-                    // Protobuf duration spellings contain only a sign, digits,
-                    // a decimal point, and the trailing `s`; no escaping needed.
-                    replacements.push((start, end, format!("\"{duration}\"")));
-                }
-            }
-        }
-    }
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    for (start, end, quoted) in replacements.into_iter().rev() {
-        yaml.replace_range(start..end, &quoted);
-    }
-    Ok(yaml)
+    Ok(serde_yml::to_string(profile)?)
 }
 
 pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
@@ -2031,15 +1990,7 @@ pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileE
 }
 
 pub fn profiles_to_yaml(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
-    let prefixes: Vec<_> = (0..profiles.len())
-        .map(|index| format!("[{index}]."))
-        .collect();
-    let entries: Vec<_> = prefixes
-        .iter()
-        .zip(profiles)
-        .map(|(prefix, profile)| (prefix.as_str(), profile))
-        .collect();
-    profile_yaml_with_quoted_durations(serde_yml::to_string(profiles)?, &entries)
+    Ok(serde_yml::to_string(profiles)?)
 }
 
 pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
@@ -3844,9 +3795,18 @@ credentials:
 
         let exact = ProviderTypeProfile::from_proto(&proto);
         let yaml = profile_to_yaml(&exact).unwrap();
-        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
-        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
-        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        // Check string values rather than the emitter's choice of quote style.
+        let document: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        let credential = &document["credentials"][0];
+        assert_eq!(credential["refresh"]["refresh_before"].as_str(), Some("0s"));
+        assert_eq!(
+            credential["refresh"]["max_lifetime"].as_str(),
+            Some("1.500s")
+        );
+        assert_eq!(
+            credential["token_grant"]["cache_ttl"].as_str(),
+            Some("0.500s")
+        );
         assert!(!yaml.contains("refresh_before_seconds"));
         assert!(!yaml.contains("max_lifetime_seconds"));
         assert!(!yaml.contains("cache_ttl_seconds"));
