@@ -5244,6 +5244,12 @@ async fn spawn_docker_control_process(
     let readiness_sandbox_id = sandbox_id.clone();
     let readiness_failures = failure_context.failures.clone();
     let task = tokio::spawn(async move {
+        let remove_supervisor = || {
+            monitored_docker.remove_container(
+                &monitored_supervisor_id,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+        };
         let wait = async {
             let mut stream = monitored_docker.wait_container(
                 &monitored_supervisor_id,
@@ -5258,17 +5264,11 @@ async fn spawn_docker_control_process(
                     &monitored_supervisor_id,
                     Some(StopContainerOptionsBuilder::default().t(5).build()),
                 ).await;
-                let _ = monitored_docker.remove_container(
-                    &monitored_supervisor_id,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                ).await;
+                let _ = remove_supervisor().await;
             }
             result = wait => {
                 if monitored_shutdown.load(Ordering::Acquire) {
-                    let _ = monitored_docker.remove_container(
-                        &monitored_supervisor_id,
-                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                    ).await;
+                    let _ = remove_supervisor().await;
                     return;
                 }
                 if matches!(
@@ -5280,17 +5280,17 @@ async fn spawn_docker_control_process(
                     Ok(Ok(())),
                 ) || monitored_shutdown.load(Ordering::Acquire)
                 {
-                    let _ = monitored_docker.remove_container(
-                        &monitored_supervisor_id,
-                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                    ).await;
+                    let _ = remove_supervisor().await;
                     return;
                 }
                 let (reason, mut message) = docker_supervisor_wait_failure(result);
                 warn!(%sandbox_id, %reason, %message, "Docker supervisor container exited unexpectedly");
                 let log_tail =
                     docker_container_log_tail(&monitored_docker, &monitored_supervisor_id).await;
-                if !log_tail.is_empty() {
+                if reason == CONDITION_WORKSPACE_VALIDATION_FAILED {
+                    warn!(%sandbox_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
+                    message = WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string();
+                } else if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
                 // The gateway can close the supervisor session as soon as it
@@ -5298,15 +5298,13 @@ async fn spawn_docker_control_process(
                 // an overlapping driver stop cannot be published as an
                 // unexpected control failure.
                 if monitored_shutdown.load(Ordering::Acquire) {
+                    let _ = remove_supervisor().await;
                     return;
                 }
                 handle_docker_runtime_failure(failure_context, reason, message).await;
                 // Publish the reason before removing the container. Readiness
                 // may inspect it after cleanup and must still see exit 78.
-                let _ = monitored_docker.remove_container(
-                    &monitored_supervisor_id,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                ).await;
+                let _ = remove_supervisor().await;
             },
         }
     });
@@ -5379,7 +5377,8 @@ async fn wait_for_docker_supervisor_ready(
                     == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)) =>
             {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                return Err(workspace_validation_status(&log_tail));
+                warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
+                return Err(workspace_validation_status());
             }
             _ if state.running == Some(false) => {
                 if let Some(status) =
@@ -5435,17 +5434,15 @@ async fn recorded_workspace_validation_failure(
     failures
         .get(sandbox_id)
         .filter(|failure| failure.reason == CONDITION_WORKSPACE_VALIDATION_FAILED)
-        .map(|failure| workspace_validation_status(&failure.message))
+        .map(|_| workspace_validation_status())
 }
 
 /// Startup failure for a supervisor that exited because the sandbox rejected
-/// the image working directory. The fixed message prefix identifies it for
+/// the image working directory. The message is fixed text, because supervisor
+/// output may contain secrets; the fixed message identifies the failure for
 /// [`supervisor_start_failure_reason`].
-fn workspace_validation_status(log_tail: &str) -> Status {
-    Status::failed_precondition(format!(
-        "{WORKSPACE_VALIDATION_FAILED_MESSAGE}{}",
-        format_log_tail(log_tail)
-    ))
+fn workspace_validation_status() -> Status {
+    Status::failed_precondition(WORKSPACE_VALIDATION_FAILED_MESSAGE)
 }
 
 /// Condition reason for a supervisor that failed before becoming ready.

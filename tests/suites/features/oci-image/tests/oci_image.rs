@@ -494,11 +494,10 @@ impl TestImage {
         let file = context.path().join("Containerfile");
         std::fs::write(&file, containerfile)
             .map_err(|error| format!("write Containerfile: {error}"))?;
-        images.push(Self {
+        let image = Self {
             engine,
             tag: format!("localhost/openshell-test-oci-{name}:{}", std::process::id()),
-        });
-        let image = images.last().expect("registered image");
+        };
         image.engine_command(&[
             "build",
             "--file",
@@ -507,7 +506,9 @@ impl TestImage {
             &image.tag,
             context.path().to_str().ok_or("context path is not UTF-8")?,
         ])?;
-        Ok(image)
+        // A failed build leaves no tag to remove.
+        images.push(image);
+        Ok(images.last().expect("registered image"))
     }
 
     fn remove(&self) -> Result<(), String> {

@@ -3655,8 +3655,8 @@ fn docker_oom_kill_stays_terminal_despite_137() {
 
 #[test]
 fn supervisor_workspace_validation_exit_is_reported_explicitly() {
-    let status = workspace_validation_status("image workspace validation failed: denied");
-    assert!(status.message().contains("log tail: image workspace"));
+    let status = workspace_validation_status();
+    assert_eq!(status.message(), WORKSPACE_VALIDATION_FAILED_MESSAGE);
     assert_eq!(
         supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
         CONDITION_WORKSPACE_VALIDATION_FAILED
