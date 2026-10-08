@@ -656,7 +656,7 @@ async fn postgres_mutation_lock_global_exclusive_blocks_every_scope() {
     let sandbox = random_id("sb");
     let scopes = [
         MutationScope::Global,
-        MutationScope::Workspace(""),
+        MutationScope::profiles(""),
         MutationScope::Workspace(&workspace),
         MutationScope::sandbox(&workspace, &sandbox),
     ];

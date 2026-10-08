@@ -2896,7 +2896,7 @@ pub(super) async fn handle_import_provider_profiles(
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let _mutation_guard = state
         .compute
-        .mutation_guard(MutationScope::Workspace(&workspace))
+        .mutation_guard(MutationScope::profiles(&workspace))
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
@@ -2992,7 +2992,7 @@ pub(super) async fn handle_update_provider_profiles(
     let target_id = normalize_profile_id_request(&request.id)?;
     let _mutation_guard = state
         .compute
-        .mutation_guard(MutationScope::Workspace(&workspace))
+        .mutation_guard(MutationScope::profiles(&workspace))
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
@@ -3157,7 +3157,7 @@ pub(super) async fn handle_delete_provider_profile(
     let id = normalize_profile_id_request(&id)?;
     let _mutation_guard = state
         .compute
-        .mutation_guard(MutationScope::Workspace(&workspace))
+        .mutation_guard(MutationScope::profiles(&workspace))
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
@@ -6017,6 +6017,48 @@ mod tests {
             .expect("import should succeed")
             .into_inner();
         assert!(response.imported);
+    }
+
+    #[tokio::test]
+    async fn import_platform_provider_profile_waits_for_sandbox_mutation_in_any_workspace() {
+        let state = test_server_state().await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("team-a", "platform-import-guard"))
+            .await
+            .unwrap();
+        let task_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            handle_import_provider_profiles(
+                &task_state,
+                authed_request(ImportProviderProfilesRequest {
+                    request_id: String::new(),
+                    profiles: vec![ProviderProfileImportItem {
+                        profile: Some(custom_profile("platform-guarded-import")),
+                        source: "platform-guarded-import.yaml".to_string(),
+                    }],
+                    workspace_scope: None,
+                }),
+            )
+            .await
+        });
+
+        // An import that does not wait finishes well within this window.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+                .await
+                .is_err(),
+            "platform profile import should wait for a sandbox mutation in any workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("import should finish after guard release")
+            .expect("join import task")
+            .expect("import should succeed")
+            .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
     }
 
     #[tokio::test]

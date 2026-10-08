@@ -37,13 +37,15 @@ use tracing::warn;
 /// and workspace-scoped profile writers hold their workspace key exclusively;
 /// sandbox-scoped settings and policy writers hold only their sandbox key
 /// exclusively. A new cross-object writer needs a scope from the same table.
+/// Profile writers pick theirs with [`MutationScope::profiles`].
 #[derive(Clone, Copy, Debug)]
 pub enum MutationScope<'a> {
     /// Global policy/settings and platform-scope profiles. Excludes every
     /// other scope fleet-wide.
     Global,
-    /// Provider and workspace-scoped profile mutations. `""` (platform)
-    /// behaves as `Global`.
+    /// Provider and workspace-scoped profile mutations in a named workspace.
+    /// The platform scope is `Global`: an empty name trips a debug assertion
+    /// and locks as `Global` in release builds.
     Workspace(&'a str),
     /// Any mutation of one sandbox's records, admin or supervisor.
     Sandbox {
@@ -60,10 +62,24 @@ impl<'a> MutationScope<'a> {
         }
     }
 
+    /// Scope of a provider profile write. Platform-scope profiles (`""`)
+    /// feed every workspace's catalog and are validated against sandboxes in
+    /// all workspaces, so they take `Global`; a named workspace takes
+    /// `Workspace(name)`.
+    pub(crate) const fn profiles(workspace: &'a str) -> Self {
+        if workspace.is_empty() {
+            Self::Global
+        } else {
+            Self::Workspace(workspace)
+        }
+    }
+
     /// Keys and modes of this scope:
     ///
-    /// - `Global` and `Workspace("")`: X(global).
-    /// - `Workspace(ws)`: S(global) X(workspace).
+    /// - `Global`: X(global).
+    /// - `Workspace(ws)`: S(global) X(workspace). An empty name is a caller
+    ///   bug that debug builds catch; release builds take X(global), which
+    ///   over-locks rather than under-locks.
     /// - `Sandbox`: S(global) S(workspace) X(sandbox). A legacy sandbox with
     ///   an empty workspace locks the default workspace, where its providers
     ///   resolve.
@@ -71,12 +87,17 @@ impl<'a> MutationScope<'a> {
         let mut set = MutationLockSet::default();
         match *self {
             Self::Global => set.insert(MutationLockKey::Global, LockMode::Exclusive),
-            Self::Workspace("") => {
-                set.insert(MutationLockKey::Global, LockMode::Exclusive);
-            }
             Self::Workspace(workspace) => {
-                set.insert(MutationLockKey::Global, LockMode::Shared);
-                set.insert(MutationLockKey::Workspace(workspace), LockMode::Exclusive);
+                debug_assert!(
+                    !workspace.is_empty(),
+                    "the platform scope is MutationScope::Global; use MutationScope::profiles"
+                );
+                if workspace.is_empty() {
+                    set.insert(MutationLockKey::Global, LockMode::Exclusive);
+                } else {
+                    set.insert(MutationLockKey::Global, LockMode::Shared);
+                    set.insert(MutationLockKey::Workspace(workspace), LockMode::Exclusive);
+                }
             }
             Self::Sandbox {
                 workspace,
@@ -460,7 +481,11 @@ mod tests {
 
         let cases = [
             (MutationScope::Global, keys(&[(Global, Exclusive)])),
-            (MutationScope::Workspace(""), keys(&[(Global, Exclusive)])),
+            (MutationScope::profiles(""), keys(&[(Global, Exclusive)])),
+            (
+                MutationScope::profiles("team-a"),
+                keys(&[(Global, Shared), (Workspace("team-a"), Exclusive)]),
+            ),
             (
                 MutationScope::Workspace("team-a"),
                 keys(&[(Global, Shared), (Workspace("team-a"), Exclusive)]),
@@ -504,9 +529,13 @@ mod tests {
     }
 
     #[test]
-    fn scope_labels_map_platform_workspace_to_global() {
+    fn scope_labels_map_platform_profiles_to_global() {
         assert_eq!(MutationScope::Global.lock_scope(), LockScope::Global);
-        assert_eq!(MutationScope::Workspace("").lock_scope(), LockScope::Global);
+        assert_eq!(MutationScope::profiles("").lock_scope(), LockScope::Global);
+        assert_eq!(
+            MutationScope::profiles("team-a").lock_scope(),
+            LockScope::Workspace
+        );
         assert_eq!(
             MutationScope::Workspace("team-a").lock_scope(),
             LockScope::Workspace
@@ -570,7 +599,7 @@ mod tests {
 
         let mut waiting_guards = vec![
             spawn_guard(&runtime, MutationScope::Global),
-            spawn_guard(&runtime, MutationScope::Workspace("")),
+            spawn_guard(&runtime, MutationScope::profiles("")),
             spawn_guard(&runtime, MutationScope::Workspace("w1")),
             spawn_guard(&runtime, MutationScope::sandbox("w1", "a")),
         ];
@@ -1029,6 +1058,13 @@ mod tests {
     async fn random_scope_mix_never_deadlocks() {
         let runtime = test_runtime().await;
         run_random_scope_mix(&[runtime], "", 64, 50, Duration::from_secs(20)).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "platform scope")]
+    fn empty_workspace_scope_panics_in_debug_builds() {
+        let _ = MutationScope::Workspace("").lock_set();
     }
 
     #[cfg(debug_assertions)]
