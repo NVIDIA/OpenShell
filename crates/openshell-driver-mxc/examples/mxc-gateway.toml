@@ -25,8 +25,5 @@ backend = "process_container"
 # process_container only: AppContainer capabilities to grant.
 # pc_capabilities = []
 
-# isolation_session only. Never use "small" (known OS bug).
-default_configuration_id = "composable"
-
 # Enable --debug on wxc-exec invocations.
 debug = false

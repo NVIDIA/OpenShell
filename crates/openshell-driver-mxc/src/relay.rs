@@ -26,8 +26,8 @@
 //! host, so a loopback listener is unreachable unless traffic is sent through
 //! the CONNECT proxy; that proxy can also capture the bridge's separate
 //! sandbox-local target connection. Binding one concrete host interface keeps
-//! the target hop on sandbox loopback and lets `allowLocalNetwork` authorize
-//! only the host callback. In principle another host or local process could
+//! the target hop on sandbox loopback and lets the MXC 1.0 directional ingress
+//! policy authorize only the host callback. In principle another host or local process could
 //! race to connect before the real Phase A/B peer does and
 //! hijack or inject traffic into the forward. Both phases are authenticated
 //! against a fresh, unguessable per-forward nonce (`ForwardSink::

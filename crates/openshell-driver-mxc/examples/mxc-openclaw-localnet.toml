@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # mxc-openclaw-localnet.toml
-# Like mxc-openclaw-gateway.toml but uses allowLocalNetwork instead of egress_proxy.
-# allowLocalNetwork=true lets the AppContainer reach the host's loopback (the gateway
-# relay) without routing through the egress proxy, which breaks node.js DLL init.
+# Like mxc-openclaw-gateway.toml but uses permissive MXC 1.0 ingress and
+# host-loopback actions instead of egress_proxy. This lets the AppContainer
+# reach the host relay without routing through the egress proxy, which breaks
+# node.js DLL initialization.
 
 [openshell]
 version = 2
@@ -20,9 +21,8 @@ pc_allow_local_network = true
 # openclaw-gateway.yaml's `ui: { allow_graphical_ui: true, ... }`. Needed
 # because Node.js (OpenClaw's runtime) touches user32/gdi32 during its own
 # startup and dies with STATUS_DLL_INIT_FAILED under the Win32k lockdown
-# that applies when a policy has no `ui:` section, confirmed empirically
-# against mxc-release-binaries-v0.8.0, even though this target never
-# actually opens a window.
+# that applies under MXC 1.0.0 when a policy has no `ui:` section, even
+# though this target never actually opens a window.
 
 # The workload command, cwd, and environment are supplied per sandbox by
 # run-openclaw-forward-test.ps1 through `sandbox create`.

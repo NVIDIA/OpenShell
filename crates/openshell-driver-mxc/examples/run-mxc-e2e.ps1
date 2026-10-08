@@ -176,8 +176,104 @@ $script:registered = $false
 $tomlBase = $null
 $gwLog    = $null
 $gwErrLog = $null
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "OPENSHELL_GATEWAY",
+    "OPENSHELL_GATEWAY_ENDPOINT",
+    "OPENSHELL_GATEWAY_INSECURE",
+    "OPENSHELL_GATEWAY_CONFIG",
+    "OPENSHELL_GATEWAY_NAME"
+)
 
 # --- Helpers ------------------------------------------------------------------
+
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [Parameter(Mandatory = $true)]
+        [bool] $Exists,
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if (-not $Exists) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Value.Length -eq 0) {
+        # Windows PowerShell 5.1 maps an empty value passed through
+        # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+        # so an inherited empty entry remains distinguishable from absence.
+        if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+        }
+        if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+        }
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Enter-IsolatedCliEnvironment {
+    $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+    foreach ($name in $cliEnvironmentNames) {
+        $exists = $processEnvironment.Contains($name)
+        $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+        }
+    }
+    $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-e2e-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $isolatedPaths = @{
+        APPDATA = Join-Path $script:cliStateRoot "appdata"
+        LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+        XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+        XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+        XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+        foreach ($entry in $isolatedPaths.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Exit-IsolatedCliEnvironment
+        throw
+    }
+}
+
+function Exit-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        $snapshot = $script:cliEnvironmentSnapshot[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
+    if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+        Remove-Item -LiteralPath $script:cliStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # Render host-runtime settings from the pristine base. Sandbox workload
 # settings are create-time driver config, not gateway-wide TOML.
@@ -233,14 +329,14 @@ function Stop-Gw($p) {
 
 function Register-Cli {
     if ($script:registered) { return }
-    $env:OPENSHELL_GATEWAY = ""
 
+    $expectedEndpoint = "http://127.0.0.1:$Port"
     $addResult = Invoke-NativeCaptured $cli @(
-        "gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName
+        "gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName
     )
     $addText = ($addResult.Output -join "`n")
     if ($addText) { $addResult.Output | ForEach-Object { Info $_ } }
-    if ($addResult.ExitCode -ne 0 -and $addText -notmatch '(?i)already exists') {
+    if ($addResult.ExitCode -ne 0) {
         throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
     }
 
@@ -293,7 +389,7 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
         $probeDir = Join-Path $env:TEMP "mxc-e2e-probe"
         New-Item -ItemType Directory -Force $probeDir | Out-Null
         $config = @{
-            version     = "0.6.0-alpha"
+            version     = "1.0.0"
             containerId = "e2e-probe-pc"
             containment = "processcontainer"
             process     = @{ commandLine = "C:\Windows\System32\cmd.exe /c exit 0"; cwd = $probeDir; timeout = 30000 }  # ms (MXC process.timeout is milliseconds)
@@ -314,21 +410,17 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
 
     if ($backendName -eq "isolation_session") {
         $config = @{
-            version     = "0.6.0-alpha"
-            phase       = "provision"
+            version     = "1.0.0"
             containment = "isolation_session"
-            filesystem  = @{ readwritePaths = @(); readonlyPaths = @() }
-            experimental = @{
-                isolation_session = @{
-                    configurationId = "composable"
-                    provision       = @{}
-                }
+            network     = @{
+                egress  = @{ default = "allow" }
+                ingress = @{ default = "allow"; hostLoopback = "allow" }
             }
         }
         $json = $config | ConvertTo-Json -Depth 20 -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $b64 = [Convert]::ToBase64String($bytes)
-        $outObj = & $wxc --config-base64 $b64 --experimental 2>&1
+        $outObj = & $wxc --config-base64 $b64 --operation provision 2>&1
         $exitCode = $LASTEXITCODE
         $output = ($outObj -join "`n").ToLower()
         if ($output -match "backend_unavailable" -or $output -match "0x80040154") {
@@ -345,19 +437,11 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
             $sandboxId = $parsed.result.sandboxId
         } catch {}
         if ($null -ne $sandboxId) {
-            $deprovConfig = @{
-                version      = "0.6.0-alpha"
-                phase        = "deprovision"
-                sandboxId    = $sandboxId
-                experimental = @{
-                    # Unit variant: null, not @{} (malformed_request otherwise).
-                    isolation_session = @{ deprovision = $null }
-                }
-            }
+            $deprovConfig = @{ version = "1.0.0" }
             $deprovJson = $deprovConfig | ConvertTo-Json -Depth 20 -Compress
             $deprovBytes = [System.Text.Encoding]::UTF8.GetBytes($deprovJson)
             $deprovB64 = [Convert]::ToBase64String($deprovBytes)
-            & $wxc --config-base64 $deprovB64 --experimental 2>&1 | Out-Null
+            & $wxc --config-base64 $deprovB64 --operation deprovision --container-id $sandboxId 2>&1 | Out-Null
         }
         return @{ Live = $true; Reason = "isolation_session probe: provisioned and deprovisioned" }
     }
@@ -379,6 +463,8 @@ $backendProbe = @{ Live = $false; Reason = "not probed" }
 $runId = Get-Date -Format 'MMddHHmmss'
 
 try {
+    Enter-IsolatedCliEnvironment
+
     # Start the transcript inside the guarded region so a Start-Transcript failure
     # is caught and the results bundle is still produced. Pre-flight runs
     # immediately below, so the transcript still captures the whole run.
@@ -750,7 +836,10 @@ try {
         }
     } finally {
         if ($gw -and -not $KeepRunning) { Stop-Gw $gw }
-        if ($KeepRunning -and $gw) { Info "gateway pid $($gw.Id) left running (-KeepRunning)" }
+        if ($KeepRunning -and $gw) {
+            Info "gateway pid $($gw.Id) left running (-KeepRunning)"
+            Info "CLI inspection endpoint: `$env:OPENSHELL_GATEWAY_ENDPOINT='http://127.0.0.1:$Port'"
+        }
     }
 }
 catch {
@@ -758,6 +847,8 @@ catch {
     Bad "harness error: $harnessError"
 }
 finally {
+    Exit-IsolatedCliEnvironment
+
     # --- Summary + results bundle ---------------------------------------------
     Step "Summary"
     $results | Format-Table -AutoSize

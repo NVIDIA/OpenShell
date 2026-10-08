@@ -1819,11 +1819,10 @@ fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         "EnforceOsPolicy" => "MXC sandbox OS policy enforced".to_string(),
         "SandboxConsoleReferencePlumbed" => "MXC sandbox console reference plumbed".to_string(),
         // The one network-plane event the provider emits. Empirically the OS
-        // Sandboxing provider fires this event *only* when an egress proxy is
-        // configured for the sandbox, but it does **not** surface the port for
-        // MXC's URL-based proxy — `proxyPort` is always 0 (MXC redirects egress via
-        // a `network.proxy.localhost` policy URL, not the OS built-in proxy-port
-        // mechanism this field reflects). The real per-sandbox listening port is
+        // Sandboxing provider fires this event when governed egress is
+        // configured for the sandbox, but `proxyPort` is always 0 because the
+        // OpenShell listener is supplied through process proxy environment and
+        // MXC receives only loopback-only directional policy. The real per-sandbox listening port is
         // recorded on the host proxy's own Network Activity [4001] "Listen" event.
         // So the presence of this event means a proxy WAS configured; only append a
         // port on the off chance a future provider/build populates it.

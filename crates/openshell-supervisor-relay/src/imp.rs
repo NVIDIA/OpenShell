@@ -55,8 +55,8 @@
 //! `mxc.rs`'s `run_oneshot`) instead of the usual `null`/`piped`-for-logging
 //! split, giving the gateway a write channel straight into the `AppContainer`.
 //! This needs **no `AppContainer` network capability at all**: it's inherited
-//! process handles, not network traffic, so none of `egress_proxy` /
-//! `network.proxy` / `privateNetworkClientServer` are involved.
+//! process handles, not network traffic, so neither `egress_proxy` nor
+//! `privateNetworkClientServer` is involved.
 //!
 //! Protocol: newline-delimited JSON, mirroring MXC's own `pipe_server` tool:
 //!   Request:  `{"id": <N>, "op": "<op>", "data": <any>}`

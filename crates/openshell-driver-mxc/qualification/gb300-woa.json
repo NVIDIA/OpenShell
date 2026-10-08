@@ -326,7 +326,7 @@
       "credits_gb300_arm64": false,
       "allow_skip": true,
       "prerequisites": [
-        "Windows build 26300.8553 or newer",
+        "Windows build 26340.9212 or newer",
         "IsoSessionApp.dll and isolation_session support in wxc-exec"
       ],
       "commands": [

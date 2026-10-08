@@ -28,9 +28,8 @@ pc_least_privilege = false
 # openclaw-gateway.yaml's `ui: { allow_graphical_ui: true, ... }`. Needed
 # because Node.js (OpenClaw's runtime) touches user32/gdi32 during its own
 # startup and dies with STATUS_DLL_INIT_FAILED under the Win32k lockdown
-# that applies when a policy has no `ui:` section, confirmed empirically
-# against mxc-release-binaries-v0.8.0, even though this target never
-# actually opens a window.
+# that applies under MXC 1.0.0 when a policy has no `ui:` section, even
+# though this target never actually opens a window.
 
 # Egress proxy for outbound TCP connectivity.
 egress_proxy      = true

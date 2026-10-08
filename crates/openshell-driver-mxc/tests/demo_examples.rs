@@ -138,6 +138,25 @@ fn shipped_aggregate_e2e_assets_support_mock_wiring_validation() {
 }
 
 #[test]
+fn shipped_runners_isolate_cli_state_and_gateway_overrides() {
+    for name in ["run-mxc-e2e.ps1", "run-ocsf-audit.ps1"] {
+        let runner = read_example(name);
+        for required in [
+            "Enter-IsolatedCliEnvironment",
+            "Exit-IsolatedCliEnvironment",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "OPENSHELL_GATEWAY",
+            "OPENSHELL_GATEWAY_ENDPOINT",
+            "Remove-Item \"Env:$name\"",
+            "CLI inspection endpoint:",
+        ] {
+            assert!(runner.contains(required), "{name} is missing {required}");
+        }
+    }
+}
+
+#[test]
 fn shipped_audit_and_websocket_configs_use_current_schema() {
     for name in ["mxc-ocsf-audit.toml", "mxc-ws-gateway.toml"] {
         let source = read_example(name);
@@ -206,22 +225,31 @@ fn shipped_inference_policies_are_narrow_and_valid_after_rendering() {
         "/portable/demo"
     };
     let fixtures = [
-        ("ollama.yaml", "local_ollama", "127.0.0.1", share),
+        (
+            "ollama.yaml",
+            "local_ollama",
+            "127.0.0.1",
+            share,
+            "__CMD_EXE__",
+            r"C:\Windows\System32\cmd.exe",
+        ),
         (
             "inference.yaml",
             "nvidia_inference",
             "integrate.api.nvidia.com",
             share,
+            "__CURL_EXE__",
+            r"C:\Windows\System32\curl.exe",
         ),
     ];
-    for (name, rule_name, endpoint, share) in fixtures {
+    for (name, rule_name, endpoint, share, binary_placeholder, binary_path) in fixtures {
         let rendered = read_example(name)
             .replace("__OPENSHELL_DEMO_SHARE__", share)
             .replace("__OLLAMA_HOST__", "127.0.0.1")
             .replace("__OLLAMA_PORT__", "11434")
             .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
             .replace("__INFERENCE_PORT__", "443")
-            .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
+            .replace(binary_placeholder, binary_path);
         let policy = parse_sandbox_policy(&rendered)
             .unwrap_or_else(|error| panic!("failed to parse rendered {name}: {error}"));
         validate_sandbox_policy(&policy)
@@ -241,7 +269,7 @@ fn shipped_inference_policies_are_narrow_and_valid_after_rendering() {
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(
             rule.binaries[0].path.to_ascii_lowercase(),
-            r"c:\windows\system32\cmd.exe"
+            binary_path.to_ascii_lowercase()
         );
     }
 }
@@ -288,6 +316,8 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
     assert!(cloud.contains("--noproxy"));
     assert!(cloud.contains("in-process wxc shim"));
     assert!(cloud.contains("does not provide MXC or AppContainer isolation"));
+    assert!(cloud.contains("$policyText.Replace(\"__CURL_EXE__\", $curlExe)"));
+    assert!(!cloud.contains("$policyText.Replace(\"__CMD_EXE__\", $cmdExe)"));
 }
 
 #[cfg(target_os = "windows")]

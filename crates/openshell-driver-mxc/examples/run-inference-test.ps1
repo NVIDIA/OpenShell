@@ -209,7 +209,7 @@ try {
     $sharePolicy = $ShareDir.Replace('\', '/')
     $policyText = [System.IO.File]::ReadAllText((Join-Path $here "inference.yaml"))
     $policyText = $policyText.Replace("__OPENSHELL_DEMO_SHARE__", $sharePolicy)
-    $policyText = $policyText.Replace("__CMD_EXE__", $cmdExe)
+    $policyText = $policyText.Replace("__CURL_EXE__", $curlExe)
     $policyText = $policyText.Replace("__INFERENCE_HOST__", $apiUri.DnsSafeHost)
     $policyText = $policyText.Replace("__INFERENCE_PORT__", [string] $apiUri.Port)
     Write-Utf8 $policyUsed $policyText

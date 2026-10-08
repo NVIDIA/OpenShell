@@ -68,6 +68,13 @@ The selected backend changes both lifecycle and enforceable policy. Backend
 selection belongs to gateway startup configuration, not to an individual
 sandbox request.
 
+The driver emits the stable MXC 1.0.0 schema. IsolationSession lifecycle
+routing uses `wxc-exec --operation`; later phases pass the returned identity
+with `--container-id`, while the JSON omits the legacy `phase`, `sandboxId`, and
+`experimental.isolation_session` fields. Provisioning declares MXC's required
+all-allow IsolationSession network posture, and exec layers OpenShell variables
+onto the agent user's default environment.
+
 | Property | `process_container` | `isolation_session` |
 |---|---|---|
 | Runtime model | One-shot AppContainer process; default backend | Persistent MXC session used to run one configured process |
@@ -112,10 +119,16 @@ The production mapping in
 | Policy area | Windows enforcement |
 |---|---|
 | Filesystem | On ProcessContainer, `read_only` and `read_write` become MXC path grants, and `include_workdir` adds the resolved working directory as read-write. The mapper normalizes separators but does not translate Linux-rooted locations into Windows paths. ProcessContainer supplies the default-deny boundary. IsolationSession cannot accept non-empty filesystem grants; without them, its backend defaults determine filesystem visibility. |
-| Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
+| Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. This path requires MXC's `baseContainerSupportsIngressHostLoopbackAllow` host capability; fallback tiers without it can run ordinary ProcessContainer workloads but cannot reach the host proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
 | UI | ProcessContainer maps graphical UI, directional clipboard access, and input injection into MXC's top-level `ui` object. An absent section maps to the restrictive UI posture. Within an explicit section, omitted fields deny. IsolationSession rejects even an empty explicit section. |
 | Process | MXC supplies the Windows process-isolation boundary, but the mapper has no portable equivalent for `run_as_user` or `run_as_group`; callers must not treat those fields as enforced Windows identity controls. The canonical command, environment, and working directory are launch inputs rather than process-policy grants. |
 | Landlock | MXC has no equivalent for the Linux Landlock compatibility mode, including `hard_requirement`. The mapper reports a non-blocking warning; Windows filesystem assurance comes from the selected MXC backend's native semantics, not Landlock. |
+
+The exported standalone mapper also emits MXC 1.0.0 directional networking.
+It maps numeric IP/CIDR destinations and TCP ports directly, but records
+error-severity loss for DNS names, wildcards, binary scope, and L7 behavior.
+Callers that need those semantics must use the governed-egress split; no
+pre-1.0 host-list output mode remains.
 
 The driver reports `supports_live_policy_updates = false`. The gateway therefore
 rejects mutations that would change a running MXC sandbox's effective policy or
