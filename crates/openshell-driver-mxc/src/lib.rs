@@ -51,7 +51,7 @@ pub use relay::RelayHandle;
 pub use policy::{EmbeddedPolicyMapper, MapCtx, MapError, MappedConfig, PolicyMapper};
 #[cfg(target_os = "windows")]
 pub use policy_map::{
-    DEFAULT_COARSE_MXC_VERSION, DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION,
-    LossItem, MxcMappingOptions, MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult,
-    build_loss_report, map_to_mxc, render_readme, split_policy,
+    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, LossItem, MxcMappingOptions,
+    MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult, build_loss_report, map_to_mxc,
+    render_readme, split_policy,
 };

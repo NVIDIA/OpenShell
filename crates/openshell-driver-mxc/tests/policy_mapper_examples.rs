@@ -11,8 +11,8 @@
 //! Byte-for-byte parity with the previous raw-YAML mapper is intentionally
 //! *not* asserted: routing through the canonical typed `SandboxPolicy`
 //! normalizes ports and uses an unordered proto map (we sort keys). Instead we
-//! assert the substantive invariants — filesystem fidelity, the host allowlist,
-//! deny-by-default, and that broadening features are flagged as losses.
+//! assert the substantive invariants — filesystem fidelity, MXC 1.0 directional
+//! networking, deny-by-default, and explicit losses for proxy-only behavior.
 
 #![cfg(target_os = "windows")]
 
@@ -56,6 +56,17 @@ fn str_list(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn allowed_cidrs(config: &Value) -> Vec<String> {
+    config["network"]["egress"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["to"].as_array())
+        .flatten()
+        .filter_map(|peer| peer["cidr"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn proxy_addr() -> std::net::SocketAddr {
     "127.0.0.1:18080".parse().unwrap()
 }
@@ -80,13 +91,14 @@ fn all_example_policies_map_with_invariants() {
         let result = map_to_mxc(&policy, &MxcMappingOptions::default());
         let cfg = &result.config;
 
-        // Deny-by-default network posture is always emitted.
-        assert_eq!(
-            cfg["network"]["defaultPolicy"],
-            "block",
-            "{} must emit defaultPolicy=block",
-            path.display()
-        );
+        // Stable MXC 1.0 directional deny-by-default posture is always emitted.
+        assert_eq!(cfg["version"], "1.0.0", "{} schema", path.display());
+        assert_eq!(cfg["network"]["egress"]["default"], "deny");
+        assert_eq!(cfg["network"]["ingress"]["default"], "deny");
+        assert_eq!(cfg["network"]["ingress"]["hostLoopback"], "deny");
+        assert!(cfg["network"].get("defaultPolicy").is_none());
+        assert!(cfg["network"].get("allowedHosts").is_none());
+        assert!(cfg["network"].get("enforcementMode").is_none());
 
         // Filesystem fidelity: read_write / read_only copied exactly.
         if let Some(fs) = &policy.filesystem {
@@ -104,14 +116,19 @@ fn all_example_policies_map_with_invariants() {
             );
         }
 
-        // Every non-wildcard endpoint host appears in allowedHosts.
-        let allowed = str_list(&cfg["network"]["allowedHosts"]);
+        // Hostname policies stay fail-closed and require governed egress; the
+        // coarse artifact contains only numeric CIDRs.
+        let allowed = allowed_cidrs(cfg);
         for rule in policy.network_policies.values() {
             for ep in &rule.endpoints {
-                if !ep.host.is_empty() && !ep.host.contains('*') {
+                if !ep.host.is_empty() && ep.host.parse::<std::net::IpAddr>().is_err() {
                     assert!(
-                        allowed.contains(&ep.host),
-                        "{} missing host {} in allowedHosts",
+                        result.loss.iter().any(|item| {
+                            item.severity == "error"
+                                && item.path.contains(".host")
+                                && item.message.contains(&ep.host)
+                        }),
+                        "{} missing DNS/glob loss for {}",
                         path.display(),
                         ep.host
                     );
@@ -119,14 +136,14 @@ fn all_example_policies_map_with_invariants() {
             }
         }
 
-        // allowedHosts is deduplicated.
+        // Directional destination CIDRs are deduplicated.
         let mut sorted = allowed.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(
             sorted.len(),
             allowed.len(),
-            "duplicate hosts for {}",
+            "duplicate CIDRs for {}",
             path.display()
         );
 
@@ -210,7 +227,7 @@ fn all_example_policies_split_with_expected_invariants() {
             assert!(str_list(&cfg["filesystem"]["readonlyPaths"]).is_empty());
         }
 
-        assert_eq!(cfg["version"], "0.8.0-alpha");
+        assert_eq!(cfg["version"], "1.0.0");
         assert_eq!(cfg["network"]["egress"]["default"], "deny");
         assert_eq!(
             cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],
@@ -252,24 +269,22 @@ fn quickstart_coarse_mapping() {
     let result = map_to_mxc(&policy, &MxcMappingOptions::default());
     let cfg = &result.config;
 
-    assert_eq!(
-        str_list(&cfg["network"]["allowedHosts"]),
-        vec!["api.github.com".to_owned()]
-    );
+    assert!(allowed_cidrs(cfg).is_empty());
     assert_eq!(
         str_list(&cfg["filesystem"]["readwritePaths"]),
         vec!["/sandbox", "/tmp", "/dev/null"]
     );
     assert_eq!(cfg["containment"], "bubblewrap");
 
-    // The github_api endpoint loses port, protocol, access, and binary scope.
+    // DNS, protocol, access, and binary scope require governed egress. The port
+    // itself is representable but no directional rule is emitted without a CIDR.
     let has = |severity: &str, needle: &str| {
         result
             .loss
             .iter()
             .any(|i| i.severity == severity && i.path.contains(needle))
     };
-    assert!(has("error", "endpoints[0].port"), "expected port loss");
+    assert!(has("error", "endpoints[0].host"), "expected DNS host loss");
     assert!(
         has("error", "endpoints[0].protocol"),
         "expected protocol loss"
@@ -395,11 +410,19 @@ fn split_policy_rejects_proxy_redirect_on_isolation_session() {
         .collect();
     assert_eq!(
         errors.len(),
-        1,
-        "expected one containment error: {errors:?}"
+        2,
+        "expected filesystem and containment errors: {errors:?}"
     );
-    assert_eq!(errors[0].path, "containment");
-    assert!(errors[0].message.contains("processcontainer"));
+    let filesystem = errors
+        .iter()
+        .find(|item| item.path == "filesystem_policy.grants")
+        .expect("isolation_session filesystem error");
+    assert!(filesystem.message.contains("cannot enforce"));
+    let containment = errors
+        .iter()
+        .find(|item| item.path == "containment")
+        .expect("isolation_session proxy-containment error");
+    assert!(containment.message.contains("processcontainer"));
     assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 
@@ -414,16 +437,18 @@ fn network_only_policy_has_empty_filesystem() {
 
     assert!(str_list(&cfg["filesystem"]["readwritePaths"]).is_empty());
     assert!(str_list(&cfg["filesystem"]["readonlyPaths"]).is_empty());
-    assert_eq!(
-        str_list(&cfg["network"]["allowedHosts"]),
-        vec!["api.anthropic.com".to_owned()]
-    );
+    assert!(allowed_cidrs(cfg).is_empty());
+    assert!(result.loss.iter().any(|item| {
+        item.severity == "error"
+            && item.path.contains(".host")
+            && item.message.contains("api.anthropic.com")
+    }));
 }
 
 // ── New tests: proxy JSON shape and non-127.0.0.1 guard ──────────────────────
 
 #[test]
-fn split_with_loopback_addr_emits_loopback_only_08_shape() {
+fn split_with_loopback_addr_emits_loopback_only_1_0_shape() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
@@ -436,7 +461,7 @@ fn split_with_loopback_addr_emits_loopback_only_08_shape() {
     let result = split_policy(&policy, &opts).expect("split returns Some");
     let cfg = &result.mxc_config;
 
-    assert_eq!(cfg["version"], "0.8.0-alpha");
+    assert_eq!(cfg["version"], "1.0.0");
     assert_eq!(cfg["network"]["egress"]["default"], "deny");
     assert_eq!(
         cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],

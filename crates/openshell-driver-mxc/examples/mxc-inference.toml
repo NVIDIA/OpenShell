@@ -11,7 +11,6 @@ version = 2
 [openshell.drivers.mxc]
 wxc_exec_path = "wxc-exec.exe"
 backend = "process_container"
-default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
 egress_proxy = true

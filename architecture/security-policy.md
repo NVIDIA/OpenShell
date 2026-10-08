@@ -39,9 +39,9 @@ contract. Any explicit section, including `{}`, is rejected before driver
 validation or provisioning when that capability is false. The MXC
 `process_container` mapper translates the fields to MXC's top-level `ui` object
 under its `processcontainer` containment value and treats omitted fields inside
-the section as deny. That object is common to MXC's 0.8 stable and 0.9
-development schemas. Both schema lines reject it for `isolation_session`, so
-that backend advertises no support and the mapper also rejects it in depth.
+the section as deny. That object is part of MXC's stable 1.0 schema, which
+rejects it for `isolation_session`, so that backend advertises no support and
+the mapper also rejects it in depth.
 Linux, macOS, and other non-MXC paths advertise no support: explicit UI policy
 fails closed, while an absent section leaves their runtime behavior unchanged.
 

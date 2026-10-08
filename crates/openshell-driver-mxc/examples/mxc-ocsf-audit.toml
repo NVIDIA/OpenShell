@@ -25,7 +25,6 @@ wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 # captures. (isolation_session is "dark" — it emits no provider events.)
 backend = "process_container"
 
-default_configuration_id = "composable"
 
 debug = false
 
@@ -33,9 +32,9 @@ debug = false
 etw_audit = true
 
 # Per-sandbox governed egress. Enabling this makes the driver start a host CONNECT
-# proxy and hand MXC a `network.proxy` redirect, which is what makes MXC emit the
-# SandboxProxyConfigured event — the config event mapped to OCSF CONFIG [5019]
-# that completes full event coverage. Requires backend = process_container and a
+# proxy and hand MXC a loopback-only directional policy. MXC emits the
+# SandboxProxyConfigured event, which maps to OCSF CONFIG [5019] and completes
+# full event coverage. Requires backend = process_container and a
 # loopback (127.0.0.1) seed address; the driver allocates a unique ephemeral port
 # per sandbox from this seed. Run-ocsf-audit.ps1 disables this when passed
 # -NoProxy.

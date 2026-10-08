@@ -24,8 +24,8 @@ The central architectural conclusion is that OpenShell rejects porting its Linux
 in-sandbox supervisor to Windows as part of this design. The value layers the
 supervisor delivers on Linux — egress policy enforcement (OPA), L7 HTTP
 inspection — are relocated to the host by running OpenShell's existing CONNECT
-proxy inside the driver process and pointing MXC's built-in `network.proxy`
-redirect at it. The integration therefore collapses to three moving parts: the
+proxy inside the driver process and giving MXC a loopback-only directional
+policy. The integration therefore collapses to three moving parts: the
 native Windows OpenShell gateway, a Windows-only MXC compute driver crate, and an
 unmodified `wxc-exec` binary, with no OpenShell binary running inside the
 sandbox.
@@ -46,9 +46,9 @@ Windows is a primary environment for the agents OpenShell targets, particularly
 for GeForce and enterprise Windows users. We want native, OS-level isolation
 that runs unelevated, with the same policy, inference, and audit guarantees users
 get on Linux. Windows 11-Preview Builds now supports MXC (`processcontainer`, backed by
-AppContainer + a Low Integrity token) as an OS-native sandbox primitive that
-already honors a `network.proxy` egress redirect. That makes a supervisor-free,
-host-enforced design feasible without any changes to Microsoft's runtime.
+AppContainer + a Low Integrity token) as an OS-native sandbox primitive. MXC
+1.0 directional policy can restrict egress to host loopback, making a
+supervisor-free, host-enforced design feasible.
 
 This is worth an RFC rather than a single issue because it is a cross-cutting
 architectural decision: it adds a new compute-driver model (in-process,
@@ -128,8 +128,8 @@ flowchart LR
         wxc -->|"creates and runs"| sandbox_a
         wxc -->|"creates and runs"| sandbox_n
 
-        sandbox_a -.->|"MXC network.proxy<br/>localhost:port_A"| proxy_a
-        sandbox_n -.->|"MXC network.proxy<br/>localhost:port_N"| proxy_n
+        sandbox_a -.->|"MXC loopback-only egress<br/>proxy env: port_A"| proxy_a
+        sandbox_n -.->|"MXC loopback-only egress<br/>proxy env: port_N"| proxy_n
     end
 
     clients -->|"gRPC + mTLS"| control
@@ -272,9 +272,9 @@ Governed egress is the core value layer. When it is enabled,
 `egress_proxy_addr` serves as a loopback address seed. For each sandbox, the MXC
 driver preserves the configured IP and binds port `0` to allocate a fresh
 ephemeral port. It starts the existing OpenShell host CONNECT proxy with that
-sandbox's trimmed network-only policy, then writes the allocated port to MXC's
-`network.proxy = { localhost: N }` redirect. Loopback inside an AppContainer is
-host loopback, so sandbox egress reaches the proxy running in the in-process MXC
+sandbox's trimmed network-only policy, injects the allocated address into the
+process proxy environment, and gives MXC loopback-only directional egress.
+Loopback inside an AppContainer reaches the proxy running in the in-process MXC
 driver inside the gateway process.
 
 The host-listener-to-sandbox topology is **1:1**, not many-to-one. Multiple
@@ -291,7 +291,7 @@ identity derived from the configured `agent_command`. The current host-mode path
 evaluates L4 host:port allow/deny via OPA, handles plaintext and forward-proxy L7
 traffic, and emits OCSF events. HTTPS MITM trust bootstrap and gateway
 denial/activity bus wiring remain follow-up work. The default `processcontainer`
-backend already honors `network.proxy`, so this design requires no MXC changes.
+backend enforces the MXC 1.0 loopback rule used by this design.
 
 ### Part 3 - Policy translation between OpenShell and MXC
 
@@ -308,23 +308,23 @@ vs exec-time split.
 | filesystem read-only paths | MXC | `filesystem.readonlyPaths` | provision |
 | filesystem denied paths | MXC | limited / unsupported | provision |
 | process (uid/gid/seccomp) | — (no analog) | reject (default) | — |
-| network (OPA / L7 / inference / privacy) | host CONNECT proxy | `network.proxy = { localhost: N }` redirect | provision |
+| network (OPA / L7 / inference / privacy) | host CONNECT proxy | MXC 1.0 loopback-only directional egress | provision |
 
 The primary governed-egress design does **not** try to map the full OpenShell
-network policy into MXC network policy. MXC receives a fail-closed redirect
-layer: `network.defaultPolicy = "block"`, empty direct allowlists, and
-`network.proxy = { localhost: N }`. The original OpenShell `network_policies`
-are preserved and handed to the host CONNECT proxy, which remains responsible
-for ports, binaries, L7 rules, `inference.local`, privacy routing, and audit.
+network policy into MXC network policy. MXC receives a fail-closed directional
+layer: `network.egress.default = "deny"`, a loopback-only CIDR grant, and
+host-loopback ingress. The original OpenShell `network_policies` are preserved
+and handed to the host CONNECT proxy, which remains responsible for ports,
+binaries, L7 rules, `inference.local`, privacy routing, and audit.
 
 The coarse MXC-only mapper is a separate fallback and analysis path for cases
-where no proxy is in the loop. In that mode, MXC can roughly express literal
-host/IP/CIDR allowlists, but it cannot encode ports, protocols, per-binary scope,
-TLS inspection behavior, credential rewrite, inference routing, or REST,
-WebSocket, and GraphQL rules. The mapper emits a structured loss report and
-rejects error-severity losses rather than silently broadening access. Critically,
-MXC defaults to `defaultPolicy: "allow"` when the network block is omitted, so
-both paths must explicitly emit `network.defaultPolicy: "block"`.
+where no proxy is in the loop. In that mode, MXC 1.0 can express numeric
+IP/CIDR destinations and TCP ports, but it cannot encode DNS names, wildcards,
+protocol/L7 behavior, per-binary scope, TLS inspection behavior, credential
+rewrite, or inference routing. The mapper emits a structured loss report and
+rejects error-severity losses rather than silently broadening access. Both
+paths explicitly emit `network.egress.default = "deny"`; there is no pre-1.0
+host-list compatibility mode.
 
 Across the five OpenShell example policies, the MXC-only coarse mapping is
 schema-valid but lossy: an aggregate of 64 access-broadening errors, 32
@@ -335,11 +335,11 @@ the host CONNECT proxy receives and enforces the original OpenShell network
 policy.
 
 To consume OpenShell policy more faithfully over time, MXC would need
-kernel-enforceable additions such as port-scoped network endpoints, a filesystem
-`defaultPolicy`, per-process/binary network scoping, and DNS/wildcard handling. A
+kernel-enforceable additions such as a filesystem default posture,
+per-process/binary network scoping, and DNS/wildcard handling. A
 proposed two-surface direction for Microsoft keeps `ContainerConfig` as the
-execution manifest (add portable kernel-enforceable fields such as ports and
-filesystem `defaultPolicy`) and adds a separate `policyProxy` surface for L7 and
+execution manifest (add portable kernel-enforceable fields such as a filesystem
+default posture) and adds a separate `policyProxy` surface for L7 and
 dynamic policy so HTTP/WebSocket/GraphQL parsing, credential rewrite, audit, and
 hot-reload stay out of every backend runner. None of these are required for the
 host-enforced design proposed here; they are enhancements that would deepen
@@ -352,10 +352,10 @@ kernel-level defense-in-depth.
   Default backend `processcontainer`; `isolation_session` opt-in. Requires
   Windows 11 build ≥ 26100 and `wxc-exec.exe` present.
 - **D2 — Reject porting the supervisor for native Windows.** Use a host proxy +
-  MXC `network.proxy` redirect for governed egress, plus driver-owned host-side
+  MXC loopback-only directional policy for governed egress, plus driver-owned host-side
   behavior for credentials and exec. No in-sandbox OpenShell binary is part of
   this RFC. Consequence: governed egress on the opt-in `isolation_session`
-  backend depends on Microsoft extending `network.proxy` to that backend; until
+  backend depends on Microsoft adding an enforceable loopback-only path; until
   then the design defaults to `processcontainer`, where it works today.
 - **D3 — User-launched native Windows gateway for the current scope.** Run
   `openshell-gateway.exe` as a regular user process. Clients connect over gRPC
@@ -392,8 +392,8 @@ are never affected and the changes can land additively.
   mapping so a gateway restart can reconcile or clean up orphaned sessions, and
   add a periodic reconcile loop once MXC exposes a list/inspect API.
 - **Opt-in `isolation_session` egress.** Becomes available if and when Microsoft
-  extends `network.proxy` to that backend; the same host proxy then governs its
-  egress.
+  adds an enforceable loopback-only path to that backend; the same host proxy
+  then governs its egress.
 
 Validation follows a layered pyramid: pure-Rust unit tests for the JSON
 builders/parsers and policy mapper (on the Windows MSVC test lane), a mock
@@ -407,13 +407,13 @@ the gateway config reference and the architecture docs.
 
 | Risk | Mitigation |
 |---|---|
-| MXC `allowedHosts`/`blockedHosts` not enforced on Windows yet, so there is no kernel-level defense-in-depth beneath the host proxy. | Rely on the host proxy for host-level allow/deny |
+| MXC 1.0 directional rules cannot express DNS names or binary/L7 scope, so the host proxy remains required for full policy fidelity. | Keep MXC egress loopback-only and rely on the authenticated host proxy for DNS, binary, and L7 decisions. |
 | Per-sandbox proxy routing must remain collision-free when multiple sandboxes run concurrently. | Bind a fresh ephemeral port on `127.0.0.1` for each sandbox and retain its proxy handle in the driver registry, making the listener-to-sandbox mapping 1:1. |
 | `--config-base64` carries credentials in argv (briefly visible in process listings). | Zero-fill after invocation; prefer passing config on stdin. |
 | Concurrency: `isolation_session` is single-session; `processcontainer` limits are unverified. | Validate `processcontainer` concurrency and document any cap. |
 | OCSF fidelity: with no in-sandbox supervisor, arbitrary in-process events are not visible (only network + lifecycle). | Accept reduced fidelity; an ETW/callback hook from the Microsoft MXC team will help restore in-process visibility later. |
 | Restart and external deletion: the registry is in-memory, so a gateway restart or out-of-band MXC deletion is not immediately reflected in OpenShell state. | Persist the sandbox-id ⇄ session-id mapping in SQLite, reconcile or deprovision orphans on startup, and add periodic reconcile when MXC exposes list/inspect. |
-| Policy fidelity: MXC cannot enforce port/binary/L7 policy, so the MXC-only tier is a coarse approximation. | Fail-safe mapper (always `block`, never silently broaden) + host proxy as the real enforcer + a published loss report. |
+| Policy fidelity: MXC cannot enforce DNS/binary/L7 policy, so the MXC-only tier is a coarse approximation. | Fail-safe mapper (always directional deny-by-default, never silently broaden) + host proxy as the real enforcer + a published loss report. |
 | Microsoft dependency: several deepening improvements are outside OpenShell's control. | Ship the host-enforced design with no MXC changes required; treat MXC enhancements as optional, not blockers. |
 
 ## Alternatives Considered
@@ -458,7 +458,7 @@ the gateway config reference and the architecture docs.
 - **RFC 0001 (core architecture)** and `architecture/sandbox.md` define the
   supervisor/relay model that the Windows design deliberately removes.
 - **Microsoft MXC (`wxc-exec`)** provides the Windows AppContainer-based
-  sandbox primitive and the `network.proxy` redirect that makes host-side
+  sandbox primitive and loopback-only directional policy that makes host-side
   enforcement possible without an in-sandbox agent.
 - **Open Policy Agent and OpenShell's CONNECT proxy / L7 / inference / privacy
   stack** are reused unchanged on the host, demonstrating that the value layers

@@ -33,7 +33,6 @@ version = 2
 wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 
 backend = "isolation_session"
-default_configuration_id = "composable"
 
 # The workload command, cwd, and environment are supplied per sandbox by
 # run-openclaw-forward-test.ps1 through `sandbox create`.

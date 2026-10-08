@@ -676,7 +676,6 @@ compute_drivers = ["mxc"]
 [openshell.drivers.mxc]
 wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 backend                 = "process_container"
-default_configuration_id = "composable"
 pc_least_privilege      = false
 pc_capabilities         = []
 # Pattern-C governed egress. The address is a loopback seed; the driver
@@ -695,6 +694,10 @@ binary with the gateway's identity instead of the intended `wxc-exec`. There
 is no usable default; older configurations that relied on the bare relative
 filename `wxc-exec.exe` must set an absolute path before upgrading.
 
+MXC 1.0 removed the IsolationSession `configurationId`. OpenShell implements
+only the MXC 1.0 contract and rejects the legacy `default_configuration_id`
+setting. Remove it from older gateway configurations before upgrading.
+
 `etw_audit` defaults to `false`. When enabled, the gateway account must be an
 administrator or belong to the Windows Performance Log Users group. Workload
 commands and working directories remain sandbox-scoped. Supply the command with
@@ -703,13 +706,14 @@ described below.
 
 Set `egress_proxy = true` with a loopback seed such as
 `egress_proxy_addr = "127.0.0.1:18080"` to enable the Windows Pattern-C split.
-MXC redirects sandbox traffic to a sandbox-unique port on the configured
-loopback IP, where the host CONNECT proxy enforces the trimmed network policy.
+The driver injects the sandbox-unique host CONNECT proxy address while MXC 1.0
+allows only loopback egress and denies direct Internet traffic. The proxy
+enforces the trimmed network policy.
 The driver exposes the proxy's public CA bundle through a sandbox-unique
 internal filesystem grant so HTTPS clients can read the injected trust path;
 the CA private key remains in gateway memory.
-Governed egress requires `process_container` until MXC supports `network.proxy`
-for isolation sessions.
+Governed egress requires `process_container` until MXC supports an enforceable
+loopback-only path for isolation sessions.
 MXC rejects policies containing `network_middlewares` before launch because
 this host-proxy path does not yet receive the gateway's built-in and remote
 middleware registry.
@@ -948,6 +952,13 @@ tier and host-preparation warnings in PowerShell:
 & "C:\path\to\wxc-exec.exe" --probe
 ```
 
+Governed egress through OpenShell's host CONNECT proxy requires the probe field
+`probes.baseContainerSupportsIngressHostLoopbackAllow` to be `true`. A host that
+reports `false` can still run ordinary ProcessContainer workloads, but MXC
+rejects the bidirectional host-loopback capability required to reach the proxy.
+`prepare-system-drive` does not add this capability; use a Windows build and
+isolation tier whose MXC probe reports it as supported.
+
 If the probe selects AppContainer + DACL (`appcontainer-dacl`) and recommends
 `prepare-system-drive`, obtain `wxc-host-prep.exe` from the MXC binaries
 distribution and run this command once in an elevated PowerShell session.
@@ -979,10 +990,9 @@ compute_drivers = ["mxc"]
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 # process_container (default) or isolation_session.
 backend = "process_container"
-default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities    = []
-# Pattern C governed egress. MXC 0.8 denies direct Internet egress and permits
+# Pattern C governed egress. MXC 1.0 denies direct Internet egress and permits
 # host loopback; proxy-aware clients receive HTTP_PROXY/HTTPS_PROXY and the host
 # CONNECT proxy enforces the trimmed network policy. Requires process_container.
 egress_proxy      = false
