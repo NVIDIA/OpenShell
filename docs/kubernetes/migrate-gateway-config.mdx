@@ -46,6 +46,45 @@ runtime counterparts.
 
 ## Examples
 
+The following values configure OIDC, telemetry, sandbox images, managed
+workspaces, rate limiting, and the Kubernetes Secrets credential driver before
+migration:
+
+```yaml
+server:
+  oidc:
+    issuer: https://idp.example/realms/openshell
+    audience: openshell-cli
+    jwksTtl: 3600
+  otlp:
+    endpoint: http://otel-collector:4317
+    serviceName: production-gateway
+  drivers:
+    kubernetes:
+      workspaceMode: managed
+  grpcRateLimit:
+    requests: 120
+    windowSeconds: 60
+  credentialDrivers:
+    kubernetesSecrets:
+      enabled: true
+      namespace: provider-secrets
+sandbox:
+  image:
+    repository: registry.example/sandbox
+    tag: latest
+    pullPolicy: IfNotPresent
+supervisor:
+  image:
+    registry: registry.example
+    repository: openshell-supervisor
+    tag: latest
+  sandboxRuntime:
+    boundaryPort: 5500
+```
+
+After migration, the same settings use `gatewayConfig`:
+
 ```yaml
 gatewayConfig:
   openshell.gateway.oidc:
@@ -65,6 +104,7 @@ gatewayConfig:
   openshell.gateway:
     grpc_rate_limit_requests: 120
     grpc_rate_limit_window_seconds: 60
+    credential_drivers: [kubernetes-secrets]
   openshell.credential_drivers.kubernetes-secrets:
     namespace: provider-secrets
 ```

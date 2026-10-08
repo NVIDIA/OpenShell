@@ -106,16 +106,7 @@ The Secret may also be issued by cert-manager, or you can reference the chart's 
 
 ### Install with HTTPS termination
 
-Enable an HTTPS listener, point it at the Secret, configure the gateway for a plaintext backend, and provide OIDC settings in `oidc-values.yaml`:
-
-```yaml
-server:
-  disableTls: true
-gatewayConfig:
-  openshell.gateway.oidc:
-    issuer: https://keycloak.example.com/realms/openshell
-    audience: openshell-cli
-```
+Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so Envoy forwards plaintext, and configure an OIDC issuer for client identity:
 
 ```shell
 helm upgrade --install openshell \
@@ -128,9 +119,13 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.protocol=HTTPS \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
-  --values oidc-values.yaml \
+  --set server.disableTls=true \
+  --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://keycloak.example.com/realms/openshell' \
+  --set 'gatewayConfig.openshell\.gateway\.oidc.audience=openshell-cli' \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
+
+Escape the dots in the TOML table name and single-quote the `--set` argument so Helm treats `openshell.gateway.oidc` as one key under `gatewayConfig`.
 
 Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
 
@@ -175,8 +170,8 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --values oidc-values.yaml \
-  --set server.disableTls=false \
+  --set 'gatewayConfig.openshell\.gateway\.oidc.issuer=https://keycloak.example.com/realms/openshell' \
+  --set 'gatewayConfig.openshell\.gateway\.oidc.audience=openshell-cli' \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
