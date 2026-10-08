@@ -15,10 +15,10 @@ permissions:
   packages: write
 
 env:
-  SOURCE_COMMIT: c8b86500771c6837f1abdc3850b5076a712cd0e7
-  CARGO_VERSION: 0.0.116-globster.6
-  ARTIFACT_TAG: 0.0.116-globster-c8b86500
-  CHART_VERSION: 0.0.116-globster.6
+  SOURCE_COMMIT: e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
+  CARGO_VERSION: 0.0.116-globster.7
+  ARTIFACT_TAG: 0.0.116-globster-e90f55cd
+  CHART_VERSION: 0.0.116-globster.7
   GATEWAY_REPOSITORY: ghcr.io/globster-monday/openshell/gateway
   SUPERVISOR_REPOSITORY: ghcr.io/globster-monday/openshell/supervisor
   CHART_REPOSITORY: oci://ghcr.io/globster-monday/openshell/helm-chart
@@ -116,21 +116,21 @@ jobs:
   gateway-binaries:
     needs: preflight
     if: needs.preflight.outputs.state == 'publish'
-    uses: globster-monday/OpenShell/.github/workflows/build-gateway-binaries.yml@c8b86500771c6837f1abdc3850b5076a712cd0e7
+    uses: globster-monday/OpenShell/.github/workflows/build-gateway-binaries.yml@e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     with:
-      cargo-version: 0.0.116-globster.6
-      image-tag: 0.0.116-globster-c8b86500
-      checkout-ref: c8b86500771c6837f1abdc3850b5076a712cd0e7
+      cargo-version: 0.0.116-globster.7
+      image-tag: 0.0.116-globster-e90f55cd
+      checkout-ref: e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     secrets: inherit
 
   supervisor-binaries:
     needs: preflight
     if: needs.preflight.outputs.state == 'publish'
-    uses: globster-monday/OpenShell/.github/workflows/build-sandbox-binaries.yml@c8b86500771c6837f1abdc3850b5076a712cd0e7
+    uses: globster-monday/OpenShell/.github/workflows/build-sandbox-binaries.yml@e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     with:
-      cargo-version: 0.0.116-globster.6
-      image-tag: 0.0.116-globster-c8b86500
-      checkout-ref: c8b86500771c6837f1abdc3850b5076a712cd0e7
+      cargo-version: 0.0.116-globster.7
+      image-tag: 0.0.116-globster-e90f55cd
+      checkout-ref: e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     secrets: inherit
 
   gateway:
@@ -138,14 +138,14 @@ jobs:
     if: >-
       always() && needs.preflight.outputs.state == 'publish' &&
       needs.gateway-binaries.result == 'success'
-    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@c8b86500771c6837f1abdc3850b5076a712cd0e7
+    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     with:
       component: gateway
       binary: openshell-gateway
       target-suffix: unknown-linux-gnu
-      image-tag: 0.0.116-globster-c8b86500
+      image-tag: 0.0.116-globster-e90f55cd
       image-repository: ghcr.io/globster-monday/openshell
-      checkout-ref: c8b86500771c6837f1abdc3850b5076a712cd0e7
+      checkout-ref: e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     secrets: inherit
 
   supervisor:
@@ -153,14 +153,14 @@ jobs:
     if: >-
       always() && needs.preflight.outputs.state == 'publish' &&
       needs.supervisor-binaries.result == 'success'
-    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@c8b86500771c6837f1abdc3850b5076a712cd0e7
+    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     with:
       component: supervisor
       binary: openshell-sandbox
       target-suffix: unknown-linux-musl
-      image-tag: 0.0.116-globster-c8b86500
+      image-tag: 0.0.116-globster-e90f55cd
       image-repository: ghcr.io/globster-monday/openshell
-      checkout-ref: c8b86500771c6837f1abdc3850b5076a712cd0e7
+      checkout-ref: e90f55cd5f5861f50c37c359e9dfa8ee2bbbff7a
     secrets: inherit
 
   chart:
