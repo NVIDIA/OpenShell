@@ -375,9 +375,9 @@ rg -q 'available evidence demonstrates a Critical' \
 rg -q 'Keep reviews pragmatic and convergent' \
     "$GATOR_DIR/prompts/gator.md"
 rg -q '### Pragmatic review calibration' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$GATOR_DIR/../../../.agents/agents/principal-engineer-reviewer.md"
 rg -q 'Do not mine unchanged code for new findings' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$GATOR_DIR/../../../.agents/agents/principal-engineer-reviewer.md"
 rg -q 'three finding-bearing rounds' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'alone is not a process blocker' \
@@ -387,7 +387,7 @@ rg -q '`test_dispatch_required`' \
 rg -q 'Apply `test:windows` whenever a PR affects Windows support' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'require the `test:windows` label' \
-    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+    "$GATOR_DIR/../../../.agents/agents/principal-engineer-reviewer.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
 rg -Fq 'Write `Summary` as natural prose that can be read aloud' \

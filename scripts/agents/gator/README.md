@@ -51,7 +51,7 @@ The launcher:
 - Installs `gator/bin/validate-review-findings` to downgrade blockers that lack the required reachability, ownership, base-vs-head, impact, and reproducer evidence.
 - Keeps that normalized evidence as Gator's internal review contract, then renders validated blockers for people as a read-aloud `Summary`, an actionable `Fix`, and a deterministic `Verify`. Exact paths and only the additional provenance an implementation agent needs appear in collapsed `Agent context`; raw evidence headings such as `Base` and `Head` are not posted publicly. Review-process provenance, docs and E2E disposition, SHAs, and state codes appear at the end of the summary in collapsed `Gator metadata`, while required human actions remain visible.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
-- Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
+- Bakes `.agents/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
 - Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during active cycles and passive sleeps.
