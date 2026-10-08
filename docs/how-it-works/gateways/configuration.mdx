@@ -1018,6 +1018,14 @@ path is never mounted into or exposed to the workload container.
 
 ### Podman
 
+Default GPU selection reads CDI devices from Podman's server info at startup
+and refreshes them before validation and creation. `host.cdiSpecDirs` identifies
+the server's spec directories; OpenShell does not scan these paths locally.
+Presence of either `host.cdiSpecDirs` or `host.discoveredDevices` makes the
+server inventory authoritative, including an empty result. Only older servers
+that omit both fields use local device-path discovery. An info API failure
+fails the default GPU request instead of selecting stale devices.
+
 Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.
 
 Caller `cdi_devices` entries must be valid CDI qualified names
