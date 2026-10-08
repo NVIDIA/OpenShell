@@ -18,8 +18,8 @@ use tokio::time::Instant;
 use super::codec::LegacyStageFailure;
 use super::request::{LegacyRequestExchange, LegacyRequestStage, legacy_request_collection_limit};
 use crate::{
-    DescribedChainEntry, HttpDirection, HttpProtocol, HttpStageTransport,
-    MAX_MIDDLEWARE_CHAIN_TIMEOUT, OnError, StageReportSink,
+    DescribedChainEntry, HttpDirection, HttpProtocol, HttpResponsePreflightInput,
+    HttpStageTransport, MAX_MIDDLEWARE_CHAIN_TIMEOUT, OnError, StageReportSink,
 };
 
 /// What the pipeline gives a legacy adapter stage when it opens it.
@@ -37,8 +37,52 @@ pub struct LegacyStageContext {
     /// Receives this exchange's [`crate::StageReport`]s. Report before
     /// sending the result the report qualifies: the pipeline records a stage
     /// that reports `LegacyFailOpen` with its `Continue` or `Unchanged`
-    /// result as failed open.
+    /// result as failed open. A response exchange forwards every report to
+    /// the relay as it arrives, and retains only `LegacyFailOpen`.
     pub reports: Arc<dyn StageReportSink>,
+    /// Response exchanges: the final upstream response head before any stage
+    /// ran. 0.1.x derived every stage's body modes from it.
+    #[allow(dead_code, reason = "the legacy response adapter reads it")]
+    pub original_response: Option<Arc<HttpResponsePreflightInput>>,
+}
+
+/// A legacy adapter stage opened for one exchange.
+pub struct LegacyStage {
+    pub transport: Arc<dyn HttpStageTransport>,
+    /// Engine callbacks of a legacy response stage.
+    pub response: Option<Arc<dyn LegacyResponseControl>>,
+}
+
+impl LegacyStage {
+    /// A stage with no engine callbacks.
+    pub fn transport(transport: Arc<dyn HttpStageTransport>) -> Self {
+        Self {
+            transport,
+            response: None,
+        }
+    }
+}
+
+/// Engine callbacks a legacy response adapter exposes beside its transport,
+/// for 0.1.x behavior the version 2 stage protocol cannot express.
+pub trait LegacyResponseControl: Send + Sync {
+    /// The input of a BUFFERED stage outgrew the selected limit
+    /// (`whole_body_over_capacity`), or its whole-body deadline expired
+    /// (`whole_body_accumulation_timeout`), after `input_size` bytes. The
+    /// pipeline holds that input.
+    ///
+    /// Records the 0.1.x outcome and returns true when the stage fails open.
+    /// The pipeline then passes the original body through the rest of the
+    /// chain without reporting the stage itself; otherwise it fails the
+    /// exchange with `middleware_failed: {reason}`. Either way the stage
+    /// ends with `MIDDLEWARE_FAILURE`.
+    fn buffered_input_failed(&self, reason: &str, input_size: usize) -> bool;
+
+    /// The pipeline calls this before `Begin` on a STREAM stage that follows
+    /// a BUFFERED stage. 0.1.x withheld every byte of output while a
+    /// whole-body stage buffered, so the stage holds its output until its
+    /// input ends and the head commits only then.
+    fn withhold_output_until_end(&self);
 }
 
 /// The 30 s chain deadline 0.1.x applied across a chain's legacy
@@ -67,14 +111,15 @@ impl LegacyChainClock {
     }
 }
 
-/// Open the adapter transport for a legacy entry, or `None` while the
-/// direction has no adapter.
+/// Open the adapter stage for a legacy entry, or `None` while the direction
+/// has no adapter.
 ///
 /// Legacy request entries run on the request adapter (`legacy::request`).
 /// Legacy response entries run on the legacy response engine until the
-/// response cutover (`legacy::response::adapter`), and the pipeline fails a
-/// legacy response entry closed if one reaches it.
-pub fn open_stage(context: &LegacyStageContext) -> Option<Arc<dyn HttpStageTransport>> {
+/// response cutover (`legacy::response::adapter`), which also supplies its
+/// [`LegacyResponseControl`], and the pipeline fails a legacy response entry
+/// closed if one reaches it.
+pub fn open_stage(context: &LegacyStageContext) -> Option<LegacyStage> {
     #[cfg(test)]
     if let Some(stage) = test_support::open(context) {
         return Some(stage);
@@ -89,7 +134,7 @@ pub fn open_stage(context: &LegacyStageContext) -> Option<Arc<dyn HttpStageTrans
                     chain_clock: context.chain_clock.clone(),
                 },
             )?;
-            Some(Arc::new(stage))
+            Some(LegacyStage::transport(Arc::new(stage)))
         }
         HttpDirection::Response => None,
     }
@@ -128,6 +173,15 @@ pub fn checks_request_input_per_stage(entries: &[DescribedChainEntry]) -> bool {
     entries
         .iter()
         .all(|entry| entry.http_protocol() != Some(HttpProtocol::V2))
+}
+
+/// True when a response chain still runs on the legacy response engine: it
+/// has no version 2 entry. The legacy response cutover (L2) removes this, and
+/// every response chain then runs on the stage pipeline.
+pub fn response_chain_uses_legacy_engine(entries: &[DescribedChainEntry]) -> bool {
+    !entries
+        .iter()
+        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2))
 }
 
 /// What a legacy BUFFERED stage does when its input outgrows the selected
@@ -217,6 +271,13 @@ impl LegacyStagePolicy {
             HttpDirection::Response => Some(LegacyOverflow::Fail),
         }
     }
+
+    /// True when a stage that completed waits for the chain's outcome as its
+    /// `session_end`. 0.1.x ended a completed response stage when the whole
+    /// response ended, with the response's outcome.
+    pub fn ends_with_chain(self) -> bool {
+        self.direction == HttpDirection::Response
+    }
 }
 
 #[cfg(test)]
@@ -225,9 +286,9 @@ pub mod test_support {
 
     use std::cell::RefCell;
 
-    use super::{Arc, HttpStageTransport, LegacyStageContext};
+    use super::{Arc, HttpStageTransport, LegacyStage, LegacyStageContext};
 
-    type Factory = Arc<dyn Fn(&LegacyStageContext) -> Arc<dyn HttpStageTransport>>;
+    type Factory = Arc<dyn Fn(&LegacyStageContext) -> LegacyStage>;
 
     thread_local! {
         static FACTORY: RefCell<Option<Factory>> = const { RefCell::new(None) };
@@ -237,11 +298,18 @@ pub mod test_support {
     pub fn install(
         factory: impl Fn(&LegacyStageContext) -> Arc<dyn HttpStageTransport> + 'static,
     ) -> FactoryGuard {
+        install_stages(move |context| LegacyStage::transport(factory(context)))
+    }
+
+    /// Like [`install`], for stages with engine callbacks.
+    pub fn install_stages(
+        factory: impl Fn(&LegacyStageContext) -> LegacyStage + 'static,
+    ) -> FactoryGuard {
         FACTORY.with(|slot| *slot.borrow_mut() = Some(Arc::new(factory)));
         FactoryGuard
     }
 
-    pub fn open(context: &LegacyStageContext) -> Option<Arc<dyn HttpStageTransport>> {
+    pub fn open(context: &LegacyStageContext) -> Option<LegacyStage> {
         FACTORY.with(|slot| slot.borrow().as_ref().map(|factory| factory(context)))
     }
 

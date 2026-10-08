@@ -757,6 +757,7 @@ where
                 HttpBodyOutput::Start {
                     header_mutations,
                     output_body_bytes,
+                    ..
                 } if fixed_length.is_none() => {
                     let output_body_bytes = output_body_bytes.filter(|_| !input_chunked);
                     let head = commit_live_head(head, &header_mutations, output_body_bytes)

@@ -121,6 +121,7 @@ impl ResponseCase {
                 ..Default::default()
             }),
             declared_input_bytes: self.declared,
+            unavailable_body_modes: Vec::new(),
         }
     }
 }

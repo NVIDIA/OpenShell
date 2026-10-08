@@ -133,7 +133,40 @@ pub fn apply(
             count: mutations.len(),
         });
     }
+    apply_checked(
+        authority,
+        existing_headers,
+        connection_nominated_headers,
+        mutations,
+        true,
+    )
+}
 
+/// Apply the mutations of several middleware responses, each of which
+/// [`apply`] already accepted, in order. Every rule except the per-response
+/// count and size limits applies.
+pub fn apply_accumulated(
+    authority: HeaderAuthority,
+    existing_headers: &[HttpHeader],
+    connection_nominated_headers: &[String],
+    mutations: &[HeaderMutation],
+) -> Result<Vec<HttpHeader>, HeaderMutationError> {
+    apply_checked(
+        authority,
+        existing_headers,
+        connection_nominated_headers,
+        mutations,
+        false,
+    )
+}
+
+fn apply_checked(
+    authority: HeaderAuthority,
+    existing_headers: &[HttpHeader],
+    connection_nominated_headers: &[String],
+    mutations: &[HeaderMutation],
+    limit_size: bool,
+) -> Result<Vec<HttpHeader>, HeaderMutationError> {
     let mut headers = existing_headers.to_vec();
     let mut mutation_bytes = 0usize;
     for mutation in mutations {
@@ -170,7 +203,9 @@ pub fn apply(
                 mutation_bytes = mutation_bytes
                     .saturating_add(name.len())
                     .saturating_add(write.value.len());
-                enforce_size_limit(mutation_bytes)?;
+                if limit_size {
+                    enforce_size_limit(mutation_bytes)?;
+                }
 
                 let action = ExistingHeaderAction::try_from(write.on_existing)
                     .map_err(|_| HeaderMutationError::InvalidExistingAction)?;
@@ -204,7 +239,9 @@ pub fn apply(
                     });
                 }
                 mutation_bytes = mutation_bytes.saturating_add(name.len());
-                enforce_size_limit(mutation_bytes)?;
+                if limit_size {
+                    enforce_size_limit(mutation_bytes)?;
+                }
                 headers.retain(|existing| existing.name != name);
             }
             None => return Err(HeaderMutationError::Empty),

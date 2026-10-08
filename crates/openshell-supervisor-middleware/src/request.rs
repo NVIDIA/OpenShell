@@ -9,8 +9,8 @@
 //! as request adapter stages in chain order with version 2 entries.
 
 use openshell_core::proto::{
-    HeaderMutation, HttpBodyMode, HttpHeader, HttpRequestPreflightHead, HttpRequestTarget,
-    MiddlewareSessionEndReason, RequestContext, http_preflight,
+    HeaderMutation, HttpBodyMode, HttpBodyUnavailableReason, HttpHeader, HttpRequestPreflightHead,
+    HttpRequestTarget, MiddlewareSessionEndReason, RequestContext, http_preflight,
 };
 use prost::Message as _;
 use tokio::sync::mpsc;
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::headers::HeaderAuthority;
 use crate::legacy::hooks;
 use crate::pipeline::{
-    self, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
+    self, BodyModeOffer, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
     HttpStageDiagnostics, Pipeline, PipelineSpec, PipelineTimeouts, StageHead,
 };
 use crate::{
@@ -152,24 +152,27 @@ impl StageHead for RequestHead<'_> {
         })
     }
 
-    fn permitted_body_modes(&self, entry: &DescribedChainEntry) -> Vec<HttpBodyMode> {
+    fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer {
         let limit = entry.max_payload_bytes();
-        let mut modes = Vec::new();
+        let mut offer = BodyModeOffer::default();
         if limit == 0 {
-            return modes;
+            return offer;
         }
-        if entry.supports_http_body_mode(HttpBodyMode::Buffered)
-            && self
+        if entry.supports_http_body_mode(HttpBodyMode::Buffered) {
+            if self
                 .input
                 .declared_body_length
                 .is_none_or(|length| length <= limit as u64)
-        {
-            modes.push(HttpBodyMode::Buffered);
+            {
+                offer.permit(HttpBodyMode::Buffered);
+            } else {
+                offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::OverLimit);
+            }
         }
         if entry.supports_http_body_mode(HttpBodyMode::Stream) {
-            modes.push(HttpBodyMode::Stream);
+            offer.permit(HttpBodyMode::Stream);
         }
-        modes
+        offer
     }
 }
 
@@ -180,6 +183,9 @@ fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
         trailer_authority: HeaderAuthority::RequestTrailers,
         connection_nominated: input.connection_nominated_headers.clone(),
         timeouts: PipelineTimeouts::default(),
+        output_trailers: true,
+        reports: None,
+        original_response: None,
     }
 }
 

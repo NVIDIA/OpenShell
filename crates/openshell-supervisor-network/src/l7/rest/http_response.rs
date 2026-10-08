@@ -3,6 +3,10 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod pipeline;
+#[cfg(test)]
+mod pipeline_tests;
+
 use super::*;
 
 /// Default wall-clock bound shared by whole-body stages in one response.
@@ -18,6 +22,9 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
+    /// The client request used HTTP/1.1, so a re-framed response may be
+    /// chunked. An HTTP/1.0 client cannot decode chunked framing.
+    pub(crate) client_accepts_chunked: bool,
 }
 
 #[derive(Clone)]
@@ -340,6 +347,23 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    if openshell_supervisor_middleware::http_response_uses_pipeline(&described) {
+        return Box::pin(pipeline::relay_response_through_pipeline(
+            request_method,
+            upstream,
+            client,
+            middleware,
+            described,
+            parsed,
+            buffered,
+            header_end,
+            status_code,
+            body_length,
+            server_wants_close,
+            event_stream,
+        ))
+        .await;
+    }
     let original_headers = parsed.headers.clone();
     let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();
@@ -468,7 +492,8 @@ where
     };
 
     let status_line = response_status_line(header_bytes)?;
-    let supports_chunked_response = !status_line.starts_with("HTTP/1.0 ");
+    let supports_chunked_response =
+        middleware.client_accepts_chunked && !status_line.starts_with("HTTP/1.0 ");
     let bodiless = is_bodiless_response(request_method, status_code);
     if bodiless {
         let finish = match session.finish(Vec::new()).await {
@@ -887,6 +912,104 @@ fn emit_http_response_diagnostics(
     }
 }
 
+/// One stage invocation as a response middleware OCSF event records it.
+struct ResponseInvocationRecord<'a> {
+    config_name: &'a str,
+    implementation: &'a str,
+    outcome: String,
+    /// HTTP protocol 1 (0.1): the body unit the record describes.
+    sequence: Option<u64>,
+    input_bytes: usize,
+    failed: bool,
+    blocked: bool,
+    /// Platform-owned reason of a failed stage.
+    failure_reason: Option<&'a str>,
+}
+
+fn http_response_invocation_event(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    status_code: u16,
+    record: &ResponseInvocationRecord<'_>,
+) -> openshell_ocsf::OcsfEvent {
+    let ResponseInvocationRecord {
+        config_name,
+        implementation,
+        outcome,
+        sequence,
+        input_bytes,
+        failed,
+        blocked,
+        failure_reason,
+    } = record;
+    let (failed, blocked) = (*failed, *blocked);
+    let mut message = format!(
+        "HTTP_RESPONSE_MIDDLEWARE config={config_name} implementation={implementation} outcome={outcome}"
+    );
+    if let Some(sequence) = sequence {
+        write!(&mut message, " sequence={sequence}").expect("writing to a String cannot fail");
+    }
+    write!(&mut message, " input_bytes={input_bytes} failed={failed}")
+        .expect("writing to a String cannot fail");
+    if let Some(reason) = failure_reason {
+        write!(&mut message, " reason={reason}").expect("writing to a String cannot fail");
+    }
+    let mut builder = openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
+        .activity(openshell_ocsf::ActivityId::Other)
+        .action(if blocked {
+            openshell_ocsf::ActionId::Denied
+        } else if failed {
+            openshell_ocsf::ActionId::Other
+        } else {
+            openshell_ocsf::ActionId::Allowed
+        })
+        .disposition(if blocked {
+            openshell_ocsf::DispositionId::Blocked
+        } else if failed {
+            openshell_ocsf::DispositionId::Error
+        } else {
+            openshell_ocsf::DispositionId::Allowed
+        })
+        .severity(if failed || blocked {
+            openshell_ocsf::SeverityId::Medium
+        } else {
+            openshell_ocsf::SeverityId::Informational
+        })
+        .status(if failed || blocked {
+            openshell_ocsf::StatusId::Failure
+        } else {
+            openshell_ocsf::StatusId::Success
+        })
+        .http_request(openshell_ocsf::HttpRequest::new(
+            &target.method,
+            openshell_ocsf::Url::new(
+                &target.scheme,
+                &target.host,
+                &target.path,
+                u16::try_from(target.port).unwrap_or_default(),
+            ),
+        ))
+        .http_response(openshell_ocsf::HttpResponse { code: status_code })
+        .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+            &target.host,
+            u16::try_from(target.port).unwrap_or_default(),
+        ))
+        .firewall_rule(policy_name, "supervisor-middleware")
+        .unmapped("middleware_config", *config_name)
+        .unmapped("middleware_implementation", *implementation)
+        .unmapped("response_middleware_outcome", outcome.as_str());
+    if let Some(sequence) = sequence {
+        builder = builder.unmapped("sequence", *sequence);
+    }
+    builder = builder
+        .unmapped("input_bytes", *input_bytes)
+        .unmapped("failed", failed);
+    if let Some(reason) = failure_reason {
+        builder = builder.unmapped("failure_reason", *reason);
+    }
+    builder.message(message).build()
+}
+
 pub(super) fn http_response_middleware_invocation_events(
     policy_name: &str,
     target: &HttpRequestTarget,
@@ -896,69 +1019,22 @@ pub(super) fn http_response_middleware_invocation_events(
     invocations
         .iter()
         .map(|invocation| {
-            let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
-            let failed = invocation.failed;
-            let blocked = invocation.outcome
-                == openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery;
-            openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
-            .activity(openshell_ocsf::ActivityId::Other)
-            .action(if blocked {
-                openshell_ocsf::ActionId::Denied
-            } else if failed {
-                openshell_ocsf::ActionId::Other
-            } else {
-                openshell_ocsf::ActionId::Allowed
-            })
-            .disposition(if blocked {
-                openshell_ocsf::DispositionId::Blocked
-            } else if failed {
-                openshell_ocsf::DispositionId::Error
-            } else {
-                openshell_ocsf::DispositionId::Allowed
-            })
-            .severity(if failed || blocked {
-                openshell_ocsf::SeverityId::Medium
-            } else {
-                openshell_ocsf::SeverityId::Informational
-            })
-            .status(if failed || blocked {
-                openshell_ocsf::StatusId::Failure
-            } else {
-                openshell_ocsf::StatusId::Success
-            })
-            .http_request(openshell_ocsf::HttpRequest::new(
-                &target.method,
-                openshell_ocsf::Url::new(
-                    &target.scheme,
-                    &target.host,
-                    &target.path,
-                    u16::try_from(target.port).unwrap_or_default(),
-                ),
-            ))
-            .http_response(openshell_ocsf::HttpResponse { code: status_code })
-            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
-                &target.host,
-                u16::try_from(target.port).unwrap_or_default(),
-            ))
-            .firewall_rule(policy_name, "supervisor-middleware")
-            .unmapped("middleware_config", invocation.config_name.as_str())
-            .unmapped(
-                "middleware_implementation",
-                invocation.implementation.as_str(),
+            http_response_invocation_event(
+                policy_name,
+                target,
+                status_code,
+                &ResponseInvocationRecord {
+                    config_name: &invocation.config_name,
+                    implementation: &invocation.implementation,
+                    outcome: format!("{:?}", invocation.outcome).to_ascii_lowercase(),
+                    sequence: Some(invocation.sequence.unwrap_or_default()),
+                    input_bytes: invocation.input_size,
+                    failed: invocation.failed,
+                    blocked: invocation.outcome
+                        == openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery,
+                    failure_reason: None,
+                },
             )
-            .unmapped("response_middleware_outcome", outcome.as_str())
-            .unmapped("sequence", invocation.sequence.unwrap_or_default())
-            .unmapped("input_bytes", invocation.input_size)
-            .unmapped("failed", failed)
-            .message(format!(
-                "HTTP_RESPONSE_MIDDLEWARE config={} implementation={} outcome={} sequence={} input_bytes={} failed={failed}",
-                invocation.config_name,
-                invocation.implementation,
-                outcome,
-                invocation.sequence.unwrap_or_default(),
-                invocation.input_size,
-            ))
-                .build()
         })
         .collect()
 }
@@ -968,37 +1044,42 @@ fn http_response_middleware_block_finding_event(
     target: &HttpRequestTarget,
     invocation: &openshell_supervisor_middleware::HttpResponseInvocation,
 ) -> Option<openshell_ocsf::OcsfEvent> {
-    if invocation.outcome
-        != openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
-    {
-        return None;
-    }
-    Some(
-        openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
-            .severity(openshell_ocsf::SeverityId::Medium)
-            .finding_info(openshell_ocsf::FindingInfo::new(
-                "openshell.middleware.http_response_blocked",
-                "HTTP response blocked by middleware",
-            ))
-            .evidence_pairs(&[
-                ("policy", policy_name),
-                ("middleware_config", invocation.config_name.as_str()),
-                (
-                    "middleware_implementation",
-                    invocation.implementation.as_str(),
-                ),
-                ("host", target.host.as_str()),
-                ("phase", "pre_return"),
-            ])
-            .unmapped("middleware_config", invocation.config_name.as_str())
-            .unmapped(
-                "middleware_implementation",
-                invocation.implementation.as_str(),
+    (invocation.outcome
+        == openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery)
+        .then(|| {
+            http_response_blocked_finding(
+                policy_name,
+                target,
+                &invocation.config_name,
+                &invocation.implementation,
             )
-            .unmapped("phase", "pre_return")
-            .message("HTTP response delivery blocked by middleware")
-            .build(),
-    )
+        })
+}
+
+fn http_response_blocked_finding(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    config_name: &str,
+    implementation: &str,
+) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+        .severity(openshell_ocsf::SeverityId::Medium)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.middleware.http_response_blocked",
+            "HTTP response blocked by middleware",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("middleware_config", config_name),
+            ("middleware_implementation", implementation),
+            ("host", target.host.as_str()),
+            ("phase", "pre_return"),
+        ])
+        .unmapped("middleware_config", config_name)
+        .unmapped("middleware_implementation", implementation)
+        .unmapped("phase", "pre_return")
+        .message("HTTP response delivery blocked by middleware")
+        .build()
 }
 
 pub(super) fn http_response_middleware_fail_open_finding_event(
@@ -1012,38 +1093,45 @@ pub(super) fn http_response_middleware_fail_open_finding_event(
     {
         return None;
     }
-    let failure_category = invocation
-        .failure_category
-        .as_deref()
-        .unwrap_or("middleware_failure");
-    Some(
-        openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
-            .severity(openshell_ocsf::SeverityId::Medium)
-            .finding_info(openshell_ocsf::FindingInfo::new(
-                "openshell.middleware.http_response_fail_open",
-                "HTTP response middleware failed open",
-            ))
-            .evidence_pairs(&[
-                ("policy", policy_name),
-                ("middleware_config", invocation.config_name.as_str()),
-                (
-                    "middleware_implementation",
-                    invocation.implementation.as_str(),
-                ),
-                ("host", target.host.as_str()),
-                ("phase", "pre_return"),
-                ("failure_category", failure_category),
-            ])
-            .unmapped("middleware_config", invocation.config_name.as_str())
-            .unmapped(
-                "middleware_implementation",
-                invocation.implementation.as_str(),
-            )
-            .unmapped("phase", "pre_return")
-            .unmapped("failure_category", failure_category)
-            .message("HTTP response middleware failed and response inspection was bypassed")
-            .build(),
-    )
+    Some(http_response_fail_open_finding(
+        policy_name,
+        target,
+        &invocation.config_name,
+        &invocation.implementation,
+        invocation
+            .failure_category
+            .as_deref()
+            .unwrap_or("middleware_failure"),
+    ))
+}
+
+fn http_response_fail_open_finding(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    config_name: &str,
+    implementation: &str,
+    failure_category: &str,
+) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+        .severity(openshell_ocsf::SeverityId::Medium)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.middleware.http_response_fail_open",
+            "HTTP response middleware failed open",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("middleware_config", config_name),
+            ("middleware_implementation", implementation),
+            ("host", target.host.as_str()),
+            ("phase", "pre_return"),
+            ("failure_category", failure_category),
+        ])
+        .unmapped("middleware_config", config_name)
+        .unmapped("middleware_implementation", implementation)
+        .unmapped("phase", "pre_return")
+        .unmapped("failure_category", failure_category)
+        .message("HTTP response middleware failed and response inspection was bypassed")
+        .build()
 }
 
 fn emit_http_response_middleware_failure(
@@ -1894,28 +1982,41 @@ where
     let mut trailers = Vec::new();
     loop {
         let line = read_response_line_with_deadline(reader, session, client, framing).await?;
-        if line.is_empty() {
+        if !push_response_trailer(&line, connection_nominated_headers, &mut trailers)? {
             return Ok(trailers);
         }
-        let line = std::str::from_utf8(&line)
-            .map_err(|_| miette!("HTTP response trailer contains invalid UTF-8"))?;
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| miette!("Malformed HTTP response trailer"))?;
-        validate_http_field_name(name)?;
-        validate_http_field_value(value.trim())?;
-        let name = name.to_ascii_lowercase();
-        if is_protected_response_field(&name) || connection_nominated_headers.contains(&name) {
-            return Err(miette!("HTTP response trailer uses a protected field name"));
-        }
-        trailers.push(HttpHeader {
-            name,
-            value: value.trim().to_string(),
-        });
-        if trailers.len() > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
-            return Err(miette!("HTTP response trailer count exceeds limit"));
-        }
     }
+}
+
+/// Validate one trailer section line and add its field to `trailers`.
+/// Returns false for the empty line that ends the section.
+fn push_response_trailer(
+    line: &[u8],
+    connection_nominated_headers: &[String],
+    trailers: &mut Vec<HttpHeader>,
+) -> Result<bool> {
+    if line.is_empty() {
+        return Ok(false);
+    }
+    let line = std::str::from_utf8(line)
+        .map_err(|_| miette!("HTTP response trailer contains invalid UTF-8"))?;
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| miette!("Malformed HTTP response trailer"))?;
+    validate_http_field_name(name)?;
+    validate_http_field_value(value.trim())?;
+    let name = name.to_ascii_lowercase();
+    if is_protected_response_field(&name) || connection_nominated_headers.contains(&name) {
+        return Err(miette!("HTTP response trailer uses a protected field name"));
+    }
+    trailers.push(HttpHeader {
+        name,
+        value: value.trim().to_string(),
+    });
+    if trailers.len() > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
+        return Err(miette!("HTTP response trailer count exceeds limit"));
+    }
+    Ok(true)
 }
 
 async fn write_response_trailers<C: AsyncWrite + Unpin>(

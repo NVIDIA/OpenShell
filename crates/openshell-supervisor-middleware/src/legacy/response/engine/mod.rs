@@ -21,13 +21,14 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::response::{HttpResponsePreflightInput, is_stale_http_response_integrity_header};
+
 use openshell_core::proto::{
-    Finding, HttpHeader, HttpRequestTarget, HttpResponseBodyMode, HttpResponseBodyPassThrough,
-    HttpResponseBodyUnit, HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflight,
-    HttpResponseTrailers, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
-    http_response_body_result, http_response_body_skip_remaining, http_response_body_transform,
-    http_response_body_unit, http_response_event, http_response_event_result,
-    http_response_preflight_result,
+    Finding, HttpHeader, HttpResponseBodyMode, HttpResponseBodyPassThrough, HttpResponseBodyUnit,
+    HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflight, HttpResponseTrailers,
+    MiddlewareSessionEnd, MiddlewareSessionEndReason, http_response_body_result,
+    http_response_body_skip_remaining, http_response_body_transform, http_response_body_unit,
+    http_response_event, http_response_event_result, http_response_preflight_result,
 };
 
 use crate::{
@@ -47,36 +48,6 @@ pub const MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum logical body bytes retained across a session's stage buffers and
 /// pending output. Temporary exchange copies have the per-binding payload cap.
 pub const MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-/// Return whether a response metadata field becomes stale after body changes.
-#[must_use]
-pub fn is_stale_http_response_integrity_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "accept-ranges"
-            | "etag"
-            | "content-md5"
-            | "digest"
-            | "content-digest"
-            | "repr-digest"
-            | "signature"
-            | "signature-input"
-    )
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpResponsePreflightInput {
-    pub context: RequestContext,
-    pub target: HttpRequestTarget,
-    pub status_code: u16,
-    /// Parsed upstream Content-Length when present and valid.
-    pub declared_body_length: Option<u64>,
-    /// Sanitized, lowercased final response headers in wire order.
-    pub headers: Vec<HttpHeader>,
-    /// Lowercased names nominated by the original response's `Connection`
-    /// fields. Their values are not exposed to middleware.
-    pub connection_nominated_headers: Vec<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpResponseInvocationOutcome {
@@ -1249,10 +1220,11 @@ mod tests {
 
     use openshell_core::middleware::{HttpRequestView, InProcessMiddleware};
     use openshell_core::proto::{
-        Decision, ExistingHeaderAction, HeaderMutation, HttpRequestResult, HttpResponseBodyResult,
-        HttpResponseBodyTransform, HttpResponsePreflightInspect, HttpResponsePreflightResult,
-        HttpResponsePreflightSkip, HttpResponseTrailersResult, MiddlewareBinding,
-        MiddlewareManifest, WriteHeader, header_mutation, http_response_preflight_result,
+        Decision, ExistingHeaderAction, HeaderMutation, HttpRequestResult, HttpRequestTarget,
+        HttpResponseBodyResult, HttpResponseBodyTransform, HttpResponsePreflightInspect,
+        HttpResponsePreflightResult, HttpResponsePreflightSkip, HttpResponseTrailersResult,
+        MiddlewareBinding, MiddlewareManifest, RequestContext, WriteHeader, header_mutation,
+        http_response_preflight_result,
     };
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_stream::wrappers::TcpListenerStream;

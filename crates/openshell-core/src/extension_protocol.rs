@@ -324,6 +324,18 @@ pub fn negotiate(
     })
 }
 
+/// True when `peer` advertises `capability` as supported.
+///
+/// A dual-protocol supervisor middleware service calls this from Describe
+/// with the caller's metadata and [`SUPERVISOR_MIDDLEWARE_HTTP_V2`] to choose
+/// between version 2 and legacy HTTP bindings.
+#[must_use]
+pub fn peer_supports(peer: &PeerMetadata, capability: &str) -> bool {
+    peer.supported_capabilities
+        .iter()
+        .any(|supported| supported == capability)
+}
+
 pub fn validate_gateway_metadata(
     family: ExtensionFamily,
     extension_name: impl Into<String>,
@@ -581,6 +593,26 @@ mod tests {
                 minor: PROTOCOL_MINOR,
             })
         );
+    }
+
+    #[test]
+    fn peer_supports_reports_advertised_capabilities_only() {
+        let legacy_peer = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        assert!(!peer_supports(&legacy_peer, SUPERVISOR_MIDDLEWARE_HTTP_V2));
+        assert!(peer_supports(
+            &legacy_peer,
+            &ExtensionFamily::SupervisorMiddleware.contract_capability()
+        ));
+
+        let v2_peer = gateway_metadata_with_capabilities(
+            ExtensionFamily::SupervisorMiddleware,
+            [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+        );
+        assert!(peer_supports(&v2_peer, SUPERVISOR_MIDDLEWARE_HTTP_V2));
+        assert!(!peer_supports(
+            &v2_peer,
+            "openshell.supervisor-middleware.http"
+        ));
     }
 
     #[test]

@@ -165,6 +165,7 @@ impl HttpMiddlewareExchange {
             policy_name: &ctx.policy_name,
             generation_guard: Some(&self.generation_guard),
             whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: request_line_is_http11(&request.raw_header),
         }
     }
 }
@@ -801,7 +802,7 @@ fn request_header_end(raw_header: &[u8]) -> usize {
         .map_or(raw_header.len(), |position| position + 4)
 }
 
-fn request_line_is_http11(head: &[u8]) -> bool {
+pub(super) fn request_line_is_http11(head: &[u8]) -> bool {
     head.split(|byte| *byte == b'\n')
         .next()
         .is_some_and(|line| line.trim_ascii_end().ends_with(b" HTTP/1.1"))

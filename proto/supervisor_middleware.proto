@@ -169,6 +169,18 @@ message HttpEvent {
 // STREAM sends output_start before any output_chunk and ends with finish or
 // reject. Unknown and unset alternatives are contract failures: OpenShell
 // fails the exchange closed and never treats them as success.
+//
+// A service may close its result stream right after the result that ends its
+// part in the exchange: a preflight continue_without_body, buffered_result,
+// finish, or reject. It may also keep the stream open until session_end or
+// the end of the event stream. OpenShell accepts both.
+//
+// A stage that cannot inspect the message, for example because it requires a
+// body format the message does not use, ends the stream with gRPC status
+// FAILED_PRECONDITION instead of a result. OpenShell then fails the exchange
+// closed with the platform-owned reason middleware_cannot_inspect rather than as
+// a service error, and does not record the status message. Reject denies the
+// content itself.
 message HttpResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
@@ -191,6 +203,36 @@ enum HttpBodyMode {
   HTTP_BODY_MODE_STREAM = 2;
 }
 
+// Why OpenShell does not offer a body mode that a version 2 binding supports.
+enum HttpBodyUnavailableReason {
+  HTTP_BODY_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  // The response has no body: the request method is HEAD, or the status is
+  // 1xx, 204, or 304.
+  HTTP_BODY_UNAVAILABLE_REASON_BODYLESS = 1;
+  // The response carries part of a representation: status 206, a
+  // Content-Range header, or multipart/byteranges content.
+  HTTP_BODY_UNAVAILABLE_REASON_PARTIAL = 2;
+  // Cache-Control no-transform forbids changing the response body.
+  HTTP_BODY_UNAVAILABLE_REASON_NO_TRANSFORM = 3;
+  // The response body has a content coding other than identity.
+  HTTP_BODY_UNAVAILABLE_REASON_ENCODED = 4;
+  // The declared body length exceeds the stage's payload limit.
+  HTTP_BODY_UNAVAILABLE_REASON_OVER_LIMIT = 5;
+  // The response is open-ended, such as text/event-stream or
+  // multipart/x-mixed-replace, and has no complete body to buffer.
+  HTTP_BODY_UNAVAILABLE_REASON_OPEN_ENDED = 6;
+  // The client could not detect a truncated response body: the client request
+  // or the response status line uses HTTP/1.0, so the response cannot be
+  // chunked.
+  HTTP_BODY_UNAVAILABLE_REASON_TRUNCATION_UNDETECTABLE = 7;
+}
+
+// A body mode the binding supports that one preflight does not offer.
+message HttpBodyModeUnavailable {
+  HttpBodyMode mode = 1;
+  HttpBodyUnavailableReason reason = 2;
+}
+
 // Head, offered modes, and limits for one version 2 stage.
 message HttpPreflight {
   oneof head {
@@ -203,8 +245,9 @@ message HttpPreflight {
   // partial, content-coded, or no-transform response, offers no modes. A
   // response offers STREAM only when OpenShell can signal truncation to the
   // client, which requires chunked downstream framing: both the client request
-  // and the response status line use HTTP/1.1. A text/event-stream response is
-  // never offered BUFFERED.
+  // and the response status line use HTTP/1.1. An open-ended response, such as
+  // text/event-stream or multipart/x-mixed-replace, is never offered BUFFERED.
+  // unavailable_body_modes says why a supported mode is missing.
   repeated HttpBodyMode permitted_body_modes = 3;
   // Permitted modes in which the stage may also mutate the head after body
   // inspection, through HttpBufferedResult.header_mutations or
@@ -218,6 +261,11 @@ message HttpPreflight {
   // stage may replace the body, so later stages must enforce their selected
   // mode limit against the body events they actually receive.
   optional uint64 declared_input_bytes = 6;
+  // One entry for each mode in the binding's supported_http_body_modes that
+  // permitted_body_modes omits, with the rule that removed it. A stage that
+  // needs the body can tell a bodyless response, which it may let continue,
+  // from a body it cannot inspect.
+  repeated HttpBodyModeUnavailable unavailable_body_modes = 7;
 }
 
 // Request head exposed after network-policy admission and before credential

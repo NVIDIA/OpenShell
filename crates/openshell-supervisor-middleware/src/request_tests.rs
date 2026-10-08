@@ -8,19 +8,19 @@ use std::sync::Mutex;
 use futures::future::BoxFuture;
 use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
 use openshell_core::proto::{
-    ExistingHeaderAction, HttpBufferedMode, HttpBufferedResult, HttpContinue, HttpFinish,
-    HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflight, HttpPreflightResult,
-    HttpReject, HttpRequestResult, HttpRequestTarget, HttpResult, HttpStreamMode, HttpUnchanged,
-    MiddlewareDiagnostics, MiddlewareSessionEndReason, RequestContext, WriteHeader,
-    header_mutation, http_buffered_result, http_event, http_inspect, http_preflight_result,
-    http_result,
+    ExistingHeaderAction, HttpBodyModeUnavailable, HttpBodyUnavailableReason, HttpBufferedMode,
+    HttpBufferedResult, HttpContinue, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk,
+    HttpOutputStart, HttpPreflight, HttpPreflightResult, HttpReject, HttpRequestResult,
+    HttpRequestTarget, HttpResult, HttpStreamMode, HttpUnchanged, MiddlewareDiagnostics,
+    MiddlewareSessionEndReason, RequestContext, WriteHeader, header_mutation, http_buffered_result,
+    http_event, http_inspect, http_preflight_result, http_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::*;
 use crate::legacy::hooks::{LegacyStageContext, test_support};
-use crate::pipeline::{PipelineSpec, PipelineTimeouts, StageHead};
+use crate::pipeline::{BodyModeOffer, PipelineSpec, PipelineTimeouts, StageHead};
 
 const LIMIT: u64 = 64 * 1024;
 
@@ -648,6 +648,7 @@ async fn stream_stage_transforms_a_large_chunked_upload_end_to_end() {
         Some(&HttpBodyOutput::Start {
             header_mutations: Vec::new(),
             output_body_bytes: None,
+            body_transformed: true,
         })
     );
     assert_eq!(
@@ -1169,6 +1170,13 @@ async fn buffered_is_offered_only_within_the_stage_limit() {
     let offered = both.log.preflight();
     assert_eq!(offered.permitted_body_modes, [HttpBodyMode::Stream as i32]);
     assert_eq!(offered.late_header_modes, [HttpBodyMode::Stream as i32]);
+    assert_eq!(
+        offered.unavailable_body_modes,
+        [HttpBodyModeUnavailable {
+            mode: HttpBodyMode::Buffered as i32,
+            reason: HttpBodyUnavailableReason::OverLimit as i32,
+        }]
+    );
     let limits = offered.limits.expect("limits");
     assert_eq!(limits.max_chunk_bytes, 16);
     assert_eq!(
@@ -1344,6 +1352,59 @@ async fn unimplemented_version_2_stage_fails_closed_and_requests_reconciliation(
         }]
     );
     assert!(runner.take_reconciliation_request());
+}
+
+#[tokio::test]
+async fn failed_precondition_is_a_platform_owned_cannot_inspect_failure() {
+    fn cannot_inspect(at_preflight: bool) -> TestStage {
+        TestStage::new(
+            "test/picky",
+            &[HttpBodyMode::Buffered],
+            move |mut io: StageIo| async move {
+                while let Some(event) = io.recv().await {
+                    let status = TonicStatus::failed_precondition("service-specific detail");
+                    match event {
+                        http_event::Event::Preflight(_) if at_preflight => {
+                            io.send_raw(Err(status)).await;
+                        }
+                        http_event::Event::Preflight(_) => {
+                            io.send(preflight_result(inspect_buffered(LIMIT), Vec::new()))
+                                .await;
+                        }
+                        http_event::Event::BufferedBody(_) => io.send_raw(Err(status)).await,
+                        _ => {}
+                    }
+                }
+            },
+        )
+    }
+
+    let runner = runner_for(&[cannot_inspect(true)]).await;
+    let outcome = preflight(&runner, &["test/picky"], Some(2)).await;
+    assert_eq!(
+        outcome.reason,
+        "middleware_failed: middleware_cannot_inspect"
+    );
+    assert_eq!(
+        outcome.diagnostics.invocations[0].failure_reason.as_deref(),
+        Some(MIDDLEWARE_CANNOT_INSPECT)
+    );
+    assert!(!runner.take_reconciliation_request());
+
+    let runner = runner_for(&[cannot_inspect(false)]).await;
+    let session = preflight(&runner, &["test/picky"], Some(2))
+        .await
+        .session
+        .expect("buffered session");
+    let (finish, output) = run_session(session, vec![b"hi".to_vec()], Vec::new()).await;
+    assert_eq!(
+        finish
+            .expect_err("the stage cannot inspect the body")
+            .reason,
+        "middleware_failed: middleware_cannot_inspect"
+    );
+    assert!(output.is_empty());
+    assert!(!runner.take_reconciliation_request());
 }
 
 #[tokio::test]
@@ -1983,8 +2044,8 @@ impl StageHead for ResponseHead {
         )
     }
 
-    fn permitted_body_modes(&self, _entry: &DescribedChainEntry) -> Vec<HttpBodyMode> {
-        Vec::new()
+    fn body_modes(&self, _entry: &DescribedChainEntry) -> BodyModeOffer {
+        BodyModeOffer::default()
     }
 }
 
@@ -2013,6 +2074,9 @@ async fn run_legacy_response(
             trailer_authority: headers::HeaderAuthority::ResponseTrailers,
             connection_nominated: Vec::new(),
             timeouts,
+            output_trailers: true,
+            reports: None,
+            original_response: None,
         },
         Vec::new(),
         None,
@@ -2457,6 +2521,9 @@ async fn legacy_response_entries_without_an_adapter_fail_closed_in_the_pipeline(
             trailer_authority: headers::HeaderAuthority::ResponseTrailers,
             connection_nominated: Vec::new(),
             timeouts: PipelineTimeouts::default(),
+            output_trailers: true,
+            reports: None,
+            original_response: None,
         },
         Vec::new(),
         None,

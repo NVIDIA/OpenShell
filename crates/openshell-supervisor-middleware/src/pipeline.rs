@@ -33,26 +33,28 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use openshell_core::proto::{
-    Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBufferedBody, HttpEvent,
-    HttpHeader, HttpInputChunk, HttpInputEnd, HttpPreflight, HttpResult, MiddlewareDiagnostics,
-    MiddlewareSessionEnd, MiddlewareSessionEndReason, http_buffered_result, http_event,
-    http_inspect, http_preflight, http_preflight_result, http_result,
+    Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpEvent, HttpHeader, HttpInputChunk,
+    HttpInputEnd, HttpPreflight, HttpResult, MiddlewareDiagnostics, MiddlewareSessionEnd,
+    MiddlewareSessionEndReason, header_mutation, http_buffered_result, http_event, http_inspect,
+    http_preflight, http_preflight_result, http_result,
 };
 
 use crate::headers::{self, HeaderAuthority};
 use crate::legacy::hooks::{
-    self, LegacyChainClock, LegacyOverflow, LegacyStageContext, LegacyStagePolicy,
+    self, LegacyChainClock, LegacyOverflow, LegacyResponseControl, LegacyStageContext,
+    LegacyStagePolicy,
 };
 use crate::runtime::RuntimeHooks;
 use crate::{
     ChainRunner, ContractFailure, ContractFailureKind, DescribedChainEntry, EXTERNAL_FINDING_LABEL,
-    HttpDirection, HttpProtocol, HttpResultStream, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
-    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
-    MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
-    MiddlewareInvocation, NamespacedFinding, OnError, StageReport, StageReports,
-    TransformedBodyPolicy, is_stable_reason_code, middleware_denial_reason,
-    transformed_body_denial,
+    HttpDirection, HttpProtocol, HttpResponsePreflightInput, HttpResultStream,
+    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
+    MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES,
+    MAX_MIDDLEWARE_REASON_BYTES, MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial,
+    MiddlewareDiagnosticPolicy, MiddlewareInvocation, NamespacedFinding, OnError, StageReport,
+    StageReportSink, StageReports, TransformedBodyPolicy, is_stable_reason_code,
+    is_stale_http_response_integrity_header, middleware_denial_reason, transformed_body_denial,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -69,6 +71,9 @@ pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
+/// Failure reason for a version 2 stage that ends its stream with
+/// `FAILED_PRECONDITION`: it cannot inspect the message.
+pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
 
 /// Body input to a pipeline: chunks, then exactly one `End`.
 #[derive(Debug)]
@@ -83,9 +88,12 @@ pub enum HttpBodyOutput {
     /// Commit the outgoing head. Apply `header_mutations`, every stage's late
     /// mutations in chain order, after the preflight mutations. When
     /// `output_body_bytes` is present, the body has exactly that length.
+    /// `body_transformed` is true when a stage streamed or replaced the body,
+    /// so representation validators in the head and trailers are stale.
     Start {
         header_mutations: Vec<HeaderMutation>,
         output_body_bytes: Option<u64>,
+        body_transformed: bool,
     },
     Chunk(Vec<u8>),
     End {
@@ -275,7 +283,7 @@ impl Default for PipelineTimeouts {
 }
 
 /// Direction-specific rules for one exchange.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PipelineSpec {
     pub direction: HttpDirection,
     pub head_authority: HeaderAuthority,
@@ -284,6 +292,38 @@ pub struct PipelineSpec {
     /// fields. Mutations treat them as hop-by-hop.
     pub connection_nominated: Vec<String>,
     pub timeouts: PipelineTimeouts,
+    /// False when the outgoing message cannot carry trailers. BUFFERED stages
+    /// then always declare their output length, and the caller drops the
+    /// final trailers.
+    pub output_trailers: bool,
+    /// Receives every stage report as it arrives. The pipeline then retains
+    /// only `LegacyFailOpen` reports for its diagnostics.
+    pub reports: Option<Arc<dyn StageReportSink>>,
+    /// HTTP protocol 1 (0.1): the original response head, for legacy
+    /// response adapters.
+    pub original_response: Option<Arc<HttpResponsePreflightInput>>,
+}
+
+/// Body modes offered to one version 2 stage.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BodyModeOffer {
+    /// Modes the stage may select.
+    pub permitted: Vec<HttpBodyMode>,
+    /// Modes the binding supports that are not offered, and why.
+    pub unavailable: Vec<HttpBodyModeUnavailable>,
+}
+
+impl BodyModeOffer {
+    pub fn permit(&mut self, mode: HttpBodyMode) {
+        self.permitted.push(mode);
+    }
+
+    pub fn withhold(&mut self, mode: HttpBodyMode, reason: HttpBodyUnavailableReason) {
+        self.unavailable.push(HttpBodyModeUnavailable {
+            mode: mode as i32,
+            reason: reason as i32,
+        });
+    }
 }
 
 /// Direction-specific preflight content.
@@ -296,9 +336,15 @@ pub trait StageHead: Sync {
         headers: &[HttpHeader],
     ) -> http_preflight::Head;
 
-    /// Body modes `entry` may select: its supported modes intersected with
-    /// runtime support, policy, and message eligibility.
-    fn permitted_body_modes(&self, entry: &DescribedChainEntry) -> Vec<HttpBodyMode>;
+    /// Body modes version 2 `entry` may select: its supported modes
+    /// intersected with runtime support, policy, and message eligibility.
+    fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer;
+
+    /// HTTP protocol 1 (0.1): body modes offered to a legacy adapter
+    /// stage, which applies 0.1.x eligibility itself.
+    fn legacy_body_modes(&self, direction: HttpDirection) -> Vec<HttpBodyMode> {
+        hooks::permitted_body_modes(direction)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +361,8 @@ pub struct Stage {
     /// Head after preflight mutations through this stage.
     head: Vec<HttpHeader>,
     legacy: Option<LegacyStagePolicy>,
+    /// Engine callbacks of a legacy response adapter.
+    legacy_response: Option<Arc<dyn LegacyResponseControl>>,
 }
 
 /// Event sender and result stream of one open stage exchange.
@@ -334,12 +382,19 @@ impl StageStream {
         let Some(sender) = self.sender.take() else {
             return;
         };
-        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, sender.send(session_end(reason))).await;
-        drop(sender);
-        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, async {
-            while self.results.next().await.is_some() {}
-        })
-        .await;
+        end_exchange(sender, &mut self.results, reason).await;
+    }
+
+    /// Move the open exchange out, leaving an ended one behind.
+    fn take(&mut self) -> Self {
+        std::mem::replace(
+            self,
+            Self {
+                sender: None,
+                results: Box::pin(futures::stream::empty()),
+                ended: true,
+            },
+        )
     }
 }
 
@@ -354,19 +409,49 @@ impl Drop for StageStream {
         let mut results = std::mem::replace(&mut self.results, Box::pin(futures::stream::empty()));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = tokio::time::timeout(
-                    SESSION_END_TIMEOUT,
-                    sender.send(session_end(MiddlewareSessionEndReason::Cancellation)),
+                end_exchange(
+                    sender,
+                    &mut results,
+                    MiddlewareSessionEndReason::Cancellation,
                 )
-                .await;
-                drop(sender);
-                let _ = tokio::time::timeout(SESSION_END_TIMEOUT, async {
-                    while results.next().await.is_some() {}
-                })
                 .await;
             });
         }
     }
+}
+
+/// Send `SessionEnd`, half-close the events, and drain the results. Results
+/// are read while the `SessionEnd` waits for queue space: a stage blocked on
+/// a full result queue stops reading its events.
+async fn end_exchange(
+    sender: mpsc::Sender<HttpEvent>,
+    results: &mut HttpResultStream,
+    reason: MiddlewareSessionEndReason,
+) {
+    let mut drained = false;
+    let _ = tokio::time::timeout(SESSION_END_TIMEOUT, async {
+        let send = sender.send(session_end(reason));
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut send => return,
+                next = results.next() => if next.is_none() {
+                    drained = true;
+                    return;
+                },
+            }
+        }
+    })
+    .await;
+    drop(sender);
+    if drained {
+        return;
+    }
+    let _ = tokio::time::timeout(SESSION_END_TIMEOUT, async {
+        while results.next().await.is_some() {}
+    })
+    .await;
 }
 
 fn session_end(reason: MiddlewareSessionEndReason) -> HttpEvent {
@@ -402,7 +487,10 @@ pub async fn preflight(
     head: &impl StageHead,
 ) -> Preflight {
     let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
-    let reports = Arc::new(StageReports::default());
+    let reports = Arc::new(ExchangeReports {
+        retained: StageReports::default(),
+        forward: spec.reports.clone(),
+    });
     let connection_nominated: Arc<[String]> = spec.connection_nominated.clone().into();
     let chain_clock = LegacyChainClock::default();
     let mut state = PreflightState {
@@ -425,25 +513,38 @@ pub async fn preflight(
                 .fail(entry_failure(entry, "binding_not_described"))
                 .await;
         }
-        let (transport, legacy, permitted) = match entry.http_protocol() {
+        let (transport, legacy, legacy_response, offer) = match entry.http_protocol() {
             Some(HttpProtocol::V2) => (
                 entry.http_stage_transport(),
                 None,
-                head.permitted_body_modes(entry),
+                None,
+                head.body_modes(entry),
             ),
-            Some(HttpProtocol::Legacy) => (
-                hooks::open_stage(&LegacyStageContext {
+            Some(HttpProtocol::Legacy) => {
+                let opened = hooks::open_stage(&LegacyStageContext {
                     entry: entry.clone(),
                     direction: spec.direction,
                     connection_nominated_headers: Arc::clone(&connection_nominated),
                     chain_clock: chain_clock.clone(),
                     reports: reports.clone(),
-                }),
-                Some(LegacyStagePolicy::new(entry, entries, spec.direction)),
-                hooks::permitted_body_modes(spec.direction),
-            ),
-            None => (None, None, Vec::new()),
+                    original_response: spec.original_response.clone(),
+                });
+                let (transport, control) = opened.map_or((None, None), |stage| {
+                    (Some(stage.transport), stage.response)
+                });
+                (
+                    transport,
+                    Some(LegacyStagePolicy::new(entry, entries, spec.direction)),
+                    control,
+                    BodyModeOffer {
+                        permitted: head.legacy_body_modes(spec.direction),
+                        unavailable: Vec::new(),
+                    },
+                )
+            }
+            None => (None, None, None, BodyModeOffer::default()),
         };
+        let permitted = offer.permitted;
         let own_limit = entry.max_payload_bytes();
         let buffered_limit =
             legacy.map_or(own_limit, |policy| policy.offered_buffered_limit(own_limit));
@@ -464,6 +565,7 @@ pub async fn preflight(
                     spec.timeouts,
                 )),
                 declared_input_bytes,
+                unavailable_body_modes: offer.unavailable,
             })),
         };
         let stage_deadline = Instant::now() + entry.timeout();
@@ -603,6 +705,7 @@ pub async fn preflight(
                     mode,
                     head: state.headers.clone(),
                     legacy,
+                    legacy_response,
                 });
             }
             http_result::Result::Reject(reject) => {
@@ -648,7 +751,39 @@ struct PreflightState {
     header_mutations: Vec<HeaderMutation>,
     stages: Vec<Stage>,
     diagnostics: HttpStageDiagnostics,
-    reports: Arc<StageReports>,
+    reports: Arc<ExchangeReports>,
+}
+
+/// Stage reports of one exchange, forwarded as they arrive when the caller
+/// supplied a sink.
+struct ExchangeReports {
+    retained: StageReports,
+    forward: Option<Arc<dyn StageReportSink>>,
+}
+
+impl ExchangeReports {
+    fn take(&self, config_name: &str) -> Vec<StageReport> {
+        self.retained.take(config_name)
+    }
+
+    fn drain(&self) -> Vec<(String, StageReport)> {
+        self.retained.drain()
+    }
+}
+
+impl StageReportSink for ExchangeReports {
+    fn report(&self, config_name: &str, report: StageReport) {
+        let Some(forward) = &self.forward else {
+            self.retained.report(config_name, report);
+            return;
+        };
+        // A forwarded long stream may report every unit. Keep only what
+        // marks a stage as failed open.
+        if report.fail_open_reason().is_some() {
+            self.retained.report(config_name, report.clone());
+        }
+        forward.report(config_name, report);
+    }
 }
 
 impl PreflightState {
@@ -682,7 +817,7 @@ pub struct Pipeline {
     stages: Vec<Stage>,
     declared_input_bytes: Option<u64>,
     runtime: Arc<RuntimeHooks>,
-    reports: Arc<StageReports>,
+    reports: Arc<ExchangeReports>,
 }
 
 impl Pipeline {
@@ -727,8 +862,13 @@ impl Pipeline {
         input: mpsc::Receiver<HttpBodyInput>,
         output: mpsc::Sender<HttpBodyOutput>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
-        self.run_with_body_policy(input, output, TransformedBodyPolicy::NotPolicyRelevant)
-            .await
+        self.run_inner(
+            input,
+            output,
+            TransformedBodyPolicy::NotPolicyRelevant,
+            std::future::pending(),
+        )
+        .await
     }
 
     /// [`Self::run`], re-checking every replaced body with `body_policy`
@@ -740,6 +880,35 @@ impl Pipeline {
         input: mpsc::Receiver<HttpBodyInput>,
         output: mpsc::Sender<HttpBodyOutput>,
         body_policy: TransformedBodyPolicy<'_>,
+    ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
+        self.run_inner(input, output, body_policy, std::future::pending())
+            .await
+    }
+
+    /// Like [`Self::run`], but ends the exchange when `abort` resolves first,
+    /// as when the caller's peer goes away: every open stage receives the
+    /// returned reason, and the run fails with `middleware_cancelled`.
+    pub async fn run_until(
+        self,
+        input: mpsc::Receiver<HttpBodyInput>,
+        output: mpsc::Sender<HttpBodyOutput>,
+        external_abort: impl Future<Output = MiddlewareSessionEndReason>,
+    ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
+        self.run_inner(
+            input,
+            output,
+            TransformedBodyPolicy::NotPolicyRelevant,
+            external_abort,
+        )
+        .await
+    }
+
+    async fn run_inner(
+        self,
+        input: mpsc::Receiver<HttpBodyInput>,
+        output: mpsc::Sender<HttpBodyOutput>,
+        body_policy: TransformedBodyPolicy<'_>,
+        external_abort: impl Future<Output = MiddlewareSessionEndReason>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
         let Self {
             spec,
@@ -785,7 +954,9 @@ impl Pipeline {
             source_body,
             aborted.clone(),
         )));
+        let mut follows_buffered = false;
         for (index, stage) in stages.into_iter().enumerate() {
+            let buffered = matches!(stage.mode, StageMode::Buffered { .. });
             let mut stage_output = senders[index + 1].take().expect("stage output link");
             if let Some(previous) = checked_body.take() {
                 let (checkpoint_input, checkpoint_link) = mpsc::channel(STAGE_QUEUE_MESSAGES);
@@ -807,12 +978,16 @@ impl Pipeline {
             tasks.push(Box::pin(run_stage(
                 index,
                 stage,
-                receivers[index].take().expect("stage input link"),
-                stage_output,
-                limits[index + 1],
+                StageLinks {
+                    input: receivers[index].take().expect("stage input link"),
+                    output: stage_output,
+                    output_limit: limits[index + 1],
+                    follows_buffered,
+                },
                 &shared,
                 aborted.clone(),
             )));
+            follows_buffered |= buffered;
         }
         drop(checked_body);
         tasks.push(Box::pin(run_sink(
@@ -822,12 +997,34 @@ impl Pipeline {
         )));
         drop(aborted);
 
+        let mut external_abort = std::pin::pin!(external_abort);
         let mut done: Vec<Option<StageDone>> = (0..count).map(|_| None).collect();
+        let mut waiting = Vec::new();
         let mut trailers = None;
         let mut failure: Option<HttpMiddlewareFailure> = None;
-        while let Some(result) = tasks.next().await {
+        loop {
+            // An external abort wins over the failures it causes, such as
+            // the input ending early.
+            let result = tokio::select! {
+                biased;
+                reason = &mut external_abort, if failure.is_none() => {
+                    abort.send_replace(Some(reason));
+                    failure = Some(HttpMiddlewareFailure {
+                        end_reason: reason,
+                        ..cancelled(&end_reason_name(reason))
+                    });
+                    continue;
+                }
+                result = tasks.next() => match result {
+                    Some(result) => result,
+                    None => break,
+                },
+            };
             match result {
-                Ok(TaskDone::Stage(index, stage)) => done[index] = Some(stage),
+                Ok(TaskDone::Stage(index, stage, stream)) => {
+                    done[index] = Some(stage);
+                    waiting.extend(stream);
+                }
                 Ok(TaskDone::Sink(value)) => trailers = Some(value),
                 Err(TaskError::Failed(error)) if failure.is_none() => {
                     abort.send_replace(Some(error.end_reason));
@@ -845,25 +1042,39 @@ impl Pipeline {
             diagnostics.extend(stage.diagnostics);
         }
         diagnostics.reports.extend(reports.drain());
-        if let Some(mut failure) = failure {
-            diagnostics.extend(*failure.diagnostics);
-            failure.diagnostics = Box::new(diagnostics);
-            return Err(failure);
-        }
-        let Some(trailers) = trailers else {
-            return Err(HttpMiddlewareFailure {
-                reason: "middleware_cancelled: pipeline_incomplete".into(),
-                denial: None,
-                end_reason: MiddlewareSessionEndReason::Cancellation,
+        let outcome = match (failure, trailers) {
+            (Some(mut failure), _) => {
+                diagnostics.extend(*failure.diagnostics);
+                failure.diagnostics = Box::new(diagnostics);
+                Err(failure)
+            }
+            (None, None) => Err(HttpMiddlewareFailure {
                 diagnostics: Box::new(diagnostics),
-            });
+                ..cancelled("pipeline_incomplete")
+            }),
+            (None, Some(trailers)) => Ok(HttpPipelineFinish {
+                trailers,
+                body_transformed,
+                diagnostics,
+            }),
         };
-        Ok(HttpPipelineFinish {
-            trailers,
-            body_transformed,
-            diagnostics,
-        })
+        let chain_end = outcome.as_ref().map_or_else(
+            |failure| failure.end_reason,
+            |_| MiddlewareSessionEndReason::Normal,
+        );
+        for mut stream in waiting {
+            stream.end(chain_end).await;
+        }
+        outcome
     }
+}
+
+/// Stable lowercase name of a session end reason.
+fn end_reason_name(reason: MiddlewareSessionEndReason) -> String {
+    reason
+        .as_str_name()
+        .trim_start_matches("MIDDLEWARE_SESSION_END_REASON_")
+        .to_ascii_lowercase()
 }
 
 fn input_unit_limit(stage: &Stage) -> usize {
@@ -886,6 +1097,7 @@ enum Frame {
     Start {
         header_mutations: Vec<HeaderMutation>,
         output_body_bytes: Option<u64>,
+        body_transformed: bool,
     },
     Chunk(Vec<u8>),
     End(Vec<HttpHeader>),
@@ -894,18 +1106,33 @@ enum Frame {
 struct Shared {
     spec: PipelineSpec,
     runtime: Arc<RuntimeHooks>,
-    reports: Arc<StageReports>,
+    reports: Arc<ExchangeReports>,
 }
 
 struct StageDone {
     diagnostics: HttpStageDiagnostics,
     transformed: bool,
+    /// The stage failed open and passed its input on, so it ends at once
+    /// with `MIDDLEWARE_FAILURE` rather than with the chain's outcome.
+    released: bool,
+}
+
+impl StageDone {
+    fn new(transformed: bool) -> Self {
+        Self {
+            diagnostics: HttpStageDiagnostics::default(),
+            transformed,
+            released: false,
+        }
+    }
 }
 
 enum TaskDone {
     Source,
     Checkpoint,
-    Stage(usize, StageDone),
+    /// A completed stage, with its exchange when that waits for the chain's
+    /// outcome.
+    Stage(usize, StageDone, Option<StageStream>),
     Sink(Vec<HttpHeader>),
 }
 
@@ -957,6 +1184,7 @@ async fn run_source(
         link.send(Frame::Start {
             header_mutations: Vec::new(),
             output_body_bytes: declared_input_bytes,
+            body_transformed: false,
         })
         .await
         .map_err(|_| TaskError::Aborted)?;
@@ -1035,7 +1263,10 @@ async fn run_checkpoint(
                 Some(Frame::Start {
                     header_mutations,
                     output_body_bytes,
-                }) if start.is_none() => start = Some((header_mutations, output_body_bytes)),
+                    body_transformed,
+                }) if start.is_none() => {
+                    start = Some((header_mutations, output_body_bytes, body_transformed));
+                }
                 Some(Frame::Chunk(data)) if start.is_some() => {
                     if body.len().saturating_add(data.len()) > MAX_MIDDLEWARE_PAYLOAD_BYTES {
                         return Err(TaskError::Failed(entry_failure(
@@ -1067,13 +1298,15 @@ async fn run_checkpoint(
                 diagnostics: Box::default(),
             }));
         }
-        let (header_mutations, output_body_bytes) = start.expect("a started stage output");
+        let (header_mutations, output_body_bytes, body_transformed) =
+            start.expect("a started stage output");
         let release = async {
             send_frame(
                 &output,
                 Frame::Start {
                     header_mutations,
                     output_body_bytes,
+                    body_transformed,
                 },
             )
             .await?;
@@ -1103,11 +1336,13 @@ async fn run_sink(
                 Some(Frame::Start {
                     header_mutations,
                     output_body_bytes,
+                    body_transformed,
                 }) if !started => {
                     started = true;
                     HttpBodyOutput::Start {
                         header_mutations,
                         output_body_bytes,
+                        body_transformed,
                     }
                 }
                 Some(Frame::Chunk(data)) if started => HttpBodyOutput::Chunk(data),
@@ -1145,26 +1380,41 @@ enum StageExit {
     Aborted(MiddlewareSessionEndReason),
 }
 
+/// Links of one stage task.
+struct StageLinks {
+    input: mpsc::Receiver<Frame>,
+    output: mpsc::Sender<Frame>,
+    output_limit: usize,
+    /// An earlier stage selected BUFFERED.
+    follows_buffered: bool,
+}
+
 async fn run_stage(
     index: usize,
     mut stage: Stage,
-    mut input: mpsc::Receiver<Frame>,
-    output: mpsc::Sender<Frame>,
-    output_limit: usize,
+    mut links: StageLinks,
     shared: &Shared,
     mut aborted: watch::Receiver<Option<MiddlewareSessionEndReason>>,
 ) -> TaskResult {
     let exit = tokio::select! {
         biased;
         reason = abort_reason(&mut aborted) => StageExit::Aborted(reason),
-        result = drive_stage(&mut stage, &mut input, &output, output_limit, shared) => {
-            StageExit::Done(result)
-        }
+        result = drive_stage(&mut stage, &mut links, shared) => StageExit::Done(result),
     };
     match exit {
         StageExit::Done(Ok(done)) => {
+            if done.released {
+                stage
+                    .stream
+                    .end(MiddlewareSessionEndReason::MiddlewareFailure)
+                    .await;
+                return Ok(TaskDone::Stage(index, done, None));
+            }
+            if stage.legacy.is_some_and(LegacyStagePolicy::ends_with_chain) {
+                return Ok(TaskDone::Stage(index, done, Some(stage.stream.take())));
+            }
             stage.stream.end(MiddlewareSessionEndReason::Normal).await;
-            Ok(TaskDone::Stage(index, done))
+            Ok(TaskDone::Stage(index, done, None))
         }
         StageExit::Done(Err(StageError::Failed(failure))) => {
             stage.stream.end(failure.end_reason).await;
@@ -1186,27 +1436,35 @@ async fn run_stage(
 struct UpstreamStart {
     header_mutations: Vec<HeaderMutation>,
     output_body_bytes: Option<u64>,
+    body_transformed: bool,
 }
 
 async fn drive_stage(
     stage: &mut Stage,
-    input: &mut mpsc::Receiver<Frame>,
-    output: &mpsc::Sender<Frame>,
-    output_limit: usize,
+    links: &mut StageLinks,
     shared: &Shared,
 ) -> Result<StageDone, StageError> {
+    let StageLinks {
+        input,
+        output,
+        output_limit,
+        follows_buffered,
+    } = links;
+    let (output_limit, follows_buffered) = (*output_limit, *follows_buffered);
     let upstream = match input.recv().await {
         Some(Frame::Start {
             header_mutations,
             output_body_bytes,
+            body_transformed,
         }) => UpstreamStart {
             header_mutations,
             output_body_bytes,
+            body_transformed,
         },
         Some(_) => return Err(entry_failure(&stage.entry, "stage_input_order_invalid").into()),
         None => return Err(StageError::LinkClosed),
     };
-    let begin_head = headers::apply(
+    let begin_head = headers::apply_accumulated(
         shared.spec.head_authority,
         &stage.head,
         &shared.spec.connection_nominated,
@@ -1228,6 +1486,9 @@ async fn drive_stage(
             .await
         }
         StageMode::Stream => {
+            if follows_buffered && let Some(control) = &stage.legacy_response {
+                control.withhold_output_until_end();
+            }
             drive_stream(
                 stage,
                 input,
@@ -1317,9 +1578,30 @@ async fn drive_buffered(
         entry,
         stream,
         legacy,
+        legacy_response,
         ..
     } = stage;
     let legacy = *legacy;
+    let control = legacy_response.clone();
+    // Input this stage can no longer collect. A legacy response adapter
+    // records the 0.1.x outcome and decides itself whether it fails open.
+    let give_up = |reason: &'static str,
+                   policy: LegacyOverflow,
+                   fail_reason: &'static str,
+                   input_size: usize| match &control {
+        Some(control) if control.buffered_input_failed(reason, input_size) => Collection::Release {
+            reason,
+            report: false,
+        },
+        Some(_) => Collection::Fail(reason),
+        None => match policy {
+            LegacyOverflow::Fail => Collection::Fail(fail_reason),
+            LegacyOverflow::Release { reason } => Collection::Release {
+                reason,
+                report: true,
+            },
+        },
+    };
     let started = Instant::now();
     // Version 2: one deadline for receipt, processing, and delivery. Legacy
     // stages keep their 0.1.x deadlines, and the adapter bounds each exchange.
@@ -1355,48 +1637,35 @@ async fn drive_buffered(
             biased;
             frame = input.recv() => frame,
             () = sleep_until(collect_deadline) => {
-                return match on_collect_deadline {
-                    LegacyOverflow::Fail => {
-                        Err(entry_failure(entry, "middleware_body_timeout").into())
-                    }
-                    LegacyOverflow::Release { reason } => {
-                        release_original(
-                            entry, upstream, body, None, input, output, output_limit, reason,
-                        )
-                        .await
-                    }
-                };
+                let collection = give_up(
+                    "whole_body_accumulation_timeout",
+                    on_collect_deadline,
+                    "middleware_body_timeout",
+                    body.len(),
+                );
+                return collection
+                    .apply(entry, upstream, body, input, output, output_limit)
+                    .await;
             }
         };
         match frame {
             Some(Frame::Chunk(data)) => {
-                if body.len().saturating_add(data.len()) > max_body_bytes {
-                    return match on_overflow {
-                        LegacyOverflow::Fail => Err(entry_failure(
-                            entry,
-                            legacy.map_or(
-                                "buffered_input_over_capacity",
-                                LegacyStagePolicy::overflow_failure_reason,
-                            ),
-                        )
-                        .into()),
-                        LegacyOverflow::Release { reason } => {
-                            body.extend_from_slice(&data);
-                            release_original(
-                                entry,
-                                upstream,
-                                body,
-                                None,
-                                input,
-                                output,
-                                output_limit,
-                                reason,
-                            )
-                            .await
-                        }
-                    };
-                }
+                let over = body.len().saturating_add(data.len()) > max_body_bytes;
                 body.extend_from_slice(&data);
+                if over {
+                    let collection = give_up(
+                        "whole_body_over_capacity",
+                        on_overflow,
+                        legacy.map_or(
+                            "buffered_input_over_capacity",
+                            LegacyStagePolicy::overflow_failure_reason,
+                        ),
+                        body.len(),
+                    );
+                    return collection
+                        .apply(entry, upstream, body, input, output, output_limit)
+                        .await;
+                }
             }
             Some(Frame::End(trailers)) => break trailers,
             Some(Frame::Start { .. }) => {
@@ -1455,7 +1724,7 @@ async fn drive_buffered(
         &result.header_mutations,
     )
     .map_err(|error| mutation_failure(entry, &error))?;
-    let trailers = headers::apply(
+    let mut trailers = headers::apply(
         shared.spec.trailer_authority,
         &trailers,
         &shared.spec.connection_nominated,
@@ -1481,6 +1750,10 @@ async fn drive_buffered(
         }
     };
     let head_changed = late_head != begin_head;
+    let transformed = outcome == HttpStageOutcome::Replacement;
+    if transformed {
+        strip_stale_trailers(&shared.spec, &mut trailers, &result.trailer_mutations);
+    }
     let mut header_mutations = upstream.header_mutations;
     header_mutations.extend(result.header_mutations);
     let delivery = async {
@@ -1489,7 +1762,9 @@ async fn drive_buffered(
             Frame::Start {
                 header_mutations,
                 // Content-Length framing cannot carry trailers.
-                output_body_bytes: trailers.is_empty().then_some(body.len() as u64),
+                output_body_bytes: (trailers.is_empty() || !shared.spec.output_trailers)
+                    .then_some(body.len() as u64),
+                body_transformed: upstream.body_transformed || transformed,
             },
         )
         .await?;
@@ -1502,11 +1777,7 @@ async fn drive_buffered(
             .map_err(|_| entry_failure(entry, "middleware_body_timeout"))??,
         None => delivery.await?,
     }
-    let transformed = outcome == HttpStageOutcome::Replacement;
-    let mut done = StageDone {
-        diagnostics: HttpStageDiagnostics::default(),
-        transformed,
-    };
+    let mut done = StageDone::new(transformed);
     let reason_code = nonempty(&diagnostics.reason_code);
     collect_diagnostics(entry, diagnostics, &mut done.diagnostics);
     let mut invocation = HttpStageInvocation {
@@ -1526,6 +1797,29 @@ async fn drive_buffered(
     }
     done.diagnostics.invocations.push(invocation);
     Ok(done)
+}
+
+/// A stage that changed a response body makes the representation validators
+/// in its input trailers stale. Drop the ones its own trailer mutations did not
+/// write.
+fn strip_stale_trailers(
+    spec: &PipelineSpec,
+    trailers: &mut Vec<HttpHeader>,
+    mutations: &[HeaderMutation],
+) {
+    if spec.direction != HttpDirection::Response {
+        return;
+    }
+    trailers.retain(|trailer| {
+        !is_stale_http_response_integrity_header(&trailer.name)
+            || mutations.iter().any(|mutation| {
+                matches!(
+                    &mutation.operation,
+                    Some(header_mutation::Operation::Write(write))
+                        if write.name.eq_ignore_ascii_case(&trailer.name)
+                )
+            })
+    });
 }
 
 /// A legacy stage that passed its input on after a failure reports it beside
@@ -1551,66 +1845,100 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// What a legacy BUFFERED stage does with input it can no longer collect.
+enum Collection {
+    /// Fail the exchange closed with this reason.
+    Fail(&'static str),
+    /// Pass the original input on. `report` is false when the adapter
+    /// already reported the outcome.
+    Release { reason: &'static str, report: bool },
+}
+
+impl Collection {
+    async fn apply(
+        self,
+        entry: &DescribedChainEntry,
+        upstream: UpstreamStart,
+        collected: Vec<u8>,
+        input: &mut mpsc::Receiver<Frame>,
+        output: &mpsc::Sender<Frame>,
+        output_limit: usize,
+    ) -> Result<StageDone, StageError> {
+        match self {
+            Self::Fail(reason) => Err(entry_failure(entry, reason).into()),
+            Self::Release { reason, report } => {
+                release_original(
+                    entry,
+                    upstream,
+                    collected,
+                    input,
+                    output,
+                    output_limit,
+                    reason,
+                    report,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// Forward the stage's original input unchanged, as `fail_open` does, and
-/// report the skipped stage.
+/// record the skipped stage.
 #[allow(clippy::too_many_arguments)]
 async fn release_original(
     entry: &DescribedChainEntry,
     upstream: UpstreamStart,
     collected: Vec<u8>,
-    trailers: Option<Vec<HttpHeader>>,
     input: &mut mpsc::Receiver<Frame>,
     output: &mpsc::Sender<Frame>,
     output_limit: usize,
     reason: &str,
+    report: bool,
 ) -> Result<StageDone, StageError> {
-    let output_body_bytes = match &trailers {
-        Some(trailers) => trailers.is_empty().then_some(collected.len() as u64),
-        None => upstream.output_body_bytes,
-    };
     send_frame(
         output,
         Frame::Start {
             header_mutations: upstream.header_mutations,
-            output_body_bytes,
+            output_body_bytes: upstream.output_body_bytes,
+            body_transformed: upstream.body_transformed,
         },
     )
     .await?;
     let mut bytes = collected.len();
     send_body(output, &collected, output_limit).await?;
-    let trailers = match trailers {
-        Some(trailers) => trailers,
-        None => loop {
-            match input.recv().await {
-                Some(Frame::Chunk(data)) => {
-                    bytes = bytes.saturating_add(data.len());
-                    send_body(output, &data, output_limit).await?;
-                }
-                Some(Frame::End(trailers)) => break trailers,
-                Some(Frame::Start { .. }) => {
-                    return Err(entry_failure(entry, "stage_input_order_invalid").into());
-                }
-                None => return Err(StageError::LinkClosed),
+    let trailers = loop {
+        match input.recv().await {
+            Some(Frame::Chunk(data)) => {
+                bytes = bytes.saturating_add(data.len());
+                send_body(output, &data, output_limit).await?;
             }
-        },
+            Some(Frame::End(trailers)) => break trailers,
+            Some(Frame::Start { .. }) => {
+                return Err(entry_failure(entry, "stage_input_order_invalid").into());
+            }
+            None => return Err(StageError::LinkClosed),
+        }
     };
     send_frame(output, Frame::End(trailers)).await?;
-    let mut diagnostics = HttpStageDiagnostics::default();
-    diagnostics.invocations.push(HttpStageInvocation {
+    let mut done = StageDone {
+        released: true,
+        ..StageDone::new(false)
+    };
+    done.diagnostics.invocations.push(HttpStageInvocation {
         input_bytes: bytes,
         output_bytes: Some(bytes),
         ..fail_open_invocation(entry, reason)
     });
-    diagnostics.reports.push((
-        entry.entry.name.clone(),
-        StageReport::LegacyFailOpen {
-            reason: reason.to_string(),
-        },
-    ));
-    Ok(StageDone {
-        diagnostics,
-        transformed: false,
-    })
+    if report {
+        done.diagnostics.reports.push((
+            entry.entry.name.clone(),
+            StageReport::LegacyFailOpen {
+                reason: reason.to_string(),
+            },
+        ));
+    }
+    Ok(done)
 }
 
 /// Why a STREAM stage's input pump stopped early.
@@ -1779,6 +2107,7 @@ async fn drive_stream(
                         Frame::Start {
                             header_mutations: header_mutations.clone(),
                             output_body_bytes: declared,
+                            body_transformed: true,
                         },
                     )
                     .await?;
@@ -1804,13 +2133,14 @@ async fn drive_stream(
                         return Err(entry_failure(entry, "stream_output_length_mismatch").into());
                     }
                     let diagnostics = validate_diagnostics(entry, finish.diagnostics.as_ref())?;
-                    let trailers = headers::apply(
+                    let mut trailers = headers::apply(
                         shared.spec.trailer_authority,
                         &trailers,
                         &shared.spec.connection_nominated,
                         &finish.trailer_mutations,
                     )
                     .map_err(|error| mutation_failure(entry, &error))?;
+                    strip_stale_trailers(&shared.spec, &mut trailers, &finish.trailer_mutations);
                     send_frame(output, Frame::End(trailers)).await?;
                     return Ok::<_, StageError>((diagnostics, output_bytes));
                 }
@@ -1844,10 +2174,7 @@ async fn drive_stream(
             }
         }
     };
-    let mut done = StageDone {
-        diagnostics: HttpStageDiagnostics::default(),
-        transformed: true,
-    };
+    let mut done = StageDone::new(true);
     let reason_code = nonempty(&diagnostics.reason_code);
     collect_diagnostics(entry, diagnostics, &mut done.diagnostics);
     done.diagnostics.invocations.push(HttpStageInvocation {
@@ -1899,6 +2226,13 @@ fn status_failure(
     }
     if status.code() == tonic::Code::DeadlineExceeded {
         return entry_failure(entry, "middleware_timeout");
+    }
+    // A version 2 stage says it cannot inspect this message. The reason is
+    // platform-owned, so it never carries the service's status text.
+    if entry.http_protocol() == Some(HttpProtocol::V2)
+        && status.code() == tonic::Code::FailedPrecondition
+    {
+        return entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT);
     }
     entry_failure(entry, &diagnostic_policy(entry).error_reason(status))
 }

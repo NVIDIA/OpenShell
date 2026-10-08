@@ -479,13 +479,13 @@ async fn sse_from_an_http_1_0_upstream_is_streamed_close_delimited() {
         .expect("relay result");
 }
 
-/// 0.1.x chooses downstream framing from the upstream status line alone. An
-/// HTTP/1.0 client whose HTTP/1.1 upstream answers close-delimited therefore
-/// receives chunked framing it cannot decode. The v2 response path is meant
-/// to avoid this; legacy stages keep 0.1.x parity until a fix deliberately
-/// changes this expectation.
+/// Downstream framing depends on both the client request and the upstream
+/// status line. An HTTP/1.0 client whose HTTP/1.1 upstream answers
+/// close-delimited receives the stream close-delimited too, since it cannot
+/// decode chunked framing. 0.1.x looked at the status line alone and sent
+/// this client chunked output.
 #[tokio::test]
-async fn http_1_0_client_receives_chunked_stream_bytes_output() {
+async fn http_1_0_client_receives_close_delimited_stream_bytes_output() {
     let (_fixture, supervisor) = stream_guard(uppercase_units, "fail_closed").await;
     let exchange = supervisor
         .exchange(
@@ -496,11 +496,16 @@ async fn http_1_0_client_receives_chunked_stream_bytes_output() {
     assert!(exchange.relay.is_ok(), "{:?}", exchange.relay);
     let head = header_lines(&exchange.client);
     assert!(
-        head.iter()
-            .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked")),
+        !head
+            .iter()
+            .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding")),
         "{head:?}"
     );
-    assert_eq!(dechunk(body_of(&exchange.client)), b"DATA: ONE\n\n");
+    assert!(
+        head.iter().any(|line| line == "Connection: close"),
+        "{head:?}"
+    );
+    assert_eq!(body_of(&exchange.client), b"DATA: ONE\n\n");
 }
 
 fn fail_second_unit(unit: &HttpResponseBodyUnit) -> Reply<HttpResponseBodyResult> {

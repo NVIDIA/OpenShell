@@ -14,25 +14,33 @@ mod remote;
 mod request;
 #[cfg(test)]
 mod request_tests;
+mod response;
+#[cfg(test)]
+mod response_tests;
 mod runtime;
 mod stage;
 mod websocket;
 
 pub use legacy::response::engine::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
-    HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightInput,
-    HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
-    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES, is_stale_http_response_integrity_header,
+    HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightOutcome,
+    HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
+    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
 };
 
 pub use pipeline::{
     HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput, HttpBodyOutput,
     HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, HttpStageInvocation,
-    HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES,
+    HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT,
 };
 pub use request::{
     HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
     MAX_HTTP_REQUEST_WITHHELD_BYTES,
+};
+pub use response::{
+    HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
+    HttpResponsePreflightInput, http_response_uses_pipeline,
+    is_stale_http_response_integrity_header,
 };
 pub use runtime::{
     ContractFailure, ContractFailureKind, FailOpenNotApplied, MiddlewareRuntimeObserver,
@@ -426,9 +434,9 @@ impl HttpProtocol {
 ///
 /// Registration rejects version 2 bindings for any other operation instead of
 /// resolving them to stages that cannot run. `http-v2` is advertised only when
-/// both directions execute version 2, so until then services that implement
-/// both protocols keep returning legacy bindings and version 2-only services
-/// are refused at Describe.
+/// both directions execute version 2: services that implement both protocols
+/// then return version 2 bindings, and version 2-only services are accepted
+/// at Describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HttpV2Support {
     request: bool,
@@ -439,13 +447,20 @@ impl HttpV2Support {
     /// What this build executes.
     const BUILD: Self = Self {
         request: true,
-        response: false,
+        response: true,
     };
 
     #[cfg(any(test, feature = "test-support"))]
     const ALL: Self = Self {
         request: true,
         response: true,
+    };
+
+    /// A 0.1.x peer, which executes only the legacy HTTP protocol.
+    #[cfg(test)]
+    const NONE: Self = Self {
+        request: false,
+        response: false,
     };
 
     const fn supports(self, direction: HttpDirection) -> bool {
@@ -1403,9 +1418,7 @@ impl MiddlewareRegistry {
     }
 
     /// Connect services as a peer that executes version 2 HTTP in both
-    /// directions, so tests can exercise registration and policy rules before
-    /// this build runs version 2 response stages, which fail closed on the
-    /// legacy response engine.
+    /// directions, whatever this build executes.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn connect_services_with_http_v2(
         in_process_services: Vec<Arc<dyn InProcessMiddleware>>,

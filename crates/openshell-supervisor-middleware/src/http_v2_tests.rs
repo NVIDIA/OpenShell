@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt as _;
 use openshell_core::extension_protocol::{
-    extension_metadata, extension_metadata_with_requirements,
+    extension_metadata, extension_metadata_with_requirements, peer_supports,
 };
 use openshell_core::proto::middleware::v1::http_request_pre_credentials_server::{
     HttpRequestPreCredentials, HttpRequestPreCredentialsServer,
@@ -157,18 +157,12 @@ impl SupervisorMiddleware for CompatService {
         &self,
         request: Request<MiddlewareDescribeRequest>,
     ) -> std::result::Result<TonicResponse<MiddlewareManifest>, TonicStatus> {
-        let capabilities = request
-            .into_inner()
-            .gateway
-            .map(|gateway| gateway.supported_capabilities)
-            .unwrap_or_default();
-        let caller_supports_http_v2 = capabilities
-            .iter()
-            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_V2);
+        let gateway = request.into_inner().gateway.unwrap_or_default();
+        let caller_supports_http_v2 = peer_supports(&gateway, SUPERVISOR_MIDDLEWARE_HTTP_V2);
         self.describe_capabilities
             .lock()
             .expect("describe capabilities")
-            .push(capabilities);
+            .push(gateway.supported_capabilities);
         Ok(TonicResponse::new(self.manifest(caller_supports_http_v2)))
     }
 
@@ -516,6 +510,15 @@ impl InProcessMiddleware for ManifestService {
     }
 }
 
+/// Register `registrations` as a 0.1.x supervisor or gateway would, without
+/// advertising `http-v2`.
+async fn connect_as_0_1_peer(
+    registrations: Vec<SupervisorMiddlewareService>,
+) -> Result<MiddlewareRegistry> {
+    MiddlewareRegistry::connect_services_inner(Vec::new(), registrations, None, HttpV2Support::NONE)
+        .await
+}
+
 #[tokio::test]
 async fn legacy_service_still_registers_and_evaluates_through_the_legacy_rpc() {
     let service = CompatService::new(Build::Legacy);
@@ -526,7 +529,8 @@ async fn legacy_service_still_registers_and_evaluates_through_the_legacy_rpc() {
     )
     .await
     .expect("a 0.1.x service registers unchanged");
-    assert_eq!(service.caller_advertised_http_v2(), [false]);
+    // This build advertises http-v2, which a 0.1.x service ignores.
+    assert_eq!(service.caller_advertised_http_v2(), [true]);
 
     let runner = ChainRunner::from_registry(registry);
     let chain = runner
@@ -549,12 +553,9 @@ async fn legacy_service_still_registers_and_evaluates_through_the_legacy_rpc() {
 async fn version_2_only_service_requires_http_v2() {
     let service = CompatService::new(Build::V2Only);
     let (address, _shutdown) = serve(service.clone()).await;
-    let error = MiddlewareRegistry::connect_services(
-        Vec::new(),
-        vec![registration("guard-service", address)],
-    )
-    .await
-    .expect_err("a peer without http-v2 refuses a version 2-only service at Describe");
+    let error = connect_as_0_1_peer(vec![registration("guard-service", address)])
+        .await
+        .expect_err("a peer without http-v2 refuses a version 2-only service at Describe");
     assert!(
         error
             .to_string()
@@ -562,12 +563,12 @@ async fn version_2_only_service_requires_http_v2() {
     );
     assert!(error.to_string().contains(SUPERVISOR_MIDDLEWARE_HTTP_V2));
 
-    let registry = MiddlewareRegistry::connect_services_with_http_v2(
+    let registry = MiddlewareRegistry::connect_services(
         Vec::new(),
         vec![registration("guard-service", address)],
     )
     .await
-    .expect("a peer that executes version 2 accepts the service");
+    .expect("this build executes version 2 and accepts the service");
     let chain = ChainRunner::from_registry(registry)
         .describe_chain(&[entry("guard", "guard-service", OnError::FailOpen)])
         .await
@@ -586,12 +587,9 @@ async fn dual_protocol_service_gets_version_2_bindings_only_when_the_caller_adve
     let service = CompatService::new(Build::Dual);
     let (address, _shutdown) = serve(service.clone()).await;
 
-    let legacy_peer = MiddlewareRegistry::connect_services(
-        Vec::new(),
-        vec![registration("guard-service", address)],
-    )
-    .await
-    .expect("dual-protocol service registers with legacy bindings");
+    let legacy_peer = connect_as_0_1_peer(vec![registration("guard-service", address)])
+        .await
+        .expect("dual-protocol service registers with legacy bindings");
     let runner = ChainRunner::from_registry(legacy_peer);
     let chain = runner
         .describe_chain(&[entry("guard", "guard-service", OnError::FailClosed)])
@@ -607,7 +605,7 @@ async fn dual_protocol_service_gets_version_2_bindings_only_when_the_caller_adve
     );
     assert_eq!(service.legacy_calls(), 1);
 
-    let v2_peer = MiddlewareRegistry::connect_services_with_http_v2(
+    let v2_peer = MiddlewareRegistry::connect_services(
         Vec::new(),
         vec![registration("guard-service", address)],
     )
@@ -858,25 +856,26 @@ fn service_requiring_http_v2_cannot_advertise_legacy_http_bindings() {
 }
 
 #[test]
-fn version_2_bindings_wait_for_runtime_support() {
-    let manifest = manifest_with(
+fn this_build_runs_and_advertises_version_2_in_both_directions() {
+    let response = manifest_with(
         vec![binding(SupervisorMiddlewareOperation::HttpResponse, 2)],
         legacy_extension(),
     );
-    let error = ensure_http_v2_supported("test service", &manifest, HttpV2Support::BUILD)
-        .expect_err("version 2 bindings are rejected until this build runs them");
+    let request = manifest_with(
+        vec![binding(SupervisorMiddlewareOperation::HttpRequest, 2)],
+        legacy_extension(),
+    );
+    for manifest in [&request, &response] {
+        ensure_http_v2_supported("test service", manifest, HttpV2Support::BUILD)
+            .expect("this build runs version 2 stages in both directions");
+    }
+    let partial = HttpV2Support {
+        request: true,
+        response: false,
+    };
+    let error = ensure_http_v2_supported("test service", &response, partial)
+        .expect_err("a direction without version 2 support rejects its bindings");
     assert!(error.to_string().contains("does not support yet"));
-    ensure_http_v2_supported(
-        "test service",
-        &manifest_with(
-            vec![binding(SupervisorMiddlewareOperation::HttpRequest, 2)],
-            legacy_extension(),
-        ),
-        HttpV2Support::BUILD,
-    )
-    .expect("this build runs version 2 request stages");
-    ensure_http_v2_supported("test service", &manifest, HttpV2Support::ALL)
-        .expect("supported once both directions execute version 2");
 
     let advertised = |support: HttpV2Support| {
         support
@@ -884,12 +883,9 @@ fn version_2_bindings_wait_for_runtime_support() {
             .supported_capabilities
             .contains(&SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string())
     };
-    assert!(!advertised(HttpV2Support::BUILD));
-    assert!(advertised(HttpV2Support::ALL));
-    assert!(!advertised(HttpV2Support {
-        request: true,
-        response: false,
-    }));
+    assert!(advertised(HttpV2Support::BUILD));
+    assert!(!advertised(partial));
+    assert!(!advertised(HttpV2Support::NONE));
 }
 
 #[tokio::test]
@@ -1075,10 +1071,12 @@ async fn unimplemented_legacy_response_rpc_fails_closed_under_fail_open() {
 /// version 2 installs the new bindings.
 #[tokio::test]
 async fn re_describe_after_a_contract_failure_installs_the_swapped_services_bindings() {
-    let service = CompatService::new(Build::Dual);
+    // A 0.1.x service is swapped to a version 2-only build behind the
+    // cached legacy manifest.
+    let service = CompatService::new(Build::Legacy);
     let (address, _shutdown) = serve(service.clone()).await;
     let registrations = vec![registration("guard-service", address)];
-    let entries = [entry("guard", "guard-service", OnError::FailClosed)];
+    let entries = [entry("guard", "guard-service", OnError::FailOpen)];
     let runner = ChainRunner::default().with_replacement_registry(
         MiddlewareRegistry::connect_services(Vec::new(), registrations.clone())
             .await
@@ -1095,19 +1093,20 @@ async fn re_describe_after_a_contract_failure_installs_the_swapped_services_bind
             .run_chain(&entries, request_input())
             .await
             .expect("evaluate")
-            .allowed
+            .allowed,
+        "UNIMPLEMENTED fails closed despite fail_open"
     );
     assert!(runner.take_reconciliation_request());
 
-    let error = MiddlewareRegistry::connect_services(Vec::new(), registrations.clone())
+    let error = connect_as_0_1_peer(registrations.clone())
         .await
         .expect_err("a peer without http-v2 refuses the version 2-only build");
     assert!(error.to_string().contains(SUPERVISOR_MIDDLEWARE_HTTP_V2));
 
     let runner = runner.with_replacement_registry(
-        MiddlewareRegistry::connect_services_with_http_v2(Vec::new(), registrations)
+        MiddlewareRegistry::connect_services(Vec::new(), registrations)
             .await
-            .expect("a peer that executes version 2 installs the new bindings"),
+            .expect("re-describing installs the new bindings"),
     );
     assert_eq!(
         runner.describe_chain(&entries).await.expect("chain")[0].http_protocol(),

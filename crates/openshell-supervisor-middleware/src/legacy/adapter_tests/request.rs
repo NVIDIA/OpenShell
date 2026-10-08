@@ -86,6 +86,7 @@ fn preflight(
             ..Default::default()
         }),
         declared_input_bytes: declared,
+        unavailable_body_modes: Vec::new(),
     }
 }
 
