@@ -7,15 +7,9 @@ description: >
   architecture reviews, security assessments, or when building engineering
   and development plans from requirements. Use proactively after significant
   code changes or before merging.
-# Shared by Claude Code (.claude/agents) and OpenCode (.opencode/agents) via
-# symlinks. Each harness ignores the other's keys. Do not add a Claude `tools:`
-# allowlist: OpenCode silently drops agents whose `tools` is not a map.
+tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
 model: inherit
 memory: project
-disallowedTools: Write, Edit, NotebookEdit
-mode: subagent
-permission:
-  edit: deny
 ---
 
 You are a principal engineer reviewing code, plans, and architecture for the
