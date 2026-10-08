@@ -5205,7 +5205,7 @@ async fn relay_rewritten_forward_request<C, U>(
     options: ForwardRelayOptions<'_>,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
-    C: TokioAsyncRead + TokioAsyncWrite + Unpin,
+    C: tokio::io::AsyncBufRead + TokioAsyncWrite + Unpin,
     U: TokioAsyncRead + TokioAsyncWrite + Unpin,
 {
     let header_end = rewritten
@@ -6721,7 +6721,7 @@ async fn handle_forward_proxy(
         }
         outcome => outcome,
     };
-    let outcome = crate::l7::relay::finalize_websocket_pre_upgrade(
+    let outcome = match crate::l7::relay::finalize_websocket_pre_upgrade(
         &mut middleware_session,
         &forward_generation_guard,
         &host_lc,
@@ -6729,11 +6729,16 @@ async fn handle_forward_proxy(
         policy_str,
         outcome_result,
     )
-    .await?;
+    .await
+    {
+        // The client went away during the response.
+        Err(error) if crate::l7::rest::is_downstream_closed(&error) => None,
+        outcome => Some(outcome?),
+    };
 
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
-    // final allowed outcome.
+    // final allowed outcome, also when the client left during the response.
     ocsf_emit!(build_forward_allow_ocsf_event(
         workload_addr,
         method,
@@ -6747,6 +6752,10 @@ async fn handle_forward_proxy(
         policy_str,
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
+    let Some(outcome) = outcome else {
+        let _ = upstream.shutdown().await;
+        return Ok(());
+    };
 
     match outcome {
         crate::l7::provider::RelayOutcome::Reusable
@@ -9018,6 +9027,144 @@ network_policies:
         }
     }
 
+    /// A forward-proxy client that leaves while its server-sent events
+    /// response is silent ends the exchange at once: the handler returns
+    /// quietly, closes the upstream connection, and still records the
+    /// allowed request.
+    #[tokio::test]
+    async fn forward_proxy_ends_a_response_whose_client_left() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_policies:
+  sse-upstream:
+    name: sse-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/events"
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load REST policy"),
+        );
+
+        // The upstream sends one event, then stays silent until the proxy
+        // closes the connection.
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "request closed before its head completed");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            socket.read_to_end(&mut rest).await.unwrap();
+            rest
+        });
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/events");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nAccept: text/event-stream\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+            let mut response = Vec::new();
+            let mut chunk = [0; 2048];
+            while !response.windows(9).any(|window| window == b"data: one") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "response closed before its first event");
+                response.extend_from_slice(&chunk[..count]);
+            }
+            // The agent gives up while the upstream is silent.
+            drop(socket);
+            response
+        });
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let stream: BoundaryDuplexStream = Box::new(proxy_connection);
+        let mut proxy_connection = tokio::io::BufReader::new(stream);
+        let (activity_tx, mut activity) =
+            mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
+
+        // Resolving the test binary's identity hashes it, which is slow under
+        // load; the upstream itself never sends again.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                None,
+                socket_addrs,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+                Some(&activity_tx),
+                None,
+            )),
+        )
+        .await
+        .expect("the handler ends without waiting for the upstream")
+        .expect("a client that left ends the exchange quietly");
+
+        let response = client.await.expect("join client");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let unexpected = tokio::time::timeout(std::time::Duration::from_secs(10), upstream)
+            .await
+            .expect("the upstream connection closed")
+            .expect("join upstream");
+        assert!(unexpected.is_empty());
+        let recorded = activity.try_recv().expect("allowed request recorded");
+        assert!(!recorded.denied);
+    }
+
     #[tokio::test]
     async fn forward_mcp_websocket_upgrade_is_denied_before_connecting_upstream() {
         if !cfg!(target_os = "linux") {
@@ -10756,7 +10903,8 @@ network_policies:
         );
         let request = b"GET /demo HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec();
         let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
-        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut app, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
         let upstream_task = tokio::spawn(async move {
             let mut request = vec![0; 1024];
             let size = upstream.read(&mut request).await.unwrap();
@@ -10845,7 +10993,8 @@ network_policies:
         let request =
             format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n").into_bytes();
         let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
-        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut app, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
         let upstream_task = tokio::spawn(async move {
             let mut request = vec![0; 1024];
             let size = upstream.read(&mut request).await.unwrap();
@@ -10938,7 +11087,8 @@ network_policies:
         let rewritten = rewrite_forward_request(raw, raw.len(), path, &authority, resolver)
             .map_err(|e| miette::miette!("{e}"))?;
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let upstream_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
@@ -11241,7 +11391,8 @@ network_policies:
         let target = path.to_string();
         let query_params = std::collections::HashMap::new();
         let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
-        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut app, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let relay = tokio::spawn(async move {
             let guard = tunnel_engine.generation_guard();
@@ -13793,7 +13944,8 @@ network_policies:
         )
         .expect("header rewrite should defer body overflow to body rewriter");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let err = relay_rewritten_forward_request(
             "POST",
@@ -13877,7 +14029,8 @@ network_policies:
         let rewritten =
             b"GET /api HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n".to_vec();
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let err = relay_rewritten_forward_request(
             "GET",
@@ -13968,7 +14121,8 @@ network_policies:
         let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let result = relay_rewritten_forward_request(
             "GET",
@@ -14021,7 +14175,8 @@ network_policies:
         let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let result = relay_rewritten_forward_request(
             "POST",

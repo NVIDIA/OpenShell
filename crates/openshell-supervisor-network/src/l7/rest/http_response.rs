@@ -46,6 +46,8 @@ impl Default for RelayResponseOptions<'_> {
     }
 }
 
+/// Relay the response to a request whose body has been read, ending it when
+/// the client goes away (see `client_link`).
 pub(super) async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
@@ -55,59 +57,94 @@ pub(super) async fn relay_response<U, C>(
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
+{
+    let link = ClientLink::new(client);
+    link.arm();
+    relay_response_to(
+        request_method,
+        upstream,
+        &link,
+        options,
+        response_middleware,
+    )
+    .await
+}
+
+/// Relay the response to `link`'s client. The caller arms the watch once the
+/// request body has been read.
+pub(super) async fn relay_response_to<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    link: &ClientLink<'_, C>,
+    options: RelayResponseOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
+{
+    let mut upstream = ProgressReader {
+        upstream,
+        progress: link.progress(),
+    };
+    let outcome = Box::pin(relay_watched_response(
+        request_method,
+        &mut upstream,
+        link,
+        options,
+        response_middleware,
+    ))
+    .await
+    .map_err(|error| link.downstream_closed_or(error))?;
+    // A half-closed client sends no further request.
+    if link.half_closed() && matches!(outcome, RelayOutcome::Reusable) {
+        return finish_response(&mut link.writer(), true)
+            .await
+            .map_err(|error| link.downstream_closed_or(error));
+    }
+    Ok(outcome)
+}
+
+/// Run one phase of the response relay until it ends or the client is gone.
+/// Only phases that hold no middleware session may be cut this way.
+async fn until_client_gone<C, T>(
+    link: &ClientLink<'_, C>,
+    relay: impl Future<Output = Result<T>>,
+) -> Result<T>
+where
+    C: AsyncBufRead + Unpin,
+{
+    tokio::select! {
+        biased;
+        relayed = relay => relayed,
+        gone = link.gone() => {
+            debug!(%gone, "HTTP response relay stopped");
+            Err(miette::Report::new(DownstreamClosed { gone }))
+        }
+    }
+}
+
+async fn relay_watched_response<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    link: &ClientLink<'_, C>,
+    options: RelayResponseOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1024];
-
-    // Forward interim responses unchanged, but retain the final response head
-    // until response middleware preflight completes.
-    let mut informational_header_bytes = 0;
-    let header_end = loop {
-        let header_end = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|end| end + 4);
-        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
-        if header_end.is_some_and(|end| end > remaining_header_bytes)
-            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
-        {
-            if let Some(observer) = options.observer.as_ref() {
-                observer.observe(EndpointResult::TransportFailed);
-            }
-            return Err(miette!("HTTP response headers exceed limit"));
-        }
-
-        if let Some(header_end) = header_end {
-            let header_str = String::from_utf8_lossy(&buf[..header_end]);
-            if matches!(
-                parse_observed_http_status_code(&header_str),
-                Some(100 | 102..=199)
-            ) {
-                informational_header_bytes += header_end;
-                client
-                    .write_all(&buf[..header_end])
-                    .await
-                    .into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
-                buf.drain(..header_end);
-                continue;
-            }
-            break header_end;
-        }
-
-        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
-        if n == 0 {
-            if let Some(observer) = options.observer.as_ref() {
-                observer.observe(EndpointResult::TransportFailed);
-            }
-            if !buf.is_empty() {
-                client.write_all(&buf).await.into_diagnostic()?;
-            }
-            return Ok(RelayOutcome::Consumed);
-        }
-        buf.extend_from_slice(&tmp[..n]);
+    let mut client = link.writer();
+    let Some((buf, header_end)) = until_client_gone(
+        link,
+        read_final_response_head(upstream, &mut client, options.observer),
+    )
+    .await?
+    else {
+        return Ok(RelayOutcome::Consumed);
     };
 
     // Parse response framing
@@ -174,7 +211,7 @@ where
         && let Some(outcome) = Box::pin(relay_response_through_middleware(
             request_method,
             upstream,
-            client,
+            link,
             response_middleware,
             &buf,
             header_end,
@@ -186,30 +223,131 @@ where
         .await?
     {
         return if matches!(outcome, RelayOutcome::Consumed) {
-            finish_response(client, true).await
+            finish_response(&mut client, true).await
         } else {
             Ok(outcome)
         };
     }
 
+    until_client_gone(
+        link,
+        Box::pin(relay_uninspected_response(
+            request_method,
+            upstream,
+            &mut client,
+            &buf,
+            header_end,
+            body_length,
+            status_code,
+            server_wants_close || http_10_closes_by_default,
+            event_stream,
+            started_at,
+        )),
+    )
+    .await
+}
+
+/// Read the upstream response up to its final head, forwarding interim
+/// responses unchanged. Returns the bytes read and the end of the final
+/// head, or `None` when the upstream closed first.
+async fn read_final_response_head<U, C>(
+    upstream: &mut U,
+    client: &mut ClientWriter<'_, '_, C>,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<(Vec<u8>, usize)>>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    // Retain the final response head until response middleware preflight
+    // completes.
+    let mut informational_header_bytes = 0;
+    loop {
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|end| end + 4);
+        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
+        if header_end.is_some_and(|end| end > remaining_header_bytes)
+            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
+        {
+            if let Some(observer) = observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            return Err(miette!("HTTP response headers exceed limit"));
+        }
+
+        if let Some(header_end) = header_end {
+            let header_str = String::from_utf8_lossy(&buf[..header_end]);
+            if matches!(
+                parse_observed_http_status_code(&header_str),
+                Some(100 | 102..=199)
+            ) {
+                informational_header_bytes += header_end;
+                client
+                    .write_all(&buf[..header_end])
+                    .await
+                    .into_diagnostic()?;
+                client.flush().await.into_diagnostic()?;
+                buf.drain(..header_end);
+                continue;
+            }
+            return Ok(Some((buf, header_end)));
+        }
+
+        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
+        if n == 0 {
+            if let Some(observer) = observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            if !buf.is_empty() {
+                client.write_all(&buf).await.into_diagnostic()?;
+            }
+            return Ok(None);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Relay a response no middleware session inspects.
+#[allow(clippy::too_many_arguments)]
+async fn relay_uninspected_response<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut ClientWriter<'_, '_, C>,
+    buf: &[u8],
+    header_end: usize,
+    body_length: BodyLength,
+    status_code: u16,
+    closes: bool,
+    event_stream: bool,
+    started_at: std::time::Instant,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
+{
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
     if is_bodiless_response(request_method, status_code) {
         client
             .write_all(&buf[..header_end])
             .await
             .into_diagnostic()?;
-        return finish_response(client, server_wants_close || http_10_closes_by_default).await;
+        client.head_delivered();
+        return finish_response(client, closes).await;
     }
 
     // No explicit framing (no Content-Length, no Transfer-Encoding).
     // Per RFC 7230 §3.3.3 the body is delimited by connection close.
     if matches!(body_length, BodyLength::None) {
-        if server_wants_close || http_10_closes_by_default || event_stream {
+        if closes || event_stream {
             // Server indicated it will close, or this is a streaming response
             // such as SSE where the body is intentionally delimited by EOF.
             let before_end = &buf[..header_end - 2];
             client.write_all(before_end).await.into_diagnostic()?;
-            if server_wants_close || http_10_closes_by_default {
+            if closes {
                 client
                     .write_all(b"Connection: close\r\n\r\n")
                     .await
@@ -217,6 +355,7 @@ where
             } else {
                 client.write_all(b"\r\n").await.into_diagnostic()?;
             }
+            client.head_delivered();
             let overflow = &buf[header_end..];
             if !overflow.is_empty() {
                 client.write_all(overflow).await.into_diagnostic()?;
@@ -239,12 +378,14 @@ where
             .write_all(&buf[..header_end])
             .await
             .into_diagnostic()?;
+        client.head_delivered();
         client.flush().await.into_diagnostic()?;
         return Ok(RelayOutcome::Reusable);
     }
 
     // Forward response headers + any overflow body bytes
-    client.write_all(&buf).await.into_diagnostic()?;
+    client.write_all(buf).await.into_diagnostic()?;
+    client.head_delivered();
     let overflow_len = (buf.len() - header_end) as u64;
 
     // Forward remaining response body
@@ -267,7 +408,7 @@ where
         "relay_response complete (explicit framing)"
     );
 
-    finish_response(client, server_wants_close || http_10_closes_by_default).await
+    finish_response(client, closes).await
 }
 
 /// Body framing determines when delivery finishes, not whether another
@@ -291,7 +432,7 @@ where
 async fn relay_response_through_middleware<U, C>(
     request_method: &str,
     upstream: &mut U,
-    client: &mut C,
+    link: &ClientLink<'_, C>,
     middleware: HttpResponseMiddlewareRelay<'_>,
     buffered: &[u8],
     header_end: usize,
@@ -302,7 +443,7 @@ async fn relay_response_through_middleware<U, C>(
 ) -> Result<Option<RelayOutcome>>
 where
     U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
 {
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
@@ -338,7 +479,7 @@ where
                 false,
             );
             send_response_delivery_failure(
-                client,
+                &mut link.writer(),
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
@@ -350,7 +491,7 @@ where
     Box::pin(pipeline::relay_response_through_pipeline(
         request_method,
         upstream,
-        client,
+        link,
         middleware,
         described,
         parsed,
@@ -368,7 +509,7 @@ where
 async fn relay_headers_only_response<U, C>(
     request_method: &str,
     upstream: &mut U,
-    client: &mut C,
+    client: &mut ClientWriter<'_, '_, C>,
     status_line: &str,
     headers: &[HttpHeader],
     preserved_credential_headers: &[String],
@@ -381,7 +522,7 @@ async fn relay_headers_only_response<U, C>(
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
 {
     let head = serialize_response_head(
         status_line,
@@ -392,6 +533,7 @@ where
         declared_trailers,
     );
     client.write_all(&head).await.into_diagnostic()?;
+    client.head_delivered();
 
     if is_bodiless_response(request_method, status_code) {
         client.flush().await.into_diagnostic()?;
@@ -440,7 +582,7 @@ struct ResponseInvocationRecord<'a> {
     input_bytes: usize,
     failed: bool,
     blocked: bool,
-    /// Platform-owned reason of a failed stage.
+    /// Platform-owned reason of a failed or cancelled stage.
     failure_reason: Option<&'a str>,
 }
 
@@ -493,7 +635,7 @@ fn http_response_invocation_event(
         } else {
             openshell_ocsf::SeverityId::Informational
         })
-        .status(if failed || blocked {
+        .status(if failed || blocked || failure_reason.is_some() {
             openshell_ocsf::StatusId::Failure
         } else {
             openshell_ocsf::StatusId::Success

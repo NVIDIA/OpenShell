@@ -7,13 +7,21 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
+mod client_link;
+#[cfg(test)]
+mod client_watch_tests;
 mod http_response;
 mod request_body;
+
+#[cfg(test)]
+pub(crate) use client_link::ReceivingClient;
+pub(crate) use client_link::{ClientGone, DownstreamClosed, is_downstream_closed};
+use client_link::{ClientLink, ClientWriter, ProgressReader};
 
 pub(crate) use http_response::{
     DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
 };
-use http_response::{RelayResponseOptions, finish_response, relay_response};
+use http_response::{RelayResponseOptions, finish_response, relay_response, relay_response_to};
 #[cfg(test)]
 use http_response::{
     http_response_middleware_fail_open_finding_event, http_response_middleware_invocation_events,
@@ -45,7 +53,7 @@ use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
@@ -136,7 +144,7 @@ impl L7Provider for RestProvider {
         upstream: &mut U,
     ) -> Result<RelayOutcome>
     where
-        C: AsyncRead + AsyncWrite + Unpin + Send,
+        C: AsyncBufRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send,
     {
         relay_http_request(req, client, upstream).await
@@ -716,7 +724,7 @@ async fn relay_http_request<C, U>(
     upstream: &mut U,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_resolver(req, client, upstream, None).await
@@ -729,7 +737,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     resolver: Option<&SecretResolver>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
@@ -743,7 +751,7 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_options_guarded(
@@ -884,7 +892,7 @@ pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
     options: RelayRequestOptions<'_>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_response_middleware_guarded_observed(
@@ -902,7 +910,7 @@ pub(crate) async fn relay_http_request_with_response_middleware_guarded_observed
     observer: Option<&EndpointObserver>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     Box::pin(relay_http_request_with_body_guarded_observed(
@@ -929,7 +937,7 @@ pub(crate) async fn relay_http_request_with_body_guarded_observed<C, U>(
     observer: Option<&EndpointObserver>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let mut observed_upstream = ObservedUpstream { upstream, observer };
@@ -4469,7 +4477,8 @@ mod tests {
         client_frame: Vec<u8>,
     ) -> (String, CapturedFrame) {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16384);
-        let (mut client_app, mut proxy_to_client) = tokio::io::duplex(16384);
+        let (mut client_app, proxy_to_client) = tokio::io::duplex(16384);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
         let req = websocket_request(request_extension);
         let resolver_for_header = resolver.clone();
         let resolver_for_upgrade = resolver.clone();
@@ -6059,7 +6068,8 @@ mod tests {
             let request =
                 request_from_buffered_http("POST", "/mcp", "/mcp", raw_request.into_bytes())
                     .expect("parse buffered MCP request");
-            let (mut client, peer) = tokio::io::duplex(4096);
+            let (client, peer) = tokio::io::duplex(4096);
+            let mut client = tokio::io::BufReader::new(client);
             let mut peer = Some(peer);
             if disconnect_client {
                 drop(peer.take());
@@ -6134,7 +6144,7 @@ mod tests {
         relay_response(
             "POST",
             &mut upstream,
-            &mut client,
+            &mut ReceivingClient(&mut client),
             RelayResponseOptions {
                 observer: Some(&observer),
                 ..Default::default()
@@ -6180,7 +6190,7 @@ mod tests {
         let outcome = relay_response(
             "POST",
             &mut upstream,
-            &mut client,
+            &mut ReceivingClient(&mut client),
             RelayResponseOptions {
                 observer: Some(&observer),
                 ..Default::default()
@@ -6218,7 +6228,7 @@ mod tests {
         relay_response(
             "POST",
             &mut upstream,
-            &mut client,
+            &mut ReceivingClient(&mut client),
             RelayResponseOptions {
                 observer: Some(&observer),
                 ..Default::default()
@@ -6261,7 +6271,7 @@ mod tests {
         relay_response(
             "POST",
             &mut upstream,
-            &mut client,
+            &mut ReceivingClient(&mut client),
             RelayResponseOptions {
                 observer: Some(&observer),
                 ..Default::default()
@@ -6319,7 +6329,7 @@ mod tests {
             relay_response(
                 "POST",
                 &mut upstream,
-                &mut client,
+                &mut ReceivingClient(&mut client),
                 RelayResponseOptions {
                     observer: Some(&observer),
                     ..Default::default()
@@ -6353,7 +6363,7 @@ mod tests {
     async fn endpoint_observation_reports_sse_headers_before_body_eof() {
         let (observer, mut receiver) = test_endpoint_observer().await;
         let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
-        let mut client = tokio::io::sink();
+        let mut client = ReceivingClient(tokio::io::sink());
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let writer = async move {
             upstream_peer
@@ -6464,7 +6474,7 @@ mod tests {
                 let outcome = relay_response(
                     "GET",
                     &mut upstream,
-                    &mut delivered,
+                    &mut ReceivingClient(&mut delivered),
                     RelayResponseOptions::default(),
                     context,
                 )
@@ -6489,7 +6499,7 @@ mod tests {
         let outcome = relay_response(
             "GET",
             &mut upstream,
-            &mut delivered,
+            &mut ReceivingClient(&mut delivered),
             RelayResponseOptions::default(),
             Some(response_middleware_context(&runner, &chain, "GET")),
         )
@@ -6532,7 +6542,7 @@ mod tests {
         let outcome = relay_response(
             "GET",
             &mut upstream,
-            &mut delivered,
+            &mut ReceivingClient(&mut delivered),
             RelayResponseOptions::default(),
             Some(response_middleware_context(&runner, &chain, "GET")),
         )
@@ -6572,7 +6582,8 @@ mod tests {
             let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
             let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
             // Small capacity forces the relay to complete partial downstream writes.
-            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let (mut client_read, client_write) = tokio::io::duplex(7);
+            let mut client_write = tokio::io::BufReader::new(client_write);
             let head = if chunked {
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n1000\r\nabc".as_slice()
             } else {
@@ -6728,7 +6739,8 @@ mod tests {
     ) -> (Result<RelayOutcome>, Vec<u8>) {
         let (runner, chain) = response_middleware_fixture_with_error(script, on_error);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
-        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, client_write) = tokio::io::duplex(16 * 1024);
+        let mut client_write = tokio::io::BufReader::new(client_write);
         let response = response.to_vec();
         tokio::spawn(async move {
             upstream_write.write_all(&response).await.unwrap();
@@ -6932,7 +6944,7 @@ mod tests {
         let mut middleware = response_middleware_context(&runner, &chain, "GET");
         middleware.generation_guard = Some(&guard);
         let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
-        let mut delivered = Vec::new();
+        let mut delivered = ReceivingClient(Vec::new());
         let relay = relay_response(
             "GET",
             &mut upstream,
@@ -6948,7 +6960,7 @@ mod tests {
             release.notify_one();
         };
         let (outcome, ()) = tokio::join!(relay, reload);
-        (outcome, delivered)
+        (outcome, delivered.0)
     }
 
     #[tokio::test]
@@ -6984,7 +6996,8 @@ mod tests {
         let (runner, chain) =
             response_middleware_fixture_with_error(ResponseRelayScript::WholeBody, on_error);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
-        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, client_write) = tokio::io::duplex(16 * 1024);
+        let mut client_write = tokio::io::BufReader::new(client_write);
         tokio::spawn(async move {
             upstream_write
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nh")
@@ -7097,7 +7110,8 @@ mod tests {
             openshell_supervisor_middleware::OnError::FailOpen,
         );
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
-        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, client_write) = tokio::io::duplex(16 * 1024);
+        let mut client_write = tokio::io::BufReader::new(client_write);
         tokio::spawn(async move {
             upstream_write
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nh")
@@ -7144,7 +7158,8 @@ mod tests {
             chain.insert(0, whole_body);
             let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
             // Force write_all to make partial progress before each wait.
-            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let (mut client_read, client_write) = tokio::io::duplex(7);
+            let mut client_write = tokio::io::BufReader::new(client_write);
             let producer = async move {
                 let head = if chunked {
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n".as_slice()
@@ -7529,7 +7544,8 @@ mod tests {
         engine.reload(TEST_POLICY, policy_data).unwrap();
         let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
         upstream_write
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
             .await
@@ -7556,7 +7572,8 @@ mod tests {
     async fn response_middleware_client_disconnect_aborts_stream_delivery() {
         let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (client_read, mut client_write) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
         drop(client_read);
         upstream_write
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
@@ -7699,7 +7716,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nServer: test\r\n\r\nhello world";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -7745,7 +7763,8 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\ndata: {}\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -7782,7 +7801,8 @@ mod tests {
     #[tokio::test]
     async fn relay_response_no_framing_event_stream_survives_idle_gap() {
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         let upstream_task = tokio::spawn(async move {
             upstream_write
@@ -7841,7 +7861,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nServer: test\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -7883,7 +7904,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -7923,7 +7945,8 @@ mod tests {
         let response = b"HTTP/1.1 204 No Content\r\nServer: test\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -7963,7 +7986,8 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -8007,7 +8031,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -8053,7 +8078,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -8148,7 +8174,8 @@ mod tests {
                     .as_ref()
                     .map(|(runner, chain)| response_middleware_context(runner, chain, method));
                 let mut upstream = response.as_bytes();
-                let (mut reader, mut writer) = tokio::io::duplex(4096);
+                let (mut reader, writer) = tokio::io::duplex(4096);
+                let mut writer = tokio::io::BufReader::new(writer);
                 let outcome = relay_response(
                     method,
                     &mut upstream,
@@ -8201,7 +8228,8 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         tokio::spawn(async move {
             upstream_write.write_all(response).await.unwrap();
@@ -8253,7 +8281,8 @@ mod tests {
         drop(upstream_write);
 
         let mut upstream_read = upstream_read;
-        let mut client_write = client_write;
+        let client_write = client_write;
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -8301,7 +8330,8 @@ mod tests {
         drop(upstream_write);
 
         let mut upstream_read = upstream_read;
-        let mut client_write = client_write;
+        let client_write = client_write;
+        let mut client_write = tokio::io::BufReader::new(client_write);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -8330,7 +8360,8 @@ mod tests {
         // Upstream responds with 101 (non-compliant). The relay should
         // reject the upgrade and return Consumed instead.
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -8389,7 +8420,8 @@ mod tests {
     async fn relay_accepts_101_with_client_upgrade_header() {
         // Client sends a proper upgrade request with Upgrade + Connection headers.
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -8445,7 +8477,8 @@ mod tests {
     #[tokio::test]
     async fn opted_in_websocket_relay_rejects_invalid_upgrade_before_upstream_write() {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -8482,7 +8515,8 @@ mod tests {
     #[tokio::test]
     async fn opted_in_websocket_relay_strips_request_extensions_and_rejects_response_extensions() {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -8554,7 +8588,8 @@ mod tests {
     #[tokio::test]
     async fn permessage_deflate_mode_allows_supported_no_context_takeover() {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -8718,7 +8753,8 @@ mod tests {
     #[tokio::test]
     async fn opted_in_websocket_relay_rejects_invalid_accept_before_forwarding_101() {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "GET".to_string(),
@@ -9009,7 +9045,8 @@ mod tests {
             body_length: BodyLength::None,
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let result = relay_http_request_with_resolver_guarded(
             &req,
@@ -9367,7 +9404,8 @@ mod tests {
         let placeholder = child_env.get("NVIDIA_API_KEY").unwrap();
 
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "POST".to_string(),
@@ -9454,7 +9492,8 @@ mod tests {
         let placeholder = child_env.get("NVIDIA_API_KEY").unwrap();
 
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let req = L7Request {
             action: "POST".to_string(),
@@ -9522,7 +9561,8 @@ mod tests {
         resolver: Option<&SecretResolver>,
     ) -> Result<String> {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         // Parse the request line to extract action and target for L7Request
         let header_str = String::from_utf8_lossy(&raw_header);
@@ -9593,7 +9633,8 @@ mod tests {
         request_body_credential_rewrite: bool,
     ) -> Result<String> {
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let header_str = String::from_utf8_lossy(&raw_header);
         let first_line = header_str.lines().next().unwrap_or("");
@@ -9886,7 +9927,8 @@ mod tests {
             raw_header,
             body_length: BodyLength::ContentLength(body.len() as u64),
         };
-        let (mut client_side, mut proxy_client) = tokio::io::duplex(1024);
+        let (mut client_side, proxy_client) = tokio::io::duplex(1024);
+        let mut proxy_client = tokio::io::BufReader::new(proxy_client);
         client_side.write_all(&body[split..]).await.unwrap();
         drop(client_side);
         let (mut proxy_upstream, mut upstream_side) = tokio::io::duplex(4096);
@@ -10058,7 +10100,8 @@ mod tests {
             body_length: BodyLength::ContentLength(body.len() as u64),
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let err = relay_http_request_with_options_guarded(
             &req,
@@ -10108,7 +10151,8 @@ mod tests {
             body_length: BodyLength::ContentLength(body.len() as u64),
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let err = relay_http_request_with_options_guarded(
             &req,
@@ -10304,7 +10348,8 @@ mod tests {
             body_length: BodyLength::None,
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
-        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        let (mut _app_side, proxy_to_client) = tokio::io::duplex(8192);
+        let mut proxy_to_client = tokio::io::BufReader::new(proxy_to_client);
 
         let upstream_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];

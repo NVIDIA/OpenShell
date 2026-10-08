@@ -1893,6 +1893,13 @@ impl ChainRunner {
         self.reserve_middleware_work().await?.into_admission()
     }
 
+    /// Persistent middleware sessions not in use.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn available_middleware_sessions(&self) -> usize {
+        self.registry.session_admission.available_permits()
+    }
+
     /// Attempt to reserve one persistent middleware session without waiting.
     ///
     /// Long-lived sessions have no useful queueing bound because their release

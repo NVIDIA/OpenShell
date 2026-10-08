@@ -31,7 +31,7 @@ use openshell_ocsf::{
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -654,7 +654,7 @@ async fn forward_inspected_request<C, U>(
     forwarding: InspectedForwarding<'_>,
 ) -> Result<Option<RelayOutcome>>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let InspectedForwarding {
@@ -742,7 +742,7 @@ async fn relay_http_request_with_credential_rejection<C, U>(
     response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
 ) -> Result<Option<RelayOutcome>>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     relay_http_request_with_credential_rejection_observed(
@@ -768,25 +768,29 @@ async fn relay_http_request_with_credential_rejection_observed<C, U>(
     observer: Option<&EndpointObserver>,
 ) -> Result<Option<RelayOutcome>>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    Box::pin(relay_http_request_with_body_observed(
-        request,
-        client,
-        upstream,
-        options,
-        ctx,
-        None,
-        response_middleware,
-        observer,
-    ))
-    .await
+    end_if_client_gone(
+        Box::pin(relay_http_request_with_body_observed(
+            request,
+            client,
+            upstream,
+            options,
+            ctx,
+            None,
+            response_middleware,
+            observer,
+        ))
+        .await,
+    )
 }
 
 /// Relay a request, with its body streamed by request middleware when
 /// `live_body` is present, answering credential and middleware failures that
-/// happen before any response byte.
+/// happen before any response byte. A client that went away during the
+/// response is a [`crate::l7::rest::is_downstream_closed`] error after the
+/// upstream connection is shut down; see [`end_if_client_gone`].
 #[allow(clippy::too_many_arguments)]
 async fn relay_http_request_with_body_observed<C, U>(
     request: &crate::l7::provider::L7Request,
@@ -799,7 +803,7 @@ async fn relay_http_request_with_body_observed<C, U>(
     observer: Option<&EndpointObserver>,
 ) -> Result<Option<RelayOutcome>>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     match Box::pin(
@@ -817,6 +821,11 @@ where
     {
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
+            // The client went away; the caller ends the connection quietly.
+            if crate::l7::rest::is_downstream_closed(&report) {
+                let _ = upstream.shutdown().await;
+                return Err(report);
+            }
             if let Some(failure) = report.downcast_ref::<crate::l7::rest::LiveRequestFailure>() {
                 let _ = upstream.shutdown().await;
                 reject_live_request_body(client, ctx, request, failure, observer).await?;
@@ -851,6 +860,15 @@ where
                 Err(report)
             }
         }
+    }
+}
+
+/// A connection whose client went away during a response ends without an
+/// error; any other relay result passes through.
+fn end_if_client_gone(result: Result<Option<RelayOutcome>>) -> Result<Option<RelayOutcome>> {
+    match result {
+        Err(error) if crate::l7::rest::is_downstream_closed(&error) => Ok(None),
+        result => result,
     }
 }
 
@@ -1651,7 +1669,7 @@ where
                 }
                 Err(error) => Err(error),
             };
-            let outcome = finalize_websocket_pre_upgrade(
+            let outcome = match finalize_websocket_pre_upgrade(
                 &mut middleware_session,
                 engine.generation_guard(),
                 &ctx.host,
@@ -1659,7 +1677,11 @@ where
                 &ctx.policy_name,
                 outcome_result,
             )
-            .await?;
+            .await
+            {
+                Err(error) if crate::l7::rest::is_downstream_closed(&error) => return Ok(()),
+                outcome => outcome?,
+            };
             match outcome {
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
@@ -2130,7 +2152,7 @@ async fn relay_rest<C, U>(
     ctx: &L7EvalContext,
 ) -> Result<()>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // Build a provider carrying the per-endpoint canonicalization options so
@@ -2407,7 +2429,7 @@ where
                 }
                 Err(error) => Err(error),
             };
-            let outcome = finalize_websocket_pre_upgrade(
+            let outcome = match finalize_websocket_pre_upgrade(
                 &mut middleware_session,
                 engine.generation_guard(),
                 &ctx.host,
@@ -2415,7 +2437,11 @@ where
                 &ctx.policy_name,
                 outcome_result,
             )
-            .await?;
+            .await
+            {
+                Err(error) if crate::l7::rest::is_downstream_closed(&error) => return Ok(()),
+                outcome => outcome?,
+            };
             match outcome {
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
@@ -2535,7 +2561,9 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
             }
         }
         Err(error) => {
-            let reason = if guard.is_stale() {
+            let reason = if crate::l7::rest::is_downstream_closed(&error) {
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect
+            } else if guard.is_stale() {
                 emit_policy_reload(guard, host, port, policy_name);
                 openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else {
@@ -2557,7 +2585,7 @@ async fn relay_jsonrpc<C, U>(
     ctx: &L7EvalContext,
 ) -> Result<()>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     loop {
@@ -2781,23 +2809,25 @@ where
                 }
             };
             let mut forwarding_ctx = ctx.clone();
-            let Some(outcome) = forward_inspected_request(
-                req,
-                client,
-                upstream,
-                &mut forwarding_ctx,
-                InspectedForwarding {
-                    config,
-                    engine,
-                    request_info: &request_info,
-                    request_id: &request_id,
-                    response_chain: &response_chain,
-                    websocket_middleware: false,
-                    observation_context: observation_context.as_ref(),
-                    live_body: None,
-                },
-            )
-            .await?
+            let Some(outcome) = end_if_client_gone(
+                forward_inspected_request(
+                    req,
+                    client,
+                    upstream,
+                    &mut forwarding_ctx,
+                    InspectedForwarding {
+                        config,
+                        engine,
+                        request_info: &request_info,
+                        request_id: &request_id,
+                        response_chain: &response_chain,
+                        websocket_middleware: false,
+                        observation_context: observation_context.as_ref(),
+                        live_body: None,
+                    },
+                )
+                .await,
+            )?
             else {
                 return Ok(());
             };
@@ -2842,7 +2872,7 @@ async fn relay_graphql<C, U>(
     ctx: &L7EvalContext,
 ) -> Result<()>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let provider =
@@ -3061,23 +3091,25 @@ where
                 }
             };
             let mut forwarding_ctx = ctx.clone();
-            let Some(outcome) = forward_inspected_request(
-                req,
-                client,
-                upstream,
-                &mut forwarding_ctx,
-                InspectedForwarding {
-                    config,
-                    engine,
-                    request_info: &request_info,
-                    request_id: &request_id,
-                    response_chain: &response_chain,
-                    websocket_middleware: false,
-                    observation_context: None,
-                    live_body: None,
-                },
-            )
-            .await?
+            let Some(outcome) = end_if_client_gone(
+                forward_inspected_request(
+                    req,
+                    client,
+                    upstream,
+                    &mut forwarding_ctx,
+                    InspectedForwarding {
+                        config,
+                        engine,
+                        request_info: &request_info,
+                        request_id: &request_id,
+                        response_chain: &response_chain,
+                        websocket_middleware: false,
+                        observation_context: None,
+                        live_body: None,
+                    },
+                )
+                .await,
+            )?
             else {
                 return Ok(());
             };
@@ -3632,7 +3664,7 @@ pub async fn relay_passthrough_with_credentials<C, U>(
     middleware_engine: Option<&crate::opa::OpaEngine>,
 ) -> Result<()>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // Passthrough path: no L7 policy is enforced here, so use default
@@ -3815,22 +3847,24 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let Some(outcome) = relay_http_request_with_body_observed(
-            &req_with_auth,
-            client,
-            upstream,
-            crate::l7::rest::RelayRequestOptions {
-                resolver,
-                credential_generation: credential_generation_guard(ctx),
-                generation_guard: Some(generation_guard),
-                ..Default::default()
-            },
-            ctx,
-            live_body.as_deref_mut(),
-            response_middleware,
-            None,
-        )
-        .await?
+        let Some(outcome) = end_if_client_gone(
+            relay_http_request_with_body_observed(
+                &req_with_auth,
+                client,
+                upstream,
+                crate::l7::rest::RelayRequestOptions {
+                    resolver,
+                    credential_generation: credential_generation_guard(ctx),
+                    generation_guard: Some(generation_guard),
+                    ..Default::default()
+                },
+                ctx,
+                live_body.as_deref_mut(),
+                response_middleware,
+                None,
+            )
+            .await,
+        )?
         else {
             return Ok(());
         };
@@ -3890,7 +3924,8 @@ mod tests {
             raw_header: b"POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 25\r\n\r\nopenshell:resolve:env:KEY".to_vec(),
             body_length: crate::l7::provider::BodyLength::ContentLength(25),
         };
-        let (mut client, mut caller) = tokio::io::duplex(4096);
+        let (client, mut caller) = tokio::io::duplex(4096);
+        let mut client = tokio::io::BufReader::new(client);
         let (mut upstream, mut server) = tokio::io::duplex(4096);
         let outcome = relay_http_request_with_credential_rejection(
             &req,
@@ -3970,7 +4005,8 @@ mod tests {
             .into_bytes(),
             body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
         };
-        let (mut client, caller) = tokio::io::duplex(4096);
+        let (client, caller) = tokio::io::duplex(4096);
+        let mut client = tokio::io::BufReader::new(client);
         let mut caller = Some(caller);
         if disconnect_client {
             // The denial must survive failure to deliver the local HTTP response.
@@ -4327,7 +4363,8 @@ mod tests {
         resolver: &SecretResolver,
         options: crate::l7::rest::RelayRequestOptions<'_>,
     ) {
-        let (mut client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut client_peer, client) = tokio::io::duplex(8192);
+        let mut client = tokio::io::BufReader::new(client);
         let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
         let ctx = L7EvalContext {
             host: "denied.example.test".to_string(),
@@ -4946,7 +4983,8 @@ network_policies:
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_rest(
@@ -6104,7 +6142,8 @@ network_policies:
         };
         let event_ctx = ctx.clone();
 
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -6207,7 +6246,8 @@ network_policies:
             ..Default::default()
         };
 
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -6315,7 +6355,8 @@ network_policies:
             binary_path: "/usr/bin/curl".into(),
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -6518,7 +6559,8 @@ network_policies:
             secret_resolver: None,
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_jsonrpc(
@@ -6753,7 +6795,8 @@ network_policies:
             secret_resolver: state.resolver(),
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_rest(
@@ -6895,7 +6938,8 @@ network_policies:
     ) -> (String, Option<String>) {
         let (config, tunnel_engine, ctx) =
             jsonrpc_transforming_relay_parts(enforcement, replacement);
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_jsonrpc(
@@ -7049,7 +7093,8 @@ network_policies:
             secret_resolver: None,
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_graphql(
@@ -7704,7 +7749,8 @@ network_policies:
             ..Default::default()
         };
 
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let engine_task = Arc::clone(&engine);
         let relay = tokio::spawn(async move {
@@ -7874,7 +7920,8 @@ network_policies:
     async fn passthrough_relay_injects_token_grant_authorization_header() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_grant_relay_context(Ok("grant-token"));
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -7937,7 +7984,8 @@ network_policies:
     async fn passthrough_relay_token_grant_failure_returns_bad_gateway_without_forwarding() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_grant_relay_context(Err("oauth unavailable"));
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -7989,7 +8037,8 @@ network_policies:
     async fn passthrough_relay_injects_token_exchange_authorization_header() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_exchange_relay_context(Ok("grant-token"));
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -8054,7 +8103,8 @@ network_policies:
     async fn passthrough_relay_token_exchange_failure_returns_bad_gateway_without_forwarding() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_exchange_relay_context(Err("oauth unavailable"));
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -9053,7 +9103,8 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ..Default::default()
         };
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_rest(
@@ -10495,7 +10546,8 @@ network_policies:
             ..Default::default()
         };
 
-        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
             relay_passthrough_with_credentials(
@@ -11818,7 +11870,8 @@ network_policies:
             raw_header: format!("POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\nAuthorization: Bearer fixture\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
             body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
         };
-        let (mut client, mut relay_client) = tokio::io::duplex(2048);
+        let (mut client, relay_client) = tokio::io::duplex(2048);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(2048);
         let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
             &request,
@@ -12623,5 +12676,142 @@ network_policies:
             .expect("relay should complete")
             .unwrap()
             .unwrap();
+    }
+
+    /// JSON-RPC and GraphQL connections whose client leaves while the upstream
+    /// is silent end quietly, as REST and passthrough connections do.
+    #[tokio::test(start_paused = true)]
+    async fn body_inspected_connections_end_quietly_when_the_client_leaves_during_silence() {
+        let mcp_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let mcp_event = r#"data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}"#;
+        let graphql_body = r#"{"query":"query { viewer }"}"#;
+        let cases = [
+            (
+                mcp_test_relay_context(),
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: mcp.example.test\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{mcp_body}",
+                    mcp_body.len()
+                ),
+                format!("{mcp_event}\n\n"),
+            ),
+            (
+                graphql_test_relay_context(),
+                format!(
+                    "POST /graphql HTTP/1.1\r\nHost: graphql.example.test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{graphql_body}",
+                    graphql_body.len()
+                ),
+                "data: one\n\n".to_string(),
+            ),
+        ];
+        for ((config, engine, ctx), request, event) in cases {
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_inspection(
+                    &config,
+                    engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            });
+
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut forwarded = Vec::new();
+            while !forwarded.ends_with(b"}") {
+                forwarded.push(upstream.read_u8().await.unwrap());
+            }
+            upstream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+                        event.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut delivered = Vec::new();
+            while !String::from_utf8_lossy(&delivered).contains("data: ") {
+                let mut buffer = [0u8; 1024];
+                let read = app.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "the client connection closed early: {request}");
+                delivered.extend_from_slice(&buffer[..read]);
+            }
+            tokio::time::sleep(std::time::Duration::from_mins(5)).await;
+            assert!(!relay.is_finished(), "{request}");
+
+            drop(app);
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                .await
+                .expect("relay should finish")
+                .unwrap()
+                .unwrap_or_else(|error| panic!("the connection ends quietly: {error}; {request}"));
+        }
+    }
+
+    /// A passthrough connection whose client leaves while the upstream is
+    /// silent ends quietly, and its upstream connection closes.
+    #[tokio::test(start_paused = true)]
+    async fn passthrough_ends_quietly_when_the_client_leaves_during_silence() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let mut relay_client = tokio::io::BufReader::new(relay_client);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        app.write_all(b"GET /v1/events HTTP/1.1\r\nHost: api.example.test:8080\r\n\r\n")
+            .await
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(upstream.read_u8().await.unwrap());
+        }
+        upstream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut delivered = Vec::new();
+        while !String::from_utf8_lossy(&delivered).contains("data: one") {
+            let mut buffer = [0u8; 1024];
+            let read = app.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the client connection closed early");
+            delivered.extend_from_slice(&buffer[..read]);
+        }
+        tokio::time::sleep(std::time::Duration::from_mins(5)).await;
+        assert!(!relay.is_finished());
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .expect("the connection ends quietly");
+        let mut unexpected = Vec::new();
+        upstream.read_to_end(&mut unexpected).await.unwrap();
+        assert!(unexpected.is_empty());
     }
 }

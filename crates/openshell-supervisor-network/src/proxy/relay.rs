@@ -13,7 +13,7 @@ use openshell_core::proto::ProviderProfileCredential;
 use openshell_core::secrets::SecretResolver;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 type DynamicCredentials = Arc<std::sync::RwLock<HashMap<String, ProviderProfileCredential>>>;
 
@@ -241,7 +241,7 @@ pub(super) async fn relay_http_stream<C, U>(
     context: RelayContext<'_>,
 ) -> Result<()>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncBufRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     match context.policy {
@@ -309,8 +309,10 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // The proxy reads its clients through a buffer, as the relay requires.
+    let mut client = tokio::io::BufReader::new(client);
     relay_http_stream(
-        client,
+        &mut client,
         upstream,
         RelayContext {
             request,
@@ -408,7 +410,7 @@ mod tests {
     async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)
     where
         C: AsyncRead + AsyncWrite + Unpin,
-        P: AsyncRead + AsyncWrite + Unpin + Send,
+        P: AsyncBufRead + AsyncWrite + Unpin + Send,
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -466,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn http_relay_reuses_then_closes_after_complete_response() {
         let (caller, client) = tokio::io::duplex(1024);
-        assert_response_lifecycle(caller, client).await;
+        assert_response_lifecycle(caller, tokio::io::BufReader::new(client)).await;
     }
 
     #[tokio::test]

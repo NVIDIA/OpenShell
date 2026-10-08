@@ -12,7 +12,7 @@
 use miette::Result;
 use std::collections::HashMap;
 use std::future::Future;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 /// Outcome of relaying a single HTTP request/response pair.
 #[derive(Debug)]
@@ -79,7 +79,9 @@ pub trait L7Provider: Send + Sync {
     ///
     /// Returns a [`RelayOutcome`] indicating whether the connection is
     /// reusable (keep-alive), consumed, or has been upgraded (101 Switching
-    /// Protocols) and must be relayed as raw bidirectional TCP.
+    /// Protocols) and must be relayed as raw bidirectional TCP. The relay
+    /// watches the buffered client for a close while the response is relayed,
+    /// without consuming a pipelined next request.
     fn relay<C, U>(
         &self,
         req: &L7Request,
@@ -87,7 +89,7 @@ pub trait L7Provider: Send + Sync {
         upstream: &mut U,
     ) -> impl Future<Output = Result<RelayOutcome>> + Send
     where
-        C: AsyncRead + AsyncWrite + Unpin + Send,
+        C: AsyncBufRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send;
 
     /// Send a protocol-appropriate deny response to the client.

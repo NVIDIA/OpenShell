@@ -26,7 +26,7 @@ use openshell_supervisor_middleware::{
 };
 use openshell_supervisor_middleware_wire_fixture::proto::middleware::{
     ExistingHeaderAction, HttpResponseBodyMode, HttpResponseBodyResult, HttpResponseBodyUnit,
-    http_response_body_unit,
+    MiddlewareSessionEndReason, http_response_body_unit,
 };
 use openshell_supervisor_middleware_wire_fixture::{
     LegacyMiddlewareFixture, LegacyRpc, Reply, RunningFixture, http_request_binding,
@@ -427,6 +427,99 @@ async fn sse_through_stream_bytes_is_delivered_incrementally() {
         .await
         .expect("join relay")
         .expect("relay result");
+}
+
+/// A client that closes during upstream silence ends a legacy `STREAM_BYTES`
+/// stage at once with `DOWNSTREAM_DISCONNECT`, and the upstream connection
+/// closes, without waiting for the upstream's next byte. 0.1.x noticed the
+/// close only at that next write.
+#[tokio::test]
+async fn a_client_close_during_upstream_silence_ends_a_legacy_stream_stage() {
+    let (fixture, supervisor) = stream_guard(uppercase_units, "fail_closed").await;
+    let Tunnel {
+        mut app,
+        mut upstream,
+        relay,
+    } = supervisor.connect();
+    app.write_all(SSE_REQUEST).await.expect("send request");
+    within(read_http_request(&mut upstream))
+        .await
+        .expect("request reaches upstream");
+    upstream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+        )
+        .await
+        .expect("send first event");
+    let mut delivered = Vec::new();
+    read_until(&mut app, &mut delivered, b"DATA: ONE\n\n").await;
+
+    drop(app);
+    within(relay)
+        .await
+        .expect("join relay")
+        .expect("the connection ends quietly");
+    assert_eq!(
+        fixture
+            .wait_for(IO_TIMEOUT, |fixture| fixture.response_session_end(0))
+            .await,
+        Some(MiddlewareSessionEndReason::DownstreamDisconnect)
+    );
+    let mut unexpected = Vec::new();
+    within(upstream.read_to_end(&mut unexpected))
+        .await
+        .expect("the upstream connection closed");
+    assert!(unexpected.is_empty());
+}
+
+/// Once the client sent its next request, the watch stops reading it, so a
+/// client that then leaves is noticed when a write to it fails. That ends the
+/// connection the same way as a close the watch saw: quietly, with
+/// `DOWNSTREAM_DISCONNECT`, and with the upstream connection closed.
+#[tokio::test]
+async fn a_failed_client_write_ends_a_legacy_stream_stage_quietly() {
+    let (fixture, supervisor) = stream_guard(uppercase_units, "fail_closed").await;
+    let Tunnel {
+        mut app,
+        mut upstream,
+        relay,
+    } = supervisor.connect();
+    app.write_all(SSE_REQUEST).await.expect("send request");
+    within(read_http_request(&mut upstream))
+        .await
+        .expect("request reaches upstream");
+    upstream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+        )
+        .await
+        .expect("send first event");
+    let mut delivered = Vec::new();
+    read_until(&mut app, &mut delivered, b"DATA: ONE\n\n").await;
+    app.write_all(b"GET /v1/next HTTP/1.1\r\n")
+        .await
+        .expect("pipelined request");
+    drop(app);
+    upstream
+        .write_all(b"b\r\ndata: two\n\n\r\n")
+        .await
+        .expect("send second event");
+
+    within(relay)
+        .await
+        .expect("join relay")
+        .expect("the connection ends quietly");
+    assert_eq!(
+        fixture
+            .wait_for(IO_TIMEOUT, |fixture| fixture.response_session_end(0))
+            .await,
+        Some(MiddlewareSessionEndReason::DownstreamDisconnect)
+    );
+    let mut unexpected = Vec::new();
+    within(upstream.read_to_end(&mut unexpected))
+        .await
+        .expect("the upstream connection closed");
+    assert!(unexpected.is_empty());
 }
 
 struct OcsfCapture(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);

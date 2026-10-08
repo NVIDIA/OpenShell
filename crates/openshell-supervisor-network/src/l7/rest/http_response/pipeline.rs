@@ -16,17 +16,21 @@
 //! and the connection closes. A policy reload stops delivery at once: before
 //! commit the connection closes without a response, and after it delivery
 //! aborts unless the client already received the whole body. STREAM has no
-//! total deadline, and upstream silence never fails a response. As for an
-//! uninspected response, an upstream body without framing ends when the
-//! upstream closes, or, except for server-sent events, after the relay's idle
-//! timeout.
+//! total deadline, and upstream silence never fails a response; the client
+//! ends it by closing its connection (see `client_link`): at once after the
+//! head reached it, or after 30 seconds without progress when it closed
+//! before. Every stage then ends with `DOWNSTREAM_DISCONNECT` and nothing
+//! more is written. As for an uninspected response, an upstream body without
+//! framing ends when the upstream closes, or, except for server-sent events,
+//! after the relay's idle timeout.
 
 use std::sync::{Arc, Mutex};
 
 use openshell_core::proto::{Finding, MiddlewareSessionEndReason};
 use openshell_supervisor_middleware::{
     HttpBodyInput, HttpBodyOutput, HttpProtocol, HttpResponseDelivery, HttpResponseInvocation,
-    HttpStageDiagnostics, HttpStageOutcome, NamespacedFinding, StageReport, StageReportSink,
+    HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, NamespacedFinding, StageReport,
+    StageReportSink,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -61,6 +65,8 @@ enum BodyRelayError {
     Upstream(miette::Report),
     /// Writing to the client failed.
     Downstream(std::io::Error),
+    /// The client went away while the relay waited.
+    ClientGone(ClientGone),
     /// The policy generation changed.
     PolicyReload(miette::Report),
     /// The stages' output could not be delivered as it declared.
@@ -71,7 +77,9 @@ impl BodyRelayError {
     const fn end_reason(&self) -> MiddlewareSessionEndReason {
         match self {
             Self::Upstream(_) => MiddlewareSessionEndReason::UpstreamDisconnect,
-            Self::Downstream(_) => MiddlewareSessionEndReason::DownstreamDisconnect,
+            Self::Downstream(_) | Self::ClientGone(_) => {
+                MiddlewareSessionEndReason::DownstreamDisconnect
+            }
             Self::PolicyReload(_) => MiddlewareSessionEndReason::PolicyReload,
             Self::Output(_) => MiddlewareSessionEndReason::MiddlewareFailure,
         }
@@ -80,7 +88,19 @@ impl BodyRelayError {
     fn into_report(self) -> miette::Report {
         match self {
             Self::Upstream(error) | Self::PolicyReload(error) | Self::Output(error) => error,
-            Self::Downstream(error) => miette!("HTTP response client write failed: {error}"),
+            Self::Downstream(error) => miette::Report::new(DownstreamClosed {
+                gone: ClientGone::Failed(error.kind()),
+            }),
+            Self::ClientGone(gone) => miette::Report::new(DownstreamClosed { gone }),
+        }
+    }
+
+    /// How the client went away, when it did.
+    fn client_gone(&self) -> Option<ClientGone> {
+        match self {
+            Self::Downstream(error) => Some(ClientGone::Failed(error.kind())),
+            Self::ClientGone(gone) => Some(*gone),
+            Self::Upstream(_) | Self::PolicyReload(_) | Self::Output(_) => None,
         }
     }
 }
@@ -90,7 +110,7 @@ impl BodyRelayError {
 pub(super) async fn relay_response_through_pipeline<U, C>(
     request_method: &str,
     upstream: &mut U,
-    client: &mut C,
+    link: &ClientLink<'_, C>,
     middleware: HttpResponseMiddlewareRelay<'_>,
     described: Vec<openshell_supervisor_middleware::DescribedChainEntry>,
     parsed: ParsedResponseHead,
@@ -103,7 +123,7 @@ pub(super) async fn relay_response_through_pipeline<U, C>(
 ) -> Result<Option<RelayOutcome>>
 where
     U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
 {
     let status_line = response_status_line(&buffered[..header_end])?;
     let chunked = middleware.client_accepts_chunked && !status_line.starts_with("HTTP/1.0 ");
@@ -151,7 +171,7 @@ where
                 false,
             );
             send_response_delivery_failure(
-                client,
+                &mut link.writer(),
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
@@ -184,7 +204,7 @@ where
         debug!(reason = %preflight.reason, "HTTP response middleware preflight denied delivery");
         if let Some(denial) = preflight.denial.as_ref() {
             send_response_middleware_denial(
-                client,
+                &mut link.writer(),
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
@@ -199,7 +219,7 @@ where
                 false,
             );
             send_response_delivery_failure(
-                client,
+                &mut link.writer(),
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
@@ -213,19 +233,22 @@ where
         if preflight.headers == original_headers {
             return Ok(None);
         }
-        let outcome = relay_headers_only_response(
-            request_method,
-            upstream,
-            client,
-            &status_line,
-            &preflight.headers,
-            &parsed.preserved_credential_headers,
-            &parsed.declared_trailers,
-            &buffered[header_end..],
-            status_code,
-            body_length,
-            server_wants_close,
-            event_stream,
+        let outcome = until_client_gone(
+            link,
+            Box::pin(relay_headers_only_response(
+                request_method,
+                upstream,
+                &mut link.writer(),
+                &status_line,
+                &preflight.headers,
+                &parsed.preserved_credential_headers,
+                &parsed.declared_trailers,
+                &buffered[header_end..],
+                status_code,
+                body_length,
+                server_wants_close,
+                event_stream,
+            )),
         )
         .await?;
         return Ok(Some(outcome));
@@ -243,7 +266,7 @@ where
             false,
         );
         send_response_delivery_failure(
-            client,
+            &mut link.writer(),
             request_method,
             middleware.policy_name,
             &middleware.target,
@@ -265,7 +288,7 @@ where
     });
     let mut reader = BufferedResponseReader::new(upstream, &buffered[header_end..]);
     let mut writer = ResponseWriter {
-        client,
+        client: link.writer(),
         status_line: &status_line,
         headers: &preflight.headers,
         parsed: &parsed,
@@ -295,10 +318,12 @@ where
             }
             Ok(())
         };
-        // The policy may change while the upstream is silent.
+        // The client may leave, or the policy change, while the upstream is
+        // silent.
         let relayed = tokio::select! {
             biased;
             relayed = async { tokio::try_join!(feed, write).map(drop) } => relayed,
+            gone = link.gone() => Err(BodyRelayError::ClientGone(gone)),
             error = policy_reloaded(middleware.generation_guard) => {
                 Err(BodyRelayError::PolicyReload(error))
             }
@@ -310,16 +335,32 @@ where
     };
     let (finish, relayed) = tokio::join!(run, relay);
     let framing = writer.framing;
+    let run_diagnostics = match &finish {
+        Ok(finish) => &finish.diagnostics,
+        Err(failure) => &failure.diagnostics,
+    };
+    emit_http_response_stage_events(
+        middleware.policy_name,
+        &middleware.target,
+        status_code,
+        run_diagnostics,
+        &legacy_reports,
+    );
+    if let Some(gone) = relayed.as_ref().err().and_then(BodyRelayError::client_gone) {
+        for event in http_response_client_gone_events(
+            middleware.policy_name,
+            &middleware.target,
+            status_code,
+            gone,
+            &preflight.diagnostics,
+            run_diagnostics,
+        ) {
+            openshell_ocsf::ocsf_emit!(event);
+        }
+    }
 
     let failure = match (finish, relayed) {
-        (Ok(finish), Ok(())) => {
-            emit_http_response_stage_events(
-                middleware.policy_name,
-                &middleware.target,
-                status_code,
-                &finish.diagnostics,
-                &legacy_reports,
-            );
+        (Ok(_), Ok(())) => {
             if let Some(guard) = middleware.generation_guard {
                 guard.ensure_current()?;
             }
@@ -334,34 +375,16 @@ where
                 },
             ));
         }
-        (Err(failure), relayed) => {
-            emit_http_response_stage_events(
-                middleware.policy_name,
-                &middleware.target,
-                status_code,
-                &failure.diagnostics,
-                &legacy_reports,
-            );
-            match relayed {
-                // The stages failed or rejected the response.
-                Ok(()) => Ok(failure),
-                Err(error) => Err(error),
-            }
-        }
-        (Ok(finish), Err(error)) => {
-            emit_http_response_stage_events(
-                middleware.policy_name,
-                &middleware.target,
-                status_code,
-                &finish.diagnostics,
-                &legacy_reports,
-            );
-            Err(error)
-        }
+        // The stages failed or rejected the response.
+        (Err(failure), Ok(())) => Ok(failure),
+        (_, Err(error)) => Err(error),
     };
     let committed = framing.is_some();
     match failure {
-        Err(error @ BodyRelayError::Downstream(_)) => Err(error.into_report()),
+        // Nothing more reaches a client that went away.
+        Err(error @ (BodyRelayError::Downstream(_) | BodyRelayError::ClientGone(_))) => {
+            Err(error.into_report())
+        }
         // A stale policy ends the connection without a response, as it does
         // before preflight.
         Err(error @ BodyRelayError::PolicyReload(_)) if !committed => Err(error.into_report()),
@@ -383,7 +406,7 @@ where
                 false,
             );
             send_response_delivery_failure(
-                &mut *writer.client,
+                &mut writer.client,
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
@@ -407,7 +430,7 @@ where
             debug!(reason = %failure.reason, "HTTP response middleware failed before commitment");
             if let Some(denial) = failure.denial.as_ref() {
                 send_response_middleware_denial(
-                    &mut *writer.client,
+                    &mut writer.client,
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
@@ -422,7 +445,7 @@ where
                     false,
                 );
                 send_response_delivery_failure(
-                    &mut *writer.client,
+                    &mut writer.client,
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
@@ -576,8 +599,8 @@ async fn read_trailer_fields<R: AsyncRead + Unpin>(
 }
 
 /// Writes the stages' output to the client, committing the head on `Start`.
-struct ResponseWriter<'c, 'a, C> {
-    client: &'c mut C,
+struct ResponseWriter<'l, 'c, 'a, C> {
+    client: ClientWriter<'l, 'c, C>,
     status_line: &'a str,
     /// Head after every preflight mutation.
     headers: &'a [HttpHeader],
@@ -590,7 +613,7 @@ struct ResponseWriter<'c, 'a, C> {
     framing: Option<OutputFraming>,
 }
 
-impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
+impl<C: AsyncBufRead + AsyncWrite + Unpin> ResponseWriter<'_, '_, '_, C> {
     async fn write(&mut self, event: HttpBodyOutput) -> std::result::Result<(), BodyRelayError> {
         // Output the stages produced under a stale policy is never delivered.
         // The end of a body framed by its length or by the connection writes
@@ -693,6 +716,7 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         // response may follow any byte of this head.
         self.framing = Some(framing);
         self.send(&head).await?;
+        self.client.head_delivered();
         self.flush().await
     }
 
@@ -942,6 +966,84 @@ pub(super) fn http_response_capacity_events(
     events
 }
 
+/// A response that held a middleware session ended because its client went
+/// away. Besides the end of the response, each stage that selected a body
+/// mode but has no record of finishing gets one with the cancellation reason,
+/// as the stages of a cancelled request do. A client leaving is not a
+/// security finding.
+pub(super) fn http_response_client_gone_events(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    status_code: u16,
+    gone: ClientGone,
+    preflight: &HttpStageDiagnostics,
+    run: &HttpStageDiagnostics,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    use openshell_ocsf::{ActionId, DispositionId, SeverityId};
+
+    let (action, disposition, severity, detail) = match gone {
+        ClientGone::HalfCloseIdle => (
+            ActionId::Denied,
+            DispositionId::Blocked,
+            SeverityId::Low,
+            "response_half_close_idle_timeout",
+        ),
+        ClientGone::Closed | ClientGone::Failed(_) => (
+            ActionId::Other,
+            DispositionId::Other,
+            SeverityId::Informational,
+            "downstream_disconnect",
+        ),
+    };
+    let port = u16::try_from(target.port).unwrap_or_default();
+    let mut events = vec![
+        openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Other)
+            .action(action)
+            .disposition(disposition)
+            .severity(severity)
+            .status(openshell_ocsf::StatusId::Failure)
+            .status_detail(detail)
+            .http_request(openshell_ocsf::HttpRequest::new(
+                &target.method,
+                openshell_ocsf::Url::new(&target.scheme, &target.host, &target.path, port),
+            ))
+            .http_response(openshell_ocsf::HttpResponse { code: status_code })
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(&target.host, port))
+            .firewall_rule(policy_name, "supervisor-middleware")
+            .message(format!("MIDDLEWARE response ended: {gone}"))
+            .build(),
+    ];
+    let finished = |stage: &HttpStageInvocation| {
+        run.invocations
+            .iter()
+            .any(|record| record.config_name == stage.config_name)
+    };
+    for stage in preflight.invocations.iter().filter(|stage| {
+        matches!(
+            stage.outcome,
+            HttpStageOutcome::Stream | HttpStageOutcome::Buffered
+        ) && !finished(stage)
+    }) {
+        events.push(http_response_invocation_event(
+            policy_name,
+            target,
+            status_code,
+            &ResponseInvocationRecord {
+                config_name: &stage.config_name,
+                implementation: &stage.implementation,
+                outcome: "cancelled".into(),
+                sequence: None,
+                input_bytes: 0,
+                failed: false,
+                blocked: false,
+                failure_reason: Some("middleware_cancelled: downstream_disconnect"),
+            },
+        ));
+    }
+    events
+}
+
 /// The response was committed when the stages failed or rejected it, or its
 /// upstream failed, so delivery was aborted.
 fn emit_http_response_middleware_abort(
@@ -991,9 +1093,11 @@ mod tests {
             let guard = engine
                 .generation_guard(engine.current_generation())
                 .expect("generation guard");
-            let (mut relay_side, _client) = tokio::io::duplex(1024);
+            let (relay_side, _client) = tokio::io::duplex(1024);
+            let mut relay_side = tokio::io::BufReader::new(relay_side);
+            let link = ClientLink::new(&mut relay_side);
             let mut writer = ResponseWriter {
-                client: &mut relay_side,
+                client: link.writer(),
                 status_line: "HTTP/1.1 200 OK",
                 headers: &parsed.headers,
                 parsed: &parsed,

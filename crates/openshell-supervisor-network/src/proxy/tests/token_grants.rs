@@ -151,7 +151,8 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
         ctx.provider_credential_revision.expect("prepared revision"),
     )
     .with_installation_id(ctx.provider_credential_installation_id.as_deref());
-    let (mut client, _app) = tokio::io::duplex(1024);
+    let (client, _app) = tokio::io::duplex(1024);
+    let mut client = tokio::io::BufReader::new(client);
     let (mut upstream, mut target) = tokio::io::duplex(1024);
     let relay = relay_rewritten_forward_request(
         "POST",

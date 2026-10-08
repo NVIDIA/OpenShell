@@ -1599,6 +1599,70 @@ async fn a_failed_body_write_ends_running_stages_with_upstream_failure() {
     relay.abort();
 }
 
+/// After the upstream stops accepting the body, the relay keeps draining the
+/// client while the response runs, and the drain tells the client watch how
+/// the client's stream ended: a client that leaves while that response is
+/// silent ends it.
+#[tokio::test]
+async fn a_client_that_leaves_while_its_body_is_drained_ends_the_response() {
+    let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
+    let supervisor = Supervisor::with_stages(std::slice::from_ref(&stage)).await;
+    let (config, tunnel, ctx) = supervisor.tunnel();
+    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+    let (relay_upstream, mut upstream) = tokio::io::duplex(8192);
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut relay_upstream = FailingWrites {
+        inner: relay_upstream,
+        failing: Arc::clone(&failing),
+    };
+    let relay = tokio::spawn(async move {
+        relay_with_inspection(
+            &config,
+            tunnel,
+            &mut relay_client,
+            &mut relay_upstream,
+            &ctx,
+        )
+        .await
+    });
+    app.write_all(
+        b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 4096\r\n\r\nhello",
+    )
+    .await
+    .expect("partial request");
+    within(read_head(&mut upstream)).await;
+    assert_eq!(
+        within(read_chunk(&mut upstream)).await.as_deref(),
+        Some(b"hello!".as_slice())
+    );
+    upstream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n")
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    within(async {
+        let mut buffer = [0u8; 1024];
+        while !String::from_utf8_lossy(&delivered).contains("data: one") {
+            let read = app.read(&mut buffer).await.expect("client read");
+            assert!(read > 0, "client closed early");
+            delivered.extend_from_slice(&buffer[..read]);
+        }
+    })
+    .await;
+    failing.store(true, std::sync::atomic::Ordering::Release);
+    app.write_all(b"world").await.expect("more of the body");
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::UpstreamFailure
+    );
+
+    drop(app);
+    within(relay)
+        .await
+        .expect("relay task")
+        .expect("the connection ends quietly");
+}
+
 /// A client that sends its whole body before it reads the answer still gets
 /// an early answer larger than the connection buffers: the relay keeps
 /// reading and discarding the body while it delivers the answer.

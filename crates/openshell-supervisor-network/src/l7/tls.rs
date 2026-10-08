@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const MAX_CACHED_CERTS: usize = 256;
@@ -238,12 +238,13 @@ impl ProxyTlsState {
 
 /// Accept TLS from a sandbox client, presenting a dynamic cert for the hostname.
 ///
-/// Returns a TLS stream that can be used for plaintext HTTP inspection.
+/// Returns a TLS stream that can be used for plaintext HTTP inspection. Its
+/// buffered plaintext lets the relay watch the client without consuming it.
 pub async fn tls_terminate_client<S>(
     client: S,
     tls_state: &ProxyTlsState,
     hostname: &str,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send>
+) -> Result<impl AsyncBufRead + AsyncWrite + Unpin + Send>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {

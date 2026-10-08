@@ -4560,6 +4560,53 @@ network_policies:
             .expect("middleware server");
     }
 
+    /// A client that goes away while the relay waits for the upgrade ends the
+    /// pre-upgrade session with `DOWNSTREAM_DISCONNECT`, even after a policy
+    /// reload.
+    #[tokio::test]
+    async fn pre_upgrade_client_disconnect_finalizes_session_as_downstream_disconnect() {
+        use openshell_supervisor_middleware::MiddlewareRegistry;
+
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy");
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .expect("invalidate generation");
+        let mut session = Some(session);
+
+        let error = crate::l7::relay::finalize_websocket_pre_upgrade(
+            &mut session,
+            &generation_guard,
+            "api.openai.com",
+            443,
+            "rest-api",
+            Err(miette::Report::new(crate::l7::rest::DownstreamClosed {
+                gone: crate::l7::rest::ClientGone::HalfCloseIdle,
+            })),
+        )
+        .await
+        .expect_err("the client went away");
+        assert!(crate::l7::rest::is_downstream_closed(&error));
+        assert!(session.is_none());
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect
+            ))
+        ));
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
     #[tokio::test]
     async fn reload_after_forwarded_upgrade_uses_typed_close_path() {
         use openshell_supervisor_middleware::MiddlewareRegistry;

@@ -53,6 +53,7 @@ enum Behavior {
 struct StageLog {
     preflights: Vec<HttpPreflight>,
     session_ends: Vec<MiddlewareSessionEndReason>,
+    request_session_ends: Vec<MiddlewareSessionEndReason>,
 }
 
 /// In-process version 2 response middleware for relay tests.
@@ -60,6 +61,8 @@ struct StageLog {
 struct ResponseStage {
     behavior: Behavior,
     modes: Vec<HttpBodyMode>,
+    /// Also stream request bodies through unchanged.
+    request_stream: bool,
     log: Arc<Mutex<StageLog>>,
 }
 
@@ -78,8 +81,14 @@ impl ResponseStage {
         Self {
             behavior,
             modes,
+            request_stream: false,
             log: Arc::default(),
         }
+    }
+
+    fn with_request_stream(mut self) -> Self {
+        self.request_stream = true;
+        self
     }
 
     fn offered(&self) -> HttpPreflight {
@@ -194,17 +203,28 @@ fn write(name: &str, value: &str) -> HeaderMutation {
 #[tonic::async_trait]
 impl InProcessMiddleware for ResponseStage {
     async fn describe(&self) -> MiddlewareManifest {
+        let mut bindings = vec![MiddlewareBinding {
+            operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+            phase: SupervisorMiddlewarePhase::PreReturn as i32,
+            max_payload_bytes: 64 * 1024,
+            http_protocol_version: 2,
+            supported_http_body_modes: self.modes.iter().map(|mode| *mode as i32).collect(),
+            ..Default::default()
+        }];
+        if self.request_stream {
+            bindings.push(MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 64 * 1024,
+                http_protocol_version: 2,
+                supported_http_body_modes: vec![HttpBodyMode::Stream as i32],
+                ..Default::default()
+            });
+        }
         MiddlewareManifest {
             name: "test/response-stage".into(),
             service_version: "test".into(),
-            bindings: vec![MiddlewareBinding {
-                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
-                phase: SupervisorMiddlewarePhase::PreReturn as i32,
-                max_payload_bytes: 64 * 1024,
-                http_protocol_version: 2,
-                supported_http_body_modes: self.modes.iter().map(|mode| *mode as i32).collect(),
-                ..Default::default()
-            }],
+            bindings,
             expected_audience: String::new(),
             extension: Some(extension_metadata(
                 ExtensionFamily::SupervisorMiddleware,
@@ -228,6 +248,57 @@ impl InProcessMiddleware for ResponseStage {
         _request: HttpRequestView<'_>,
     ) -> Result<HttpRequestResult> {
         Err(miette!("version 2 response test middleware"))
+    }
+
+    /// STREAM: pass the request body through unchanged.
+    async fn open_http_request_stage(
+        &self,
+        mut events: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        let log = Arc::clone(&self.log);
+        let (results, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let reply = match event.event {
+                    Some(http_event::Event::Preflight(_)) => {
+                        http_result::Result::PreflightResult(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
+                                mode: Some(http_inspect::Mode::Stream(HttpStreamMode {})),
+                            })),
+                            header_mutations: Vec::new(),
+                            diagnostics: None,
+                        })
+                    }
+                    Some(http_event::Event::Begin(_)) => {
+                        http_result::Result::OutputStart(HttpOutputStart::default())
+                    }
+                    Some(http_event::Event::InputChunk(chunk)) => output_chunk(chunk.data),
+                    Some(http_event::Event::InputEnd(_)) => {
+                        http_result::Result::Finish(HttpFinish::default())
+                    }
+                    Some(http_event::Event::SessionEnd(end)) => {
+                        if let Ok(reason) = MiddlewareSessionEndReason::try_from(end.reason) {
+                            log.lock()
+                                .expect("stage log")
+                                .request_session_ends
+                                .push(reason);
+                        }
+                        break;
+                    }
+                    _ => continue,
+                };
+                if results
+                    .send(Ok(HttpResult {
+                        result: Some(reply),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(receiver)))
     }
 
     async fn open_http_response_stage(
@@ -343,8 +414,34 @@ fn start_guarded(
     client_accepts_chunked: bool,
     generation_guard: Option<PolicyGenerationGuard>,
 ) -> Relay {
+    let (relay_client, client) = tokio::io::duplex(1024 * 1024);
+    let (upstream, task) = spawn_relay(
+        stage,
+        method,
+        client_accepts_chunked,
+        generation_guard,
+        tokio::io::BufReader::new(relay_client),
+    );
+    Relay {
+        upstream,
+        client,
+        task,
+    }
+}
+
+/// Relay one response to `relay_client` through a version 2 stage. Returns
+/// the upstream side and the relay task.
+fn spawn_relay<C>(
+    stage: &ResponseStage,
+    method: &'static str,
+    client_accepts_chunked: bool,
+    generation_guard: Option<PolicyGenerationGuard>,
+    mut relay_client: C,
+) -> (DuplexStream, tokio::task::JoinHandle<Result<RelayOutcome>>)
+where
+    C: AsyncBufRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut relay_upstream, upstream) = tokio::io::duplex(1024 * 1024);
-    let (mut relay_client, client) = tokio::io::duplex(1024 * 1024);
     let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(stage.clone()));
     let task = tokio::spawn(async move {
         let chain = [openshell_supervisor_middleware::ChainEntry {
@@ -383,11 +480,7 @@ fn start_guarded(
         )
         .await
     });
-    Relay {
-        upstream,
-        client,
-        task,
-    }
+    (upstream, task)
 }
 
 /// Relay one complete upstream response and return the outcome and what the
@@ -729,8 +822,10 @@ async fn upstream_failure_after_commit_aborts() {
     );
 }
 
+/// Once the client has sent its next request, the watch stops reading it, so
+/// a close behind that request is noticed when the next write fails.
 #[tokio::test]
-async fn client_disconnect_ends_the_stages_with_downstream_disconnect() {
+async fn a_close_behind_the_next_request_is_noticed_at_the_next_write() {
     let stage = ResponseStage::new(Behavior::Uppercase);
     let Relay {
         mut upstream,
@@ -743,7 +838,13 @@ async fn client_disconnect_ends_the_stages_with_downstream_disconnect() {
         .expect("first chunk");
     let mut delivered = Vec::new();
     read_until(&mut client, &mut delivered, b"HELLO").await;
+    client
+        .write_all(b"GET /v1/next HTTP/1.1\r\n")
+        .await
+        .expect("pipelined request");
     drop(client);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!task.is_finished(), "the watch stopped at the next request");
     upstream
         .write_all(b"5\r\nworld\r\n")
         .await
@@ -752,7 +853,10 @@ async fn client_disconnect_ends_the_stages_with_downstream_disconnect() {
         .await
         .expect("join relay")
         .expect_err("the client went away");
-    assert!(error.to_string().contains("client write failed"), "{error}");
+    assert!(
+        matches!(gone(&error), Some(ClientGone::Failed(_))),
+        "a failed write is a typed client disconnect: {error}"
+    );
     assert_eq!(
         stage.session_end().await,
         MiddlewareSessionEndReason::DownstreamDisconnect
@@ -969,6 +1073,9 @@ network_policies:
           - allow:
               method: GET
               path: "/v1/**"
+          - allow:
+              method: POST
+              path: "/v1/**"
     binaries:
       - {{ path: /usr/bin/curl }}
 "#
@@ -984,54 +1091,88 @@ struct Tunnel {
 }
 
 async fn tunnel(stage: &ResponseStage) -> Tunnel {
-    let engine =
-        crate::opa::OpaEngine::from_strings(TEST_POLICY, &response_policy()).expect("load policy");
-    let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-        vec![Arc::new(stage.clone())],
-        Vec::new(),
-    )
-    .await
-    .expect("this build registers version 2 response bindings");
-    engine
-        .replace_middleware_registry(registry)
-        .expect("install middleware registry");
-    let (endpoint, generation) = engine
-        .query_endpoint_config_with_generation(&crate::opa::NetworkInput {
-            host: HOST.into(),
-            port: PORT,
-            binary_path: "/usr/bin/curl".into(),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        })
-        .expect("endpoint config");
-    let config =
-        crate::l7::parse_l7_config(&endpoint.expect("configured endpoint")).expect("REST config");
-    let tunnel_engine = engine
-        .clone_engine_for_tunnel(generation)
-        .expect("tunnel engine");
-    let ctx = crate::l7::relay::L7EvalContext {
-        host: HOST.into(),
-        port: PORT,
-        request_default_port: Some(PORT),
-        policy_name: "rest_api".into(),
-        binary_path: "/usr/bin/curl".into(),
-        ..Default::default()
-    };
-    let (app, mut relay_client) = tokio::io::duplex(1024 * 1024);
-    let (mut relay_upstream, server) = tokio::io::duplex(1024 * 1024);
-    let relay = tokio::spawn(async move {
-        let _engine = engine;
-        crate::l7::relay::relay_with_inspection(
-            &config,
-            tunnel_engine,
-            &mut relay_client,
-            &mut relay_upstream,
-            &ctx,
+    Inspector::new(stage).await.into_tunnel()
+}
+
+/// A policy engine that inspects responses from [`HOST`] with one stage.
+/// Its tunnels share the supervisor's middleware session budget.
+struct Inspector {
+    engine: crate::opa::OpaEngine,
+}
+
+impl Inspector {
+    async fn new(stage: &ResponseStage) -> Self {
+        let engine = crate::opa::OpaEngine::from_strings(TEST_POLICY, &response_policy())
+            .expect("load policy");
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            vec![Arc::new(stage.clone())],
+            Vec::new(),
         )
         .await
-    });
-    Tunnel { app, server, relay }
+        .expect("this build registers version 2 response bindings");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install middleware registry");
+        Self { engine }
+    }
+
+    fn sessions_available(&self) -> usize {
+        self.engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .available_middleware_sessions()
+    }
+
+    /// A tunnel whose relay task keeps the engine alive.
+    fn into_tunnel(self) -> Tunnel {
+        let Tunnel { app, server, relay } = self.open();
+        let relay = tokio::spawn(async move {
+            let _inspector = self;
+            relay.await.expect("join relay")
+        });
+        Tunnel { app, server, relay }
+    }
+
+    fn open(&self) -> Tunnel {
+        let (endpoint, generation) = self
+            .engine
+            .query_endpoint_config_with_generation(&crate::opa::NetworkInput {
+                host: HOST.into(),
+                port: PORT,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint.expect("configured endpoint"))
+            .expect("REST config");
+        let tunnel_engine = self
+            .engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: HOST.into(),
+            port: PORT,
+            request_default_port: Some(PORT),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let (app, mut relay_client) = tokio::io::duplex(1024 * 1024);
+        let (mut relay_upstream, server) = tokio::io::duplex(1024 * 1024);
+        let relay = tokio::spawn(async move {
+            crate::l7::relay::relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        Tunnel { app, server, relay }
+    }
 }
 
 /// Read one request head from the upstream side.
@@ -1411,4 +1552,551 @@ fn exhausted_capacity_is_reported_for_responses() {
         assert!(serialized.contains("http_response"), "{serialized}");
         assert!(serialized.contains("policy"), "{serialized}");
     }
+}
+
+const SSE_REQUEST: &[u8] =
+    b"GET /v1/events HTTP/1.1\r\nHost: api.example.test\r\nAccept: text/event-stream\r\n\r\n";
+const SSE_HEAD_AND_FIRST_EVENT: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n";
+
+fn gone(error: &miette::Report) -> Option<ClientGone> {
+    error
+        .downcast_ref::<DownstreamClosed>()
+        .map(|closed| closed.gone)
+}
+
+/// An agent that stops reading a server-sent events response closes its
+/// connection. The relay notices at once, even while the upstream is silent:
+/// the stage ends with `DOWNSTREAM_DISCONNECT`, the middleware session goes
+/// back to the supervisor's budget, and the upstream connection closes.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_event_stream_releases_its_session_and_upstream_at_once() {
+    let stage = ResponseStage::new(Behavior::Inspect);
+    let inspector = Inspector::new(&stage).await;
+    let budget = inspector.sessions_available();
+    let Tunnel {
+        mut app,
+        mut server,
+        relay,
+    } = inspector.open();
+    app.write_all(SSE_REQUEST).await.expect("request");
+    read_request(&mut server).await;
+    server
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    read_until(&mut app, &mut delivered, b"data: one\n\n").await;
+    assert_eq!(
+        stage.offered().permitted_body_modes,
+        [HttpBodyMode::Stream as i32]
+    );
+    assert_eq!(inspector.sessions_available(), budget - 1);
+
+    // The upstream goes quiet between events, and the agent gives up.
+    tokio::time::sleep(Duration::from_mins(5)).await;
+    assert!(!relay.is_finished());
+    let closed_at = tokio::time::Instant::now();
+    drop(app);
+
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    );
+    within(relay)
+        .await
+        .expect("join relay")
+        .expect("the connection ends quietly");
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        closed_at.elapsed()
+    );
+    assert_eq!(inspector.sessions_available(), budget);
+    let mut unexpected = Vec::new();
+    within(server.read_to_end(&mut unexpected))
+        .await
+        .expect("the upstream connection closed");
+    assert!(unexpected.is_empty(), "{unexpected:?}");
+}
+
+/// Each inspected STREAM response holds one of the supervisor's 32
+/// middleware sessions while it runs. Event streams whose clients left give
+/// their sessions back while their upstreams stay open and silent, so the
+/// next response is still inspected.
+#[tokio::test(start_paused = true)]
+async fn abandoned_event_streams_do_not_exhaust_the_session_budget() {
+    const SESSIONS: usize = openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS;
+    let stage = ResponseStage::new(Behavior::Inspect);
+    let inspector = Inspector::new(&stage).await;
+    let mut streams = Vec::new();
+    for _ in 0..SESSIONS {
+        let Tunnel {
+            mut app,
+            mut server,
+            relay,
+        } = inspector.open();
+        app.write_all(SSE_REQUEST).await.expect("request");
+        read_request(&mut server).await;
+        server
+            .write_all(SSE_HEAD_AND_FIRST_EVENT)
+            .await
+            .expect("first event");
+        let mut delivered = Vec::new();
+        read_until(&mut app, &mut delivered, b"data: one\n\n").await;
+        streams.push((app, server, relay));
+    }
+    assert_eq!(inspector.sessions_available(), 0);
+
+    let mut silent_upstreams = Vec::new();
+    for (app, server, relay) in streams {
+        drop(app);
+        within(relay)
+            .await
+            .expect("join relay")
+            .expect("relay result");
+        silent_upstreams.push(server);
+    }
+    assert_eq!(inspector.sessions_available(), SESSIONS);
+
+    let Tunnel {
+        mut app,
+        mut server,
+        relay,
+    } = inspector.open();
+    app.write_all(SSE_REQUEST).await.expect("request");
+    read_request(&mut server).await;
+    server
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    read_until(&mut app, &mut delivered, b"data: one\n\n").await;
+    assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    {
+        let log = stage.log.lock().expect("stage log");
+        assert_eq!(log.preflights.len(), SESSIONS + 1);
+        assert_eq!(
+            log.session_ends,
+            vec![MiddlewareSessionEndReason::DownstreamDisconnect; SESSIONS]
+        );
+    }
+    drop(app);
+    within(relay)
+        .await
+        .expect("join relay")
+        .expect("relay result");
+    drop(silent_upstreams);
+}
+
+/// A close after the head ends a committed response at once. Nothing more
+/// reaches the client: no terminating chunk and no error response.
+#[tokio::test(start_paused = true)]
+async fn a_close_after_the_head_ends_the_response_without_another_write() {
+    let stage = ResponseStage::new(Behavior::Uppercase);
+    let Relay {
+        mut upstream,
+        mut client,
+        task,
+    } = start(&stage, "GET", true);
+    upstream
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    read_until(&mut client, &mut delivered, b"DATA: ONE\n\n").await;
+    client.shutdown().await.expect("client close");
+
+    let error = within(task)
+        .await
+        .expect("join relay")
+        .expect_err("the client went away");
+    assert_eq!(gone(&error), Some(ClientGone::Closed), "{error}");
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    );
+    let mut rest = Vec::new();
+    within(client.read_to_end(&mut rest))
+        .await
+        .expect("client read");
+    assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
+}
+
+/// Client transport whose reads fail with `ConnectionReset` once `reset`
+/// fires, as after a TCP RST.
+struct ResettableClient {
+    inner: DuplexStream,
+    reset: tokio::sync::oneshot::Receiver<()>,
+    was_reset: bool,
+}
+
+impl AsyncRead for ResettableClient {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.was_reset && std::pin::Pin::new(&mut this.reset).poll(cx).is_ready() {
+            this.was_reset = true;
+        }
+        if this.was_reset {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ResettableClient {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// A reset is never a half-close: even before the head reaches the client,
+/// the relay ends a BUFFERED stage at once and answers nothing.
+#[tokio::test(start_paused = true)]
+async fn a_reset_before_commit_ends_a_buffered_stage_at_once() {
+    let stage = ResponseStage::new(Behavior::Redact);
+    let (relay_side, mut client) = tokio::io::duplex(64 * 1024);
+    let (reset, on_reset) = tokio::sync::oneshot::channel();
+    let (mut upstream, task) = spawn_relay(
+        &stage,
+        "GET",
+        true,
+        None,
+        tokio::io::BufReader::new(ResettableClient {
+            inner: relay_side,
+            reset: on_reset,
+            was_reset: false,
+        }),
+    );
+    upstream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"token\":")
+        .await
+        .expect("partial body");
+    within(async {
+        while stage.log.lock().expect("stage log").preflights.is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    reset.send(()).expect("reset");
+
+    let error = within(task)
+        .await
+        .expect("join relay")
+        .expect_err("the client went away");
+    assert_eq!(
+        gone(&error),
+        Some(ClientGone::Failed(std::io::ErrorKind::ConnectionReset)),
+        "{error}"
+    );
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    );
+    let mut delivered = Vec::new();
+    within(client.read_to_end(&mut delivered))
+        .await
+        .expect("client read");
+    assert!(
+        delivered.is_empty(),
+        "no 502 reaches a gone client: {}",
+        String::from_utf8_lossy(&delivered)
+    );
+}
+
+/// A client that half-closes right after its request, as `nc -N` does, still
+/// gets a response that keeps moving, even past 30 seconds in total, and the
+/// connection then closes instead of waiting for another request.
+#[tokio::test(start_paused = true)]
+async fn a_half_closed_client_gets_a_response_that_keeps_moving() {
+    let stage = ResponseStage::new(Behavior::Uppercase);
+    let Relay {
+        mut upstream,
+        mut client,
+        task,
+    } = start(&stage, "GET", true);
+    client.shutdown().await.expect("half-close");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    upstream
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    for event in ["data: two\n\n", "data: six\n\n"] {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        upstream
+            .write_all(format!("b\r\n{event}\r\n").as_bytes())
+            .await
+            .expect("event");
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    upstream.write_all(b"0\r\n\r\n").await.expect("last chunk");
+
+    let mut delivered = Vec::new();
+    within(client.read_to_end(&mut delivered))
+        .await
+        .expect("the connection closes after the response");
+    let (_head, body) = head_and_body(&delivered);
+    assert_eq!(dechunk(body).0, b"DATA: ONE\n\nDATA: TWO\n\nDATA: SIX\n\n");
+    let outcome = within(task).await.expect("join relay");
+    assert!(matches!(outcome, Ok(RelayOutcome::Consumed)), "{outcome:?}");
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::Normal
+    );
+}
+
+/// A half-closed client cannot be told from one that left, so its response
+/// ends once it makes no progress for 30 seconds: no upstream read and no
+/// client write.
+#[tokio::test(start_paused = true)]
+async fn a_half_closed_client_response_ends_after_thirty_idle_seconds() {
+    let stage = ResponseStage::new(Behavior::Uppercase);
+    let Relay {
+        mut upstream,
+        mut client,
+        task,
+    } = start(&stage, "GET", true);
+    client.shutdown().await.expect("half-close");
+    upstream
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    read_until(&mut client, &mut delivered, b"DATA: ONE\n\n").await;
+
+    let idle = client_link::HALF_CLOSE_IDLE_TIMEOUT;
+    tokio::time::sleep(idle.saturating_sub(Duration::from_secs(1))).await;
+    assert!(!task.is_finished(), "still open 29 seconds after progress");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(task.is_finished(), "ended 31 seconds after progress");
+    let error = within(task)
+        .await
+        .expect("join relay")
+        .expect_err("the idle half-closed response ends");
+    assert_eq!(gone(&error), Some(ClientGone::HalfCloseIdle), "{error}");
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    );
+}
+
+/// A client that already sent its next request is waiting for this response,
+/// so the watch stops: nothing aborts during a long quiet gap, even after the
+/// client closes behind that request. The next request reaches its own policy
+/// decision only after this response, and no byte of it reaches the upstream
+/// before then.
+#[tokio::test(start_paused = true)]
+async fn a_pipelined_request_waits_for_its_own_policy_decision() {
+    let next = b"DELETE /v1/events HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
+    for next_arrives_during_the_response in [false, true] {
+        let stage = ResponseStage::new(Behavior::Inspect);
+        let Tunnel {
+            mut app,
+            mut server,
+            relay,
+        } = tunnel(&stage).await;
+        if next_arrives_during_the_response {
+            app.write_all(SSE_REQUEST).await.expect("request");
+        } else {
+            app.write_all(&[SSE_REQUEST, next].concat())
+                .await
+                .expect("pipelined requests");
+        }
+        let request = read_request(&mut server).await;
+        assert!(request.starts_with(b"GET /v1/events "));
+        server
+            .write_all(SSE_HEAD_AND_FIRST_EVENT)
+            .await
+            .expect("first event");
+        let mut delivered = Vec::new();
+        read_until(&mut app, &mut delivered, b"data: one\n\n").await;
+        if next_arrives_during_the_response {
+            app.write_all(next).await.expect("next request");
+        }
+        app.shutdown().await.expect("client close");
+
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        assert!(!relay.is_finished());
+        let mut early = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), server.read(&mut early))
+                .await
+                .is_err(),
+            "no byte of the next request reaches the upstream first"
+        );
+        server
+            .write_all(b"b\r\ndata: two\n\n\r\n0\r\n\r\n")
+            .await
+            .expect("last event");
+        let mut rest = Vec::new();
+        within(app.read_to_end(&mut rest))
+            .await
+            .expect("client read");
+        delivered.extend(rest);
+        assert!(contains(&delivered, b"data: two\n\n\r\n0\r\n\r\n"));
+        assert!(
+            contains(&delivered, b"HTTP/1.1 403 Forbidden\r\n"),
+            "the next request was denied by policy: {}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert_eq!(
+            stage.session_end().await,
+            MiddlewareSessionEndReason::Normal
+        );
+        within(relay)
+            .await
+            .expect("join relay")
+            .expect("relay result");
+        let mut forwarded = Vec::new();
+        within(server.read_to_end(&mut forwarded))
+            .await
+            .expect("upstream read");
+        assert!(
+            forwarded.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&forwarded)
+        );
+    }
+}
+
+/// On the live upload path the watch arms once the request body has been
+/// read, so a client that closes while the response is quiet ends the
+/// response stages with `DOWNSTREAM_DISCONNECT`.
+#[tokio::test(start_paused = true)]
+async fn a_close_after_a_streamed_upload_ends_the_response_stages() {
+    let stage = ResponseStage::new(Behavior::Inspect).with_request_stream();
+    let Tunnel {
+        mut app,
+        mut server,
+        relay,
+    } = tunnel(&stage).await;
+    app.write_all(
+        b"POST /v1/events HTTP/1.1\r\nHost: api.example.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await
+    .expect("request");
+    let mut request = Vec::new();
+    read_until(&mut server, &mut request, b"0\r\n\r\n").await;
+    assert!(contains(&request, b"hello"));
+    server
+        .write_all(SSE_HEAD_AND_FIRST_EVENT)
+        .await
+        .expect("first event");
+    let mut delivered = Vec::new();
+    read_until(&mut app, &mut delivered, b"data: one\n\n").await;
+
+    tokio::time::sleep(Duration::from_mins(5)).await;
+    drop(app);
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    );
+    assert_eq!(
+        stage.log.lock().expect("stage log").request_session_ends,
+        [MiddlewareSessionEndReason::Normal]
+    );
+    within(relay)
+        .await
+        .expect("join relay")
+        .expect("the connection ends quietly");
+}
+
+/// A response that held a middleware session and ended because its client
+/// went away is recorded without a finding: one HTTP activity event, and a
+/// record with the cancellation reason for each stage that had not finished.
+#[test]
+fn a_client_that_went_away_is_recorded_without_a_finding() {
+    use openshell_supervisor_middleware::HttpProtocol;
+
+    let preflight = HttpStageDiagnostics {
+        invocations: vec![
+            stage_invocation(
+                "stream",
+                Some(HttpProtocol::V2),
+                HttpStageOutcome::Stream,
+                None,
+            ),
+            stage_invocation(
+                "buffered",
+                Some(HttpProtocol::V2),
+                HttpStageOutcome::Buffered,
+                None,
+            ),
+            stage_invocation(
+                "headers",
+                Some(HttpProtocol::V2),
+                HttpStageOutcome::Continue,
+                None,
+            ),
+        ],
+        ..Default::default()
+    };
+    let run = HttpStageDiagnostics {
+        invocations: vec![stage_invocation(
+            "buffered",
+            Some(HttpProtocol::V2),
+            HttpStageOutcome::Unchanged,
+            None,
+        )],
+        ..Default::default()
+    };
+    let closed = event_values(&pipeline::http_response_client_gone_events(
+        "policy",
+        &event_target(),
+        200,
+        ClientGone::Closed,
+        &preflight,
+        &run,
+    ));
+    assert_eq!(closed.len(), 2, "{closed:#?}");
+    assert!(closed.iter().all(|event| event["finding_info"].is_null()));
+    assert_eq!(closed[0]["severity"], "Informational");
+    assert_eq!(closed[0]["status"], "Failure");
+    assert_eq!(closed[0]["status_detail"], "downstream_disconnect");
+    assert_eq!(
+        closed[0]["message"],
+        "MIDDLEWARE response ended: client closed the connection"
+    );
+    assert_eq!(closed[1]["unmapped"]["middleware_config"], "stream");
+    assert_eq!(
+        closed[1]["unmapped"]["response_middleware_outcome"],
+        "cancelled"
+    );
+    assert_eq!(
+        closed[1]["unmapped"]["failure_reason"],
+        "middleware_cancelled: downstream_disconnect"
+    );
+    assert_eq!(closed[1]["status"], "Failure");
+
+    let idle = event_values(&pipeline::http_response_client_gone_events(
+        "policy",
+        &event_target(),
+        200,
+        ClientGone::HalfCloseIdle,
+        &preflight,
+        &run,
+    ));
+    assert_eq!(idle[0]["severity"], "Low");
+    assert_eq!(idle[0]["status_detail"], "response_half_close_idle_timeout");
 }

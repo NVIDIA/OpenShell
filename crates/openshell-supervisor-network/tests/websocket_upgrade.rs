@@ -103,7 +103,8 @@ async fn websocket_upgrade_through_l7_relay_exchanges_message() {
     let mut upstream = TcpStream::connect(ws_addr).await.unwrap();
 
     // In-memory duplex for the client side of the relay
-    let (mut client_app, mut client_proxy) = tokio::io::duplex(8192);
+    let (mut client_app, client_proxy) = tokio::io::duplex(8192);
+    let mut client_proxy = tokio::io::BufReader::new(client_proxy);
 
     let host = format!("127.0.0.1:{}", ws_addr.port());
     let raw_header = build_ws_upgrade_request(&host);
@@ -228,7 +229,8 @@ async fn normal_http_request_still_works_after_relay_changes() {
     });
 
     let mut upstream = TcpStream::connect(addr).await.unwrap();
-    let (mut client_read, mut client_proxy) = tokio::io::duplex(8192);
+    let (mut client_read, client_proxy) = tokio::io::duplex(8192);
+    let mut client_proxy = tokio::io::BufReader::new(client_proxy);
 
     let raw_header = format!(
         "GET /api HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",

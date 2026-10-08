@@ -574,41 +574,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for UpstreamWrites<'_, W> {
     }
 }
 
-/// Write half that records whether any response byte reached the client.
-struct ResponseCommit<W> {
-    inner: W,
-    committed: bool,
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for ResponseCommit<W> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
-        if matches!(result, std::task::Poll::Ready(Ok(written)) if written > 0) {
-            this.committed = true;
-        }
-        result
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
 /// Relay a request whose body request middleware streams, and its response.
 ///
 /// The upload and the response run concurrently. An upstream response that
@@ -617,7 +582,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ResponseCommit<W> {
 /// that stops accepting the body may have answered first, so its response is
 /// still delivered. Any other upload failure before a response byte returns
 /// [`LiveRequestFailure`] or a body credential error for the caller to answer;
-/// after that, delivery aborts.
+/// after that, delivery aborts. The client watch arms once the upload has
+/// read the whole body, or, after an upstream write failure, learns from the
+/// drain that keeps reading the rest of it.
 pub(super) async fn relay_live_request_and_response<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -628,83 +595,91 @@ pub(super) async fn relay_live_request_and_response<C, U>(
     response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
 ) -> Result<RelayOutcome>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: AsyncBufRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
-    let (mut client_reader, client_writer) = tokio::io::split(&mut *client);
-    let mut client_writer = ResponseCommit {
-        inner: client_writer,
-        committed: false,
-    };
-    let (mut upstream_reader, mut upstream_writer) = tokio::io::split(&mut *upstream);
-    let mut upload = Box::pin(upload_live_request(
-        head,
-        body,
-        &mut client_reader,
-        &mut upstream_writer,
-        options,
-    ));
-    let mut response = Box::pin(relay_response(
-        &req.action,
-        &mut upstream_reader,
-        &mut client_writer,
-        response_options,
-        response_middleware,
-    ));
+    let link = ClientLink::new(client);
+    let relayed = async {
+        let mut client_reader = link.reader();
+        let (mut upstream_reader, mut upstream_writer) = tokio::io::split(&mut *upstream);
+        let mut upload = Box::pin(upload_live_request(
+            head,
+            body,
+            &mut client_reader,
+            &mut upstream_writer,
+            options,
+        ));
+        let mut response = Box::pin(relay_response_to(
+            &req.action,
+            &mut upstream_reader,
+            &link,
+            response_options,
+            response_middleware,
+        ));
 
-    tokio::select! {
-        biased;
-        uploaded = upload.as_mut() => {
-            drop(upload);
-            if let Err(error) = uploaded {
-                if error.downcast_ref::<UpstreamWriteFailed>().is_some() {
-                    let _ = upstream_writer.shutdown().await;
-                    // The client may finish sending its body before it reads
-                    // the answer, so keep reading and discarding it.
-                    let mut sink = tokio::io::sink();
-                    let discard = tokio::io::copy(&mut client_reader, &mut sink);
-                    let responded = tokio::select! {
-                        responded = response.as_mut() => responded,
-                        _ = discard => response.as_mut().await,
-                    };
+        tokio::select! {
+            biased;
+            uploaded = upload.as_mut() => {
+                drop(upload);
+                if let Err(error) = uploaded {
+                    if error.downcast_ref::<UpstreamWriteFailed>().is_some() {
+                        let _ = upstream_writer.shutdown().await;
+                        // The client may finish sending its body before it reads
+                        // the answer, so keep reading and discarding it. The
+                        // watch learns from this drain how the client's stream
+                        // ended.
+                        link.arm_reported();
+                        let mut sink = tokio::io::sink();
+                        let discard = tokio::io::copy(&mut client_reader, &mut sink);
+                        let responded = tokio::select! {
+                            responded = response.as_mut() => responded,
+                            _ = discard => response.as_mut().await,
+                        };
+                        drop(response);
+                        return match responded {
+                            Ok(RelayOutcome::Reusable) => {
+                                finish_response(&mut link.writer(), true).await
+                            }
+                            Ok(RelayOutcome::Consumed | RelayOutcome::Upgraded { .. }) => {
+                                Ok(RelayOutcome::Consumed)
+                            }
+                            Err(gone) if is_downstream_closed(&gone) => Err(gone),
+                            Err(_) => Err(error),
+                        };
+                    }
                     drop(response);
-                    return match responded {
-                        Ok(RelayOutcome::Reusable) => {
-                            finish_response(&mut client_writer, true).await
-                        }
-                        Ok(RelayOutcome::Consumed | RelayOutcome::Upgraded { .. }) => {
-                            Ok(RelayOutcome::Consumed)
-                        }
-                        Err(_) => Err(error),
-                    };
+                    let _ = upstream_writer.shutdown().await;
+                    if link.wrote_response() {
+                        return Err(miette!(
+                            "request body relay failed after the response started: {error}"
+                        ));
+                    }
+                    return Err(error);
                 }
-                drop(response);
-                let _ = upstream_writer.shutdown().await;
-                if client_writer.committed {
-                    return Err(miette!(
-                        "request body relay failed after the response started: {error}"
-                    ));
-                }
-                return Err(error);
+                upstream_writer.flush().await.into_diagnostic()?;
+                link.arm();
+                response.await
             }
-            upstream_writer.flush().await.into_diagnostic()?;
-            response.await
-        }
-        responded = response.as_mut() => {
-            drop(response);
-            // Dropping the upload cancels every request middleware stage.
-            drop(upload);
-            body.cancelled("upstream_response");
-            let _ = upstream_writer.shutdown().await;
-            match responded? {
-                RelayOutcome::Reusable => finish_response(&mut client_writer, true).await,
-                RelayOutcome::Consumed | RelayOutcome::Upgraded { .. } => {
-                    Ok(RelayOutcome::Consumed)
+            responded = response.as_mut() => {
+                drop(response);
+                // Dropping the upload cancels every request middleware stage.
+                drop(upload);
+                body.cancelled("upstream_response");
+                let _ = upstream_writer.shutdown().await;
+                match responded? {
+                    RelayOutcome::Reusable => finish_response(&mut link.writer(), true).await,
+                    RelayOutcome::Consumed | RelayOutcome::Upgraded { .. } => {
+                        Ok(RelayOutcome::Consumed)
+                    }
                 }
             }
         }
     }
+    .await;
+    // A response or upload error after the client went away, such as a
+    // failed write to it, is the client's doing.
+    relayed.map_err(|error| link.downstream_closed_or(error))
 }
 
 /// Why the upstream writer stopped.
