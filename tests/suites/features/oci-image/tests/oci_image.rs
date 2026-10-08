@@ -22,6 +22,9 @@ const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const ENGINE_ENV: &str = "OPENSHELL_TEST_CONTAINER_ENGINE";
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+/// Sandbox condition reason for an image `WORKDIR` the sandbox identity
+/// cannot use.
+const WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFailed";
 /// A complete sandbox policy without a `process` section, so the sandbox
 /// identity falls back to the image `USER`.
 const IMAGE_IDENTITY_POLICY: &str = "version: 1
@@ -127,9 +130,8 @@ async fn default_workdir_uses_managed_workspace() {
 }
 
 /// OpenShell rejects a custom `WORKDIR` that the image user cannot write
-/// instead of granting the user new access to it. Drivers may surface the
-/// rejection through different startup diagnostics rather than one condition
-/// reason.
+/// instead of granting the user new access to it, and reports that reason
+/// rather than a generic startup failure.
 #[tokio::test]
 async fn unwritable_custom_workdir_is_rejected() {
     run("oci-image/unwritable-workdir", async |runner, images| {
@@ -190,78 +192,17 @@ USER app
                     create.failure_diagnostic("sandbox creation fails before the command runs")
                 );
             }
-            let diagnostic = format!("{}\n{}", create.stdout(), create.stderr());
-            if !has_workspace_rejection_diagnostic(&diagnostic) {
-                return Err(create.failure_diagnostic(
-                "sandbox creation reports a workspace, permission, or workload startup rejection",
-            ));
+            if !create.stdout().contains(WORKSPACE_VALIDATION_FAILED)
+                && !create.stderr().contains(WORKSPACE_VALIDATION_FAILED)
+            {
+                return Err(create.failure_diagnostic(&format!(
+                    "sandbox creation fails with {WORKSPACE_VALIDATION_FAILED}"
+                )));
             }
         }
         Ok(())
     })
     .await;
-}
-
-fn has_workspace_rejection_diagnostic(diagnostic: &str) -> bool {
-    let diagnostic = diagnostic.to_ascii_lowercase();
-    // A successful control does not excuse a later connectivity or image-pull
-    // failure. Those are not evidence of workspace rejection, even if their
-    // messages happen to mention the workspace.
-    if [
-        "connection refused",
-        "connection reset",
-        "imagepull",
-        "image pull",
-        "failed to pull",
-        "pull access denied",
-        "manifest unknown",
-        "no such image",
-    ]
-    .iter()
-    .any(|message| diagnostic.contains(message))
-    {
-        return false;
-    }
-    // The CLI may wrap the human message across lines with diagnostic gutters.
-    // Match the existing startup reason and exit detail independently.
-    if diagnostic.contains("containerexited") && diagnostic.contains("exited with code") {
-        return true;
-    }
-    [
-        "workspace",
-        "workingdir",
-        "permission denied",
-        // Some drivers expose the rejected workload launch through SSH rather
-        // than propagating the runtime's workspace validation text.
-        "subsystem request failed",
-    ]
-    .iter()
-    .any(|message| diagnostic.contains(message))
-}
-
-#[test]
-fn workspace_rejection_diagnostics_do_not_require_one_condition_reason() {
-    for diagnostic in [
-        "image workspace validation failed",
-        "WorkingDir /workspace/project is not writable",
-        "Permission denied (os error 13)",
-        "ContainerExited: Container exited with code 1",
-        "Error: × sandbox entered error phase while provisioning: ContainerExited: Container\n  │ exited with code 1",
-        "subsystem request failed",
-    ] {
-        assert!(has_workspace_rejection_diagnostic(diagnostic));
-    }
-    for diagnostic in [
-        "",
-        "gateway connection refused",
-        "image pull failed",
-        "image pull failed for workspace fixture",
-        "gateway connection refused while creating workspace",
-        "ImagePullFailed: failed to pull image for WorkingDir test",
-        "ContainerExited",
-    ] {
-        assert!(!has_workspace_rejection_diagnostic(diagnostic));
-    }
 }
 
 async fn run(
