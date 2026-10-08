@@ -263,11 +263,27 @@ impl Drop for PendingLockConnection {
 /// outgrow it raise it through `[openshell.gateway] database_max_connections`.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 
+/// Smallest pool ceiling an operator may configure.
+///
+/// The SSH identity lock keeps one data connection for as long as it is held,
+/// and its holder queries the same pool, so a single-connection pool would
+/// wait on itself until the acquire times out.
+pub const MIN_MAX_CONNECTIONS: u32 = 2;
+
 impl PostgresStore {
-    /// Connect and size the pool, falling back to [`DEFAULT_MAX_CONNECTIONS`].
-    pub async fn connect(url: &str, max_connections: Option<u32>) -> PersistenceResult<Self> {
-        Self::connect_with_lock_pool_size(url, max_connections, MUTATION_LOCK_POOL_MAX_CONNECTIONS)
-            .await
+    /// Connect and size the data and lock pools, falling back to
+    /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
+    pub async fn connect(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+    ) -> PersistenceResult<Self> {
+        Self::connect_with_lock_pool_size(
+            url,
+            max_connections,
+            lock_max_connections.unwrap_or(MUTATION_LOCK_POOL_MAX_CONNECTIONS),
+        )
+        .await
     }
 
     pub(super) async fn connect_with_lock_pool_size(
@@ -276,7 +292,11 @@ impl PostgresStore {
         lock_pool_size: u32,
     ) -> PersistenceResult<Self> {
         let max_connections = max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
-        tracing::info!(max_connections, "sizing Postgres connection pool");
+        tracing::info!(
+            max_connections,
+            lock_max_connections = lock_pool_size,
+            "sizing Postgres connection pools"
+        );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(url)

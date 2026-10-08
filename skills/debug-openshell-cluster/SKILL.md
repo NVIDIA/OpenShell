@@ -507,9 +507,14 @@ another operation on the same sandbox waits behind the change, holding that
 sandbox's key. Provisioning-deadline expiry also takes
 its workspace key locally, so provider and workspace-profile changes on the
 same replica can delay it. Each
-replica takes its advisory locks on a dedicated pool of 4 PostgreSQL
-connections, one per guard, so at most 4 guarded operations per replica hold
-or wait for PostgreSQL locks at once. A request cancelled during its lock wait
+replica takes its advisory locks on a dedicated lock pool of PostgreSQL
+connections, one per guard, 4 by default (gateway config
+`database_lock_max_connections`), so at most that many guarded
+operations per replica hold or wait for PostgreSQL locks at once. Its data
+pool (`database_max_connections`, 10 by default) is separate. Helm deployments
+set both keys under `gatewayConfig.openshell.gateway`.
+The gateway logs both sizes at startup in
+`sizing Postgres connection pools`. A request cancelled during its lock wait
 frees its slot while its backend keeps waiting, with any keys it took, until
 the 10-second deadline, so `pg_locks` can briefly show more lock sessions from
 one pod. A guard that waits on a PostgreSQL lock
@@ -526,8 +531,8 @@ fields, and increments `openshell_server_mutation_lock_timeouts_total`. The
 
 - `waiting for a local mutation lock`: another operation on the same replica
   holds a conflicting key.
-- `waiting for a mutation lock connection`: all 4 lock-pool connections of that
-  replica were in use, by waiters or by holders slowed by a compute driver,
+- `waiting for a mutation lock connection`: every lock-pool connection of that
+  replica was in use, by waiters or by holders slowed by a compute driver,
   credential backend, middleware, or provider profile source call, or a local
   wait left less than a second to open one. `pg_locks` shows no row for the
   timed-out operation. Look for the pod's granted or waiting advisory-lock
@@ -555,7 +560,8 @@ counter. PostgreSQL refused the connection, ran out of connection slots, was
 starting up, or did not answer. Check the PostgreSQL logs for "too many
 clients already", "remaining connection slots are reserved", or "the database
 system is starting up", and compare
-`SELECT count(*) FROM pg_stat_activity` with `SHOW max_connections`.
+`SELECT count(*) FROM pg_stat_activity` with `SHOW max_connections`. Each
+replica opens up to its data plus lock pool sizes, 14 with the defaults.
 
 A gateway log line `timed out returning PostgreSQL mutation lock connection;
 discarded connection` means returning a lock session stalled for 5 seconds and
@@ -1133,8 +1139,8 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
-| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full 4-connection lock pool on one replica, a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, the `detail` field of `mutation lock acquisition timed out` in gateway logs, the `pg_locks` query in Step 6 |
-| Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, the connection sizing in the High Availability guide |
+| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, the `detail` field of `mutation lock acquisition timed out` in gateway logs, the `pg_locks` query in Step 6 |
+| Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |

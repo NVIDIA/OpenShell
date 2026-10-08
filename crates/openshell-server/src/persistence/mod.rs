@@ -388,7 +388,7 @@ impl Store {
     /// Connect to a persistence store based on the database URL, leaving pool
     /// sizing at the backend default.
     pub async fn connect(url: &str) -> CoreResult<Self> {
-        Self::connect_with_pool_size(url, None).await
+        Self::connect_with_pool_sizes(url, None, None).await
     }
 
     /// Connect to a persistence store based on the database URL.
@@ -397,12 +397,26 @@ impl Store {
     /// its built-in default when `None`. The two backends have different
     /// defaults, and an in-memory `SQLite` database ignores the override
     /// entirely — it must be held by exactly one connection.
-    pub async fn connect_with_pool_size(
+    /// `lock_max_connections` sizes the `PostgreSQL` mutation lock pool the
+    /// same way; `SQLite` has no lock pool and ignores it. A `PostgreSQL`
+    /// data pool below 2 is rejected before any connection opens.
+    pub async fn connect_with_pool_sizes(
         url: &str,
         max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
     ) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url, max_connections)
+            if let Some(configured) = max_connections
+                && configured < postgres::MIN_MAX_CONNECTIONS
+            {
+                return Err(CoreError::config(format!(
+                    "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
+                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
+                     keeps one data connection while it queries the pool",
+                    postgres::MIN_MAX_CONNECTIONS
+                )));
+            }
+            let store = PostgresStore::connect(url, max_connections, lock_max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -411,6 +425,11 @@ impl Store {
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
+            if lock_max_connections.is_some() {
+                tracing::warn!(
+                    "ignoring the configured mutation lock pool ceiling: SQLite has no lock pool"
+                );
+            }
             let store = SqliteStore::connect(url, max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;

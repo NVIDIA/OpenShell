@@ -74,17 +74,29 @@ pub const MUTATION_LOCK_TIMEOUT_SETTING: &str = "10s";
 /// Opening a lock connection can take this long, so a timeout with less time left is contention.
 pub const LOCK_CONNECTION_MIN_BUDGET: Duration = Duration::from_secs(1);
 
-/// Size of the dedicated `PostgreSQL` lock pool.
+/// Default size of the dedicated `PostgreSQL` lock pool, used when
+/// `[openshell.gateway] database_lock_max_connections` is not set.
 ///
 /// Lock connections come from their own pool so that guard holders can never
 /// starve the data pool their critical sections need. Each replica opens at
-/// most 10 data plus 4 lock connections. A cancelled acquisition frees its
+/// most `database_max_connections` data plus `database_lock_max_connections`
+/// lock connections, 10 plus 4 by default. A cancelled acquisition frees its
 /// slot at once, but its backend can stay until its `lock_timeout` while the
 /// pool opens a replacement, so size `max_connections` with headroom for
 /// rollouts as the high-availability guide describes
-/// (`(2 × replicas + surge) × 14`). Each guard holds
-/// one lock connection, so a replica sustains about 4 / c guarded operations
-/// per second, where c is how long one guard is held.
+/// (`(2 × replicas + surge) × (data + lock connections)`).
+///
+/// Each guard holds one lock connection, so a replica sustains about n / c
+/// guarded operations per second, where n is the lock pool size and c is how
+/// long one guard is held. The data pool's 10 is `SQLx`'s default, set
+/// explicitly when `PostgreSQL` support landed (5a15de63). The 4 is a
+/// judgment call: `bench_postgres_lock_pool_absorbs_a_12ms_reconnect_burst`
+/// (about 170 guarded operations per second on one replica, each held about
+/// 20 ms) keeps about 3.3 lock connections busy, so 4 leaves headroom while
+/// staying well under the data pool. Each extra slot costs
+/// `2 × replicas + surge` server connections during a rollout, so raise it
+/// for replicas whose guarded operations wait for a lock connection rather
+/// than by default.
 pub(super) const MUTATION_LOCK_POOL_MAX_CONNECTIONS: u32 = 4;
 
 /// Domain separator hashed into every derived key.

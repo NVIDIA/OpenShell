@@ -231,10 +231,13 @@ autoscaling:
   enabled: false
   # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
   minReplicas: 2
-  # -- Maximum gateway replicas. Each replica opens up to 14 PostgreSQL
-  # connections; size the database for rollouts at this count, as the High
-  # Availability guide describes. With a Deployment, the default of 4 needs
-  # `max_connections` of at least 126, more than the PostgreSQL default of 100.
+  # -- Maximum gateway replicas. Each replica opens up to
+  # database_max_connections + database_lock_max_connections PostgreSQL
+  # connections (14 with the defaults; set them under
+  # gatewayConfig.openshell.gateway); size the database for rollouts at this
+  # count, as the High Availability guide describes. With a Deployment and the
+  # default pool sizes, the default of 4 needs `max_connections` of at least
+  # 126, more than the PostgreSQL default of 100.
   maxReplicas: 4
   # -- Target average CPU utilization, as a percentage of
   # resources.requests.cpu. Set to null to disable. Requires

@@ -8,7 +8,8 @@
 //!
 //! Advisory locks are database-wide, not per schema, so every test uses
 //! random workspace and sandbox ids, and `mise run test:rust:postgres` runs
-//! the tests one at a time. The stores here run no migrations: the schema only
+//! the tests one at a time. Apart from the pool-size test, which connects as
+//! the gateway does, the stores here run no migrations: the schema only
 //! scopes their connections.
 
 use super::mutation_lock::{
@@ -922,48 +923,56 @@ async fn postgres_mutation_lock_released_connection_is_reused_without_residual_l
 #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
 async fn postgres_mutation_lock_pool_never_exceeds_configured_size() {
     let fixture = LockFixture::new().await;
-    let postgres = PostgresStore::connect(fixture.schema.url(), None)
-        .await
-        .expect("connect a store with the production lock pool");
-    let store = Store::Postgres(postgres.clone());
-    let workspace = random_id("ws");
-
-    let holders: Vec<_> = (0..32)
-        .map(|_| {
-            let store = store.clone();
-            let workspace = workspace.clone();
-            tokio::spawn(async move {
-                let sandbox = random_id("sb");
-                let guard = acquire(
-                    &store,
-                    MutationScope::sandbox(&workspace, &sandbox),
-                    PROCEEDS_WITHIN,
-                )
-                .await?;
-                tokio::time::sleep(HOLD).await;
-                drop(guard);
-                Ok::<_, PersistenceError>(())
-            })
-        })
-        .collect();
-    let mut largest = 0;
-    while !holders.iter().all(JoinHandle::is_finished) {
-        largest = largest.max(postgres.lock_pool_size());
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    for holder in holders {
-        holder
+    let mut stores = Vec::new();
+    // The production default, then a configured size above it, both through
+    // the entry point the gateway uses.
+    for (configured, expected) in [(None, MUTATION_LOCK_POOL_MAX_CONNECTIONS), (Some(6), 6)] {
+        let store = Store::connect_with_pool_sizes(fixture.schema.url(), None, configured)
             .await
-            .expect("holder task")
-            .expect("every holder acquires its locks");
-    }
-    largest = largest.max(postgres.lock_pool_size());
+            .expect("connect a store as the gateway does");
+        let Store::Postgres(postgres) = &store else {
+            unreachable!("a postgres:// URL connects a PostgreSQL store");
+        };
+        let workspace = random_id("ws");
 
-    assert_eq!(
-        largest, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
-        "32 concurrent holders fill the lock pool without exceeding it"
-    );
-    fixture.finish(vec![store]).await;
+        let holders: Vec<_> = (0..32)
+            .map(|_| {
+                let store = store.clone();
+                let workspace = workspace.clone();
+                tokio::spawn(async move {
+                    let sandbox = random_id("sb");
+                    let guard = acquire(
+                        &store,
+                        MutationScope::sandbox(&workspace, &sandbox),
+                        PROCEEDS_WITHIN,
+                    )
+                    .await?;
+                    tokio::time::sleep(HOLD).await;
+                    drop(guard);
+                    Ok::<_, PersistenceError>(())
+                })
+            })
+            .collect();
+        let mut largest = 0;
+        while !holders.iter().all(JoinHandle::is_finished) {
+            largest = largest.max(postgres.lock_pool_size());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for holder in holders {
+            holder
+                .await
+                .expect("holder task")
+                .expect("every holder acquires its locks");
+        }
+        largest = largest.max(postgres.lock_pool_size());
+
+        assert_eq!(
+            largest, expected,
+            "32 concurrent holders fill the lock pool ({configured:?} configured) without exceeding it"
+        );
+        stores.push(store);
+    }
+    fixture.finish(stores).await;
 }
 
 #[tokio::test]

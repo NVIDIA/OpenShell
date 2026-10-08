@@ -609,7 +609,12 @@ pub(crate) async fn run_server(
     );
 
     let store = Arc::new(
-        Store::connect_with_pool_size(database_url, config.database_max_connections).await?,
+        Store::connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        )
+        .await?,
     );
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,

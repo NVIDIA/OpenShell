@@ -253,6 +253,14 @@ pub struct Config {
     /// connection.
     pub database_max_connections: Option<u32>,
 
+    /// Connection ceiling for the `PostgreSQL` mutation lock pool.
+    ///
+    /// `None` keeps the built-in default of 4. Each mutation guard holds one
+    /// lock connection, so this bounds how many guarded mutations a replica
+    /// runs or waits on in `PostgreSQL` at once. `SQLite` has no lock pool and
+    /// ignores it.
+    pub database_lock_max_connections: Option<u32>,
+
     /// Explicit compute driver configured for the gateway.
     /// `None` enables runtime auto-detection.
     pub compute_driver: Option<String>,
@@ -903,6 +911,7 @@ impl Config {
             gateway_jwt: None,
             database_url: String::new(),
             database_max_connections: None,
+            database_lock_max_connections: None,
             compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
@@ -961,6 +970,18 @@ impl Config {
     #[must_use]
     pub const fn with_database_max_connections(mut self, max_connections: Option<u32>) -> Self {
         self.database_max_connections = max_connections;
+        self
+    }
+
+    /// Create a new configuration with a mutation lock pool connection ceiling.
+    ///
+    /// `None` keeps the built-in default.
+    #[must_use]
+    pub const fn with_database_lock_max_connections(
+        mut self,
+        max_connections: Option<u32>,
+    ) -> Self {
+        self.database_lock_max_connections = max_connections;
         self
     }
 

@@ -397,11 +397,14 @@ kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/openshell/pods
 
 ### Size PostgreSQL Connections
 
-Each gateway pod opens up to 14 PostgreSQL connections on demand, 10 for data
-access and 4 for mutation locks. A request cancelled during a lock wait can
-leave its lock session open for up to 10 seconds, so keep headroom. The chart
-uses the Kubernetes default rolling update strategy for each workload kind, so
-the number of pods that run during a rollout depends on the kind.
+With the default settings, each gateway pod opens up to 14 PostgreSQL
+connections on demand: 10 for data access (`database_max_connections`) and 4
+for mutation locks (`database_lock_max_connections`), both set under
+`gatewayConfig.openshell.gateway`. A request cancelled during
+a lock wait can leave its lock session open for up to 10 seconds, so keep
+headroom. The chart uses the Kubernetes default rolling update strategy for
+each workload kind, so the number of pods that run during a rollout depends on
+the kind.
 
 A Deployment rollout adds up to 25 percent of the replica count, rounded up,
 as surge pods. Kubernetes does not count terminating pods against that surge,
@@ -409,9 +412,11 @@ and each replaced pod can keep its connections throughout its termination
 grace period. A rollout can therefore run up to twice the replica count at
 once, and an eviction or an autoscaler scale-down during the rollout adds more
 terminating pods. Set PostgreSQL `max_connections` to at least
-`(2 × replicas + surge) × 14`, which leaves one surge of margin for those
-pods, plus headroom for your other clients and administration. Use
-`autoscaling.maxReplicas` as the replica count when autoscaling is enabled.
+`(2 × replicas + surge) × (data + lock connections)`, which leaves one surge
+of margin for those pods, plus headroom for your other clients and
+administration. Use `autoscaling.maxReplicas` as the replica count when
+autoscaling is enabled. With the defaults, that is
+`(2 × replicas + surge) × 14`:
 
 | Replicas | Surge | Minimum `max_connections` |
 |---|---|---|
@@ -429,9 +434,15 @@ its own terminating pods.
 If you run several replicas as a StatefulSet with
 `workload.allowMultiReplicaStatefulSet`, a rollout adds no surge pods. It
 replaces one pod at a time and creates each replacement only after the old pod
-exits. Set `max_connections` to at least `replicas × 14`, using
-`autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for your
-other clients and administration.
+exits. Set `max_connections` to at least
+`replicas × (data + lock connections)`, 14 per replica with the defaults,
+using `autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for
+your other clients and administration.
+
+Raise `database_lock_max_connections` only when mutation lock timeouts on a
+replica come from a full lock pool: the gateway logs them with the detail
+`waiting for a mutation lock connection`. Each extra lock connection adds
+`2 × replicas + surge` to the minimum `max_connections` for a Deployment.
 
 If a connection pooler sits between the gateway and PostgreSQL, use session
 pooling. The gateway holds session-level advisory locks, which transaction
@@ -457,10 +468,10 @@ resource state and reconcile effects, then send a new request with a new
 
 ### Upgrade from an Earlier Release
 
-Each gateway pod now opens up to 14 PostgreSQL connections instead of 10. The
-upgrade rollout already runs new pods at that count, so raise `max_connections`
-to the minimum in [Size PostgreSQL Connections](#size-postgresql-connections)
-before you upgrade.
+With the default settings, each gateway pod now opens up to 14 PostgreSQL
+connections instead of 10. The upgrade rollout already runs new pods at that
+count, so raise `max_connections` to the minimum in
+[Size PostgreSQL Connections](#size-postgresql-connections) before you upgrade.
 
 While gateways from the earlier release and the new release run together
 during the upgrade, the older replicas serialize every mutation across the

@@ -34,8 +34,10 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 const ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE: u32 = 100;
-/// Sandboxes reconciled at once, matching the four-connection mutation lock
-/// pool.
+/// Sandboxes reconciled at once. On `PostgreSQL` each holds one mutation lock
+/// connection, so this matches the default lock pool size. With a smaller
+/// configured pool the extra reconciliations wait for a lock connection, and
+/// startup reconciliation does not fill a larger one.
 const ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY: usize = 4;
 /// Guarded attempts per sandbox before repeated write conflicts fail startup.
 /// Lock timeouts usually stop earlier, at the retry window below.
