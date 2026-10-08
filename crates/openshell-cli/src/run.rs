@@ -4,7 +4,8 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
+    PolicyGetView, parse_annotation_pairs, parse_credential_expiry_cli_value, parse_env_from_pairs,
+    parse_env_pairs,
     parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
@@ -450,6 +451,7 @@ pub struct SandboxCreateConfig<'a> {
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
@@ -480,6 +482,7 @@ impl Default for SandboxCreateConfig<'_> {
             tty_override: None,
             auto_providers_override: None,
             labels: HashMap::new(),
+            annotations: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
@@ -518,6 +521,7 @@ pub async fn sandbox_create(
         tty_override,
         auto_providers_override,
         labels,
+        mut annotations,
         environment,
         approval_mode,
         output,
@@ -662,14 +666,12 @@ pub async fn sandbox_create(
             && command.is_empty()
             && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
     let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
-    let annotations = if persist {
-        HashMap::new()
-    } else {
-        HashMap::from([(
+    if !persist {
+        annotations.insert(
             "openshell.nvidia.com/retention".to_string(),
             "ephemeral".to_string(),
-        )])
-    };
+        );
+    }
     let request = CreateSandboxRequest {
         request_id: String::new(),
         spec: Some(SandboxSpec {
