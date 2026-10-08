@@ -126,6 +126,12 @@ pub struct GatewayFileSection {
     /// Security posture when a sandbox rejects a candidate policy generation.
     #[serde(default)]
     pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
+    /// How configuration reaches sandbox supervisors: `poll` or `push`.
+    #[serde(default)]
+    pub config_delivery_mode: Option<openshell_core::ConfigDeliveryMode>,
+    /// Push mode only: seconds between per-session consistency checks.
+    #[serde(default)]
+    pub config_consistency_check_interval_seconds: Option<u32>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.

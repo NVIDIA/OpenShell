@@ -17,6 +17,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
 mod credentials;
@@ -296,6 +297,10 @@ pub struct ServerState {
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
 
+    /// Push-mode configuration delivery. `None` in poll mode, which keeps no
+    /// delivery state.
+    pub(crate) config_delivery: Option<Arc<config_delivery::ConfigDelivery>>,
+
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -445,6 +450,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            config_delivery: None,
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             replica_id,
@@ -612,6 +618,16 @@ pub(crate) async fn run_server(
     );
 
     let store = Arc::new(Store::connect(database_url).await?);
+    let config_delivery = config_delivery::ConfigDelivery::from_config(
+        &config,
+        store.is_single_replica(),
+        store.pool_size(),
+    )
+    .map_err(Error::config)?;
+    info!(
+        mode = config.config_delivery_mode.as_str(),
+        "sandbox configuration delivery mode"
+    );
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),
@@ -712,6 +728,7 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
+    state.config_delivery = config_delivery;
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
@@ -978,6 +995,9 @@ pub(crate) async fn run_server(
     state
         .provider_profile_sources
         .spawn_refreshers(&shutdown_rx);
+    if state.config_delivery.is_some() {
+        config_delivery::spawn_profile_catalog_publisher(state.clone(), shutdown_rx.clone());
+    }
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");

@@ -2916,6 +2916,10 @@ pub(super) async fn handle_import_provider_profiles(
         ));
     }
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::for_profiles(&workspace),
+    );
     Ok(Response::new(ImportProviderProfilesResponse {
         diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
         profiles: imported,
@@ -3050,6 +3054,10 @@ pub(super) async fn handle_update_provider_profiles(
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::for_profiles(&workspace),
+    );
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
         profile: Some(profile),
@@ -3144,6 +3152,10 @@ pub(super) async fn handle_delete_provider_profile(
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::for_profiles(&workspace),
+    );
     Ok(Response::new(DeleteProviderProfileResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
     }))
@@ -3972,6 +3984,10 @@ pub(super) async fn handle_update_provider(
     .await;
     match result {
         Ok(provider) => {
+            crate::config_delivery::publish(
+                state,
+                crate::config_delivery::Scope::Provider(provider.object_id().to_string()),
+            );
             let provider_version = provider
                 .metadata
                 .as_ref()
@@ -4959,6 +4975,10 @@ pub(super) async fn handle_configure_provider_refresh(
             .await?;
     }
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Provider(state_record.provider_id.clone()),
+    );
     replay_facts.refresh(&state_record)?;
     Ok(Response::new(ConfigureProviderRefreshResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
@@ -5003,6 +5023,10 @@ pub(super) async fn handle_rotate_provider_credential(
     )
     .await?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Provider(refresh_state.provider_id.clone()),
+    );
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
@@ -5115,6 +5139,10 @@ pub(super) async fn handle_delete_provider_refresh(
             })?;
     }
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Provider(provider.object_id().to_string()),
+    );
     Ok(Response::new(DeleteProviderRefreshResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
     }))

@@ -199,3 +199,58 @@ mod tests {
         );
     }
 }
+
+/// Provider environment values are credentials; `Debug` shows only their keys.
+impl std::fmt::Debug for GetSandboxProviderEnvironmentResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut environment_keys: Vec<&String> = self.environment.keys().collect();
+        environment_keys.sort();
+        f.debug_struct("GetSandboxProviderEnvironmentResponse")
+            .field("environment_keys", &environment_keys)
+            .field("provider_env_revision", &self.provider_env_revision)
+            .field(
+                "credential_expiration_times",
+                &self.credential_expiration_times,
+            )
+            .field("dynamic_credentials", &self.dynamic_credentials)
+            .field(
+                "static_credential_bindings",
+                &self.static_credential_bindings,
+            )
+            .field(
+                "non_secret_environment_keys",
+                &self.non_secret_environment_keys,
+            )
+            .field("provider_attachment_epoch", &self.provider_attachment_epoch)
+            .field("policy_hash", &self.policy_hash)
+            .field("readiness_reason", &self.readiness_reason)
+            .field("files", &self.files.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn provider_environment_debug_redacts_values() {
+        let update = GatewayMessage {
+            payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
+                delivery_id: 1,
+                provider_environment: Some(GetSandboxProviderEnvironmentResponse {
+                    environment: std::iter::once((
+                        "API_TOKEN".to_string(),
+                        "super-secret-value".to_string(),
+                    ))
+                    .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        };
+        let debug = format!("{update:?}");
+        assert!(debug.contains("API_TOKEN"));
+        assert!(!debug.contains("super-secret-value"));
+    }
+}

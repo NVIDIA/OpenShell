@@ -17,6 +17,7 @@ compile_error!(
 
 mod activity_aggregator;
 mod backend_setup;
+mod config_push;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
@@ -1149,6 +1150,17 @@ async fn run_sandbox_with_backend(
         });
     }
 
+    // A supervisor session can carry pushed configuration. The session only
+    // exists when the access plane runs (an SSH socket is configured).
+    let (config_push_sender, config_push_receiver) =
+        if ssh_socket_path.is_some() && sandbox_id.is_some() && openshell_endpoint.is_some() {
+            let (sender, receiver) =
+                openshell_supervisor_process::supervisor_session::config_push_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(sandbox), Some(endpoint), Some(engine)) = (
         sandbox_id.as_deref(),
@@ -1208,7 +1220,7 @@ async fn run_sandbox_with_backend(
             if workload_started.wait_for(|started| *started).await.is_err() {
                 return;
             }
-            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
+            if let Err(e) = run_policy_poll_loop(poll_ctx, config_push_receiver).await {
                 ocsf_emit!(
                     AppLifecycleBuilder::new(ocsf_ctx())
                         .activity(ActivityId::Fail)
@@ -1257,6 +1269,7 @@ async fn run_sandbox_with_backend(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            config_push_sender,
             ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
@@ -4141,13 +4154,61 @@ async fn report_runtime_configuration(
     .is_ok()
 }
 
-async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
+async fn run_policy_poll_loop(
+    ctx: PolicyPollLoopContext,
+    push: Option<openshell_supervisor_process::supervisor_session::ConfigPushReceiver>,
+) -> Result<()> {
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
         &ctx.endpoint,
         ctx.extension_credentials.clone(),
     )
     .await?;
-    run_policy_poll_loop_with_client(ctx, client).await
+    match push {
+        Some(push) => run_config_loop_with_client(ctx, client, push).await,
+        None => run_policy_poll_loop_with_client(ctx, client).await,
+    }
+}
+
+async fn sleep_until_or_never(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Start the reporters every configuration loop needs and build its applier.
+fn start_config_applier<C: PolicyGatewayClient>(
+    mut ctx: PolicyPollLoopContext,
+    client: &C,
+) -> ConfigApplier {
+    let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_policy_status_reporter(
+        client.clone(),
+        ctx.sandbox_id.clone(),
+        status_receiver,
+    ));
+    if let Some(endpoint_status_receiver) = ctx.endpoint_status_rx.take() {
+        tokio::spawn(endpoint_status::run_reporter(
+            client.clone(),
+            ctx.sandbox_id.clone(),
+            endpoint_status_receiver,
+            ctx.supervisor_session_id.clone(),
+        ));
+    }
+    ConfigApplier::new(ctx, status_sender)
+}
+
+/// Configuration loop for a supervisor whose session may push configuration.
+async fn run_config_loop_with_client<C: PolicyGatewayClient>(
+    ctx: PolicyPollLoopContext,
+    client: C,
+    push: openshell_supervisor_process::supervisor_session::ConfigPushReceiver,
+) -> Result<()> {
+    let interval = Duration::from_secs(ctx.interval_secs);
+    let applier = start_config_applier(ctx, &client);
+    config_push::ConfigLoop::new(applier, client, push, interval)
+        .run()
+        .await
 }
 
 /// Outcome of applying one configuration snapshot through [`ConfigApplier`].
@@ -4170,7 +4231,8 @@ enum ApplyOutcome {
     /// credentials were revoked; dynamic grants that remain bound stay active.
     ProviderFailed,
     /// The snapshot needs a provider environment that has not arrived yet.
-    /// Nothing was changed.
+    /// Neither policy nor credentials changed; provider readiness reports
+    /// that credentials are awaited.
     AwaitingProvider,
     /// The admission report failed; the same snapshot must be applied again.
     ReportFailed,
@@ -4207,7 +4269,6 @@ enum ProviderFetch {
     Fetched(Box<Result<openshell_core::grpc_client::ProviderEnvironmentResult>>),
     /// Not available yet. The caller holds the snapshot and retries when it
     /// arrives.
-    #[allow(dead_code, reason = "constructed by pushed delivery")]
     Awaiting,
 }
 
@@ -4323,6 +4384,17 @@ impl ConfigApplier {
             last_failed_runtime_revision: None,
             last_runtime_failure_outcome: ApplyOutcome::FailedRetained,
             rejected_policy_generation: None,
+        }
+    }
+
+    /// Admission fence registered by this supervisor at startup, if any.
+    fn admission_instance_id(&self) -> Option<String> {
+        match &self.ctx.loaded_policy_origin {
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(revision),
+                ..
+            } => revision.admission_instance_id.clone(),
+            _ => None,
         }
     }
 
@@ -5037,28 +5109,14 @@ impl ConfigApplier {
 }
 
 async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
-    mut ctx: PolicyPollLoopContext,
+    ctx: PolicyPollLoopContext,
     client: C,
 ) -> Result<()> {
-    let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(run_policy_status_reporter(
-        client.clone(),
-        ctx.sandbox_id.clone(),
-        status_receiver,
-    ));
-    if let Some(endpoint_status_receiver) = ctx.endpoint_status_rx.take() {
-        tokio::spawn(endpoint_status::run_reporter(
-            client.clone(),
-            ctx.sandbox_id.clone(),
-            endpoint_status_receiver,
-            ctx.supervisor_session_id.clone(),
-        ));
-    }
     let endpoint = ctx.endpoint.clone();
     let sandbox_id = ctx.sandbox_id.clone();
     let sandbox = ctx.sandbox.clone();
     let interval = Duration::from_secs(ctx.interval_secs);
-    let mut applier = ConfigApplier::new(ctx, status_sender);
+    let mut applier = start_config_applier(ctx, &client);
     let provider_source = FetchedProviderEnvironment {
         client: &client,
         endpoint: &endpoint,
@@ -9635,5 +9693,240 @@ network_policies:
                 .unwrap()
                 .contains("previous policy IS active")
         );
+    }
+
+    mod config_push_loop {
+        use super::*;
+        use openshell_core::proto::{
+            ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, GetSandboxConfigResponse,
+            GetSandboxProviderEnvironmentResponse, SupervisorMessage, supervisor_message,
+        };
+        use openshell_supervisor_process::supervisor_session::{
+            ConfigDeliveryState, ConfigPushSender, config_push_channel,
+        };
+
+        fn pushed_config(version: u32, provider_env_revision: u64) -> GetSandboxConfigResponse {
+            GetSandboxConfigResponse {
+                policy: Some(proto_policy_fixture()),
+                version,
+                policy_hash: format!("hash-v{version}"),
+                config_revision: u64::from(version) * 100,
+                policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
+                provider_env_revision,
+                configuration_admitted: true,
+                ..Default::default()
+            }
+        }
+
+        fn pushed_provider(
+            revision: u64,
+            policy_hash: &str,
+        ) -> GetSandboxProviderEnvironmentResponse {
+            GetSandboxProviderEnvironmentResponse {
+                provider_env_revision: revision,
+                policy_hash: policy_hash.to_string(),
+                ..Default::default()
+            }
+        }
+
+        struct Harness {
+            sender: ConfigPushSender,
+            replies_tx: tokio::sync::mpsc::Sender<SupervisorMessage>,
+            replies: tokio::sync::mpsc::Receiver<SupervisorMessage>,
+            reports: tokio::sync::mpsc::UnboundedReceiver<(u32, bool, String)>,
+            polls: UnboundedSender<openshell_core::grpc_client::SettingsPollResult>,
+            polled: Arc<tokio::sync::Mutex<Vec<String>>>,
+            credentials: ProviderCredentialState,
+            handle: tokio::task::JoinHandle<Result<()>>,
+        }
+
+        impl Harness {
+            fn start(state: ConfigDeliveryState) -> Self {
+                let v1 = settings_poll_result(
+                    Some(proto_policy_fixture()),
+                    1,
+                    openshell_core::proto::PolicySource::Sandbox,
+                );
+                let engine = Arc::new(
+                    OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"),
+                );
+                let mut revision = LoadedPolicyRevision::from_snapshot(&v1);
+                revision.admission_instance_id =
+                    Some("00000000-0000-4000-8000-000000000001".to_string());
+                let mut ctx = policy_poll_test_context(
+                    engine,
+                    LoadedPolicyOrigin::Gateway {
+                        revision: Some(revision),
+                        has_last_valid_policy: true,
+                    },
+                    default_middleware_connector(),
+                );
+                ctx.interval_secs = 3600;
+                let credentials = ctx.provider_credentials.clone();
+                let (client, polls, reports) = scripted_policy_gateway();
+                let polled = client.polled_sandboxes.clone();
+                let (sender, receiver) = config_push_channel();
+                sender.set_state(state);
+                let handle = tokio::spawn(run_config_loop_with_client(ctx, client, receiver));
+                let (replies_tx, replies) = tokio::sync::mpsc::channel(8);
+                Self {
+                    sender,
+                    replies_tx,
+                    replies,
+                    reports,
+                    polls,
+                    polled,
+                    credentials,
+                    handle,
+                }
+            }
+
+            fn push(
+                &self,
+                delivery_id: u64,
+                initial: bool,
+                sandbox_config: Option<GetSandboxConfigResponse>,
+                provider_environment: Option<GetSandboxProviderEnvironmentResponse>,
+            ) {
+                assert!(self.sender.deliver(
+                    ConfigUpdate {
+                        delivery_id,
+                        initial,
+                        sandbox_config,
+                        provider_environment,
+                    },
+                    &self.replies_tx,
+                ));
+            }
+
+            async fn answer(&mut self) -> ConfigUpdateResult {
+                let message = timeout(Duration::from_secs(2), self.replies.recv())
+                    .await
+                    .expect("answer timed out")
+                    .expect("reply channel closed");
+                match message.payload {
+                    Some(supervisor_message::Payload::ConfigUpdateResult(result)) => result,
+                    other => panic!("unexpected message {other:?}"),
+                }
+            }
+
+            async fn push_initial(&mut self) {
+                self.push(
+                    1,
+                    true,
+                    Some(pushed_config(1, 0)),
+                    Some(pushed_provider(0, "hash-v1")),
+                );
+                let answer = self.answer().await;
+                assert_eq!(answer.delivery_id, 1);
+                assert_eq!(
+                    answer.configuration_instance_id,
+                    "00000000-0000-4000-8000-000000000001"
+                );
+                assert_eq!(
+                    answer.sandbox_config.unwrap().outcome,
+                    i32::from(ConfigApplyOutcome::IgnoredDuplicate)
+                );
+                assert_eq!(
+                    answer.provider_environment.unwrap().outcome,
+                    i32::from(ConfigApplyOutcome::IgnoredDuplicate)
+                );
+                expect_policy_report(&mut self.reports, 1).await;
+            }
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                self.handle.abort();
+            }
+        }
+
+        #[tokio::test]
+        async fn pushed_initial_snapshot_matching_startup_is_acknowledged_without_polling() {
+            let mut harness = Harness::start(ConfigDeliveryState::Pushing {
+                session_id: "s1".to_string(),
+            });
+            harness.push_initial().await;
+            assert!(
+                harness.polled.lock().await.is_empty(),
+                "a pushing supervisor must not poll"
+            );
+        }
+
+        #[tokio::test]
+        async fn pushed_policy_waits_for_matching_provider_environment() {
+            let mut harness = Harness::start(ConfigDeliveryState::Pushing {
+                session_id: "s1".to_string(),
+            });
+            harness.push_initial().await;
+
+            harness.push(2, false, Some(pushed_config(2, 7)), None);
+            let answer = harness.answer().await;
+            assert_eq!(
+                answer.sandbox_config.as_ref().unwrap().outcome,
+                i32::from(ConfigApplyOutcome::AwaitingComponent)
+            );
+            assert!(answer.provider_environment.is_none());
+            assert_eq!(harness.credentials.snapshot().revision, 0);
+
+            harness.push(3, false, None, Some(pushed_provider(7, "hash-v2")));
+            let answer = harness.answer().await;
+            assert_eq!(answer.delivery_id, 3);
+            let config = answer.sandbox_config.expect("held policy is answered");
+            assert_eq!(config.outcome, i32::from(ConfigApplyOutcome::Applied));
+            assert_eq!(config.identity.unwrap().config_revision, 200);
+            assert_eq!(
+                answer.provider_environment.unwrap().outcome,
+                i32::from(ConfigApplyOutcome::Applied)
+            );
+            expect_policy_report(&mut harness.reports, 2).await;
+            assert_eq!(harness.credentials.snapshot().revision, 7);
+        }
+
+        #[tokio::test]
+        async fn pushed_provider_environment_is_never_installed_with_a_mismatched_policy() {
+            let mut harness = Harness::start(ConfigDeliveryState::Pushing {
+                session_id: "s1".to_string(),
+            });
+            harness.push_initial().await;
+
+            harness.push(2, false, None, Some(pushed_provider(9, "hash-v2")));
+            let answer = harness.answer().await;
+            assert!(answer.sandbox_config.is_none());
+            assert_eq!(
+                answer.provider_environment.unwrap().outcome,
+                i32::from(ConfigApplyOutcome::AwaitingComponent)
+            );
+            assert_eq!(harness.credentials.snapshot().revision, 0);
+
+            // The matching policy completes the held provider environment.
+            harness.push(3, false, Some(pushed_config(2, 9)), None);
+            let answer = harness.answer().await;
+            assert_eq!(
+                answer.sandbox_config.unwrap().outcome,
+                i32::from(ConfigApplyOutcome::Applied)
+            );
+            let provider = answer
+                .provider_environment
+                .expect("held provider environment is answered");
+            assert_eq!(provider.outcome, i32::from(ConfigApplyOutcome::Applied));
+            assert_eq!(provider.identity.unwrap().provider_env_revision, 9);
+            assert_eq!(harness.credentials.snapshot().revision, 9);
+        }
+
+        #[tokio::test]
+        async fn supervisor_polls_when_the_session_does_not_push() {
+            let mut harness = Harness::start(ConfigDeliveryState::Polling);
+            harness
+                .polls
+                .send(settings_poll_result(
+                    Some(proto_policy_fixture()),
+                    1,
+                    openshell_core::proto::PolicySource::Sandbox,
+                ))
+                .unwrap();
+            expect_policy_report(&mut harness.reports, 1).await;
+            assert_eq!(harness.polled.lock().await.len(), 1);
+        }
     }
 }

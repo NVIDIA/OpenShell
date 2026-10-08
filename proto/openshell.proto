@@ -1600,6 +1600,9 @@ enum ConfigApplyOutcome {
   CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD = 6;
   CONFIG_APPLY_OUTCOME_FAILED_CLOSED = 7;
   CONFIG_APPLY_OUTCOME_UNSUPPORTED = 8;
+  // The supervisor holds this part until the matching other part arrives.
+  // Nothing was applied. The gateway rebuilds the other part once.
+  CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT = 9;
 }
 
 // Durable lifecycle of one desired-state update operation.
@@ -2987,6 +2990,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ConfigUpdateResult config_update_result = 5;
   }
 }
 
@@ -2999,6 +3003,7 @@ message GatewayMessage {
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
     SessionRedirect session_redirect = 6;
+    ConfigUpdate config_update = 7;
   }
 }
 
@@ -3021,6 +3026,10 @@ message SupervisorHello {
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
   bool supports_session_redirect = 6;
+  // The supervisor applies configuration pushed as ConfigUpdate and answers
+  // each one with ConfigUpdateResult. Gateways never push to a supervisor
+  // that does not set this.
+  bool supports_config_push = 7;
 }
 
 // Gateway accepts the supervisor session.
@@ -3031,6 +3040,11 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval.
   google.protobuf.Duration heartbeat_interval = 102;
+  // The gateway pushes configuration on this session, starting with an
+  // initial ConfigUpdate. The supervisor stops polling GetSandboxConfig while
+  // the session lasts. Set only when the supervisor sent
+  // SupervisorHello.supports_config_push.
+  bool config_push = 3;
 }
 
 // Gateway rejects the supervisor session.
@@ -3051,6 +3065,68 @@ message SessionRedirect {
   string peer_endpoint = 1;
   // Replica ID that should own this sandbox, for logging.
   string owner_replica_id = 2;
+}
+
+// Complete configuration parts pushed to a supervisor.
+//
+// Each part present replaces the supervisor's copy of that part; parts are
+// never diffs. The two parts are versioned independently. Each carries the
+// provider attachment epoch, provider environment revision, and policy hash
+// it was built against, so the supervisor can tell whether they match. It
+// never installs a provider environment that does not match the policy it
+// enforces. At most one update per part is unanswered at a time.
+message ConfigUpdate {
+  // Gateway-assigned, increasing within the session. The result echoes it.
+  uint64 delivery_id = 1;
+  // The first update of the session. It carries both parts, built from one
+  // read of the gateway's state, unless the policy part is not admitted, in
+  // which case it carries only the policy part.
+  bool initial = 2;
+  // Effective policy and settings. Absent when this update does not carry
+  // the part.
+  openshell.sandbox.v1.GetSandboxConfigResponse sandbox_config = 3;
+  // Provider credentials and files. Absent when this update does not carry
+  // the part.
+  GetSandboxProviderEnvironmentResponse provider_environment = 4;
+}
+
+// The supervisor's answer to one ConfigUpdate.
+message ConfigUpdateResult {
+  // ConfigUpdate.delivery_id being answered.
+  uint64 delivery_id = 1;
+  // Admission fence registered by this supervisor instance at startup
+  // (SandboxConfigurationAdmission.instance_id). The gateway records
+  // admission only for the current instance. Empty when the supervisor runs
+  // an explicit local policy.
+  string configuration_instance_id = 2;
+  // Present when the update carried the policy and settings part.
+  ConfigPartResult sandbox_config = 3;
+  // Present when the update carried the provider environment part.
+  ConfigPartResult provider_environment = 4;
+}
+
+// Outcome of one pushed configuration part.
+//
+// A result acknowledges the part, so the gateway stops resending it, unless
+// its outcome is UNSPECIFIED, IGNORED_STALE, or AWAITING_COMPONENT.
+message ConfigPartResult {
+  ConfigApplyOutcome outcome = 1;
+  // Identity of the part this result answers, copied from the update. The
+  // gateway rejects a result whose identity differs from what it sent.
+  ConfigPartIdentity identity = 2;
+  // Bounded, credential-free diagnostic for a failed outcome.
+  string error = 3;
+}
+
+// Identity of one configuration part. Revisions are equality tokens.
+message ConfigPartIdentity {
+  // Sandbox config only.
+  uint64 config_revision = 1;
+  // Sandbox config only.
+  uint32 policy_version = 2;
+  string policy_hash = 3;
+  uint64 provider_env_revision = 4;
+  string provider_attachment_epoch = 5;
 }
 
 // Supervisor heartbeat.

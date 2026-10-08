@@ -1858,6 +1858,10 @@ async fn auto_approve_chunk(
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.to_string()),
+    );
     state.sandbox_watch_bus.notify(sandbox_id);
     if let Err(error) =
         reconcile_pending_chunks_after_policy_change(state, context.workspace, context.sandbox)
@@ -2734,17 +2738,9 @@ pub(super) async fn handle_get_sandbox_config(
                 MinWorkspaceRole::User,
             )
             .await?;
-            Ok(Response::new(GetSandboxConfigResponse {
-                configuration_admitted: false,
-                configuration_error: configuration_failure_diagnostic(&error).to_string(),
-                configuration_instance_id: sandbox
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.configuration_admission.as_ref())
-                    .map_or_else(String::new, |admission| admission.instance_id.clone()),
-                workspace: sandbox.object_workspace().to_string(),
-                ..Default::default()
-            }))
+            Ok(Response::new(config_snapshot::not_admitted_sandbox_config(
+                &sandbox, &error,
+            )))
         }
         result => result,
     }
@@ -3481,6 +3477,7 @@ async fn handle_update_config_inner(
                 if changed {
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
+                    crate::config_delivery::publish(state, crate::config_delivery::Scope::All);
                 }
                 return Ok(update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
@@ -3537,6 +3534,7 @@ async fn handle_update_config_inner(
             if changed {
                 global_settings.revision = global_settings.revision.wrapping_add(1);
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
+                crate::config_delivery::publish(state, crate::config_delivery::Scope::All);
             }
 
             return Ok(update_config_response(
@@ -3583,6 +3581,7 @@ async fn handle_update_config_inner(
 
             global_settings.revision = global_settings.revision.wrapping_add(1);
             save_global_settings(state.store.as_ref(), &global_settings).await?;
+            crate::config_delivery::publish(state, crate::config_delivery::Scope::All);
 
             if req.delete_setting
                 && key == POLICY_SETTING_KEY
@@ -3647,6 +3646,10 @@ async fn handle_update_config_inner(
                     &sandbox_settings,
                 )
                 .await?;
+                crate::config_delivery::publish(
+                    state,
+                    crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+                );
             }
 
             response_annotations = persist_update_config_annotations(
@@ -3691,6 +3694,10 @@ async fn handle_update_config_inner(
                 &sandbox_settings,
             )
             .await?;
+            crate::config_delivery::publish(
+                state,
+                crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+            );
         }
 
         response_annotations = persist_update_config_annotations(
@@ -3766,6 +3773,10 @@ async fn handle_update_config_inner(
             .await?
         };
 
+        crate::config_delivery::publish(
+            state,
+            crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+        );
         state.sandbox_watch_bus.notify(&sandbox_id);
         emit_gateway_policy_audit_log(
             &sandbox_id,
@@ -3971,6 +3982,10 @@ async fn handle_update_config_inner(
         })?
     };
     response_annotations = committed_annotations;
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
     // The committed revision changed what pending proposals were evaluated
     // against. Schedule the refresh here: the matching-revision check below
@@ -4026,6 +4041,10 @@ async fn handle_update_config_inner(
         .supersede_older_policies(&sandbox_id, next_version)
         .await;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
@@ -4202,7 +4221,7 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
         .collect()
 }
 
-fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+pub(super) fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
     if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
@@ -4237,7 +4256,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     use openshell_core::proto::ConfigurationAdmissionState;
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
-    let mut admission = request
+    let admission = request
         .get_ref()
         .admission
         .clone()
@@ -4250,12 +4269,48 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
+    record_configuration_admission(
+        state,
+        &sandbox_id,
+        admission,
+        &request.get_ref().expected_instance_id,
+        AdmissionEvidence::Current(request.extensions()),
+    )
+    .await?;
+    Ok(Response::new(
+        openshell_core::proto::ReportSandboxConfigurationResponse {},
+    ))
+}
+
+/// What confirms the configuration generation a supervisor reports.
+pub enum AdmissionEvidence<'a> {
+    /// Rebuild the current configuration as the reporting caller. Used by
+    /// `ReportSandboxConfiguration`, which reports a generation the supervisor
+    /// fetched itself.
+    Current(&'a tonic::Extensions),
+    /// The policy and settings part the gateway pushed. The supervisor's
+    /// result was already matched to it, so no rebuild is needed.
+    Pushed(&'a GetSandboxConfigResponse),
+}
+
+/// Record a supervisor's configuration admission report on the sandbox and
+/// update its readiness. `admission.state` must not be unspecified.
+pub async fn record_configuration_admission(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    mut admission: openshell_core::proto::SandboxConfigurationAdmission,
+    expected_instance_id: &str,
+    evidence: AdmissionEvidence<'_>,
+) -> Result<(), Status> {
+    use openshell_core::proto::ConfigurationAdmissionState;
+    let reported = ConfigurationAdmissionState::try_from(admission.state)
+        .map_err(|_| Status::invalid_argument("invalid admission state"))?;
     let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
         super::persistence_error_to_status(error, "acquire configuration admission lock")
     })?;
     let mut sandbox = state
         .store
-        .get_message::<Sandbox>(&sandbox_id)
+        .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
@@ -4279,8 +4334,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         .and_then(|status| status.configuration_admission.as_ref());
     if reported == ConfigurationAdmissionState::Pending
         && current.is_some_and(|current| current.instance_id != admission.instance_id)
-        && current.map_or("", |current| current.instance_id.as_str())
-            != request.get_ref().expected_instance_id
+        && current.map_or("", |current| current.instance_id.as_str()) != expected_instance_id
     {
         return Err(Status::failed_precondition(
             "supervisor registration fence has changed",
@@ -4294,14 +4348,23 @@ pub(super) async fn handle_report_sandbox_configuration(
         ));
     }
     if reported == ConfigurationAdmissionState::Accepted {
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            name: sandbox_name.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        let config = handle_get_sandbox_config(state, config_request)
-            .await?
-            .into_inner();
+        let config = match evidence {
+            AdmissionEvidence::Current(extensions) => {
+                let mut config_request = Request::new(GetSandboxConfigRequest {
+                    name: sandbox_name.clone(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        workspace.clone(),
+                    )),
+                });
+                *config_request.extensions_mut() = extensions.clone();
+                std::borrow::Cow::Owned(
+                    handle_get_sandbox_config(state, config_request)
+                        .await?
+                        .into_inner(),
+                )
+            }
+            AdmissionEvidence::Pushed(config) => std::borrow::Cow::Borrowed(config),
+        };
         if !config.configuration_admitted || !configuration_generation_matches(&admission, &config)
         {
             return Err(Status::aborted(
@@ -4312,16 +4375,24 @@ pub(super) async fn handle_report_sandbox_configuration(
     } else if reported == ConfigurationAdmissionState::Rejected {
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-            name: sandbox_name,
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        admission.error = match handle_get_sandbox_config(state, config_request).await {
-            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+        let config = match evidence {
+            AdmissionEvidence::Current(extensions) => {
+                let mut config_request = Request::new(GetSandboxConfigRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                    name: sandbox_name,
+                });
+                *config_request.extensions_mut() = extensions.clone();
+                handle_get_sandbox_config(state, config_request)
+                    .await
+                    .map(|config| std::borrow::Cow::Owned(config.into_inner()))
+            }
+            AdmissionEvidence::Pushed(config) => Ok(std::borrow::Cow::Borrowed(config)),
+        };
+        admission.error = match config {
+            Ok(config) if !configuration_generation_matches(&admission, &config) => {
                 return Err(Status::aborted("rejected configuration generation has changed"));
             }
-            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+            Ok(config) if !config.configuration_error.is_empty() => config.configuration_error.clone(),
             _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
         };
         if let Some(current) = current
@@ -4340,6 +4411,12 @@ pub(super) async fn handle_report_sandbox_configuration(
             admission = current.clone();
         }
     }
+    // The registration fence is part of the pushed policy part.
+    let fence_changed = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .is_none_or(|current| current.instance_id != admission.instance_id);
     let expected_version = sandbox
         .metadata
         .as_ref()
@@ -4367,7 +4444,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     }
     let updated = state
         .store
-        .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+        .update_message_cas::<Sandbox, _>(sandbox_id, expected_version, |sandbox| {
             sandbox
                 .status
                 .get_or_insert_with(Default::default)
@@ -4391,10 +4468,14 @@ pub(super) async fn handle_report_sandbox_configuration(
             super::persistence_error_to_status(error, "report configuration admission")
         })?;
     state.sandbox_index.update_from_sandbox(&updated);
-    state.sandbox_watch_bus.notify(&sandbox_id);
-    Ok(Response::new(
-        openshell_core::proto::ReportSandboxConfigurationResponse {},
-    ))
+    state.sandbox_watch_bus.notify(sandbox_id);
+    if fence_changed {
+        crate::config_delivery::publish(
+            state,
+            crate::config_delivery::Scope::Sandbox(sandbox_id.to_string()),
+        );
+    }
+    Ok(())
 }
 
 pub(super) async fn handle_report_policy_status(
@@ -5266,6 +5347,10 @@ async fn handle_approve_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
     if let Err(error) =
         reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
@@ -5401,6 +5486,10 @@ async fn handle_reject_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
     if was_approved {
         refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
@@ -5678,6 +5767,10 @@ async fn handle_approve_all_draft_chunks_inner(
     }
     let chunks_approved = u32::try_from(accepted.len()).unwrap_or(u32::MAX);
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
     if let Err(error) =
         reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
@@ -5855,6 +5948,10 @@ async fn handle_undo_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
+    crate::config_delivery::publish(
+        state,
+        crate::config_delivery::Scope::Sandbox(sandbox_id.clone()),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
     emit_gateway_policy_audit_log(
         &sandbox_id,

@@ -53,6 +53,10 @@ pub(super) struct PostgresAdvisoryLockGuard {
 }
 
 impl PostgresStore {
+    pub(super) fn pool_size(&self) -> usize {
+        usize::try_from(self.pool.options().get_max_connections()).unwrap_or(1)
+    }
+
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)

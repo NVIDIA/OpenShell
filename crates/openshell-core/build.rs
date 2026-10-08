@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
+        // Messages with `(openshell.options.v1.secret)` fields that cross the
+        // supervisor session implement a redacting `Debug` in `proto/mod.rs`.
+        .skip_debug(["openshell.v1.GetSandboxProviderEnvironmentResponse"])
         .compile_protos(&proto_files, &[proto_root])?;
 
     println!(

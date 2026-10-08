@@ -83,6 +83,46 @@ impl FromStr for PolicyValidationFailureMode {
     }
 }
 
+/// How the gateway delivers configuration to sandbox supervisors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDeliveryMode {
+    /// Supervisors poll `GetSandboxConfig` on an interval.
+    #[default]
+    Poll,
+    /// The gateway pushes configuration over the supervisor session when it
+    /// changes. Supervisors that cannot apply pushed configuration keep
+    /// polling. Requires a single-replica gateway.
+    Push,
+}
+
+impl ConfigDeliveryMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Push => "push",
+        }
+    }
+}
+
+impl FromStr for ConfigDeliveryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "push" => Ok(Self::Push),
+            _ => Err(format!(
+                "invalid config delivery mode '{value}'; expected poll or push"
+            )),
+        }
+    }
+}
+
+/// Default interval between consistency checks of pushed configuration.
+pub const DEFAULT_CONFIG_CONSISTENCY_CHECK_INTERVAL_SECONDS: u32 = 60;
+
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
@@ -208,6 +248,13 @@ pub struct Config {
 
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
+    /// How configuration reaches sandbox supervisors.
+    pub config_delivery_mode: ConfigDeliveryMode,
+
+    /// In push mode, how often each session's configuration is rebuilt to
+    /// repair a missed change, in seconds. Must be between 5 and 86400.
+    pub config_consistency_check_interval_seconds: u32,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
@@ -879,6 +926,9 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            config_delivery_mode: ConfigDeliveryMode::default(),
+            config_consistency_check_interval_seconds:
+                DEFAULT_CONFIG_CONSISTENCY_CHECK_INTERVAL_SECONDS,
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
@@ -1145,13 +1195,26 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
+        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    #[test]
+    fn config_delivery_mode_defaults_to_poll_and_parses() {
+        assert_eq!(
+            Config::new(None).config_delivery_mode,
+            ConfigDeliveryMode::Poll
+        );
+        assert_eq!("push".parse(), Ok(ConfigDeliveryMode::Push));
+        assert_eq!("poll".parse(), Ok(ConfigDeliveryMode::Poll));
+        assert!("stream".parse::<ConfigDeliveryMode>().is_err());
+        assert_eq!(ConfigDeliveryMode::Push.as_str(), "push");
+    }
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {

@@ -282,6 +282,14 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Connections in the primary pool: how many queries can run at once.
+    pub fn pool_size(&self) -> usize {
+        match self {
+            Self::Postgres(store) => store.pool_size(),
+            Self::Sqlite(store) => store.pool_size(),
+        }
+    }
+
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local

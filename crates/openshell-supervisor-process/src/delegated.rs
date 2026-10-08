@@ -87,6 +87,7 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    config_push: Option<crate::supervisor_session::ConfigPushSender>,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
@@ -169,6 +170,7 @@ pub async fn start_boundary_access(
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    config_push,
                 },
             );
             // Session establishment retries through gateway restarts. The

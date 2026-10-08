@@ -301,7 +301,8 @@ struct LiveSession {
     /// outbound stream. Without this, a concurrent `open_relay` that grabbed
     /// the old session's `tx` just before supersede could still enqueue a
     /// `RelayOpen` onto the stale stream and sit until the relay timeout.
-    shutdown: oneshot::Sender<()>,
+    /// Taken when the session is closed in place.
+    shutdown: Option<oneshot::Sender<()>>,
     /// Set after the supervisor confirms that every expected foreground
     /// attachment has closed and terminal output delivery is complete.
     terminal_delivery_finalized: bool,
@@ -439,7 +440,7 @@ impl SupervisorSessionRegistry {
                 sandbox_id,
                 session_id,
                 tx,
-                shutdown,
+                shutdown: Some(shutdown),
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
@@ -451,7 +452,9 @@ impl SupervisorSessionRegistry {
         match previous {
             Some(prev) => {
                 // Best-effort — the old task may have already exited.
-                let _ = prev.shutdown.send(());
+                if let Some(shutdown) = prev.shutdown {
+                    let _ = shutdown.send(());
+                }
                 true
             }
             None => false,
@@ -470,11 +473,28 @@ impl SupervisorSessionRegistry {
     pub fn disconnect(&self, sandbox_id: &str) -> bool {
         let session = self.sessions.lock().unwrap().remove(sandbox_id);
         if let Some(session) = session {
-            let _ = session.shutdown.send(());
+            if let Some(shutdown) = session.shutdown {
+                let _ = shutdown.send(());
+            }
             true
         } else {
             false
         }
+    }
+
+    /// Close one supervisor session, if it is still the current one. The
+    /// registration stays until the session task finishes, so its normal
+    /// disconnect handling runs. The supervisor reconnects and starts a
+    /// fresh session.
+    pub(crate) fn disconnect_session(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let shutdown = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+            .and_then(|session| session.shutdown.take());
+        shutdown.is_some_and(|shutdown| shutdown.send(()).is_ok())
     }
 
     /// Remove the session only if its `session_id` matches the one we are
@@ -2202,6 +2222,8 @@ async fn establish_supervisor_session(
         "supervisor session: accepted"
     );
 
+    let config_push = crate::config_delivery::negotiate(&state, &hello);
+
     // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2272,6 +2294,7 @@ async fn establish_supervisor_session(
                 u64::from(HEARTBEAT_INTERVAL_SECS),
             ))
             .ok(),
+            config_push,
         })),
     };
     if tx.send(accepted).await.is_err() {
@@ -2312,6 +2335,17 @@ async fn establish_supervisor_session(
         .replay_pending_relays(&sandbox_id, &session_id, &tx)
         .await;
 
+    // Pushed configuration has its own outbound queue, drained only when no
+    // control message (heartbeat, relay, redirect) is waiting. At most one
+    // update per configuration part is unanswered, so it stays small.
+    let config_rx = if config_push && let Some(delivery) = state.config_delivery.as_ref() {
+        let (config_tx, config_rx) = mpsc::channel::<GatewayMessage>(2);
+        delivery.register(state.clone(), &sandbox_id, &session_id, config_tx);
+        Some(config_rx)
+    } else {
+        None
+    };
+
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -2335,6 +2369,9 @@ async fn establish_supervisor_session(
         // EOF at once instead of waiting out any handoff below.
         drop(tx);
         drop(inbound);
+        if let Some(delivery) = state_clone.config_delivery.as_ref() {
+            delivery.unregister(&sandbox_id_clone, &session_id);
+        }
         finish_supervisor_session(
             &state_clone,
             &sandbox_id_clone,
@@ -2346,12 +2383,25 @@ async fn establish_supervisor_session(
     });
 
     // Return the outbound stream.
-    let stream = ReceiverStream::new(rx);
-    let stream: Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
-    > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
+    Ok(Response::new(session_outbound_stream(rx, config_rx)))
+}
 
-    Ok(Response::new(stream))
+/// Merge the session's control and configuration queues. Control messages
+/// always go first, so configuration never delays heartbeats or relays.
+pub(crate) fn session_outbound_stream(
+    control: mpsc::Receiver<GatewayMessage>,
+    config: Option<mpsc::Receiver<GatewayMessage>>,
+) -> Pin<Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>> {
+    let control = ReceiverStream::new(control);
+    let Some(config) = config else {
+        return Box::pin(tokio_stream::StreamExt::map(control, Ok));
+    };
+    let merged = futures::stream::select_with_strategy(
+        control,
+        ReceiverStream::new(config),
+        |(): &mut ()| futures::stream::PollNext::Left,
+    );
+    Box::pin(tokio_stream::StreamExt::map(merged, Ok))
 }
 
 pub async fn handle_report_main_process_exit(
@@ -2679,6 +2729,17 @@ async fn handle_supervisor_message(
     owner_guard: &mut OwnerGuard,
 ) -> bool {
     match msg.payload {
+        Some(supervisor_message::Payload::ConfigUpdateResult(result)) => {
+            if let Some(delivery) = state.config_delivery.as_ref() {
+                delivery.deliver_result(sandbox_id, session_id, result);
+            } else {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    "supervisor session: configuration result without push; ignoring"
+                );
+            }
+        }
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
             match tokio::time::timeout(OWNER_RENEW_TIMEOUT, owner_index.renew(owner_guard)).await {

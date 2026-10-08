@@ -63,11 +63,11 @@ pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
-    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
-    UpstreamProxyConfig,
+    AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_CONFIG_CONSISTENCY_CHECK_INTERVAL_SECONDS,
+    GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
+    GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
+    GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig,
+    OidcConfig, PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

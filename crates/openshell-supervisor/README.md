@@ -16,6 +16,31 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
 
+## Configuration delivery
+
+Startup fetches the sandbox's policy, settings, and provider environment with
+RPCs, prepares the image policy, and reports admission before the workload
+starts. After that, `ConfigApplier` reconciles every later snapshot. It owns the
+applied-state trackers, failure posture (quarantine or retained last valid
+policy), credential installation, audit events, and policy status reports.
+
+Snapshots reach `ConfigApplier` from one of two places. When the gateway
+session reports `SessionAccepted.config_push`, the gateway pushes `ConfigUpdate`
+messages over the session and the supervisor stops polling. The configuration
+loop (`config_push.rs`) answers each pushed part with a `ConfigUpdateResult`. A
+policy part that needs a provider environment the supervisor has not received
+is held and answered `AWAITING_COMPONENT`. A provider environment is installed
+only together with a policy part that names the same attachment epoch, provider
+environment revision, and policy hash. When the session does not push, or is
+disconnected, the loop polls `GetSandboxConfig` every
+`OPENSHELL_POLICY_POLL_INTERVAL_SECS` (default 10) and fetches the provider
+environment on demand, as earlier releases did.
+
+While pushing, the loop retries a degraded apply (unreachable middleware) on
+the poll interval and reports recovery with `ReportSandboxConfiguration`. It
+also rotates extension credentials on their own schedule, because there are no
+polls to drive rotation.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

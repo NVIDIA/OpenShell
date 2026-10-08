@@ -25,14 +25,22 @@ use tonic::{Code, Status};
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
 pub const RELAY_PENDING: &str = "openshell_server_relay_pending";
 pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacity";
+pub const CONFIG_PUSH_SESSIONS: &str = "openshell_server_config_push_sessions";
+pub const CONFIG_BUILDS_WAITING: &str = "openshell_server_config_builds_waiting";
 // Counters
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
+pub const CONFIG_UPDATES_SENT_TOTAL: &str = "openshell_server_config_updates_sent_total";
+pub const CONFIG_UNCHANGED_TOTAL: &str = "openshell_server_config_unchanged_total";
+pub const CONFIG_RESULTS_TOTAL: &str = "openshell_server_config_results_total";
+pub const CONFIG_RESULTS_REJECTED_TOTAL: &str = "openshell_server_config_results_rejected_total";
+pub const CONFIG_ACK_TIMEOUTS_TOTAL: &str = "openshell_server_config_ack_timeouts_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
 pub const CONFIG_BUILD_DURATION_SECONDS: &str = "openshell_server_config_build_duration_seconds";
+pub const CONFIG_BUILD_WAIT_SECONDS: &str = "openshell_server_config_build_wait_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -42,6 +50,8 @@ const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
 const LABEL_PART: &str = "part";
 const LABEL_TRIGGER: &str = "trigger";
+const LABEL_KIND: &str = "kind";
+const LABEL_LANE: &str = "lane";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
 /// claim timeout and the 15 s routed-relay wait.
@@ -51,10 +61,11 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 3] = [
+const BUCKETED_HISTOGRAMS: [&str; 4] = [
     RELAY_CLAIM_DURATION_SECONDS,
     PEER_REQUEST_DURATION_SECONDS,
     CONFIG_BUILD_DURATION_SECONDS,
+    CONFIG_BUILD_WAIT_SECONDS,
 ];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
@@ -162,12 +173,34 @@ impl ConfigPart {
 pub enum BuildTrigger {
     /// An RPC asked for it: a supervisor poll, or a status or readiness query.
     Request,
+    /// The gateway built it to push to a supervisor session.
+    Push,
 }
 
 impl BuildTrigger {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Request => "request",
+            Self::Push => "push",
+        }
+    }
+}
+
+/// Which build capacity a pushed configuration build waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuildLane {
+    /// A change to one sandbox, an initial snapshot, or a repair.
+    Sandbox,
+    /// A change to a workspace, a provider, or every sandbox, or a
+    /// consistency check.
+    Fanout,
+}
+
+impl BuildLane {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::Fanout => "fanout",
         }
     }
 }
@@ -289,6 +322,46 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
     );
+    describe_gauge!(
+        CONFIG_PUSH_SESSIONS,
+        Unit::Count,
+        "Supervisor sessions on this replica that receive pushed configuration."
+    );
+    describe_gauge!(
+        CONFIG_BUILDS_WAITING,
+        Unit::Count,
+        "Push sessions on this replica with a configuration change waiting for a build."
+    );
+    describe_counter!(
+        CONFIG_UPDATES_SENT_TOTAL,
+        Unit::Count,
+        "Configuration parts pushed to supervisors."
+    );
+    describe_counter!(
+        CONFIG_UNCHANGED_TOTAL,
+        Unit::Count,
+        "Rebuilt configuration parts not pushed because the supervisor already has them."
+    );
+    describe_counter!(
+        CONFIG_RESULTS_TOTAL,
+        Unit::Count,
+        "Supervisor answers to pushed configuration parts."
+    );
+    describe_counter!(
+        CONFIG_RESULTS_REJECTED_TOTAL,
+        Unit::Count,
+        "Supervisor answers rejected because they did not match the pushed part."
+    );
+    describe_counter!(
+        CONFIG_ACK_TIMEOUTS_TOTAL,
+        Unit::Count,
+        "Pushed configuration parts the supervisor did not answer in time."
+    );
+    describe_histogram!(
+        CONFIG_BUILD_WAIT_SECONDS,
+        Unit::Seconds,
+        "Time from a recorded configuration change to the start of the session's build."
+    );
     describe_histogram!(
         CONFIG_BUILD_DURATION_SECONDS,
         Unit::Seconds,
@@ -298,6 +371,8 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
     gauge!(RELAY_PENDING).increment(0.0);
+    gauge!(CONFIG_PUSH_SESSIONS).increment(0.0);
+    gauge!(CONFIG_BUILDS_WAITING).increment(0.0);
     gauge!(RELAY_PENDING_CAPACITY).set(count_as_f64(relay.per_replica));
     for kind in RelayKind::ALL {
         for route in RelayRoute::ALL {
@@ -355,10 +430,26 @@ impl GaugeSlot {
         Self::acquire(RELAY_PENDING)
     }
 
+    /// Share of `openshell_server_config_push_sessions`.
+    pub fn config_push_session() -> Self {
+        Self::acquire(CONFIG_PUSH_SESSIONS)
+    }
+
+    /// Share of `openshell_server_config_builds_waiting`.
+    pub fn config_build_waiting() -> Self {
+        Self::acquire(CONFIG_BUILDS_WAITING)
+    }
+
     fn acquire(name: &'static str) -> Self {
         let gauge = gauge!(name);
         gauge.increment(1.0);
         Self(gauge)
+    }
+}
+
+impl std::fmt::Debug for GaugeSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GaugeSlot")
     }
 }
 
@@ -377,6 +468,44 @@ pub fn record_config_build(part: ConfigPart, trigger: BuildTrigger, ok: bool, el
         LABEL_OUTCOME => if ok { "ok" } else { "error" }
     )
     .record(elapsed);
+}
+
+/// A pushed update carrying `part` was queued for a session.
+pub fn record_config_update_sent(part: ConfigPart, initial: bool) {
+    counter!(
+        CONFIG_UPDATES_SENT_TOTAL,
+        LABEL_PART => part.label(),
+        LABEL_KIND => if initial { "initial" } else { "update" }
+    )
+    .increment(1);
+}
+
+/// A rebuilt part matched what the session already has, so it was not sent.
+pub fn record_config_unchanged(part: ConfigPart) {
+    counter!(CONFIG_UNCHANGED_TOTAL, LABEL_PART => part.label()).increment(1);
+}
+
+/// A supervisor answered a pushed part. `outcome` is the snake-case
+/// `ConfigApplyOutcome` name.
+pub fn record_config_result(part: ConfigPart, outcome: &'static str) {
+    counter!(CONFIG_RESULTS_TOTAL, LABEL_PART => part.label(), LABEL_OUTCOME => outcome)
+        .increment(1);
+}
+
+/// A supervisor result was rejected because it did not match what was sent.
+pub fn record_config_result_rejected(part: ConfigPart, reason: &'static str) {
+    counter!(CONFIG_RESULTS_REJECTED_TOTAL, LABEL_PART => part.label(), LABEL_REASON => reason)
+        .increment(1);
+}
+
+/// A pushed part was not answered in time and will be sent again.
+pub fn record_config_ack_timeout(part: ConfigPart) {
+    counter!(CONFIG_ACK_TIMEOUTS_TOTAL, LABEL_PART => part.label()).increment(1);
+}
+
+/// Time from the first change recorded for a session to the start of its build.
+pub fn record_config_build_wait(lane: BuildLane, waited: Duration) {
+    histogram!(CONFIG_BUILD_WAIT_SECONDS, LABEL_LANE => lane.label()).record(waited);
 }
 
 pub fn record_relay_rejected(reason: RelayRejection) {
@@ -634,6 +763,7 @@ mod tests {
             true,
             sample,
         );
+        record_config_build_wait(BuildLane::Sandbox, sample);
         histogram!(
             PEER_REQUEST_DURATION_SECONDS,
             LABEL_OPERATION => "relay",

@@ -564,6 +564,26 @@ fn prepare_server_config_with_drivers(
         config.policy_validation_failure_mode = mode;
     }
 
+    if let Some(mode) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.config_delivery_mode)
+    {
+        config.config_delivery_mode = mode;
+    }
+
+    if let Some(seconds) = file.as_ref().and_then(|f| {
+        f.openshell
+            .gateway
+            .config_consistency_check_interval_seconds
+    }) {
+        if !(5..=86_400).contains(&seconds) {
+            return Err(miette::miette!(
+                "config_consistency_check_interval_seconds must be between 5 and 86400"
+            ));
+        }
+        config.config_consistency_check_interval_seconds = seconds;
+    }
+
     if let Some(seconds) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.image_preparation_timeout_seconds)

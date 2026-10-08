@@ -58,6 +58,15 @@ pub struct SandboxConfigInputs {
     provider_records: Vec<ProviderEnvironmentRecord>,
 }
 
+impl SandboxConfigInputs {
+    /// Object ids of the providers the sandbox attaches, as loaded.
+    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
+        self.provider_records
+            .iter()
+            .map(|record| record.object_id.as_str())
+    }
+}
+
 /// Load the inputs shared by both configuration parts.
 ///
 /// Independent reads run concurrently. The global policy revision is read only
@@ -387,6 +396,33 @@ pub async fn build_sandbox_config(
             .map(|spec| spec.provider_attachment_epoch.clone())
             .unwrap_or_default(),
     })
+}
+
+/// Whether a build error means the stored configuration is invalid, rather
+/// than that the gateway failed to read it.
+pub fn is_configuration_error(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+    )
+}
+
+/// The snapshot served to a supervisor whose stored configuration failed
+/// validation. A malformed stored candidate must not prevent a supervisor
+/// from registering and waiting for repair, and the response never exposes
+/// parser payloads or copies malformed policy history.
+pub fn not_admitted_sandbox_config(sandbox: &Sandbox, error: &Status) -> GetSandboxConfigResponse {
+    GetSandboxConfigResponse {
+        configuration_admitted: false,
+        configuration_error: super::configuration_failure_diagnostic(error).to_string(),
+        configuration_instance_id: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+            .map_or_else(String::new, |admission| admission.instance_id.clone()),
+        workspace: sandbox.object_workspace().to_string(),
+        ..Default::default()
+    }
 }
 
 /// Effective policy used to bind provider credentials, from loaded inputs.

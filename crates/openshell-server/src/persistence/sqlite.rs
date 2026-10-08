@@ -201,6 +201,10 @@ impl SqliteStore {
         self.close().await;
     }
 
+    pub(super) fn pool_size(&self) -> usize {
+        usize::try_from(self.pool.options().get_max_connections()).unwrap_or(1)
+    }
+
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };

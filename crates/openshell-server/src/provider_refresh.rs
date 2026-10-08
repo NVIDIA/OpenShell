@@ -1918,24 +1918,38 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(touched) => {
+                    // Refresh writes change the provider environment of every
+                    // sandbox that attaches these providers.
+                    for provider_id in touched {
+                        crate::config_delivery::publish(
+                            &state,
+                            crate::config_delivery::Scope::Provider(provider_id),
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
 }
 
+/// Run one refresh sweep. Returns the ids of providers whose refresh state
+/// the sweep may have written.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<Vec<String>, Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -1955,7 +1969,7 @@ async fn run_refresh_worker_tick(
         .iter()
         .any(|state| refresh_state_has_work(state, now_ms))
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let span = tracing::info_span!(
         "refresh",
@@ -1963,8 +1977,10 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span)).await;
-    Ok(())
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
 }
 
 fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
@@ -1984,7 +2000,8 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
-) {
+) -> Vec<String> {
+    let mut touched = std::collections::BTreeSet::new();
     for state in states {
         if state
             .metadata
@@ -1999,6 +2016,7 @@ async fn refresh_states(
                 );
                 continue;
             };
+            touched.insert(state.provider_id.clone());
             if let Err(err) = delete_refresh_state_with_credentials(
                 store,
                 credentials,
@@ -2078,6 +2096,7 @@ async fn refresh_states(
             status = %state.status,
             "refreshing provider credential"
         );
+        touched.insert(state.provider_id.clone());
         if let Err(err) = refresh_provider_credential(
             store,
             state.object_workspace(),
@@ -2099,6 +2118,7 @@ async fn refresh_states(
             );
         }
     }
+    touched.into_iter().collect()
 }
 
 #[cfg(test)]

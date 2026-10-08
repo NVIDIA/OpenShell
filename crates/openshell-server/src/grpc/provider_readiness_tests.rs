@@ -74,6 +74,7 @@ fn hello() -> SupervisorHello {
         supports_provider_readiness: true,
         redirected: false,
         supports_session_redirect: true,
+        supports_config_push: false,
     }
 }
 

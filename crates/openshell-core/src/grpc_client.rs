@@ -1139,7 +1139,7 @@ pub async fn fetch_provider_environment(
 
 /// Preserve snapshot authority and reject invalid credential expiration times.
 /// Unknown delivery reasons withhold credentials rather than implying readiness.
-fn provider_environment_result(
+pub fn provider_environment_result(
     inner: GetSandboxProviderEnvironmentResponse,
 ) -> Result<ProviderEnvironmentResult> {
     let credential_expires_at_ms = inner
@@ -1340,7 +1340,8 @@ pub struct SettingsPollResult {
     pub extension_authentication_enabled: bool,
 }
 
-fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
+/// Convert a policy and settings snapshot, polled or pushed.
+pub fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
         configuration_instance_id: inner.configuration_instance_id,
         configuration_admitted: inner.configuration_admitted,
@@ -1422,6 +1423,7 @@ mod settings_poll_tests {
 }
 
 /// Credential material and the authority snapshot that produced its bindings.
+#[derive(Clone)]
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub files: HashMap<String, String>,

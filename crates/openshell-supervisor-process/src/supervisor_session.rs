@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    ConfigUpdate, ConfigUpdateResult, FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame,
+    RelayInit, RelayOpen, RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat,
+    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
+    supervisor_message,
 };
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
@@ -43,6 +44,94 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    /// Hands pushed configuration to the supervisor's configuration loop.
+    /// Without it, the session does not offer to receive pushed configuration.
+    pub config_push: Option<ConfigPushSender>,
+}
+
+/// Pushed configuration updates queued for the configuration loop. The
+/// gateway leaves at most one update per configuration part unanswered.
+const CONFIG_PUSH_QUEUE: usize = 4;
+
+/// How configuration currently reaches this supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigDeliveryState {
+    /// No session is accepted.
+    Disconnected,
+    /// The accepted session does not push configuration; poll for it.
+    Polling,
+    /// The accepted session pushes configuration.
+    Pushing { session_id: String },
+}
+
+/// One pushed update and the session to answer it on.
+pub struct PushedConfig {
+    pub update: ConfigUpdate,
+    pub reply: ConfigReply,
+}
+
+/// Answers a pushed update on the session that delivered it.
+#[derive(Clone)]
+pub struct ConfigReply {
+    tx: mpsc::Sender<SupervisorMessage>,
+}
+
+impl ConfigReply {
+    /// Queue the answer. Returns false when the session that delivered the
+    /// update has ended; its replacement starts with a fresh snapshot.
+    pub fn send(&self, result: ConfigUpdateResult) -> bool {
+        self.tx
+            .try_send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
+            })
+            .is_ok()
+    }
+}
+
+/// Session side of the pushed-configuration channel.
+#[derive(Clone)]
+pub struct ConfigPushSender {
+    updates: mpsc::Sender<PushedConfig>,
+    state: watch::Sender<ConfigDeliveryState>,
+}
+
+/// Configuration-loop side of the pushed-configuration channel.
+pub struct ConfigPushReceiver {
+    pub updates: mpsc::Receiver<PushedConfig>,
+    pub state: watch::Receiver<ConfigDeliveryState>,
+}
+
+/// Create the channel between the session and the configuration loop.
+pub fn config_push_channel() -> (ConfigPushSender, ConfigPushReceiver) {
+    let (updates_tx, updates_rx) = mpsc::channel(CONFIG_PUSH_QUEUE);
+    let (state_tx, state_rx) = watch::channel(ConfigDeliveryState::Disconnected);
+    (
+        ConfigPushSender {
+            updates: updates_tx,
+            state: state_tx,
+        },
+        ConfigPushReceiver {
+            updates: updates_rx,
+            state: state_rx,
+        },
+    )
+}
+
+impl ConfigPushSender {
+    /// Publish how configuration reaches the supervisor now.
+    pub fn set_state(&self, state: ConfigDeliveryState) {
+        self.state.send_replace(state);
+    }
+
+    /// Hand a pushed update to the configuration loop, answering on `tx`.
+    pub fn deliver(&self, update: ConfigUpdate, tx: &mpsc::Sender<SupervisorMessage>) -> bool {
+        self.updates
+            .try_send(PushedConfig {
+                update,
+                reply: ConfigReply { tx: tx.clone() },
+            })
+            .is_ok()
+    }
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -335,6 +424,7 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        config_push: runtime.config_push,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -350,6 +440,7 @@ struct SessionConfig {
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    config_push: Option<ConfigPushSender>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -370,6 +461,9 @@ async fn run_session_loop(config: SessionConfig) {
         let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
+        }
+        if let Some(config_push) = &config.config_push {
+            config_push.set_state(ConfigDeliveryState::Disconnected);
         }
         match result {
             Ok(SessionOutcome::Closed) => {
@@ -514,6 +608,7 @@ async fn run_single_session(
             supports_provider_readiness: true,
             redirected,
             supports_session_redirect: true,
+            supports_config_push: config.config_push.is_some(),
         })),
     })
     .await
@@ -554,6 +649,16 @@ async fn run_single_session(
     if let Some(updates) = &config.session_id_updates {
         updates.send_replace(Some(accepted.session_id.clone()));
     }
+    let config_push = config.config_push.as_ref().filter(|_| accepted.config_push);
+    if let Some(sender) = &config.config_push {
+        sender.set_state(if accepted.config_push {
+            ConfigDeliveryState::Pushing {
+                session_id: accepted.session_id.clone(),
+            }
+        } else {
+            ConfigDeliveryState::Polling
+        });
+    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         target,
@@ -580,6 +685,22 @@ async fn run_single_session(
                         return Ok(SessionOutcome::Closed);
                     }
                 };
+                if let Some(gateway_message::Payload::ConfigUpdate(update)) = msg.payload {
+                    if let Some(sender) = config_push {
+                        if !sender.deliver(update, &tx) {
+                            warn!(
+                                sandbox_id = %config.sandbox_id,
+                                "supervisor session: pushed configuration queue is full; dropping update"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            sandbox_id = %config.sandbox_id,
+                            "supervisor session: unexpected pushed configuration; ignoring"
+                        );
+                    }
+                    continue;
+                }
                 if let Some(gateway_message::Payload::SessionRedirect(r)) = &msg.payload {
                     if supervisor_is_terminating(&config.terminating) {
                         return Ok(SessionOutcome::Closed);
