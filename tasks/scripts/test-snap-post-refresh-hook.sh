@@ -25,7 +25,7 @@ EOF
   PATH="$work/bin:$PATH" SNAP_COMMON="$common" SNAP_INSTANCE_NAME=openshell "$hook"
 }
 
-for mode in user system; do
+for mode in user system disable; do
   common="$work/$mode"
   mkdir -p "$common"
   printf '%s\n' 'disable_tls = true' >"$common/gateway.toml"

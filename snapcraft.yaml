@@ -38,13 +38,13 @@ description: |
 
   **Legacy upgrades**
 
-  Installations upgraded from older revisions retain their existing gateway
-  state under the compatibility service `openshell.system-gateway`.
+  Installations upgraded from the former `openshell.gateway` service retain
+  their state through `openshell.system-gateway`. Existing HTTPS registrations
+  continue to work because the endpoint and TLS identity do not change.
 
-  If `snap get openshell gateway-mode` reports `system` after an automatic or
-  direct `snap refresh`, copy the system gateway's client credentials into
-  each trusted user's Snap state and replace that user's old HTTP gateway
-  registration. Wait for `openshell.system-gateway` to be active first:
+  If this user still has an old HTTP registration, or has not previously been
+  enrolled, wait for `openshell.system-gateway` to be active, copy its client
+  credentials, and register its HTTPS endpoint:
 
     snap services openshell.system-gateway
     d=~/snap/openshell/common/.local/state/openshell/tls
@@ -56,9 +56,14 @@ description: |
     sudo install -o "$USER" -g "$(id -gn)" -m 600 \
       /var/snap/openshell/common/tls/client/tls.key "$d/client/"
     openshell gateway list
-    openshell gateway remove <old-http-registration>
+    old_registration="NAME_FROM_GATEWAY_LIST"
+    openshell gateway remove "$old_registration"
     openshell gateway add https://127.0.0.1:17670 --local --name openshell
     openshell status
+
+  The user and system gateways have separate state. See the OpenShell
+  installation guide before changing `gateway-mode`; use `gateway-mode=disable`
+  to stop both services while preserving the current TLS directory.
 
 base: core24
 grade: stable

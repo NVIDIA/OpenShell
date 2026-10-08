@@ -398,6 +398,47 @@ wait:system-gateway-listener
 register:system-gateway
 wait:gateway-status"
 
+if (
+  has_cmd() {
+    case "$1" in
+      snap) return 0 ;;
+      docker) return 1 ;;
+      *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
+  }
+  snap() {
+    case "${1:-}:${2:-}" in
+      list:docker) return 1 ;;
+      list:openshell) return 0 ;;
+      get:openshell) printf '%s\n' disable ;;
+      *) echo "FAIL: disabled mode reached snap command: $*" >&2; return 99 ;;
+    esac
+  }
+  as_root() {
+    if [ "${1:-}:${2:-}" = snap:get ]; then
+      shift
+      snap "$@"
+    else
+      echo "FAIL: disabled mode reached root command: $*" >&2
+      return 99
+    fi
+  }
+  set_linux_target_runtime_dir() { :; }
+  install_linux_snap
+) >"$out" 2>"$err"; then
+  echo "FAIL: disabled Snap gateway mode should block installation" >&2
+  exit 1
+fi
+if ! grep -Fq "OpenShell snap gateway mode is disabled" "$err"; then
+  echo "FAIL: disabled Snap gateway mode missing recovery guidance" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if grep -Fq "disabled mode reached" "$err"; then
+  cat "$err" >&2 || true
+  exit 1
+fi
+
 assert_snap_install_rejected() {
   local name=$1
   local docker_present=$2

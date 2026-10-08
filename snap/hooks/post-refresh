@@ -11,7 +11,7 @@ set -eu
 
 gateway_mode=$(snapctl get gateway-mode)
 case "$gateway_mode" in
-	user | system)
+	user | system | disable)
 		exit 0
 		;;
 	'')

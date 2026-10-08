@@ -32,6 +32,10 @@ run_hook system
 expected=$'stop --disable openshell.user-gateway\nstart --enable openshell.system-gateway'
 [[ $(cat "$work/snapctl.log") == "$expected" ]]
 
+run_hook disable
+expected=$'stop --disable openshell.user-gateway\nstop --disable openshell.system-gateway'
+[[ $(cat "$work/snapctl.log") == "$expected" ]]
+
 for mode in '' invalid; do
   if run_hook "$mode" >"$work/out" 2>"$work/err"; then
     echo "FAIL: configure hook accepted gateway mode '${mode}'" >&2

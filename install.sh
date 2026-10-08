@@ -1305,6 +1305,7 @@ snap_gateway_mode() {
   _mode="$(as_root snap get openshell gateway-mode 2>/dev/null || true)"
   case "$_mode" in
     user | system) printf '%s\n' "$_mode" ;;
+    disable) error "OpenShell snap gateway mode is disabled. Complete the gateway transition with 'sudo snap set openshell gateway-mode=user' or 'sudo snap set openshell gateway-mode=system', then rerun the installer." ;;
     '') error "OpenShell snap gateway mode was not initialized" ;;
     *) error "unsupported OpenShell snap gateway mode: ${_mode}" ;;
   esac
@@ -1452,14 +1453,6 @@ install_linux_snap() {
   require_cmd snap
   set_linux_target_runtime_dir
 
-  if snap list docker >/dev/null 2>&1; then
-    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
-Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
-  fi
-  if ! has_cmd docker; then
-    error "Docker is required before installing the OpenShell snap.
-Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
-  fi
   if snap list openshell >/dev/null 2>&1; then
     _existing_snap=true
     _existing_mode="$(as_root snap get openshell gateway-mode 2>/dev/null || true)"
@@ -1468,6 +1461,18 @@ Install Docker Engine from a system package or Docker's package repository, then
     _existing_mode=user
   fi
 
+  if [ "$_existing_mode" = disable ]; then
+    error "OpenShell snap gateway mode is disabled. Complete the gateway transition with 'sudo snap set openshell gateway-mode=user' or 'sudo snap set openshell gateway-mode=system', then rerun the installer."
+  fi
+
+  if snap list docker >/dev/null 2>&1; then
+    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
+Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
+  fi
+  if ! has_cmd docker; then
+    error "Docker is required before installing the OpenShell snap.
+Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
+  fi
   info "using existing Docker installation"
   if [ "$_existing_mode" = user ]; then
     wait_for_user_docker_daemon

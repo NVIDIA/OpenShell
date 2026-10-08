@@ -226,9 +226,17 @@ assert_contains "$snap_install_docs" "snap start --user openshell.user-gateway"
 assert_contains "$snapcraft" "snap start --user openshell.user-gateway"
 assert_contains "$snap_install_docs" "openshell.user-gateway"
 assert_contains "$snap_install_docs" "openshell.system-gateway"
+assert_contains "$snap_install_docs" "Existing HTTPS registrations continue to work"
+assert_contains "$snapcraft" "Existing HTTPS registrations"
 assert_contains "$snap_install_docs" "/var/snap/openshell/common/tls"
-assert_contains "$snap_install_docs" "openshell gateway remove <old-http-registration>"
+assert_contains "$snap_install_docs" 'old_registration="NAME_FROM_GATEWAY_LIST"'
+assert_contains "$snap_install_docs" 'openshell gateway remove "$old_registration"'
 assert_contains "$snap_install_docs" "openshell gateway add https://127.0.0.1:17670 --local --name openshell"
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=disable"
+assert_contains "$snap_install_docs" 'tls-backup-$(date +%s%N)'
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=user"
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=system"
+assert_contains "$snapcraft" "gateway-mode=disable"
 assert_not_contains "$snap_install_docs" "snap services --user"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
