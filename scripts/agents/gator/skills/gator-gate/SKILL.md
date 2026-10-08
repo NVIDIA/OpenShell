@@ -40,7 +40,14 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
 - Do not post `/ok to test <full-head-sha>` unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
-- Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
+- Surface security-related findings introduced or newly exposed by an unmerged
+  PR in that PR's normal review, using the same evidence, severity, and blocker
+  rules as other findings. A security classification alone does not require
+  private triage or suspend operator-authorized test dispatch.
+- For pre-existing vulnerabilities independent of the PR, follow `SECURITY.md`:
+  retain detailed evidence privately and notify the operator without publishing
+  exploit details. Do not initiate external disclosure, contact PSIRT, or submit
+  a security report without explicit operator authorization.
 
 Maintainer authority means one of:
 
@@ -651,6 +658,14 @@ Keep reviews proportional, scope-bound, and convergent:
 - Route pre-existing security defects through the private security process.
   Do not publish exploit details or make them blockers on the current PR.
   Route other pre-existing defects to a non-blocking follow-up.
+- A pre-existing unsafe primitive does not make a new PR-owned exposure
+  pre-existing. Compare base and head: if the PR creates a new reachable path,
+  trusted sink, or security contract that makes the defect exploitable, surface
+  the regression in the PR review with its invariant, impact, fix, and verification.
+  Do not substitute a generic private-security notice for actionable feedback
+  or invent a `private_security_review_required` gate solely because the finding
+  is security-related. Existing review blockers still follow normal state rules;
+  this distinction does not waive findings or authorize tests otherwise forbidden.
 - Treat docs, skill drift, diagnostic wording, and test-strength feedback as
   non-blocking unless the published contract is materially false, the
   diagnostic causes an operational or safety failure, or missing coverage
