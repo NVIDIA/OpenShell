@@ -175,6 +175,10 @@ ocsf_emit!(event);
 
 Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-names).
 
+## Pull Requests
+
+Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages

@@ -388,7 +388,11 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not change applicable verification, review, or private vulnerability disclosure requirements.
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+
+The `PR Issue Acceptance` workflow publishes a status on the PR head commit when a PR is opened, edited, reopened, or updated with new commits. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the status required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
+
+Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
 ### Branch Names
 

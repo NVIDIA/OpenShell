@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR Issue Acceptance
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: pr-issue-acceptance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  issue-acceptance:
+    if: github.repository_owner == 'NVIDIA'
+    runs-on: ubuntu-latest
+    steps:
+      # Load trusted base code only; never check out or execute the PR head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: tasks/scripts/check_issue_acceptance.cjs
+          sparse-checkout-cone-mode: false
+
+      - name: Check author access and linked issue acceptance
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const check = require('./tasks/scripts/check_issue_acceptance.cjs');
+            await check({ github, context, core });
