@@ -116,7 +116,7 @@ pub const OCSF_SCHEMA_VERSION_VALUES: &[&str] = &["", "1.1", "1.3"];
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // When true the sandbox writes OCSF v1.8.0 JSONL records to
-    // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
+    // `/var/log/openshell-ocsf*.jsonl` (daily rotation, 3 files) in addition
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
         key: "ocsf_json_enabled",

@@ -75,7 +75,7 @@ const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
 /// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
 /// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
-/// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
+/// `openshell-ocsf.YYYY-MM-DD.jsonl`, which we never want to surface here (the
 /// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
 /// `/v1/denials`).
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
@@ -1655,16 +1655,20 @@ mod tests {
 
     #[tokio::test]
     async fn recent_denials_skips_jsonl_log_files() {
-        // The shorthand reader must not surface `openshell-ocsf.*.log` content
+        // The shorthand reader must not surface current or legacy JSONL content
         // even if a deny-looking line is present, so the response stays
         // independent of the JSONL appender's enabled state.
         let dir = tempfile::tempdir().unwrap();
-        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.log");
-        std::fs::write(
-            &jsonl,
-            r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
-        )
-        .unwrap();
+        for extension in ["jsonl", "log"] {
+            let jsonl = dir
+                .path()
+                .join(format!("openshell-ocsf.2026-05-06.{extension}"));
+            std::fs::write(
+                &jsonl,
+                r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
+            )
+            .unwrap();
+        }
 
         let ctx = PolicyLocalContext::with_log_dir(
             None,

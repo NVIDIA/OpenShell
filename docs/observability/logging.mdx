@@ -261,9 +261,17 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 | File | Format | Rotation |
 |---|---|---|
 | `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily |
-| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily |
+| `openshell-ocsf.YYYY-MM-DD.jsonl` | OCSF JSONL when enabled | Daily |
 
-Each supervisor file appender is configured with a three-file limit. The shorthand appender's filename prefix also matches JSONL files, so its cleanup can delete JSONL history on filesystems that expose file creation timestamps. Do not rely on independent three-file retention for each format.
+Each format rotates daily with an independent three-file limit.
+
+Update supervisor OCSF collectors from `openshell-ocsf.*.log` to
+`openshell-ocsf.*.jsonl`. On startup, the supervisor migrates existing
+`openshell-ocsf.*.log` files to `.jsonl` before initializing either appender.
+It does not overwrite an existing destination. If migration fails, including
+when both extensions exist for the same date, file logging falls back to stderr
+without running retention cleanup. Collect and resolve conflicting files before
+restarting. Shorthand filenames and Windows MXC gateway filenames are unchanged.
 
 File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output.
 
