@@ -236,8 +236,9 @@ cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
-`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+`values-gateway.yaml` creates the `openshell-ingress` `Gateway` (listener on
+port 80, class `eg`) and an `openshell` `GRPCRoute` in the `openshell`
+namespace. The `high-availability` profile
 installs the Envoy Gateway Helm chart and layers both
 `values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
 release.
@@ -257,7 +258,7 @@ as a real reverse proxy while gateway pods rotate behind it:
 
 ```bash
 KUBECONFIG=kubeconfig kubectl get svc -A \
-  -l gateway.envoyproxy.io/owning-gateway-name=openshell
+  -l gateway.envoyproxy.io/owning-gateway-name=openshell-ingress
 KUBECONFIG=kubeconfig kubectl -n <envoy-service-namespace> port-forward \
   svc/<envoy-service-name> 8080:80
 openshell gateway add http://127.0.0.1:8080 --name openshell --local

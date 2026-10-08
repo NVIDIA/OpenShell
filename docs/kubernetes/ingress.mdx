@@ -10,7 +10,7 @@ position: 5
 
 By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. The examples use [Envoy Gateway](https://gateway.envoyproxy.io), but you can select another implementation through `grpcRoute.gateway.className`.
 
 ## Install Envoy Gateway
 
@@ -62,13 +62,55 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.className=eg
 ```
 
-## Get the external address
+The generated Gateway defaults to `<fullname>-ingress`, while the OpenShell Service keeps the `<fullname>` name. Keeping these names distinct avoids collisions with Gateway implementations that name their proxy Service after the Gateway.
 
-After the Gateway is provisioned, Envoy Gateway creates a LoadBalancer service in the `openshell` namespace. Wait for it to get an external address:
+<Note>
+Existing releases that created a Gateway under the previous `<fullname>` default can retain that resource name by setting `grpcRoute.gateway.name=<fullname>` before upgrading.
+</Note>
+
+### Use another GatewayClass
+
+Set `grpcRoute.gateway.className` to any GatewayClass installed by your Gateway API implementation:
 
 ```shell
-kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=true \
+  --set grpcRoute.gateway.className=<gateway-class>
 ```
+
+For ingress, the OpenShell chart creates only the Gateway and GRPCRoute. Install and manage the selected controller, GatewayClass, and Gateway API CRDs separately.
+
+### Use an existing Gateway
+
+To attach OpenShell to a platform-managed Gateway, disable Gateway creation and set the parent Gateway name and namespace. Set `sectionName` when the route should attach to a specific listener:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=false \
+  --set grpcRoute.gateway.name=platform-gateway \
+  --set grpcRoute.gateway.namespace=gateway-system \
+  --set grpcRoute.gateway.sectionName=grpc
+```
+
+The existing Gateway listener must allow routes from the OpenShell release namespace.
+
+## Get the external address
+
+With the Envoy Gateway example above, the controller creates a LoadBalancer service in the `openshell` namespace. Wait for it to get an external address:
+
+```shell
+kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell-ingress
+```
+
+For another Gateway API implementation or an existing Gateway, follow that implementation's instructions to find the external address.
 
 After the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
 
