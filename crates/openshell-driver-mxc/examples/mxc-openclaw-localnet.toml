@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # mxc-openclaw-localnet.toml
-# Like mxc-openclaw-gateway.toml but uses allowLocalNetwork instead of egress_proxy.
-# allowLocalNetwork=true lets the AppContainer reach the host's loopback (the gateway
-# relay) without routing through the egress proxy, which breaks node.js DLL init.
+# Like mxc-openclaw-gateway.toml but uses permissive MXC 1.0 ingress and
+# host-loopback actions instead of egress_proxy. This lets the AppContainer
+# reach the host relay without routing through the egress proxy, which breaks
+# node.js DLL initialization.
 
 [openshell]
 version = 2

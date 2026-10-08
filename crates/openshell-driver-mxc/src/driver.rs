@@ -175,7 +175,7 @@ impl MxcBackend {
 ///
 /// Loaded from `[openshell.drivers.mxc]` in the gateway TOML file, or from
 /// environment variables / CLI flags via the standard gateway precedence chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)] // Independent, existing gateway TOML options.
 pub struct MxcComputeConfig {
@@ -193,17 +193,17 @@ pub struct MxcComputeConfig {
     /// `processContainer` only: `AppContainer` capabilities to grant.
     pub pc_capabilities: Vec<String>,
     /// `processContainer` only: inject a network section with
-    /// `defaultPolicy: "allow"` so the `AppContainer` has unrestricted outbound
+    /// `egress.default = "allow"` so the `AppContainer` has unrestricted outbound
     /// TCP access.  Required when `pc_capabilities` alone is insufficient to
     /// enable network access in the target wxc-exec build. When `egress_proxy`
     /// is also enabled, sandbox policies without explicit network rules are
     /// rejected instead of falling back from governed egress to unrestricted
     /// access.
     pub pc_network_allow: bool,
-    /// `processContainer` only: include `"allowLocalNetwork": true` in the
-    /// MXC network section.  Required for node.js (and other runtimes that
-    /// need loopback during DLL initialization) to start inside a
-    /// processcontainer.
+    /// `processContainer` only: allow inbound/private-network and host-loopback
+    /// traffic through the MXC 1.0 directional ingress policy. Required for
+    /// node.js (and other runtimes that need loopback during DLL initialization)
+    /// to start inside a processcontainer.
     pub pc_allow_local_network: bool,
     /// `processContainer` only: when `true`, start with an EMPTY process env
     /// (not even `MINIMAL_WINDOWS_BOOTSTRAP_ENV`) instead of the safe
@@ -242,8 +242,8 @@ pub struct MxcComputeConfig {
     /// the full network policy. Policies without network rules do not start a
     /// listener or receive proxy environment variables.
     pub egress_proxy: bool,
-    /// Loopback `IP:PORT` seed for MXC `network.proxy` while governed egress is
-    /// enabled. The driver preserves the loopback IP and allocates a unique
+    /// Loopback `IP:PORT` seed for the host CONNECT proxy used by governed
+    /// egress. The driver preserves the loopback IP and allocates a unique
     /// ephemeral port per sandbox.
     pub egress_proxy_addr: String,
 
@@ -253,32 +253,6 @@ pub struct MxcComputeConfig {
     /// Sandboxing provider MXC drives and emits OCSF into the gateway trail.
     /// Requires the gateway account to be in "Performance Log Users" (or admin).
     pub etw_audit: bool,
-}
-
-impl Default for MxcComputeConfig {
-    fn default() -> Self {
-        Self {
-            // No usable default: `wxc_exec_path` must be explicitly set to an
-            // absolute path (see `validate_configuration` and the field doc
-            // comment above). Shipping a bare relative filename here would
-            // silently reintroduce the exact PATH/CWD-hijack risk the
-            // validation exists to reject.
-            wxc_exec_path: String::new(),
-            backend: MxcBackend::default(),
-            pc_least_privilege: false,
-            pc_capabilities: Vec::new(),
-            pc_network_allow: false,
-            pc_relay_spawner_path: String::new(),
-            pc_relay_target_port: 0,
-            pc_allow_local_network: false,
-            pc_minimal_env: false,
-            egress_proxy: false,
-            egress_proxy_addr: String::new(),
-
-            debug: false,
-            etw_audit: false,
-        }
-    }
 }
 
 impl MxcComputeConfig {
@@ -840,10 +814,8 @@ fn resolve_agent_proxy_ca_paths(
     stage_tls_ca_files(host_proxy_ca_paths, share_dir, sandbox_id)
 }
 
-/// PROTOTYPE (2026-09-10): env-var-based governed egress, as an alternative
-/// to MXC's own `network.proxy`/`runtimeConfig.networkProxy` transparent
-/// redirect (both confirmed broken for this driver's use case -- see
-/// `network_json()` in mxc.rs for the elevation/loopback-block history).
+/// PROTOTYPE (2026-09-10): env-var-based governed egress paired with MXC 1.0
+/// loopback-only directional egress (see `network_json()` in mxc.rs).
 /// `HTTP_PROXY`/`HTTPS_PROXY` are honored voluntarily by well-behaved HTTP
 /// clients (curl, most language HTTP libraries, Node fetch, git, etc.), not
 /// enforced by the OS -- but paired with the sandbox's own default-deny
@@ -1862,7 +1834,7 @@ async fn run_lifecycle(
         timeout: 0,
     };
     let network = proxy_addr.map(|addr| MxcNetwork {
-        default_policy: "block".into(),
+        egress_default: "deny".into(),
         proxy: Some(addr),
         allow_local_network: false,
     });
@@ -1927,7 +1899,7 @@ async fn run_lifecycle(
             // Build the effective network config:
             // - egress_proxy: use the proxy-based network (already in `network`)
             // - pc_network_allow: inject allow-all (fallback for builds without capability support)
-            // - pc_allow_local_network: block-default but with allowLocalNetwork=true so
+            // - pc_allow_local_network: deny-by-default egress plus permissive ingress so
             //   intra-container loopback works and the spawner can reach the relay on the
             //   host's route-selected private interface without a full egress proxy.
             let effective_network = if network.is_none()
@@ -1936,13 +1908,13 @@ async fn run_lifecycle(
                 // Both flags apply to the same no-proxy startup case and
                 // aren't mutually exclusive -- honor both instead of letting
                 // pc_allow_local_network's branch silently force
-                // default_policy back to "block" and drop pc_network_allow's
+                // egress_default back to "deny" and drop pc_network_allow's
                 // unrestricted-egress intent.
                 Some(MxcNetwork {
-                    default_policy: if config.pc_network_allow {
+                    egress_default: if config.pc_network_allow {
                         "allow".into()
                     } else {
-                        "block".into()
+                        "deny".into()
                     },
                     proxy: None,
                     allow_local_network: config.pc_allow_local_network,

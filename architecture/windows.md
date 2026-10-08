@@ -124,6 +124,12 @@ The production mapping in
 | Process | MXC supplies the Windows process-isolation boundary, but the mapper has no portable equivalent for `run_as_user` or `run_as_group`; callers must not treat those fields as enforced Windows identity controls. The canonical command, environment, and working directory are launch inputs rather than process-policy grants. |
 | Landlock | MXC has no equivalent for the Linux Landlock compatibility mode, including `hard_requirement`. The mapper reports a non-blocking warning; Windows filesystem assurance comes from the selected MXC backend's native semantics, not Landlock. |
 
+The exported standalone mapper also emits MXC 1.0.0 directional networking.
+It maps numeric IP/CIDR destinations and TCP ports directly, but records
+error-severity loss for DNS names, wildcards, binary scope, and L7 behavior.
+Callers that need those semantics must use the governed-egress split; no
+pre-1.0 host-list output mode remains.
+
 The driver reports `supports_live_policy_updates = false`. The gateway therefore
 rejects mutations that would change a running MXC sandbox's effective policy or
 provider bindings before persistence. Filesystem, UI, network, and credential

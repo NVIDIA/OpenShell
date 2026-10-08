@@ -492,6 +492,76 @@ fn dryrun_accepts_split_policy_output() {
     );
 }
 
+/// The standalone mapper must emit the same stable MXC 1.0 schema as the live
+/// governed-egress path. Exercise a numeric destination and ports so this test
+/// would fail if the mapper regressed to the retired host-list shape.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn dryrun_accepts_standalone_mapper_output() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    let (_tempdir, temp_path) = temp_fixture();
+    let mut policy = SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![temp_path.clone()],
+        }),
+        ..Default::default()
+    };
+    policy.network_policies.insert(
+        "numeric-egress".into(),
+        NetworkPolicyRule {
+            name: "numeric-egress".into(),
+            endpoints: vec![NetworkEndpoint {
+                host: "198.51.100.7".into(),
+                ports: vec![80, 443],
+                ..Default::default()
+            }],
+            binaries: Vec::new(),
+        },
+    );
+    let options = openshell_driver_mxc::MxcMappingOptions {
+        containment: "processcontainer".into(),
+        command: "cmd /c exit 0".into(),
+        container_id: "standalone-mapper-dryrun".into(),
+        cwd: Some(temp_path),
+        ..Default::default()
+    };
+    let result = openshell_driver_mxc::map_to_mxc(&policy, &options);
+    assert!(
+        result
+            .loss
+            .iter()
+            .all(|item| item.path != "network_policies.numeric-egress.endpoints[0].host")
+    );
+    let config = result.config;
+    assert_eq!(config["version"], "1.0.0");
+    assert_eq!(config["network"]["egress"]["default"], "deny");
+    assert_eq!(
+        config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "198.51.100.7/32"
+    );
+    assert_eq!(
+        config["network"]["egress"]["allow"][0]["ports"],
+        serde_json::json!([
+            { "protocol": "tcp", "port": 80 },
+            { "protocol": "tcp", "port": 443 }
+        ])
+    );
+
+    let (code, stdout, stderr) = dry_run(&wxc, &config);
+    assert_eq!(
+        code,
+        0,
+        "standalone mapper output rejected by MXC 1.0 --dry-run\nconfig={}\nstdout={stdout}\nstderr={stderr}",
+        serde_json::to_string_pretty(&config).unwrap_or_default()
+    );
+}
+
 // ── (b) Enforcement tests — probe-gated ───────────────────────────────────────
 //
 // These skip on this box (processcontainer velocity keys not enabled;

@@ -4,12 +4,12 @@
 //! Coarse OpenShell-policy → MXC `ContainerConfig` mapping.
 //!
 //! Operates on the typed [`SandboxPolicy`] (parse it with
-//! `openshell_policy::parse_sandbox_policy`). Network policy is flattened into
-//! an MXC host allowlist; everything MXC cannot express is recorded as a loss
-//! item. The top-level `network_policies` map is iterated in sorted key order
-//! so the output is deterministic (the proto map is unordered).
+//! `openshell_policy::parse_sandbox_policy`). Numeric destinations and ports
+//! map to MXC 1.0 directional rules; everything MXC cannot express is recorded
+//! as a loss item. The top-level `network_policies` map is iterated in sorted
+//! key order so the output is deterministic (the proto map is unordered).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use openshell_core::proto::{
     NetworkEndpoint, NetworkPolicyRule, SandboxPolicy, UiClipboardAccess, UiPolicy,
@@ -17,20 +17,15 @@ use openshell_core::proto::{
 use serde_json::{Value, json};
 
 use super::config::{
-    DEFAULT_COARSE_MXC_VERSION, DEFAULT_COMMAND, DEFAULT_CONTAINMENT, add_backend_network_loss,
-    add_backend_specific_config, default_enforcement_mode, filesystem_default_deny_message,
+    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, add_backend_network_loss,
+    add_backend_specific_config, filesystem_default_deny_message,
 };
 use super::loss::{LossItem, add_loss};
-use crate::mxc::MXC_SCHEMA_VERSION;
 
 /// Options controlling the generated MXC config. Fields not relevant to the
 /// coarse map (e.g. `proxy_redirect`) are reserved for the governed-egress split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
-    /// Caller-selectable schema version written only into standalone coarse-map
-    /// output. The governed-egress split and live driver requests instead use
-    /// [`MXC_SCHEMA_VERSION`].
-    pub mxc_version: String,
     /// MXC containment backend.
     pub containment: String,
     /// `process.commandLine` value.
@@ -43,8 +38,6 @@ pub struct MxcMappingOptions {
     pub env: Vec<String>,
     /// `process.timeout`.
     pub timeout_ms: u64,
-    /// Emit `OpenShell` wildcard hosts into `allowedHosts` despite lossiness.
-    pub allow_wildcards: bool,
     /// Governed-egress redirect address (used by the governed-egress split, not the
     /// coarse map).
     pub proxy_redirect: Option<SocketAddr>,
@@ -53,14 +46,12 @@ pub struct MxcMappingOptions {
 impl Default for MxcMappingOptions {
     fn default() -> Self {
         Self {
-            mxc_version: DEFAULT_COARSE_MXC_VERSION.to_owned(),
             containment: DEFAULT_CONTAINMENT.to_owned(),
             command: DEFAULT_COMMAND.to_owned(),
             container_id: "openshell-policy".to_owned(),
             cwd: None,
             env: Vec::new(),
             timeout_ms: 0,
-            allow_wildcards: false,
             proxy_redirect: None,
         }
     }
@@ -190,7 +181,7 @@ fn build_split_mxc_config(
 
     // Direct Internet egress is denied. Proxy-aware clients can reach only the
     // OpenShell proxy (and other host loopback listeners) through 127.0.0.1.
-    if proxy_supported && proxy_addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
+    if proxy_supported && proxy_addr.ip() != IpAddr::from([127, 0, 0, 1]) {
         add_loss(
             items,
             "proxy_redirect",
@@ -215,7 +206,7 @@ fn build_split_mxc_config(
     });
 
     let mut config = json!({
-        "version": MXC_SCHEMA_VERSION,
+        "version": DEFAULT_MXC_VERSION,
         "containerId": opts.container_id,
         "containment": opts.containment,
         "lifecycle": {
@@ -232,7 +223,7 @@ fn build_split_mxc_config(
 
     // No network hosts, so backend-specific network blocks (processContainer
     // internetClient, etc.) are not added — correct for the proxy path.
-    add_backend_specific_config(&mut config, &opts.containment, &[], items);
+    add_backend_specific_config(&mut config, &opts.containment, false, items);
     add_static_policy_loss(policy, opts, items);
     config
 }
@@ -254,19 +245,22 @@ fn build_mxc_config(
     }
 
     let filesystem = map_filesystem(policy, opts, items);
-    let allowed_hosts = map_network(policy, opts, items);
-
-    let mut network = json!({
-        "defaultPolicy": "block",
-        "allowedHosts": allowed_hosts,
-        "blockedHosts": [],
-    });
-    if let Some(mode) = default_enforcement_mode(&opts.containment, &allowed_hosts) {
-        network["enforcementMode"] = json!(mode);
+    let allow_rules = map_network(policy, opts, items);
+    let has_direct_egress = !allow_rules.is_empty();
+    let mut egress = json!({ "default": "deny" });
+    if has_direct_egress {
+        egress["allow"] = json!(allow_rules);
     }
+    let network = json!({
+        "egress": egress,
+        "ingress": {
+            "default": "deny",
+            "hostLoopback": "deny",
+        },
+    });
 
     let mut config = json!({
-        "version": opts.mxc_version,
+        "version": DEFAULT_MXC_VERSION,
         "containerId": opts.container_id,
         "containment": opts.containment,
         "lifecycle": {
@@ -281,7 +275,7 @@ fn build_mxc_config(
         config["ui"] = ui;
     }
 
-    add_backend_specific_config(&mut config, &opts.containment, &allowed_hosts, items);
+    add_backend_specific_config(&mut config, &opts.containment, has_direct_egress, items);
     add_static_policy_loss(policy, opts, items);
     config
 }
@@ -437,7 +431,7 @@ fn map_network(
     policy: &SandboxPolicy,
     opts: &MxcMappingOptions,
     items: &mut Vec<LossItem>,
-) -> Vec<String> {
+) -> Vec<Value> {
     if !policy.network_middlewares.is_empty() {
         add_loss(
             items,
@@ -461,7 +455,7 @@ fn map_network(
     let mut rules: Vec<(&String, &NetworkPolicyRule)> = policy.network_policies.iter().collect();
     rules.sort_by(|a, b| a.0.cmp(b.0));
 
-    let mut allowed_hosts: Vec<String> = Vec::new();
+    let mut allow_rules: Vec<Value> = Vec::new();
 
     for (key, rule) in rules {
         let rule_path = format!("network_policies.{key}");
@@ -473,12 +467,12 @@ fn map_network(
                 "error",
                 "OpenShell policy entry has no endpoints.",
                 "network endpoints",
-                "No MXC host allowlist entries were produced for this policy.",
+                "No MXC directional allow rules were produced for this policy.",
             );
         }
         for (index, endpoint) in rule.endpoints.iter().enumerate() {
             let endpoint_path = format!("{rule_path}.endpoints[{index}]");
-            map_endpoint(endpoint, &endpoint_path, &mut allowed_hosts, opts, items);
+            map_endpoint(endpoint, &endpoint_path, &mut allow_rules, items);
         }
 
         if rule.binaries.is_empty() {
@@ -508,43 +502,51 @@ fn map_network(
     }
 
     add_backend_network_loss(policy, &opts.containment, items);
-    allowed_hosts
+    allow_rules
 }
 
 fn map_endpoint(
     endpoint: &NetworkEndpoint,
     path: &str,
-    allowed_hosts: &mut Vec<String>,
-    opts: &MxcMappingOptions,
+    allow_rules: &mut Vec<Value>,
     items: &mut Vec<LossItem>,
 ) {
-    // host
-    if endpoint.host.is_empty() {
-        add_loss(
-            items,
-            &format!("{path}.host"),
-            "error",
-            "Endpoint has no host.",
-            "network endpoint host",
-            "Endpoint was not added to MXC allowedHosts.",
-        );
-    } else if contains_wildcard(&endpoint.host) {
-        let (message, impact) = if opts.allow_wildcards {
-            append_unique(allowed_hosts, endpoint.host.clone());
+    let mut cidrs = Vec::new();
+    let numeric_host = if endpoint.host.is_empty() {
+        None
+    } else {
+        normalize_cidr(&endpoint.host)
+    };
+
+    if let Some(cidr) = &numeric_host {
+        append_unique(&mut cidrs, cidr.clone());
+    } else if endpoint.host.is_empty() {
+        if endpoint.allowed_ips.is_empty() {
+            add_loss(
+                items,
+                &format!("{path}.host"),
+                "error",
+                "Endpoint has neither a numeric host nor allowed_ips.",
+                "network endpoint destination",
+                "No MXC 1.0 directional allow rule is emitted.",
+            );
+        }
+    } else {
+        let (feature, message) = if contains_wildcard(&endpoint.host) {
             (
+                "OpenShell wildcard host matching",
                 format!(
-                    "Wildcard host emitted despite non-portable MXC semantics: {}.",
+                    "Wildcard host '{}' cannot be represented by MXC 1.0 directional CIDR rules.",
                     endpoint.host
                 ),
-                "Backend behavior is not portable and may fail or broaden access.",
             )
         } else {
             (
+                "OpenShell DNS host matching",
                 format!(
-                    "Wildcard host omitted because MXC has no portable syntax: {}.",
+                    "DNS host '{}' cannot be represented by MXC 1.0 directional CIDR rules.",
                     endpoint.host
                 ),
-                "Generated MXC config is more restrictive for this endpoint.",
             )
         };
         add_loss(
@@ -552,61 +554,106 @@ fn map_endpoint(
             &format!("{path}.host"),
             "error",
             &message,
-            "OpenShell wildcard host matching",
-            impact,
+            feature,
+            "The hostname is omitted; supply allowed_ips or use governed egress for DNS policy.",
         );
-    } else {
-        append_unique(allowed_hosts, endpoint.host.clone());
     }
 
-    // port / ports (the proto normalizes a single port into `ports`)
-    if !endpoint.ports.is_empty() {
-        let (field, repr) = if endpoint.ports.len() == 1 {
-            ("port", endpoint.ports[0].to_string())
+    for (index, raw) in endpoint.allowed_ips.iter().enumerate() {
+        if let Some(cidr) = normalize_cidr(raw) {
+            append_unique(&mut cidrs, cidr);
         } else {
-            ("ports", format!("{:?}", endpoint.ports))
+            add_loss(
+                items,
+                &format!("{path}.allowed_ips[{index}]"),
+                "error",
+                &format!("'{raw}' is not a valid IP address or CIDR for MXC 1.0."),
+                "DNS result pinning / SSRF override",
+                "The invalid destination is omitted from the directional allow rule.",
+            );
+        }
+    }
+
+    if !endpoint.allowed_ips.is_empty() && numeric_host.is_none() {
+        let reason = if endpoint.host.is_empty() {
+            "OpenShell permits DNS names whose resolved address is in allowed_ips, while MXC also permits direct connections to those CIDRs."
+        } else {
+            "MXC can carry the CIDRs but cannot bind them to the requested DNS hostname."
         };
         add_loss(
             items,
-            &format!("{path}.{field}"),
-            "error",
-            &format!("MXC allowedHosts cannot encode port constraint {repr}."),
-            "port-scoped outbound policy",
-            "MXC allows or blocks the host as a whole.",
-        );
-    }
-
-    // allowed_ips
-    for ip in &endpoint.allowed_ips {
-        append_unique(allowed_hosts, ip.clone());
-        add_loss(
-            items,
             &format!("{path}.allowed_ips"),
-            "warning",
-            &format!(
-                "MXC can carry CIDR/IP '{ip}', but cannot bind it to DNS for '{}'.",
-                endpoint.host
-            ),
+            "error",
+            reason,
             "DNS result pinning / SSRF override",
-            "The CIDR/IP becomes a standalone allowed destination.",
+            "The valid CIDRs are emitted, but the caller must reject the coarse mapping or accept the broader direct-IP scope.",
         );
     }
 
     report_endpoint_l7_losses(endpoint, path, items);
+
+    if cidrs.is_empty() {
+        return;
+    }
+
+    let selected_ports: Vec<u32> = if !endpoint.ports.is_empty() {
+        endpoint.ports.clone()
+    } else if endpoint.port > 0 {
+        vec![endpoint.port]
+    } else {
+        Vec::new()
+    };
+    let had_explicit_ports = !selected_ports.is_empty();
+    let mut valid_ports = Vec::new();
+    for (index, port) in selected_ports.into_iter().enumerate() {
+        if (1..=u32::from(u16::MAX)).contains(&port) {
+            if !valid_ports.contains(&port) {
+                valid_ports.push(port);
+            }
+        } else {
+            add_loss(
+                items,
+                &format!("{path}.ports[{index}]"),
+                "error",
+                &format!("Port {port} is outside the MXC 1.0 range 1..=65535."),
+                "port-scoped outbound policy",
+                "The invalid port is omitted from the directional allow rule.",
+            );
+        }
+    }
+    if had_explicit_ports && valid_ports.is_empty() {
+        return;
+    }
+    let port_rules: Vec<Value> = if valid_ports.is_empty() {
+        vec![json!({ "protocol": "tcp" })]
+    } else {
+        valid_ports
+            .into_iter()
+            .map(|port| json!({ "protocol": "tcp", "port": port }))
+            .collect()
+    };
+    let rule = json!({
+        "to": cidrs
+            .into_iter()
+            .map(|cidr| json!({ "cidr": cidr }))
+            .collect::<Vec<_>>(),
+        "ports": port_rules,
+    });
+    append_unique_value(allow_rules, rule);
 }
 
 fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut Vec<LossItem>) {
-    if !endpoint.protocol.is_empty() {
+    if !endpoint.protocol.is_empty() && endpoint.protocol != "tcp" {
         add_loss(
             items,
             &format!("{path}.protocol"),
             "error",
             &format!(
-                "MXC has no protocol-aware policy equivalent for '{}'.",
+                "MXC 1.0 can preserve TCP transport but cannot enforce OpenShell protocol '{}'.",
                 endpoint.protocol
             ),
             "protocol-aware proxy policy",
-            "MXC host filtering cannot enforce REST/WebSocket/GraphQL semantics.",
+            "The directional rule is TCP-only, but REST/WebSocket/GraphQL/SQL/JSON-RPC/MCP semantics require governed egress.",
         );
     }
 
@@ -625,7 +672,7 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
                 endpoint.tls
             ),
             "TLS inspection mode",
-            "MXC network policy is host-level only.",
+            "MXC 1.0 applies only the directional CIDR/port rule.",
         );
     }
 
@@ -644,9 +691,9 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
                 items,
                 &format!("{path}.enforcement"),
                 "warning",
-                "MXC enforcementMode is backend-wide, not per endpoint.",
+                "MXC 1.0 directional rules are enforce-only and have no per-endpoint enforcement selector.",
                 "per-endpoint enforcement",
-                "The mapper chooses a backend-level enforcement mode.",
+                "The generated directional rule is enforced.",
             );
         }
     }
@@ -727,6 +774,73 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
     if endpoint.graphql_max_body_bytes > 0 {
         add_graphql_loss(items, path, "graphql_max_body_bytes");
     }
+
+    let string_losses: &[(&str, &str, &str)] = &[
+        (
+            endpoint.path.as_str(),
+            "path",
+            "path-scoped endpoint routing",
+        ),
+        (
+            endpoint.credential_signing.as_str(),
+            "credential_signing",
+            "proxy-side credential signing",
+        ),
+        (
+            endpoint.signing_service.as_str(),
+            "signing_service",
+            "credential-signing service selection",
+        ),
+        (
+            endpoint.signing_region.as_str(),
+            "signing_region",
+            "credential-signing region selection",
+        ),
+    ];
+    for (value, field, feature) in string_losses {
+        if !value.is_empty() {
+            add_proxy_only_loss(items, path, field, feature);
+        }
+    }
+
+    if endpoint.advisor_proposed {
+        add_proxy_only_loss(items, path, "advisor_proposed", "policy-advisor provenance");
+    }
+    if endpoint.json_rpc_max_body_bytes > 0 {
+        add_proxy_only_loss(
+            items,
+            path,
+            "json_rpc_max_body_bytes",
+            "JSON-RPC request-size policy",
+        );
+    }
+    if endpoint.mcp.is_some() {
+        add_proxy_only_loss(items, path, "mcp", "MCP protocol policy");
+    }
+    if endpoint.credential_binding.is_some() {
+        add_proxy_only_loss(
+            items,
+            path,
+            "credential_binding",
+            "provider credential binding",
+        );
+    }
+    if endpoint.allow_uninspected_credentials {
+        add_proxy_only_loss(
+            items,
+            path,
+            "allow_uninspected_credentials",
+            "uninspected credential traffic approval",
+        );
+    }
+    if endpoint.provider_credentialed {
+        add_proxy_only_loss(
+            items,
+            path,
+            "provider_credentialed",
+            "provider credential provenance",
+        );
+    }
 }
 
 fn add_graphql_loss(items: &mut Vec<LossItem>, path: &str, field: &str) {
@@ -737,6 +851,17 @@ fn add_graphql_loss(items: &mut Vec<LossItem>, path: &str, field: &str) {
         &format!("MXC has no GraphQL policy equivalent for {field}."),
         "GraphQL operation policy",
         "GraphQL inspection and persisted-query behavior is lost.",
+    );
+}
+
+fn add_proxy_only_loss(items: &mut Vec<LossItem>, path: &str, field: &str, feature: &str) {
+    add_loss(
+        items,
+        &format!("{path}.{field}"),
+        "error",
+        &format!("MXC 1.0 has no equivalent for {feature}."),
+        feature,
+        "The coarse config preserves only its directional CIDR/port restriction; governed egress is required for this behavior.",
     );
 }
 
@@ -801,6 +926,29 @@ fn append_unique(list: &mut Vec<String>, value: String) {
     if !list.contains(&value) {
         list.push(value);
     }
+}
+
+fn append_unique_value(list: &mut Vec<Value>, value: Value) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+fn normalize_cidr(value: &str) -> Option<String> {
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
+        None => (value, None),
+    };
+    let address = address.parse::<IpAddr>().ok()?;
+    let max_prefix: u8 = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix = prefix.unwrap_or(max_prefix);
+    if prefix > max_prefix {
+        return None;
+    }
+    Some(format!("{address}/{prefix}"))
 }
 
 fn contains_wildcard(host: &str) -> bool {

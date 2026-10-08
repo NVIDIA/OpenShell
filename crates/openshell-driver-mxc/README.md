@@ -65,9 +65,9 @@ pc_minimal_env = false
 # A sandbox with egress_proxy enabled but no explicit network rules rejects
 # this fallback instead of silently changing governed egress to allow-all.
 pc_network_allow = false
-# processContainer only: include "allowLocalNetwork": true in the MXC
-# network section. This compatibility setting broadens network access and is
-# not required by the BaseContainer qualification profile.
+# processContainer only: emit permissive MXC 1.0 ingress and host-loopback
+# actions. This compatibility setting broadens network access and is not
+# required by the BaseContainer qualification profile.
 pc_allow_local_network = false
 # Pattern C governed egress. Requires backend = "process_container".
 egress_proxy = false
@@ -96,7 +96,7 @@ authenticated host CONNECT proxy.
 `pc_network_allow = true` is an explicit unrestricted-egress compatibility
 fallback. If it is combined with `egress_proxy = true`, a sandbox policy
 without explicit network rules is rejected synchronously rather than falling
-through from governed egress to `defaultPolicy = "allow"`.
+through from governed egress to `network.egress.default = "allow"`.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
@@ -282,8 +282,8 @@ This example uses `process_container`. The `IsoSessionApp.dll` and
 
 The generic real-`wxc-exec.exe` tasks print a SKIP reason and exit 0 when the
 binary or requested backend is unavailable. Once ProcessContainer is live,
-required capabilities are authoritative: rejection of `network.proxy` or
-another enforcement failure fails the task. These tasks are useful developer
+required capabilities are authoritative: rejection of the loopback-only
+directional policy or another enforcement failure fails the task. These tasks are useful developer
 diagnostics, but a skipped run is not qualification evidence. The GB300 task
 is deliberately strict and fails on every required skip.
 

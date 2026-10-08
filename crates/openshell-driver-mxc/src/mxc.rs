@@ -86,11 +86,13 @@ pub struct MxcFilesystem {
 /// Network redirect fragment emitted when governed egress is enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcNetwork {
-    pub default_policy: String,
+    /// MXC 1.0 `network.egress.default` action.
+    pub egress_default: String,
     pub proxy: Option<SocketAddr>,
-    /// When true, includes `"allowLocalNetwork": true` in the network JSON.
-    /// Required for node.js to initialize inside a processcontainer — without
-    /// it, node.exe DLL initialization fails with `STATUS_DLL_INIT_FAILED`.
+    /// When true, permits inbound/private-network and host-loopback traffic
+    /// through the MXC 1.0 directional `network.ingress` policy. Required for
+    /// node.js to initialize inside a processcontainer — without it, node.exe
+    /// DLL initialization fails with `STATUS_DLL_INIT_FAILED`.
     pub allow_local_network: bool,
 }
 
@@ -177,13 +179,6 @@ fn redact_env_for_debug(config: &serde_json::Value) -> serde_json::Value {
 }
 
 fn network_json(network: &MxcNetwork) -> serde_json::Value {
-    // MXC 1.0.0 uses a directional egress/ingress format.
-    // "block" default_policy maps to egress.default "deny"; "allow" maps to "allow".
-    let egress_default = if network.default_policy == "block" {
-        "deny"
-    } else {
-        "allow"
-    };
     let mut value = if network.proxy.is_some() {
         // Use direct loopback egress rather than runtimeConfig.networkProxy proxy
         // mode. Proxy mode routes all outbound TCP through processmodel.dll's WFP
@@ -215,7 +210,7 @@ fn network_json(network: &MxcNetwork) -> serde_json::Value {
             "ingress": { "default": "allow", "hostLoopback": "allow" },
         })
     } else {
-        serde_json::json!({ "egress": { "default": egress_default } })
+        serde_json::json!({ "egress": { "default": network.egress_default } })
     };
     if network.proxy.is_none() && network.allow_local_network {
         value["ingress"] = serde_json::json!({ "default": "allow", "hostLoopback": "allow" });
@@ -918,7 +913,7 @@ mod tests {
         // MXC 1.0.0: egress/ingress replaces the legacy
         // defaultPolicy / allowedHosts / proxy.localhost shape.
         let network = MxcNetwork {
-            default_policy: "block".into(),
+            egress_default: "deny".into(),
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
             allow_local_network: false,
         };
