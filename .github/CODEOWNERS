@@ -6,7 +6,7 @@
 
 ## Merge enforcement — these paths decide who can merge, so they notify the full
 # list of maintainers to raise scrutiny on changes here.
-# 
+#
 # PR checks run local to the branch, so unless the check specifically avoids
 # using branch-local files, a PR could change its own gates and appear to pass
 # them. Covering the required checks here closes that gap.
@@ -30,6 +30,10 @@
 /tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_maintainer_approval_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/alert_maintainer_change_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# PR issue acceptance checks
+/tasks/scripts/check_issue_acceptance.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_issue_acceptance.test.cjs @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
 # Auditable SBOM check
 /tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
