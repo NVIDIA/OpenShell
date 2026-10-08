@@ -36,6 +36,19 @@ fn runtime_engine_with_identity(policy: &str, require_binary_identity: bool) -> 
     );
 
     let mut engine = Engine::new();
+    // The runtime registers this native builtin for endpoint selectors only.
+    engine
+        .add_extension(
+            "openshell.endpoint_path_matches".into(),
+            2,
+            Box::new(|params: Vec<Value>| {
+                Ok(Value::from(openshell_core::endpoint_path::matches(
+                    params[0].as_string()?,
+                    params[1].as_string()?,
+                )))
+            }),
+        )
+        .expect("runtime endpoint path matcher should register");
     engine
         .add_policy("sandbox-policy.rego".into(), SANDBOX_POLICY_REGO.into())
         .expect("runtime Rego should compile");

@@ -1086,7 +1086,9 @@ endpoint_path_matches_request(ep, request) if {
 endpoint_path_matches_request(ep, request) if {
 	path := object.get(ep, "path", "")
 	path != ""
-	path_matches(request.path, path)
+	# Registered by the embedded engine; use the same Rust matcher as route
+	# selection. Rule paths retain the distinct path_matches semantics above.
+	openshell.endpoint_path_matches(path, request.path)
 }
 
 # An endpoint has extended config if it specifies an L7 protocol, allowed_ips,
