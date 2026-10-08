@@ -9,8 +9,6 @@
 //! legacy middleware does. A live body streams to the upstream while the
 //! client uploads; its head commits on the pipeline's final `Start`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use futures::FutureExt as _;
 use openshell_supervisor_middleware::{HttpBodyOutput, HttpPipelineFinish};
 
@@ -243,7 +241,7 @@ impl ChunkedRequestBodyReader {
                 self.position = 0;
                 Ok(true)
             }
-            Some(Err(error)) => Err(error).into_diagnostic(),
+            Some(Err(error)) => Err(disconnected(error)),
             None => Ok(false),
         }
     }
@@ -260,7 +258,7 @@ impl ChunkedRequestBodyReader {
         let byte = client
             .read_u8()
             .await
-            .map_err(|_| miette!("connection closed before the chunked request body ended"))?;
+            .map_err(|_| disconnected("connection closed before the chunked request body ended"))?;
         if let Some(guard) = generation_guard {
             guard.ensure_current()?;
         }
@@ -337,12 +335,14 @@ async fn read_payload<C: AsyncRead + Unpin>(
         None => 0,
         Some(Ok(0)) => {
             unit.truncate(start);
-            return Err(miette!("connection closed before the request body ended"));
+            return Err(disconnected(
+                "connection closed before the request body ended",
+            ));
         }
         Some(Ok(read)) => read,
         Some(Err(error)) => {
             unit.truncate(start);
-            return Err(error).into_diagnostic();
+            return Err(disconnected(error));
         }
     };
     unit.truncate(start + read);
@@ -352,6 +352,20 @@ async fn read_payload<C: AsyncRead + Unpin>(
         guard.ensure_current()?;
     }
     Ok(read)
+}
+
+/// The client stopped sending a request body before it ended: its connection
+/// closed or failed. Other body read errors mean its framing is malformed.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{detail}")]
+pub struct RequestBodyDisconnected {
+    detail: String,
+}
+
+fn disconnected(detail: impl fmt::Display) -> miette::Report {
+    miette::Report::new(RequestBodyDisconnected {
+        detail: detail.to_string(),
+    })
 }
 
 fn parse_request_trailer(line: &[u8]) -> Result<HttpHeader> {
@@ -515,7 +529,7 @@ pub struct UpstreamWriteFailed {
 /// Upstream write half that records whether a write failed.
 struct UpstreamWrites<'a, W> {
     inner: &'a mut W,
-    failed: &'a AtomicBool,
+    failed: &'a tokio::sync::watch::Sender<bool>,
 }
 
 impl<W> UpstreamWrites<'_, W> {
@@ -524,7 +538,7 @@ impl<W> UpstreamWrites<'_, W> {
         result: std::task::Poll<std::io::Result<T>>,
     ) -> std::task::Poll<std::io::Result<T>> {
         if matches!(result, std::task::Poll::Ready(Err(_))) {
-            self.failed.store(true, Ordering::Release);
+            self.failed.send_replace(true);
         }
         result
     }
@@ -713,18 +727,16 @@ where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
-    let failed = AtomicBool::new(false);
+    let (failed, _) = tokio::sync::watch::channel(false);
     let mut upstream = UpstreamWrites {
         inner: upstream,
         failed: &failed,
     };
     let uploaded = upload_live_body(head, body, client, &mut upstream, options, &failed).await;
     match uploaded {
-        Err(error) if failed.load(Ordering::Acquire) => {
-            Err(miette::Report::new(UpstreamWriteFailed {
-                detail: error.to_string(),
-            }))
-        }
+        Err(error) if *failed.borrow() => Err(miette::Report::new(UpstreamWriteFailed {
+            detail: error.to_string(),
+        })),
         uploaded => uploaded,
     }
 }
@@ -735,7 +747,7 @@ async fn upload_live_body<C, U>(
     client: &mut C,
     upstream: &mut U,
     options: RelayRequestOptions<'_>,
-    upstream_failed: &AtomicBool,
+    upstream_failed: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
@@ -886,7 +898,7 @@ mod tests {
     async fn upstream_writes_record_a_failed_write() {
         let (mut upstream, peer) = tokio::io::duplex(16);
         drop(peer);
-        let failed = AtomicBool::new(false);
+        let (failed, _) = tokio::sync::watch::channel(false);
         let mut writes = UpstreamWrites {
             inner: &mut upstream,
             failed: &failed,
@@ -895,7 +907,7 @@ mod tests {
             .write_all(b"body")
             .await
             .expect_err("the upstream closed");
-        assert!(failed.load(Ordering::Acquire));
+        assert!(*failed.borrow());
     }
 
     #[tokio::test]

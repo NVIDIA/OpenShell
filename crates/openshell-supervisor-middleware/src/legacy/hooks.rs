@@ -4,21 +4,24 @@
 //! HTTP protocol 1 (0.1). Removed in 0.2.0.
 //!
 //! Engine integration points for legacy HTTP adapter stages. An adapter
-//! implements [`HttpStageTransport`] inside the supervisor: it answers
-//! preflight locally, translates body events to the legacy RPCs, and reports
-//! `fail_open` outcomes to the exchange's [`StageReportSink`]. The stage
+//! implements [`HttpStageTransport`] inside the supervisor: it translates
+//! stage events to the legacy RPCs and reports `fail_open` outcomes to the
+//! exchange's [`StageReportSink`]. The stage
 //! pipeline calls these functions for resolved legacy entries only; version 2
 //! entries never get legacy engine behavior.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use openshell_core::proto::HttpBodyMode;
 use tokio::time::Instant;
 
 use super::codec::LegacyStageFailure;
 use super::request::{LegacyRequestExchange, LegacyRequestStage, legacy_request_collection_limit};
+use super::response::adapter::{LegacyResponseExchange, LegacyResponseStage};
+use crate::pipeline::STAGE_QUEUE_MESSAGES;
 use crate::{
-    DescribedChainEntry, HttpDirection, HttpProtocol, HttpResponsePreflightInput,
+    ChainRunner, DescribedChainEntry, HttpDirection, HttpProtocol, HttpResponsePreflightInput,
     HttpStageTransport, MAX_MIDDLEWARE_CHAIN_TIMEOUT, OnError, StageReportSink,
 };
 
@@ -42,8 +45,10 @@ pub struct LegacyStageContext {
     pub reports: Arc<dyn StageReportSink>,
     /// Response exchanges: the final upstream response head before any stage
     /// ran. 0.1.x derived every stage's body modes from it.
-    #[allow(dead_code, reason = "the legacy response adapter reads it")]
     pub original_response: Option<Arc<HttpResponsePreflightInput>>,
+    /// Owner of the shared middleware work queue. Legacy response stages
+    /// reserve it for each body exchange, as 0.1.x did.
+    pub runner: ChainRunner,
 }
 
 /// A legacy adapter stage opened for one exchange.
@@ -81,7 +86,8 @@ pub trait LegacyResponseControl: Send + Sync {
     /// The pipeline calls this before `Begin` on a STREAM stage that follows
     /// a BUFFERED stage. 0.1.x withheld every byte of output while a
     /// whole-body stage buffered, so the stage holds its output until its
-    /// input ends and the head commits only then.
+    /// input ends, within the 0.1.x retained-body budget, and the head
+    /// commits only then.
     fn withhold_output_until_end(&self);
 }
 
@@ -111,14 +117,13 @@ impl LegacyChainClock {
     }
 }
 
-/// Open the adapter stage for a legacy entry, or `None` while the direction
-/// has no adapter.
+/// Open the adapter stage for a legacy entry, or `None` when the entry cannot
+/// run as one, which fails the exchange closed.
 ///
 /// Legacy request entries run on the request adapter (`legacy::request`).
-/// Legacy response entries run on the legacy response engine until the
-/// response cutover (`legacy::response::adapter`), which also supplies its
-/// [`LegacyResponseControl`], and the pipeline fails a legacy response entry
-/// closed if one reaches it.
+/// Legacy response entries run on the response adapter
+/// (`legacy::response::adapter`), which also supplies its
+/// [`LegacyResponseControl`] and needs the original response head.
 pub fn open_stage(context: &LegacyStageContext) -> Option<LegacyStage> {
     #[cfg(test)]
     if let Some(stage) = test_support::open(context) {
@@ -136,9 +141,44 @@ pub fn open_stage(context: &LegacyStageContext) -> Option<LegacyStage> {
             )?;
             Some(LegacyStage::transport(Arc::new(stage)))
         }
-        HttpDirection::Response => None,
+        HttpDirection::Response => {
+            let stage = Arc::new(LegacyResponseStage::new(
+                &context.entry,
+                LegacyResponseExchange {
+                    reports: Arc::clone(&context.reports),
+                    original: context.original_response.clone()?,
+                    runner: context.runner.clone(),
+                },
+            )?);
+            Some(LegacyStage {
+                transport: stage.clone(),
+                response: Some(stage),
+            })
+        }
     }
 }
+
+/// Longest the pipeline waits for a legacy stage's preflight result. The
+/// adapter bounds its legacy exchange with the entry timeout and applies
+/// `on_error` itself, as 0.1.x did without a chain deadline, so this only
+/// stops an adapter that never answers.
+pub fn preflight_backstop(entry: &DescribedChainEntry) -> Duration {
+    entry.timeout() + LEGACY_ADAPTER_GRACE
+}
+
+/// Longest a legacy STREAM stage may go without accepting input or returning
+/// a result. The adapter bounds each legacy exchange with the entry timeout
+/// and applies `on_error` itself, and it may run a full input queue, the
+/// unit in flight, the final unit, and the trailers exchange back to back
+/// without a result. The pipeline's stall timeout, which bounds version 2
+/// services, would otherwise fail a slow `fail_open` stage closed first.
+pub fn stall_backstop(entry: &DescribedChainEntry, idle: Duration) -> Duration {
+    let exchanges = u32::try_from(STAGE_QUEUE_MESSAGES + 3).unwrap_or(u32::MAX);
+    idle.max(entry.timeout().saturating_mul(exchanges) + LEGACY_ADAPTER_GRACE)
+}
+
+/// Time a legacy adapter has past its own timeouts to answer the pipeline.
+const LEGACY_ADAPTER_GRACE: Duration = Duration::from_secs(1);
 
 /// Platform-owned failure reason a legacy adapter ended its stage with,
 /// keeping the 0.1.x reason. The pipeline checks contract failures first.
@@ -173,15 +213,6 @@ pub fn checks_request_input_per_stage(entries: &[DescribedChainEntry]) -> bool {
     entries
         .iter()
         .all(|entry| entry.http_protocol() != Some(HttpProtocol::V2))
-}
-
-/// True when a response chain still runs on the legacy response engine: it
-/// has no version 2 entry. The legacy response cutover (L2) removes this, and
-/// every response chain then runs on the stage pipeline.
-pub fn response_chain_uses_legacy_engine(entries: &[DescribedChainEntry]) -> bool {
-    !entries
-        .iter()
-        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2))
 }
 
 /// What a legacy BUFFERED stage does when its input outgrows the selected

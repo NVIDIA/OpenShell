@@ -15,7 +15,7 @@
 //!   merge into one `HttpBufferedResult`.
 //! - `STREAM_BYTES` becomes STREAM. Output starts at `Begin`, so the head
 //!   commits after preflight, unless an earlier stage buffered the whole body
-//!   ([`LegacyResponseStage::withhold_output_until_end`]). Each input chunk is
+//!   ([`LegacyResponseControl::withhold_output_until_end`]). Each input chunk is
 //!   exchanged in lockstep, and `InputEnd` sends the empty final unit and the
 //!   trailers before `Finish`. After `skip_remaining` or a `fail_open`
 //!   failure, the rest of the body passes through locally.
@@ -44,17 +44,10 @@
 //!   when the exchange ends.
 //! - Contract failures fail closed.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the legacy response cutover routes legacy entries through this adapter"
-    )
-)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
@@ -63,32 +56,34 @@ use openshell_core::proto::{
     Finding, HeaderMutation, HttpBodyMode, HttpBufferedBody, HttpBufferedMode, HttpBufferedResult,
     HttpContinue, HttpEvent, HttpFinish, HttpHeader, HttpInputChunk, HttpInputEnd, HttpInspect,
     HttpOutputChunk, HttpOutputStart, HttpPreflight, HttpPreflightResult, HttpReject,
-    HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflight, HttpResponseTrailers,
-    HttpStreamMode, HttpUnchanged, MiddlewareSessionEnd, MiddlewareSessionEndReason, RemoveHeader,
-    SupervisorMiddlewareOperation, header_mutation, http_buffered_result, http_event, http_inspect,
-    http_preflight, http_preflight_result, http_response_event, http_response_event_result,
+    HttpResponseBodyUnit, HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflight,
+    HttpResponseTrailers, HttpStreamMode, HttpUnchanged, MiddlewareSessionEnd,
+    MiddlewareSessionEndReason, RemoveHeader, SupervisorMiddlewareOperation, header_mutation,
+    http_buffered_result, http_event, http_inspect, http_preflight, http_preflight_result,
+    http_response_body_unit, http_response_event, http_response_event_result,
     http_response_preflight_result, http_result,
 };
 
-use super::engine::validation::{
-    BodyAction, CurrentBodyAction, body_restriction, encoded_header_bytes, permitted_body_modes,
+use super::validation::{
+    BodyAction, CurrentBodyAction, StageMode, encoded_header_bytes, permitted_body_modes,
     strip_stale_integrity, validate_body_result, validate_diagnostics, validate_inspect,
-    validate_preflight_input, validate_trailers_result,
+    validate_trailers_result,
 };
-use super::engine::{
-    HttpResponseStageTransport, STREAM_CHANNEL_CAPACITY, StageMode, body_event,
-    normalize_diagnostics, response_failure_category,
+use super::{
+    HttpResponseInvocation, HttpResponseInvocationOutcome, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
+    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
 };
 use crate::legacy::codec::{
     LegacyStageFailure, Results, diagnostics, event_order_failure, invariant_failure, next_event,
     spawn_stage,
 };
+use crate::legacy::hooks::LegacyResponseControl;
+use crate::response::validate_preflight_input;
 use crate::{
-    ContractFailureKind, DescribedChainEntry, HttpProtocol, HttpResponseInvocation,
-    HttpResponseInvocationOutcome, HttpResponsePreflightInput, HttpResultStream,
-    HttpStageTransport, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES, MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
-    MiddlewareServiceState, OnError, StageReport, StageReportSink, headers,
-    is_stale_http_response_integrity_header,
+    ChainRunner, ContractFailureKind, DescribedChainEntry, HttpProtocol,
+    HttpResponsePreflightInput, HttpResponseResultStream, HttpResultStream, HttpStageTransport,
+    MiddlewareDiagnosticPolicy, MiddlewareServiceState, MiddlewareWorkAdmissionOutcome, OnError,
+    StageReport, StageReportSink, headers, is_stale_http_response_integrity_header,
 };
 
 /// Most output a stage withholding its output may retain, as 0.1.x reserved
@@ -108,6 +103,10 @@ pub struct LegacyResponseExchange {
     /// stage's body modes from it, and validated mutations against its
     /// `Connection`-nominated names.
     pub original: Arc<HttpResponsePreflightInput>,
+    /// Owner of the shared middleware work queue. A stage holds a slot only
+    /// during each body or trailers exchange, so a long stream holds none
+    /// between units.
+    pub runner: ChainRunner,
 }
 
 /// HTTP protocol 1 (0.1). Removed in 0.2.0.
@@ -139,38 +138,6 @@ impl LegacyResponseStage {
             exchange,
             withhold_output: Arc::default(),
         })
-    }
-
-    /// Engine hook for a BUFFERED stage whose input the pipeline holds. Call
-    /// it when the body outgrows the selected limit
-    /// (`whole_body_over_capacity`) or the whole-body deadline expires
-    /// (`whole_body_accumulation_timeout`), with the bytes collected so far.
-    ///
-    /// Records the 0.1.x outcome and returns true when the stage fails open.
-    /// The pipeline then passes the original body through the rest of the
-    /// chain at once; otherwise it fails the exchange with
-    /// `middleware_failed: {reason}`. Either way it ends the stage with
-    /// `MIDDLEWARE_FAILURE`.
-    pub fn buffered_input_failed(&self, reason: &str, input_size: usize) -> bool {
-        let fail_open = self.entry.on_error() == OnError::FailOpen;
-        self.record_failure(fail_open, reason, None, input_size);
-        if fail_open {
-            self.report_fail_open(reason);
-        }
-        fail_open
-    }
-
-    /// Engine hook for a STREAM stage after a stage that completed BUFFERED.
-    /// Call it before sending `Begin`.
-    ///
-    /// 0.1.x withheld all output while a whole-body stage buffered, so a
-    /// later stream stage ran over the whole body before the head committed:
-    /// its block was the canonical denial and its failure a failure response,
-    /// not an abort. The stage then holds its output until its input ends,
-    /// within the 0.1.x retained-body budget, and starts output with the
-    /// final length when no trailers remain.
-    pub fn withhold_output_until_end(&self) {
-        self.withhold_output.store(true, Ordering::Release);
     }
 
     fn record(
@@ -235,7 +202,7 @@ impl LegacyResponseStage {
                 failed: true,
                 stage_disabled: true,
                 reason_code: None,
-                failure_category: Some(response_failure_category(reason).into()),
+                failure_category: Some(super::failure_category(reason).into()),
             },
             Vec::new(),
             HashMap::new(),
@@ -249,6 +216,32 @@ impl LegacyResponseStage {
                 reason: reason.to_string(),
             },
         );
+    }
+}
+
+impl LegacyResponseControl for LegacyResponseStage {
+    /// The pipeline holds the input of a BUFFERED stage, so it calls this when
+    /// the body outgrows the selected limit (`whole_body_over_capacity`) or
+    /// the whole-body deadline expires (`whole_body_accumulation_timeout`).
+    /// The stage records the 0.1.x outcome and fails open under `fail_open`.
+    fn buffered_input_failed(&self, reason: &str, input_size: usize) -> bool {
+        let fail_open = self.entry.on_error() == OnError::FailOpen;
+        self.record_failure(fail_open, reason, None, input_size);
+        if fail_open {
+            self.report_fail_open(reason);
+        }
+        fail_open
+    }
+
+    /// 0.1.x withheld all output while a whole-body stage buffered, so a
+    /// later stream stage ran over the whole body before the head committed:
+    /// its block was the canonical denial and its failure a failure response,
+    /// not an abort. The stage then holds its output until its input ends
+    /// and starts output with the final length when no trailers remain. Held
+    /// output that would pass the 0.1.x retained-body budget starts streaming
+    /// instead.
+    fn withhold_output_until_end(&self) {
+        self.withhold_output.store(true, Ordering::Release);
     }
 }
 
@@ -304,6 +297,9 @@ enum ExchangeError {
     Failed(String),
     /// A contract failure, passed to the pipeline unchanged.
     Contract(ContractFailureKind, tonic::Status),
+    /// The shared middleware work queue was full. 0.1.x failed the response
+    /// whatever `on_error` said.
+    AdmissionExhausted,
     /// The pipeline stopped reading results.
     Abandoned,
 }
@@ -352,13 +348,14 @@ impl ResponseCodec {
 
     async fn run(mut self, mut events: mpsc::Receiver<HttpEvent>) {
         self.process(&mut events).await;
-        // 0.1.x ended every stage it opened. Here the pipeline went away
-        // without ending this one.
-        let reason = if self.completed {
+        // 0.1.x ended every stage it opened. A pipeline that ended this one
+        // during an exchange and stopped reading results left its reason
+        // queued; otherwise it went away without ending this one.
+        let reason = queued_session_end(&mut events).unwrap_or(if self.completed {
             MiddlewareSessionEndReason::Normal
         } else {
             MiddlewareSessionEndReason::Cancellation
-        };
+        });
         self.end_legacy(reason).await;
     }
 
@@ -463,8 +460,7 @@ impl ResponseCodec {
         if validate_preflight_input(original).is_err() {
             return self.preflight_failure("response_input_over_capacity").await;
         }
-        let legacy_modes =
-            permitted_body_modes(original, entry, body_restriction(original).as_deref());
+        let legacy_modes = permitted_body_modes(original, entry);
         let limits = preflight.limits.unwrap_or_default();
         if let Ok(limit) = usize::try_from(limits.max_chunk_bytes)
             && limit > 0
@@ -854,6 +850,10 @@ impl ResponseCodec {
                 self.contract_failure(kind, status, None, input_size).await;
                 return None;
             }
+            ExchangeError::AdmissionExhausted => {
+                self.admission_exhausted().await;
+                return None;
+            }
             ExchangeError::Abandoned => return None,
         };
         let fail_open = self.stage.entry.on_error() == OnError::FailOpen;
@@ -978,6 +978,10 @@ impl ResponseCodec {
                     .await;
                 None
             }
+            ExchangeError::AdmissionExhausted => {
+                self.admission_exhausted().await;
+                None
+            }
             ExchangeError::Abandoned => None,
         }
     }
@@ -1023,17 +1027,44 @@ impl ResponseCodec {
         self.results.fail(status).await;
     }
 
+    /// Fail closed without recording an invocation, as 0.1.x failed a
+    /// response it could not admit.
+    async fn admission_exhausted(&mut self) {
+        self.end_legacy(MiddlewareSessionEndReason::MiddlewareFailure)
+            .await;
+        self.results
+            .fail(LegacyStageFailure::new("admission_exhausted").into_status())
+            .await;
+    }
+
     async fn order_failure(&mut self) {
         self.end_legacy(MiddlewareSessionEndReason::MiddlewareFailure)
             .await;
         self.results.fail(event_order_failure()).await;
     }
 
-    /// One legacy exchange under the entry timeout.
+    /// One legacy body or trailers exchange under the entry timeout, holding
+    /// a slot of the shared middleware work queue. 0.1.x held one slot while
+    /// every stage of the chain exchanged one body unit; stages here run
+    /// concurrently, so a chain may hold one slot per stage.
     async fn exchange(
         &mut self,
         event: HttpResponseEvent,
     ) -> Result<HttpResponseEventResult, ExchangeError> {
+        if self.legacy.is_none() {
+            return Err(ExchangeError::Failed("middleware_stream_closed".into()));
+        }
+        let _work = match self
+            .results
+            .unless_closed(self.stage.exchange.runner.reserve_middleware_work())
+            .await
+        {
+            None => return Err(ExchangeError::Abandoned),
+            Some(Ok(MiddlewareWorkAdmissionOutcome::Admitted(work))) => work,
+            Some(Ok(MiddlewareWorkAdmissionOutcome::QueueExhausted) | Err(_)) => {
+                return Err(ExchangeError::AdmissionExhausted);
+            }
+        };
         let Some(transport) = self.legacy.as_mut() else {
             return Err(ExchangeError::Failed("middleware_stream_closed".into()));
         };
@@ -1063,11 +1094,23 @@ impl ResponseCodec {
     }
 
     /// Release `output`, or hold it back while the stage withholds output.
+    /// Output that would take what is held past the 0.1.x retained-body
+    /// budget starts the output with what is held instead, and the rest of the
+    /// body streams: that much input passed through an earlier whole-body
+    /// stage only after it failed open, and 0.1.x resumed streaming then.
     /// False when the pipeline stopped reading.
     async fn emit(&mut self, output: Vec<u8>) -> bool {
-        if let Some(withheld) = &mut self.withheld {
+        if let Some(withheld) = &mut self.withheld
+            && withheld.len().saturating_add(output.len()) <= WITHHELD_OUTPUT_LIMIT
+        {
             withheld.extend_from_slice(&output);
             return true;
+        }
+        if let Some(withheld) = self.withheld.take()
+            && (!self.results.send(output_start(None)).await
+                || !send_output(&self.results, self.output_limit, &withheld).await)
+        {
+            return false;
         }
         send_output(&self.results, self.output_limit, &output).await
     }
@@ -1096,6 +1139,21 @@ impl ResponseCodec {
             transport.end(reason).await;
         }
     }
+}
+
+/// Reason of a `session_end` still queued behind the events the stage read.
+fn queued_session_end(
+    events: &mut mpsc::Receiver<HttpEvent>,
+) -> Option<MiddlewareSessionEndReason> {
+    while let Ok(event) = events.try_recv() {
+        if let Some(http_event::Event::SessionEnd(end)) = event.event {
+            return Some(
+                MiddlewareSessionEndReason::try_from(end.reason)
+                    .unwrap_or(MiddlewareSessionEndReason::Cancellation),
+            );
+        }
+    }
+    None
 }
 
 fn continue_without_body(header_mutations: Vec<HeaderMutation>) -> http_result::Result {
@@ -1135,4 +1193,76 @@ async fn send_output(results: &Results, limit: usize, output: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Legacy events a stage may queue before the service reads them.
+const STREAM_CHANNEL_CAPACITY: usize = 4;
+/// Longest a stage waits to deliver its legacy `session_end`.
+const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// One open `HttpResponsePreReturn.Evaluate` stream.
+struct HttpResponseStageTransport {
+    sender: mpsc::Sender<HttpResponseEvent>,
+    responses: HttpResponseResultStream,
+}
+
+impl HttpResponseStageTransport {
+    async fn end(self, reason: MiddlewareSessionEndReason) {
+        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.end_inner(reason)).await;
+    }
+
+    async fn end_inner(self, reason: MiddlewareSessionEndReason) {
+        let Self {
+            sender,
+            mut responses,
+        } = self;
+        let end = HttpResponseEvent {
+            event: Some(http_response_event::Event::SessionEnd(
+                MiddlewareSessionEnd {
+                    reason: reason as i32,
+                    protocol_error: None,
+                },
+            )),
+        };
+        if sender.send(end).await.is_err() {
+            return;
+        }
+        // Keep the response stream alive while half-closing the request side.
+        // Dropping both handles together schedules an HTTP/2 CANCEL and can
+        // discard the terminal event before remote middleware receives it.
+        drop(sender);
+        while responses.next().await.is_some() {}
+    }
+}
+
+fn body_event(sequence: u64, data: Vec<u8>, end_of_stream: bool) -> HttpResponseEvent {
+    HttpResponseEvent {
+        event: Some(http_response_event::Event::Body(HttpResponseBodyUnit {
+            sequence,
+            payload: Some(http_response_body_unit::Payload::Data(data)),
+            end_of_stream,
+        })),
+    }
+}
+
+/// Replace service-provided diagnostic text from operator services with
+/// platform-owned values, as 0.1.x did. Built-in diagnostics are kept.
+fn normalize_diagnostics(
+    entry: &DescribedChainEntry,
+    findings: &mut [Finding],
+    metadata: &mut HashMap<String, String>,
+) {
+    if entry
+        .service
+        .as_ref()
+        .is_some_and(|service| service.diagnostic_policy == MiddlewareDiagnosticPolicy::Normalize)
+    {
+        metadata.clear();
+        for finding in findings {
+            finding.r#type = format!("{}.finding", entry.entry.implementation);
+            finding.label = crate::EXTERNAL_FINDING_LABEL.to_string();
+            finding.confidence.clear();
+            finding.severity = "medium".into();
+        }
+    }
 }

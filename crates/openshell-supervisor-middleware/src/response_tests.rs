@@ -18,6 +18,12 @@ use openshell_core::proto::{
     header_mutation, http_buffered_result, http_event, http_inspect, http_preflight,
     http_preflight_result, http_result,
 };
+use openshell_supervisor_middleware_wire_fixture::proto::middleware::{
+    HttpResponseBodyMode as LegacyBodyMode, http_response_body_unit, http_response_event,
+};
+use openshell_supervisor_middleware_wire_fixture::{
+    LegacyMiddlewareFixture, Reply, RunningFixture, http_response_binding, results,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1242,46 +1248,269 @@ async fn legacy_stages_keep_the_0_1_offer_unless_the_body_is_restricted() {
     }
 }
 
+/// A response chain that mixes a legacy `STREAM_BYTES` entry with version 2
+/// STREAM and BUFFERED entries runs every stage in policy order. The legacy
+/// entry runs on its adapter over the v0.1.2 wire and reports its 0.1.x
+/// invocations, and the version 2 BUFFERED stage holds the head until it
+/// completes.
 #[tokio::test]
-async fn chains_with_a_version_2_entry_run_on_the_pipeline() {
-    let legacy = observer_stage("test/legacy", &[]).legacy();
-    let v2 = observer_stage("test/v2", &[]);
-    let runner = runner_for(&[legacy, v2]).await;
-    for (names, pipeline) in [
-        (vec!["test/legacy"], false),
-        (vec!["test/v2"], true),
-        (vec!["test/legacy", "test/v2"], true),
-        (vec!["test/unregistered"], false),
-    ] {
-        let described = runner
-            .describe_http_response_chain(&chain(&names))
-            .await
-            .expect("describe");
+async fn mixed_legacy_and_version_2_response_chains_run_in_policy_order() {
+    let fixture = LegacyMiddlewareFixture::new("compat/mixed")
+        .with_binding(http_response_binding(LIMIT))
+        .on_response_preflight(|_| {
+            results::preflight_inspect(LegacyBodyMode::StreamBytes, Vec::new()).into()
+        })
+        .on_response_body(|unit| match unit.payload.as_ref() {
+            Some(http_response_body_unit::Payload::Data(data)) if !data.is_empty() => {
+                results::body_transform(unit.sequence, [data.as_slice(), b"-l"].concat()).into()
+            }
+            _ => results::body_pass_through(unit.sequence).into(),
+        })
+        .spawn()
+        .await
+        .expect("spawn legacy fixture");
+    let upper = stream_stage("test/upper", UPPERCASE);
+    let wrap = buffered_stage("test/wrap", |data| Some([b"[", &data[..], b"]"].concat()));
+    let runner = ChainRunner::from_registry(
+        MiddlewareRegistry::connect_services_with_http_v2(
+            vec![Arc::new(upper), Arc::new(wrap)],
+            vec![SupervisorMiddlewareService {
+                name: "legacy-mixed".into(),
+                grpc_endpoint: fixture.endpoint(),
+                max_payload_bytes: LIMIT,
+                allow_insecure_transport: true,
+                ..Default::default()
+            }],
+        )
+        .await
+        .expect("registry"),
+    );
+    let described = runner
+        .describe_http_response_chain(&chain(&["legacy-mixed", "test/upper", "test/wrap"]))
+        .await
+        .expect("describe");
+    let reports = Arc::new(StageReports::default());
+    let preflight = runner
+        .preflight_http_response_pipeline(
+            described,
+            response_input(200, &[]),
+            HttpResponseDelivery {
+                reports: Some(reports.clone()),
+                ..HttpResponseDelivery::new(true)
+            },
+        )
+        .await
+        .expect("preflight");
+    assert!(preflight.allowed, "{}", preflight.reason);
+
+    let (finish, output) = run_response(
+        preflight.session.expect("every stage inspects the body"),
+        vec![b"a".to_vec(), b"b".to_vec()],
+        Vec::new(),
+    )
+    .await;
+    finish.expect("the mixed chain completes");
+    assert_eq!(output_start_of(&output), (Some(8), true));
+    assert_eq!(output_body(&output), b"[A-LB-L]");
+    let units: Vec<_> = fixture.response_sessions()[0]
+        .iter()
+        .filter_map(|event| match &event.event {
+            Some(http_response_event::Event::Body(unit)) => Some(unit.sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(units, [1, 2, 3], "two units and the empty final unit");
+    let outcomes: Vec<_> = reports
+        .drain()
+        .into_iter()
+        .filter_map(|(name, report)| match report {
+            StageReport::LegacyResponseInvocation { invocation, .. } => {
+                Some((name, invocation.outcome))
+            }
+            StageReport::LegacyFailOpen { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            HttpResponseInvocationOutcome::Stream,
+            HttpResponseInvocationOutcome::Transform,
+            HttpResponseInvocationOutcome::Transform,
+            HttpResponseInvocationOutcome::PassThrough,
+            HttpResponseInvocationOutcome::Trailers,
+        ]
+        .map(|outcome| ("legacy-mixed".to_string(), outcome))
+    );
+}
+
+/// Register one legacy response fixture as `legacy-guard`, with the 500 ms
+/// default timeout.
+async fn legacy_guard(fixture: LegacyMiddlewareFixture) -> (RunningFixture, ChainRunner) {
+    let fixture = fixture
+        .with_binding(http_response_binding(LIMIT))
+        .spawn()
+        .await
+        .expect("spawn legacy fixture");
+    let runner = ChainRunner::from_registry(
+        MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "legacy-guard".into(),
+                grpc_endpoint: fixture.endpoint(),
+                max_payload_bytes: LIMIT,
+                allow_insecure_transport: true,
+                ..Default::default()
+            }],
+        )
+        .await
+        .expect("registry"),
+    );
+    (fixture, runner)
+}
+
+fn legacy_stream_guard() -> LegacyMiddlewareFixture {
+    LegacyMiddlewareFixture::new("compat/stream-guard")
+        .on_response_preflight(|_| {
+            results::preflight_inspect(LegacyBodyMode::StreamBytes, Vec::new()).into()
+        })
+        .on_response_body(|unit| match unit.payload.as_ref() {
+            Some(http_response_body_unit::Payload::Data(data)) if !data.is_empty() => {
+                results::body_transform(unit.sequence, data.to_ascii_uppercase()).into()
+            }
+            _ => results::body_pass_through(unit.sequence).into(),
+        })
+}
+
+/// The legacy adapter bounds its preflight exchange with the entry timeout
+/// and applies `on_error`, as 0.1.x did. The pipeline's own preflight
+/// deadline must not fail the stage first.
+#[tokio::test]
+async fn a_slow_legacy_preflight_follows_on_error() {
+    let (_fixture, runner) = legacy_guard(
+        LegacyMiddlewareFixture::new("compat/slow-preflight").on_response_preflight(|_| {
+            Reply::from(results::preflight_inspect(
+                LegacyBodyMode::StreamBytes,
+                Vec::new(),
+            ))
+            .after(Duration::from_secs(2))
+        }),
+    )
+    .await;
+    for on_error in [OnError::FailOpen, OnError::FailClosed] {
+        let mut entries = chain(&["legacy-guard"]);
+        entries[0].on_error = on_error;
+        let outcome = response_preflight(&runner, &entries, response_input(200, &[]), true).await;
+        assert!(outcome.session.is_none(), "{on_error:?}");
         assert_eq!(
-            http_response_uses_pipeline(&described),
-            pipeline,
-            "{names:?}"
+            outcome.allowed,
+            on_error == OnError::FailOpen,
+            "{on_error:?}"
         );
+        if on_error == OnError::FailClosed {
+            assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
+        } else {
+            assert_eq!(
+                outcome.diagnostics.invocations[0].outcome,
+                HttpStageOutcome::FailOpen
+            );
+        }
     }
 }
 
+/// HTTP protocol 1 (0.1): after the body ends, a legacy stream stage
+/// runs the empty final unit and the trailers exchange without returning a
+/// result in between. Each exchange is bounded by the entry timeout under
+/// `on_error`, as 0.1.x bounded them, so the pipeline's stall timeout does
+/// not fail the stage first.
 #[tokio::test]
-async fn legacy_entries_without_an_adapter_fail_a_mixed_response_chain_closed() {
-    let legacy = observer_stage("test/legacy", &[]).legacy();
-    let v2 = observer_stage("test/v2", &[]);
-    let runner = runner_for(&[legacy, v2.clone()]).await;
-    let mut entries = chain(&["test/v2", "test/legacy"]);
-    entries[1].on_error = OnError::FailOpen;
+async fn slow_legacy_end_of_body_exchanges_are_not_stalls() {
+    let slow = Duration::from_millis(300);
+    let (_fixture, runner) = legacy_guard(
+        legacy_stream_guard()
+            .on_response_body(move |unit| match unit.payload.as_ref() {
+                Some(http_response_body_unit::Payload::Data(data)) if !data.is_empty() => {
+                    results::body_transform(unit.sequence, data.to_ascii_uppercase()).into()
+                }
+                _ => Reply::from(results::body_pass_through(unit.sequence)).after(slow),
+            })
+            .on_response_trailers(move |_| Reply::from(results::trailers_unchanged()).after(slow)),
+    )
+    .await;
+    let outcome = response_preflight(
+        &runner,
+        &chain(&["legacy-guard"]),
+        response_input(200, &[]),
+        true,
+    )
+    .await;
+    let mut session = outcome.session.expect("the legacy stage streams");
+    session.set_timeouts(PipelineTimeouts {
+        stream_idle: Duration::from_millis(400),
+        ..PipelineTimeouts::default()
+    });
+    let (finish, output) = run_response(session, vec![b"body".to_vec()], Vec::new()).await;
+    finish.expect("the end-of-body exchanges finish within their timeouts");
+    assert_eq!(output_body(&output), b"BODY");
+}
+
+/// HTTP protocol 1 (0.1): a legacy response stage reserves the shared
+/// work queue for each body exchange, as 0.1.x did, so an open stream holds
+/// no work slot between units. When the queue is full, the exchange fails
+/// closed whatever `on_error` says.
+#[tokio::test]
+async fn legacy_response_stages_reserve_work_for_each_body_exchange() {
+    let (_fixture, runner) = legacy_guard(legacy_stream_guard()).await;
+    let mut entries = chain(&["legacy-guard"]);
+    entries[0].on_error = OnError::FailOpen;
     let outcome = response_preflight(&runner, &entries, response_input(200, &[]), true).await;
-    assert!(!outcome.allowed);
+    let session = outcome.session.expect("the legacy stage streams");
+
+    let (input_tx, input_rx) = mpsc::channel(4);
+    let (output_tx, mut output_rx) = mpsc::channel(4);
+    let run = tokio::spawn(session.run_until(input_rx, output_tx, std::future::pending()));
+    input_tx
+        .send(HttpBodyInput::Chunk(b"one".to_vec()))
+        .await
+        .expect("first unit");
+    let mut released = Vec::new();
+    while released != b"ONE" {
+        match output_rx.recv().await.expect("output") {
+            HttpBodyOutput::Chunk(data) => released.extend(data),
+            HttpBodyOutput::Start { .. } => {}
+            HttpBodyOutput::End { .. } => panic!("the body has not ended"),
+        }
+    }
     assert_eq!(
-        outcome.reason,
-        "middleware_failed: http_stage_not_executable"
+        runner.registry.work_admission.available_permits(),
+        MAX_CONCURRENT_MIDDLEWARE_WORK,
+        "an idle stream holds no work slot"
     );
-    assert_eq!(
-        v2.log.wait_for_session_end().await,
-        MiddlewareSessionEndReason::StageSkipped
-    );
+
+    let active: Vec<_> = (0..MAX_CONCURRENT_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission)
+                .try_acquire_owned()
+                .expect("active work")
+        })
+        .collect();
+    let waiters: Vec<_> = (0..MAX_QUEUED_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission_waiters)
+                .try_acquire_owned()
+                .expect("queued work")
+        })
+        .collect();
+    input_tx
+        .send(HttpBodyInput::Chunk(b"two".to_vec()))
+        .await
+        .expect("second unit");
+    let failure = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("bounded exchange")
+        .expect("join")
+        .expect_err("an exhausted work queue fails the stream");
+    assert_eq!(failure.reason, "middleware_failed: admission_exhausted");
+    drop((active, waiters));
 }
 
 /// Run a response session over `chunks` and drain its output.
@@ -1677,7 +1906,10 @@ async fn exhausted_session_budget_applies_each_entry_on_error() {
     .await;
     assert!(!v2.allowed);
     assert!(v2.session_capacity_exhausted);
-    assert_eq!(v2.reason, "middleware_failed: session_capacity_exhausted");
+    assert_eq!(
+        v2.reason,
+        "middleware_failed: middleware_session_capacity_exhausted"
+    );
 
     // HTTP protocol 1 (0.1): a fail_open legacy stage passes the
     // response on uninspected.
@@ -1690,6 +1922,11 @@ async fn exhausted_session_budget_applies_each_entry_on_error() {
     assert_eq!(
         legacy_outcome.diagnostics.invocations[0].outcome,
         HttpStageOutcome::FailOpen
+    );
+    assert_eq!(
+        legacy_outcome.diagnostics.invocations[0].fail_open_category(),
+        Some("session_capacity"),
+        "the fail_open finding keeps the 0.1.x failure category"
     );
     assert!(legacy.log.kinds().is_empty());
 
@@ -1705,6 +1942,46 @@ async fn exhausted_session_budget_applies_each_entry_on_error() {
         outcome.session.is_some(),
         "a released permit admits one more"
     );
+}
+
+/// 0.1.x checked the session budget before the work queue, so with both
+/// exhausted a legacy chain follows each entry's `on_error` instead of being
+/// shed.
+#[tokio::test]
+async fn the_session_budget_is_checked_before_work_admission() {
+    let legacy = observer_stage("test/legacy", &[]).legacy();
+    let runner = runner_for(std::slice::from_ref(&legacy)).await;
+    let (_adapters, _controls) = install_adapters(std::slice::from_ref(&legacy), true);
+    let sessions: Vec<_> = (0..MAX_CONCURRENT_MIDDLEWARE_SESSIONS)
+        .map(|_| {
+            Arc::clone(&runner.registry.session_admission)
+                .try_acquire_owned()
+                .expect("session")
+        })
+        .collect();
+    let work: Vec<_> = (0..MAX_CONCURRENT_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission)
+                .try_acquire_owned()
+                .expect("active work")
+        })
+        .collect();
+    let waiters: Vec<_> = (0..MAX_QUEUED_MIDDLEWARE_WORK)
+        .map(|_| {
+            Arc::clone(&runner.registry.work_admission_waiters)
+                .try_acquire_owned()
+                .expect("queued work")
+        })
+        .collect();
+
+    let mut entries = chain(&["test/legacy"]);
+    entries[0].on_error = OnError::FailOpen;
+    let outcome = response_preflight(&runner, &entries, response_input(200, &[]), true).await;
+    assert!(outcome.allowed, "{}", outcome.reason);
+    assert!(outcome.session_capacity_exhausted);
+    assert!(!outcome.admission_exhausted);
+    assert!(legacy.log.kinds().is_empty());
+    drop((sessions, work, waiters));
 }
 
 #[tokio::test]

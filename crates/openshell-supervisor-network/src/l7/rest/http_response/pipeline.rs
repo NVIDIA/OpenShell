@@ -13,14 +13,20 @@
 //!
 //! A failure before commit returns the canonical 403 or 502 response. After
 //! commit, delivery aborts: no terminating chunk, trailers, or error body,
-//! and the connection closes. STREAM has no total deadline, and upstream
-//! silence never fails a response. As for an uninspected response, an
-//! upstream body without framing ends when the upstream closes, or, except for
-//! server-sent events, after the relay's idle timeout.
+//! and the connection closes. A policy reload stops delivery at once: before
+//! commit the connection closes without a response, and after it delivery
+//! aborts unless the client already received the whole body. STREAM has no
+//! total deadline, and upstream silence never fails a response. As for an
+//! uninspected response, an upstream body without framing ends when the
+//! upstream closes, or, except for server-sent events, after the relay's idle
+//! timeout.
 
-use openshell_core::proto::MiddlewareSessionEndReason;
+use std::sync::{Arc, Mutex};
+
+use openshell_core::proto::{Finding, MiddlewareSessionEndReason};
 use openshell_supervisor_middleware::{
-    HttpBodyInput, HttpBodyOutput, HttpResponseDelivery, HttpStageDiagnostics, HttpStageOutcome,
+    HttpBodyInput, HttpBodyOutput, HttpProtocol, HttpResponseDelivery, HttpResponseInvocation,
+    HttpStageDiagnostics, HttpStageOutcome, NamespacedFinding, StageReport, StageReportSink,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -113,8 +119,15 @@ where
         headers: parsed.headers.clone(),
         connection_nominated_headers: parsed.connection_nominated.clone(),
     };
+    let legacy_reports = Arc::new(LegacyResponseReports {
+        policy_name: middleware.policy_name.to_string(),
+        target: middleware.target.clone(),
+        status_code,
+        failed: Mutex::default(),
+    });
     let delivery = HttpResponseDelivery {
         buffered_body_timeout: middleware.whole_body_timeout,
+        reports: Some(legacy_reports.clone()),
         ..HttpResponseDelivery::new(chunked)
     };
     let preflight = if parsed.representable {
@@ -160,7 +173,13 @@ where
         &middleware.target,
         status_code,
         &preflight.diagnostics,
+        &legacy_reports,
     );
+    for event in
+        http_response_capacity_events(middleware.policy_name, &middleware.target, &preflight)
+    {
+        openshell_ocsf::ocsf_emit!(event);
+    }
     if !preflight.allowed {
         debug!(reason = %preflight.reason, "HTTP response middleware preflight denied delivery");
         if let Some(denial) = preflight.denial.as_ref() {
@@ -276,7 +295,14 @@ where
             }
             Ok(())
         };
-        let relayed = tokio::try_join!(feed, write).map(drop);
+        // The policy may change while the upstream is silent.
+        let relayed = tokio::select! {
+            biased;
+            relayed = async { tokio::try_join!(feed, write).map(drop) } => relayed,
+            error = policy_reloaded(middleware.generation_guard) => {
+                Err(BodyRelayError::PolicyReload(error))
+            }
+        };
         if let Err(error) = &relayed {
             let _ = abort.send(error.end_reason());
         }
@@ -292,6 +318,7 @@ where
                 &middleware.target,
                 status_code,
                 &finish.diagnostics,
+                &legacy_reports,
             );
             if let Some(guard) = middleware.generation_guard {
                 guard.ensure_current()?;
@@ -313,6 +340,7 @@ where
                 &middleware.target,
                 status_code,
                 &failure.diagnostics,
+                &legacy_reports,
             );
             match relayed {
                 // The stages failed or rejected the response.
@@ -326,6 +354,7 @@ where
                 &middleware.target,
                 status_code,
                 &finish.diagnostics,
+                &legacy_reports,
             );
             Err(error)
         }
@@ -333,6 +362,9 @@ where
     let committed = framing.is_some();
     match failure {
         Err(error @ BodyRelayError::Downstream(_)) => Err(error.into_report()),
+        // A stale policy ends the connection without a response, as it does
+        // before preflight.
+        Err(error @ BodyRelayError::PolicyReload(_)) if !committed => Err(error.into_report()),
         Err(error) if committed => {
             emit_http_response_middleware_abort(
                 middleware.policy_name,
@@ -399,6 +431,14 @@ where
             }
             Ok(Some(RelayOutcome::Consumed))
         }
+    }
+}
+
+/// Resolves with the stale-generation error once the policy changes.
+async fn policy_reloaded(generation_guard: Option<&PolicyGenerationGuard>) -> miette::Report {
+    match generation_guard {
+        Some(guard) => guard.reloaded().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -552,6 +592,20 @@ struct ResponseWriter<'c, 'a, C> {
 
 impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
     async fn write(&mut self, event: HttpBodyOutput) -> std::result::Result<(), BodyRelayError> {
+        // Output the stages produced under a stale policy is never delivered.
+        // The end of a body framed by its length or by the connection writes
+        // nothing, so a body the client already received in full is complete
+        // rather than aborted.
+        let writes_nothing = matches!(
+            (&event, self.framing),
+            (
+                HttpBodyOutput::End { .. },
+                Some(OutputFraming::ContentLength { remaining: 0 } | OutputFraming::CloseDelimited)
+            )
+        );
+        if !writes_nothing {
+            self.ensure_current()?;
+        }
         match (event, self.framing) {
             (
                 HttpBodyOutput::Start {
@@ -595,11 +649,6 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         output_body_bytes: Option<u64>,
         body_transformed: bool,
     ) -> std::result::Result<(), BodyRelayError> {
-        if let Some(guard) = self.generation_guard {
-            guard
-                .ensure_current()
-                .map_err(BodyRelayError::PolicyReload)?;
-        }
         // A changed body makes the upstream's representation validators
         // stale.
         let mut headers = self.headers.to_vec();
@@ -674,6 +723,12 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         }
     }
 
+    fn ensure_current(&self) -> std::result::Result<(), BodyRelayError> {
+        self.generation_guard
+            .map_or(Ok(()), PolicyGenerationGuard::ensure_current)
+            .map_err(BodyRelayError::PolicyReload)
+    }
+
     async fn send(&mut self, bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
         self.client
             .write_all(bytes)
@@ -689,26 +744,135 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
     }
 }
 
+/// HTTP protocol 1 (0.1). Removed in 0.2.0.
+///
+/// Emits the OCSF events of legacy response stages from the 0.1.x invocation
+/// records their adapters report as each step completes, as the 0.1.x engine
+/// emitted them after each body unit.
+pub(super) struct LegacyResponseReports {
+    pub(super) policy_name: String,
+    pub(super) target: HttpRequestTarget,
+    pub(super) status_code: u16,
+    /// Stages whose adapter recorded a failure, by config name. Config names
+    /// are the keys of the policy's middleware map, so each names exactly one
+    /// stage of this response's chain.
+    pub(super) failed: Mutex<HashSet<String>>,
+}
+
+impl LegacyResponseReports {
+    /// True when the adapter of `config_name` recorded a failure itself.
+    fn recorded_failure(&self, config_name: &str) -> bool {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(config_name)
+    }
+}
+
+impl StageReportSink for LegacyResponseReports {
+    fn report(&self, config_name: &str, report: StageReport) {
+        // A `LegacyFailOpen` report qualifies a failed invocation record the
+        // adapter already reported.
+        let StageReport::LegacyResponseInvocation {
+            invocation,
+            findings,
+            ..
+        } = report
+        else {
+            return;
+        };
+        if invocation.failed {
+            self.failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(config_name.to_string());
+        }
+        for event in legacy_response_invocation_events(
+            &self.policy_name,
+            &self.target,
+            self.status_code,
+            config_name,
+            &invocation,
+            findings,
+        ) {
+            openshell_ocsf::ocsf_emit!(event);
+        }
+    }
+}
+
+/// Events of one 0.1.x invocation record: the invocation, its `fail_open` or
+/// block finding, and the findings of its step.
+pub(super) fn legacy_response_invocation_events(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    status_code: u16,
+    config_name: &str,
+    invocation: &HttpResponseInvocation,
+    findings: Vec<Finding>,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events = http_response_middleware_invocation_events(
+        policy_name,
+        target,
+        status_code,
+        std::slice::from_ref(invocation),
+    );
+    events.extend(http_response_middleware_fail_open_finding_event(
+        policy_name,
+        target,
+        invocation,
+    ));
+    events.extend(http_response_middleware_block_finding_event(
+        policy_name,
+        target,
+        invocation,
+    ));
+    let findings: Vec<_> = findings
+        .into_iter()
+        .map(|finding| NamespacedFinding {
+            middleware: config_name.to_string(),
+            finding,
+        })
+        .collect();
+    events.extend(crate::l7::middleware::middleware_finding_events(&findings));
+    events
+}
+
 /// OCSF events for one phase of a response through the stage pipeline.
 fn emit_http_response_stage_events(
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     diagnostics: &HttpStageDiagnostics,
+    legacy_reports: &LegacyResponseReports,
 ) {
-    for event in http_response_stage_events(policy_name, target, status_code, diagnostics) {
+    for event in http_response_stage_events(
+        policy_name,
+        target,
+        status_code,
+        diagnostics,
+        legacy_reports,
+    ) {
         openshell_ocsf::ocsf_emit!(event);
     }
 }
 
-fn http_response_stage_events(
+pub(super) fn http_response_stage_events(
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     diagnostics: &HttpStageDiagnostics,
+    legacy_reports: &LegacyResponseReports,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut events = Vec::new();
     for invocation in &diagnostics.invocations {
+        // HTTP protocol 1 (0.1): the adapter reported this stage's
+        // invocation records. Only a failure the pipeline recorded without
+        // the adapter, such as an exhausted session budget, is emitted here.
+        if invocation.protocol == Some(HttpProtocol::Legacy)
+            && (!invocation.failed || legacy_reports.recorded_failure(&invocation.config_name))
+        {
+            continue;
+        }
         let blocked = invocation.outcome == HttpStageOutcome::Reject;
         events.push(http_response_invocation_event(
             policy_name,
@@ -733,27 +897,48 @@ fn http_response_stage_events(
                 &invocation.implementation,
             ));
         }
-        // HTTP protocol 1 (0.1): an adapter that reported its fail-open
-        // outcome emits the finding with its own invocation record.
-        let reported = diagnostics.reports.iter().any(|(config_name, report)| {
-            config_name == &invocation.config_name && report.fail_open_reason().is_some()
-        });
-        if invocation.outcome == HttpStageOutcome::FailOpen && !reported {
+        // HTTP protocol 1 (0.1): only entries without a version 2
+        // binding fail open, and their finding keeps the 0.1.x category.
+        if let Some(category) = invocation.fail_open_category() {
             events.push(http_response_fail_open_finding(
                 policy_name,
                 target,
                 &invocation.config_name,
                 &invocation.implementation,
-                invocation
-                    .failure_reason
-                    .as_deref()
-                    .unwrap_or("middleware_failure"),
+                category,
             ));
         }
     }
     events.extend(crate::l7::middleware::middleware_finding_events(
         &diagnostics.findings,
     ));
+    events
+}
+
+/// Findings for platform capacity that refused a response's middleware, as
+/// requests and WebSocket sessions report it.
+pub(super) fn http_response_capacity_events(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    preflight: &openshell_supervisor_middleware::HttpResponsePipelinePreflight,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events = Vec::new();
+    if preflight.session_capacity_exhausted {
+        events.push(
+            crate::l7::middleware::middleware_session_capacity_exhausted_event(
+                policy_name,
+                &target.host,
+                openshell_supervisor_middleware::HttpDirection::Response.as_str(),
+            ),
+        );
+    }
+    if preflight.admission_exhausted {
+        events.push(crate::l7::middleware::middleware_admission_exhausted_event(
+            policy_name,
+            &target.host,
+            openshell_supervisor_middleware::HttpDirection::Response,
+        ));
+    }
     events
 }
 
@@ -782,4 +967,66 @@ fn emit_http_response_middleware_abort(
         .message("HTTP response middleware failed after response commitment; delivery aborted")
         .build();
     openshell_ocsf::ocsf_emit!(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A policy reload after the stages delivered a body in full aborts
+    /// nothing: the end of a body framed by its length or by the connection
+    /// writes no stale output. The end of a chunked body writes its
+    /// terminator, so it fails.
+    #[tokio::test]
+    async fn the_end_of_a_delivered_body_writes_nothing_under_a_reloaded_policy() {
+        const TEST_POLICY: &str = include_str!("../../../../data/sandbox-policy.rego");
+        let parsed = parse_response_head_for_middleware(b"HTTP/1.1 200 OK\r\n\r\n").expect("head");
+        for (output_body_bytes, chunked, completes) in [
+            (Some(5), true, true),
+            (None, false, true),
+            (None, true, false),
+        ] {
+            let engine = crate::opa::OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy");
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .expect("generation guard");
+            let (mut relay_side, _client) = tokio::io::duplex(1024);
+            let mut writer = ResponseWriter {
+                client: &mut relay_side,
+                status_line: "HTTP/1.1 200 OK",
+                headers: &parsed.headers,
+                parsed: &parsed,
+                chunked,
+                connection_close: false,
+                generation_guard: Some(&guard),
+                framing: None,
+            };
+            writer
+                .write(HttpBodyOutput::Start {
+                    header_mutations: Vec::new(),
+                    output_body_bytes,
+                    body_transformed: false,
+                })
+                .await
+                .expect("head");
+            writer
+                .write(HttpBodyOutput::Chunk(b"hello".to_vec()))
+                .await
+                .expect("body");
+            engine
+                .reload(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy reload");
+            let ended = writer
+                .write(HttpBodyOutput::End {
+                    trailers: Vec::new(),
+                })
+                .await;
+            assert_eq!(
+                ended.is_ok(),
+                completes,
+                "declared length {output_body_bytes:?}, chunked {chunked}: {ended:?}"
+            );
+        }
+    }
 }

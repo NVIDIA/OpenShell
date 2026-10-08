@@ -9,13 +9,16 @@ use std::time::Duration;
 use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
 use openshell_core::middleware::{HttpRequestView, HttpResultStream, InProcessMiddleware};
 use openshell_core::proto::{
-    ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBodyModeUnavailable,
+    ExistingHeaderAction, Finding, HeaderMutation, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpBufferedMode, HttpBufferedResult, HttpContinue, HttpEvent,
     HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflight, HttpPreflightResult,
     HttpReject, HttpRequestResult, HttpResult, HttpStreamMode, HttpUnchanged, MiddlewareBinding,
     MiddlewareDiagnostics, MiddlewareManifest, MiddlewareSessionEndReason,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WriteHeader, header_mutation,
     http_buffered_result, http_event, http_inspect, http_preflight_result, http_result,
+};
+use openshell_supervisor_middleware::{
+    HttpStageDiagnostics, HttpStageOutcome, StageReport, StageReportSink as _,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
@@ -836,6 +839,110 @@ async fn a_policy_reload_mid_stream_ends_the_stages_and_the_connection() {
     );
 }
 
+/// A policy reload while the upstream is silent ends the stages with
+/// `POLICY_RELOAD` at once and aborts the response, without waiting for the
+/// upstream's next byte.
+#[tokio::test]
+async fn a_policy_reload_during_upstream_silence_ends_the_stages_at_once() {
+    const TEST_POLICY: &str = include_str!("../../../../data/sandbox-policy.rego");
+    let engine =
+        crate::opa::OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("policy");
+    let guard = engine
+        .generation_guard(engine.current_generation())
+        .expect("generation guard");
+    let stage = ResponseStage::new(Behavior::Uppercase);
+    let Relay {
+        mut upstream,
+        mut client,
+        task,
+    } = start_guarded(&stage, "GET", true, Some(guard));
+    upstream
+        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+        .await
+        .expect("first chunk");
+    let mut delivered = Vec::new();
+    read_until(&mut client, &mut delivered, b"HELLO").await;
+    engine
+        .reload(TEST_POLICY, "network_policies: {}\n")
+        .expect("policy reload");
+
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::PolicyReload
+    );
+    let error = within(task)
+        .await
+        .expect("join relay")
+        .expect_err("a stale policy ends the response");
+    assert!(
+        error.to_string().contains("policy generation is stale"),
+        "{error}"
+    );
+    let mut rest = Vec::new();
+    within(client.read_to_end(&mut rest))
+        .await
+        .expect("client read");
+    assert!(!contains(&rest, b"0\r\n\r\n"), "{rest:?}");
+}
+
+/// A policy reload before the head commits ends the connection without a
+/// response, as a stale policy does before preflight: not even a canonical
+/// failure response is produced under it.
+#[tokio::test]
+async fn a_policy_reload_before_commit_ends_the_connection_without_a_response() {
+    const TEST_POLICY: &str = include_str!("../../../../data/sandbox-policy.rego");
+    let engine =
+        crate::opa::OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("policy");
+    let guard = engine
+        .generation_guard(engine.current_generation())
+        .expect("generation guard");
+    let stage = ResponseStage::new(Behavior::Redact);
+    let Relay {
+        mut upstream,
+        mut client,
+        task,
+    } = start_guarded(&stage, "GET", true, Some(guard));
+    upstream
+        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+        .await
+        .expect("first chunk");
+    within(async {
+        while stage.log.lock().expect("stage log").preflights.is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    engine
+        .reload(TEST_POLICY, "network_policies: {}\n")
+        .expect("policy reload");
+    upstream
+        .write_all(b"5\r\nworld\r\n0\r\n\r\n")
+        .await
+        .expect("rest of the body");
+
+    let error = within(task)
+        .await
+        .expect("join relay")
+        .expect_err("a stale policy ends the connection");
+    assert!(
+        error.to_string().contains("policy generation is stale"),
+        "{error}"
+    );
+    let mut delivered = Vec::new();
+    within(client.read_to_end(&mut delivered))
+        .await
+        .expect("client read");
+    assert!(
+        delivered.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&delivered)
+    );
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::PolicyReload
+    );
+}
+
 const TEST_POLICY: &str = include_str!("../../../../data/sandbox-policy.rego");
 const HOST: &str = "api.example.test";
 const PORT: u16 = 8080;
@@ -1075,4 +1182,233 @@ async fn stream_failure_before_output_starts_returns_502() {
         stage.session_end().await,
         MiddlewareSessionEndReason::MiddlewareFailure
     );
+}
+
+fn event_target() -> HttpRequestTarget {
+    HttpRequestTarget {
+        scheme: "https".into(),
+        host: "api.example.test".into(),
+        port: 443,
+        method: "GET".into(),
+        path: "/v1/data".into(),
+        query: String::new(),
+    }
+}
+
+fn legacy_reports() -> pipeline::LegacyResponseReports {
+    pipeline::LegacyResponseReports {
+        policy_name: "policy".into(),
+        target: event_target(),
+        status_code: 200,
+        failed: Mutex::default(),
+    }
+}
+
+fn legacy_record(
+    outcome: openshell_supervisor_middleware::HttpResponseInvocationOutcome,
+    failure_category: Option<&str>,
+) -> openshell_supervisor_middleware::HttpResponseInvocation {
+    openshell_supervisor_middleware::HttpResponseInvocation {
+        config_name: "guard".into(),
+        implementation: "legacy/guard".into(),
+        outcome,
+        sequence: Some(2),
+        input_size: 5,
+        output_size: None,
+        failed: failure_category.is_some(),
+        stage_disabled: failure_category.is_some(),
+        reason_code: None,
+        failure_category: failure_category.map(Into::into),
+    }
+}
+
+fn stage_invocation(
+    config_name: &str,
+    protocol: Option<openshell_supervisor_middleware::HttpProtocol>,
+    outcome: HttpStageOutcome,
+    failure_reason: Option<&str>,
+) -> openshell_supervisor_middleware::HttpStageInvocation {
+    openshell_supervisor_middleware::HttpStageInvocation {
+        config_name: config_name.into(),
+        implementation: format!("example/{config_name}"),
+        protocol,
+        outcome,
+        input_bytes: 0,
+        output_bytes: None,
+        transformed: false,
+        failed: failure_reason.is_some(),
+        reason_code: None,
+        failure_reason: failure_reason.map(Into::into),
+    }
+}
+
+fn event_values(events: &[openshell_ocsf::OcsfEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .map(|event| serde_json::to_value(event).expect("serialize event"))
+        .collect()
+}
+
+/// HTTP protocol 1 (0.1): one adapter record becomes the 0.1.x events:
+/// the invocation, its `fail_open` or block finding, and the step's findings
+/// under the stage's config name.
+#[test]
+fn legacy_records_become_their_0_1_x_events() {
+    use openshell_supervisor_middleware::HttpResponseInvocationOutcome as Outcome;
+
+    let fail_open = event_values(&pipeline::legacy_response_invocation_events(
+        "policy",
+        &event_target(),
+        200,
+        "guard",
+        &legacy_record(Outcome::FailOpen, Some("timeout")),
+        Vec::new(),
+    ));
+    assert_eq!(fail_open.len(), 2, "{fail_open:#?}");
+    assert_eq!(fail_open[0]["unmapped"]["sequence"], 2);
+    assert_eq!(
+        fail_open[1]["finding_info"]["uid"],
+        "openshell.middleware.http_response_fail_open"
+    );
+    assert_eq!(fail_open[1]["unmapped"]["failure_category"], "timeout");
+
+    let blocked = event_values(&pipeline::legacy_response_invocation_events(
+        "policy",
+        &event_target(),
+        200,
+        "guard",
+        &legacy_record(Outcome::BlockDelivery, None),
+        vec![Finding {
+            r#type: "legacy/guard.finding".into(),
+            label: "match".into(),
+            severity: "high".into(),
+            ..Default::default()
+        }],
+    ));
+    assert_eq!(blocked.len(), 3, "{blocked:#?}");
+    assert_eq!(
+        blocked[1]["finding_info"]["uid"],
+        "openshell.middleware.http_response_blocked"
+    );
+    assert_eq!(blocked[2]["finding_info"]["uid"], "legacy/guard.finding");
+    assert!(blocked[2].to_string().contains("guard"), "{}", blocked[2]);
+}
+
+/// HTTP protocol 1 (0.1): the stage events of a response leave out the
+/// legacy stages whose adapter reported its own records, so nothing is
+/// emitted twice. A legacy failure recorded only by the pipeline, such as an
+/// exhausted session budget, is still emitted, and every `fail_open` finding
+/// keeps the 0.1.x failure category.
+#[test]
+fn stage_events_leave_legacy_records_to_the_adapter() {
+    use openshell_supervisor_middleware::HttpProtocol;
+    use openshell_supervisor_middleware::HttpResponseInvocationOutcome as Outcome;
+
+    let reports = legacy_reports();
+    reports.report(
+        "guard",
+        StageReport::LegacyResponseInvocation {
+            invocation: legacy_record(Outcome::FailClosed, Some("timeout")),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+        },
+    );
+    let diagnostics = HttpStageDiagnostics {
+        invocations: vec![
+            stage_invocation(
+                "guard",
+                Some(HttpProtocol::Legacy),
+                HttpStageOutcome::Stream,
+                None,
+            ),
+            stage_invocation(
+                "guard",
+                Some(HttpProtocol::Legacy),
+                HttpStageOutcome::FailClosed,
+                Some("middleware_timeout"),
+            ),
+            stage_invocation(
+                "saturated",
+                Some(HttpProtocol::Legacy),
+                HttpStageOutcome::FailOpen,
+                Some("middleware_session_capacity_exhausted"),
+            ),
+            stage_invocation(
+                "unbound",
+                None,
+                HttpStageOutcome::FailOpen,
+                Some("binding_not_described"),
+            ),
+            stage_invocation("v2", Some(HttpProtocol::V2), HttpStageOutcome::Reject, None),
+        ],
+        ..Default::default()
+    };
+    let events = event_values(&pipeline::http_response_stage_events(
+        "policy",
+        &event_target(),
+        200,
+        &diagnostics,
+        &reports,
+    ));
+    let invocations: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["unmapped"]["middleware_config"].as_str())
+        .collect();
+    assert_eq!(
+        invocations,
+        ["saturated", "saturated", "unbound", "unbound", "v2", "v2"],
+        "{events:#?}"
+    );
+    let categories: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["finding_info"]["uid"] == "openshell.middleware.http_response_fail_open"
+        })
+        .map(|event| event["unmapped"]["failure_category"].clone())
+        .collect();
+    assert_eq!(categories, ["session_capacity", "invalid_result"]);
+}
+
+/// A response refused for platform capacity reports it as a request does.
+#[test]
+fn exhausted_capacity_is_reported_for_responses() {
+    let preflight = |session_capacity_exhausted, admission_exhausted| {
+        openshell_supervisor_middleware::HttpResponsePipelinePreflight {
+            allowed: false,
+            reason: String::new(),
+            denial: None,
+            headers: Vec::new(),
+            session: None,
+            diagnostics: HttpStageDiagnostics::default(),
+            admission_exhausted,
+            session_capacity_exhausted,
+        }
+    };
+    assert!(
+        pipeline::http_response_capacity_events(
+            "policy",
+            &event_target(),
+            &preflight(false, false)
+        )
+        .is_empty()
+    );
+    for (session, admission, uid) in [
+        (
+            true,
+            false,
+            "openshell.middleware.session_capacity_exhausted",
+        ),
+        (false, true, "openshell.middleware.admission_exhausted"),
+    ] {
+        let events = event_values(&pipeline::http_response_capacity_events(
+            "policy",
+            &event_target(),
+            &preflight(session, admission),
+        ));
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(events[0]["finding_info"]["uid"], uid);
+        let serialized = events[0].to_string();
+        assert!(serialized.contains("http_response"), "{serialized}");
+        assert!(serialized.contains("policy"), "{serialized}");
+    }
 }

@@ -2411,6 +2411,7 @@ fn stage_invocation(name: &str, outcome: HttpStageOutcome) -> HttpStageInvocatio
     HttpStageInvocation {
         config_name: name.into(),
         implementation: format!("test/{name}"),
+        protocol: Some(HttpProtocol::V2),
         outcome,
         input_bytes: 0,
         output_bytes: None,
@@ -2505,8 +2506,11 @@ async fn legacy_chain_deadline_starts_after_a_slow_upload() {
     assert_eq!(output_body(&output), b"earlylate+legacy");
 }
 
+/// Legacy response entries run on the response adapter, which derives the
+/// 0.1.x body-mode offer from the original response head. A response
+/// pipeline without that head cannot run them and fails closed.
 #[tokio::test]
-async fn legacy_response_entries_without_an_adapter_fail_closed_in_the_pipeline() {
+async fn legacy_response_stages_need_the_original_response_head() {
     let runner = legacy_runner(true).await;
     let described = runner
         .describe_http_response_chain(&chain(&["test/small"]))

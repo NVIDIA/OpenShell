@@ -20,8 +20,8 @@
 //! 3. An open-ended response, such as server-sent events, is never offered
 //!    BUFFERED.
 //!
-//! HTTP protocol 1 (0.1): a chain without a version 2 entry still runs on
-//! the legacy response engine, and legacy stages keep 0.1.x eligibility.
+//! HTTP protocol 1 (0.1): legacy entries run as response adapter stages
+//! in chain order with version 2 entries, and keep 0.1.x eligibility.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,17 +174,9 @@ impl HttpResponsePipelineSession {
     }
 }
 
-/// True when a response chain runs on the stage pipeline. Legacy HTTP
-/// protocol (0.1): a chain without a version 2 entry runs on the legacy
-/// response engine until the legacy response cutover.
-#[must_use]
-pub fn http_response_uses_pipeline(described: &[DescribedChainEntry]) -> bool {
-    !hooks::response_chain_uses_legacy_engine(described)
-}
-
 /// Why a response body cannot be inspected at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyRestriction {
+pub enum BodyRestriction {
     /// A HEAD response, or status 1xx, 204, or 304.
     Bodyless,
     /// Status 206, `Content-Range`, or `multipart/byteranges`.
@@ -206,7 +198,7 @@ impl BodyRestriction {
     }
 }
 
-fn body_restriction(input: &HttpResponsePreflightInput) -> Option<BodyRestriction> {
+pub fn body_restriction(input: &HttpResponsePreflightInput) -> Option<BodyRestriction> {
     let headers = |name: &'static str| {
         input
             .headers
@@ -248,7 +240,7 @@ fn body_restriction(input: &HttpResponsePreflightInput) -> Option<BodyRestrictio
 
 /// True for a response with no complete body to buffer, such as server-sent
 /// events.
-fn is_open_ended(input: &HttpResponsePreflightInput) -> bool {
+pub fn is_open_ended(input: &HttpResponsePreflightInput) -> bool {
     input.headers.iter().any(|header| {
         header.name.eq_ignore_ascii_case("content-type")
             && (media_type_is(&header.value, "text/event-stream")
@@ -359,8 +351,29 @@ impl ChainRunner {
                 "response_input_over_capacity",
             ));
         }
+        let session = if described.iter().any(DescribedChainEntry::is_resolved) {
+            match self.try_reserve_middleware_session() {
+                MiddlewareSessionAdmission::Admitted(permit) => Some(permit),
+                MiddlewareSessionAdmission::AtCapacity => {
+                    // The 0.1.x reason, whose fail_open finding category is
+                    // `session_capacity`.
+                    return Ok(HttpResponsePipelinePreflight {
+                        session_capacity_exhausted: true,
+                        ..stage_failures(
+                            &described,
+                            input.headers,
+                            "middleware_session_capacity_exhausted",
+                        )
+                    });
+                }
+            }
+        } else {
+            None
+        };
         // HTTP protocol 1 (0.1): legacy stages keep 0.1.x work
-        // admission for their preflight.
+        // admission, after the session budget as in 0.1.x: one reservation
+        // for the chain's preflight here, and one for each body exchange in
+        // the adapter.
         let _work = if hooks::requires_work_admission(&described) {
             let admission = self.reserve_middleware_work().await?;
             match admission {
@@ -371,19 +384,6 @@ impl ChainRunner {
                         reason: "middleware_failed: admission_exhausted".into(),
                         admission_exhausted: true,
                         ..outcome(input.headers, HttpStageDiagnostics::default())
-                    });
-                }
-            }
-        } else {
-            None
-        };
-        let session = if described.iter().any(DescribedChainEntry::is_resolved) {
-            match self.try_reserve_middleware_session() {
-                MiddlewareSessionAdmission::Admitted(permit) => Some(permit),
-                MiddlewareSessionAdmission::AtCapacity => {
-                    return Ok(HttpResponsePipelinePreflight {
-                        session_capacity_exhausted: true,
-                        ..stage_failures(&described, input.headers, "session_capacity_exhausted")
                     });
                 }
             }
@@ -492,7 +492,7 @@ fn stage_failures(
     outcome(headers, diagnostics)
 }
 
-fn validate_preflight_input(input: &HttpResponsePreflightInput) -> Result<(), ()> {
+pub fn validate_preflight_input(input: &HttpResponsePreflightInput) -> Result<(), ()> {
     if input.context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES
         || input.target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES
         || input.headers.len() > MAX_MIDDLEWARE_HEADERS

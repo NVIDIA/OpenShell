@@ -21,7 +21,7 @@ use http_response::{
     strip_response_integrity_headers,
 };
 pub(crate) use request_body::{
-    LiveRequestFailure, RequestBodyReader, prepare_request_body_stream,
+    LiveRequestFailure, RequestBodyDisconnected, RequestBodyReader, prepare_request_body_stream,
     rebuild_request_for_live_body, rebuild_request_headers_only,
     rebuild_request_with_middleware_body,
 };
@@ -75,7 +75,6 @@ async fn max_middleware_body_bytes() -> usize {
 const RELAY_BUF_SIZE: usize = 8192;
 const MAX_CHUNK_LINE_BYTES: usize = MAX_HEADER_BYTES;
 const MAX_CHUNK_TRAILER_FIELDS: usize = 128;
-const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
     b"HEAD ",
@@ -6959,7 +6958,9 @@ mod tests {
 
         let error = outcome.expect_err("stale stream output must not be delivered");
         assert!(error.to_string().contains("policy generation is stale"));
-        assert!(delivered.ends_with(b"\r\n\r\n"));
+        // The head commits while the first unit is exchanged, so the reload
+        // may land before or after it; no body byte follows either way.
+        assert!(delivered.is_empty() || delivered.ends_with(b"\r\n\r\n"));
         assert!(!delivered.windows(5).any(|window| window == b"HELLO"));
     }
 
@@ -6973,30 +6974,112 @@ mod tests {
         assert!(delivered.is_empty());
     }
 
-    #[tokio::test]
-    async fn response_middleware_whole_body_timeout_obeys_failure_policy() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let (outcome, delivered) = run_response_middleware_relay_with_timeout(
-            response,
+    /// Relay a `Content-Length: 5` response whose body trickles in after
+    /// `delay`, with a whole-body stage under `on_error`.
+    async fn run_trickled_whole_body_relay(
+        on_error: openshell_supervisor_middleware::OnError,
+        whole_body_timeout: std::time::Duration,
+        delay: std::time::Duration,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        let (runner, chain) =
+            response_middleware_fixture_with_error(ResponseRelayScript::WholeBody, on_error);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(async move {
+            upstream_write
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nh")
+                .await
+                .unwrap();
+            for byte in b"ello" {
+                tokio::time::sleep(delay).await;
+                upstream_write.write_all(&[*byte]).await.unwrap();
+            }
+            upstream_write.shutdown().await.unwrap();
+        });
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.whole_body_timeout = whole_body_timeout;
+        let outcome = relay_response(
             "GET",
-            ResponseRelayScript::SlowWholeBody,
-            openshell_supervisor_middleware::OnError::FailOpen,
-            std::time::Duration::from_millis(15),
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(middleware),
         )
         .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
-        assert!(
-            String::from_utf8(delivered)
-                .unwrap()
-                .ends_with("\r\n\r\nhello")
-        );
+        drop(client_write);
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+        (outcome, delivered)
+    }
 
+    /// Body of a delivered response, decoded by the framing its head names.
+    fn delivered_body(delivered: &[u8]) -> Vec<u8> {
+        let head_end = delivered
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("response head")
+            + 4;
+        let head = String::from_utf8_lossy(&delivered[..head_end]).to_ascii_lowercase();
+        let mut wire = &delivered[head_end..];
+        if !head.contains("transfer-encoding: chunked\r\n") {
+            return wire.to_vec();
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = wire
+                .windows(2)
+                .position(|bytes| bytes == b"\r\n")
+                .expect("chunk size line");
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&wire[..line_end]).expect("chunk size"),
+                16,
+            )
+            .expect("chunk size");
+            wire = &wire[line_end + 2..];
+            if size == 0 {
+                return body;
+            }
+            body.extend_from_slice(&wire[..size]);
+            assert_eq!(&wire[size..size + 2], b"\r\n");
+            wire = &wire[size + 2..];
+        }
+    }
+
+    /// Legacy stages keep the 0.1.x split of the whole-body deadline: it
+    /// bounds accumulating the body, and the entry timeout bounds the
+    /// exchange that follows. 0.1.x also bounded that exchange by what was
+    /// left of the whole-body deadline.
+    #[tokio::test]
+    async fn response_middleware_whole_body_exchange_is_bounded_by_the_entry_timeout() {
         let (outcome, delivered) = run_response_middleware_relay_with_timeout(
-            response,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
             "GET",
             ResponseRelayScript::SlowWholeBody,
             openshell_supervisor_middleware::OnError::FailClosed,
             std::time::Duration::from_millis(15),
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert_eq!(delivered_body(&delivered), b"whole:hello");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_whole_body_timeout_obeys_failure_policy() {
+        let timeout = std::time::Duration::from_millis(15);
+        let delay = std::time::Duration::from_millis(10);
+        let (outcome, delivered) = run_trickled_whole_body_relay(
+            openshell_supervisor_middleware::OnError::FailOpen,
+            timeout,
+            delay,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert_eq!(delivered_body(&delivered), b"hello");
+
+        let (outcome, delivered) = run_trickled_whole_body_relay(
+            openshell_supervisor_middleware::OnError::FailClosed,
+            timeout,
+            delay,
         )
         .await;
         assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
@@ -7041,13 +7124,7 @@ mod tests {
         client_read.read_to_end(&mut delivered).await.unwrap();
 
         assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
-        let delivered = String::from_utf8(delivered).unwrap();
-        let (_, body) = delivered.split_once("\r\n\r\n").unwrap();
-        let decoded = collect_chunked_body(&mut tokio::io::empty(), body.as_bytes(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(decoded, b"hello");
-        assert!(!delivered.contains("whole:hello"), "{delivered}");
+        assert_eq!(delivered_body(&delivered), b"hello");
     }
 
     #[tokio::test(start_paused = true)]
@@ -7127,26 +7204,7 @@ mod tests {
             .expect("response relay stalled");
             assert!(outcome.is_ok(), "{outcome:?}");
             assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
-            let head_end = delivered
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let mut wire = &delivered[head_end..];
-            let mut body = Vec::new();
-            loop {
-                let end = wire.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
-                let size =
-                    usize::from_str_radix(std::str::from_utf8(&wire[..end]).unwrap(), 16).unwrap();
-                wire = &wire[end + 2..];
-                if size == 0 {
-                    assert_eq!(wire, b"\r\n");
-                    break;
-                }
-                body.extend_from_slice(&wire[..size]);
-                assert_eq!(&wire[size..size + 2], b"\r\n");
-                wire = &wire[size + 2..];
-            }
+            let body = delivered_body(&delivered);
             let mut expected = vec![b'A'; 2048];
             expected.push(b'B');
             assert_eq!(body, expected, "chunked={chunked}");
@@ -7164,7 +7222,7 @@ mod tests {
         assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
         let delivered = String::from_utf8(delivered).unwrap();
         assert!(delivered.contains("Trailer: x-upstream\r\n"), "{delivered}");
-        assert!(delivered.contains("5\r\nHELLO\r\n"), "{delivered}");
+        assert_eq!(delivered_body(delivered.as_bytes()), b"HELLO");
         assert!(delivered.contains("x-upstream: kept\r\n"), "{delivered}");
         assert!(!delivered.contains("digest:"), "{delivered}");
         assert!(!delivered.contains("ext=yes"), "{delivered}");

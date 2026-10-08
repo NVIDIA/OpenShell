@@ -226,6 +226,17 @@ impl PolicyGenerationGuard {
             }
         }
     }
+
+    /// Resolve with the stale-generation error once the policy generation
+    /// changes. Stays pending if the engine goes away without publishing a
+    /// new generation.
+    pub async fn reloaded(&self) -> miette::Report {
+        self.wait_until_stale().await;
+        match self.ensure_current() {
+            Err(error) => error,
+            Ok(()) => std::future::pending().await,
+        }
+    }
 }
 
 /// Per-tunnel L7 policy evaluator bound to the engine generation captured when
@@ -11432,15 +11443,19 @@ network_policies:
             .expect("replace registry");
         assert!(!engine.take_middleware_reconciliation_request());
 
+        let described = old_runner
+            .describe_http_response_chain(&[ChainEntry {
+                name: "guard".into(),
+                implementation: "test/unimplemented".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: openshell_supervisor_middleware::OnError::FailOpen,
+            }])
+            .await
+            .expect("describe");
         let outcome = old_runner
-            .preflight_http_response(
-                &[ChainEntry {
-                    name: "guard".into(),
-                    implementation: "test/unimplemented".into(),
-                    order: 0,
-                    config: prost_types::Struct::default(),
-                    on_error: openshell_supervisor_middleware::OnError::FailOpen,
-                }],
+            .preflight_http_response_pipeline(
+                described,
                 openshell_supervisor_middleware::HttpResponsePreflightInput {
                     context: openshell_core::proto::RequestContext::default(),
                     target: openshell_core::proto::HttpRequestTarget::default(),
@@ -11449,6 +11464,7 @@ network_policies:
                     headers: Vec::new(),
                     connection_nominated_headers: Vec::new(),
                 },
+                openshell_supervisor_middleware::HttpResponseDelivery::new(true),
             )
             .await
             .expect("preflight");

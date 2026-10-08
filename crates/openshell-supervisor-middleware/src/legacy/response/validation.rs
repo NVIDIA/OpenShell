@@ -1,37 +1,60 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP response middleware protocol and payload validation.
+//! Legacy HTTP response protocol (0.1). Removed in 0.2.0.
+//!
+//! Validation of legacy response results, and the 0.1.x body-mode offer.
 
-use super::*;
+use openshell_core::proto::{
+    Finding, HttpHeader, HttpResponseBodyMode, HttpResponseBodyPassThrough,
+    HttpResponseEventResult, http_response_body_result, http_response_body_skip_remaining,
+    http_response_body_transform, http_response_event_result,
+};
+use prost::Message as _;
 
-pub(in crate::legacy::response) enum BodyAction {
+use crate::response::{HttpResponsePreflightInput, body_restriction, is_open_ended};
+use crate::{
+    DescribedChainEntry, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
+    MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES, MAX_MIDDLEWARE_METADATA_BYTES,
+    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_REASON_BYTES, MAX_MIDDLEWARE_REASON_CODE_BYTES,
+    headers, is_stable_reason_code, is_stale_http_response_integrity_header,
+};
+
+/// Body lifecycle a legacy stage selected at preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StageMode {
+    HeadersOnly,
+    WholeBody,
+    Stream,
+}
+
+pub(super) enum BodyAction {
     PassThrough,
     Transform(Vec<u8>),
     BlockDelivery,
     SkipRemaining(CurrentBodyAction),
 }
 
-pub(in crate::legacy::response) enum CurrentBodyAction {
+pub(super) enum CurrentBodyAction {
     PassThrough,
     Transform(Vec<u8>),
 }
 
-pub(in crate::legacy::response) struct BodyDecision {
-    pub(in crate::legacy::response) action: BodyAction,
-    pub(in crate::legacy::response) reason_code: String,
-    pub(in crate::legacy::response) findings: Vec<Finding>,
-    pub(in crate::legacy::response) metadata: std::collections::HashMap<String, String>,
+pub(super) struct BodyDecision {
+    pub(super) action: BodyAction,
+    pub(super) reason_code: String,
+    pub(super) findings: Vec<Finding>,
+    pub(super) metadata: std::collections::HashMap<String, String>,
 }
 
-pub(in crate::legacy::response) struct TrailersDecision {
-    pub(in crate::legacy::response) headers: Vec<HttpHeader>,
-    pub(in crate::legacy::response) reason_code: String,
-    pub(in crate::legacy::response) findings: Vec<Finding>,
-    pub(in crate::legacy::response) metadata: std::collections::HashMap<String, String>,
+pub(super) struct TrailersDecision {
+    pub(super) headers: Vec<HttpHeader>,
+    pub(super) reason_code: String,
+    pub(super) findings: Vec<Finding>,
+    pub(super) metadata: std::collections::HashMap<String, String>,
 }
 
-pub(in crate::legacy::response) fn validate_trailers_result(
+pub(super) fn validate_trailers_result(
     result: HttpResponseEventResult,
     trailers: &[HttpHeader],
     entry: &DescribedChainEntry,
@@ -83,13 +106,13 @@ pub(in crate::legacy::response) fn validate_trailers_result(
     })
 }
 
-pub(in crate::legacy::response) fn encoded_header_bytes(headers: &[HttpHeader]) -> usize {
+pub(super) fn encoded_header_bytes(headers: &[HttpHeader]) -> usize {
     headers.iter().fold(0usize, |total, header| {
         total.saturating_add(header.encoded_len())
     })
 }
 
-pub(in crate::legacy::response) fn validate_body_result(
+pub(super) fn validate_body_result(
     result: HttpResponseEventResult,
     sequence: u64,
     max_payload_bytes: usize,
@@ -152,7 +175,7 @@ fn validate_replacement(
     Ok(replacement)
 }
 
-pub(in crate::legacy::response) fn validate_inspect(
+pub(super) fn validate_inspect(
     entry: &DescribedChainEntry,
     inspect: &openshell_core::proto::HttpResponsePreflightInspect,
     permitted_modes: &[i32],
@@ -186,30 +209,7 @@ pub(in crate::legacy::response) fn validate_inspect(
     Ok(mode)
 }
 
-pub(in crate::legacy::response) fn validate_preflight_input(
-    input: &HttpResponsePreflightInput,
-) -> miette::Result<()> {
-    if input.context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
-        return Err(miette::miette!("response context exceeds platform limit"));
-    }
-    if input.target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES {
-        return Err(miette::miette!("response target exceeds platform limit"));
-    }
-    if input.headers.len() > MAX_MIDDLEWARE_HEADERS {
-        return Err(miette::miette!(
-            "response header count exceeds platform limit"
-        ));
-    }
-    if input.headers.iter().fold(0usize, |total, header| {
-        total.saturating_add(header.encoded_len())
-    }) > MAX_MIDDLEWARE_HEADER_BYTES
-    {
-        return Err(miette::miette!("response headers exceed platform limit"));
-    }
-    Ok(())
-}
-
-pub(in crate::legacy::response) fn validate_diagnostics(
+pub(super) fn validate_diagnostics(
     reason: &str,
     reason_code: &str,
     findings: &[Finding],
@@ -245,67 +245,21 @@ pub(in crate::legacy::response) fn validate_diagnostics(
     Ok(())
 }
 
-pub(in crate::legacy::response) fn body_restriction(
-    input: &HttpResponsePreflightInput,
-) -> Option<String> {
-    if input.target.method.eq_ignore_ascii_case("HEAD")
-        || input.status_code == 204
-        || input.status_code == 304
-    {
-        return Some("bodyless_response".into());
-    }
-    if input.status_code == 206
-        || input
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("content-range"))
-        || input.headers.iter().any(|header| {
-            header.name.eq_ignore_ascii_case("content-type")
-                && header
-                    .value
-                    .split(';')
-                    .next()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/byteranges"))
-        })
-    {
-        return Some("unsupported_partial_response".into());
-    }
-    if input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("cache-control")
-            && header.value.split(',').any(|directive| {
-                directive
-                    .split('=')
-                    .next()
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("no-transform"))
-            })
-    }) {
-        return Some("response_no_transform".into());
-    }
-    if input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("content-encoding")
-            && header
-                .value
-                .split(',')
-                .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
-    }) {
-        return Some("unsupported_content_encoding".into());
-    }
-    None
-}
-
-pub(in crate::legacy::response) fn permitted_body_modes(
+/// Body modes 0.1.x offered a stage: `HEADERS_ONLY` always, and unless the
+/// response body cannot be inspected, `WHOLE_BODY_BYTES` for a closed-ended
+/// body within the stage limit and `STREAM_BYTES` for a non-zero limit.
+pub(super) fn permitted_body_modes(
     input: &HttpResponsePreflightInput,
     entry: &DescribedChainEntry,
-    body_restriction: Option<&str>,
 ) -> Vec<i32> {
     let mut modes = vec![HttpResponseBodyMode::HeadersOnly as i32];
-    if body_restriction.is_some() {
+    if body_restriction(input).is_some() {
         return modes;
     }
     if input
         .declared_body_length
         .is_none_or(|length| length <= entry.max_payload_bytes as u64)
-        && !is_open_ended_response(input)
+        && !is_open_ended(input)
     {
         modes.push(HttpResponseBodyMode::WholeBodyBytes as i32);
     }
@@ -315,18 +269,55 @@ pub(in crate::legacy::response) fn permitted_body_modes(
     modes
 }
 
-fn is_open_ended_response(input: &HttpResponsePreflightInput) -> bool {
-    input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("content-type")
-            && matches!(
-                header.value.split(';').next().map(str::trim),
-                Some(value)
-                    if value.eq_ignore_ascii_case("text/event-stream")
-                        || value.eq_ignore_ascii_case("multipart/x-mixed-replace")
-            )
-    })
+pub(super) fn strip_stale_integrity(headers: &mut Vec<HttpHeader>) {
+    headers.retain(|header| !is_stale_http_response_integrity_header(&header.name));
 }
 
-pub(in crate::legacy::response) fn strip_stale_integrity(headers: &mut Vec<HttpHeader>) {
-    headers.retain(|header| !is_stale_http_response_integrity_header(&header.name));
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{ChainEntry, OnError};
+
+    fn input() -> HttpResponsePreflightInput {
+        HttpResponsePreflightInput {
+            context: openshell_core::proto::RequestContext::default(),
+            target: openshell_core::proto::HttpRequestTarget {
+                method: "GET".into(),
+                ..Default::default()
+            },
+            status_code: 200,
+            declared_body_length: None,
+            headers: vec![HttpHeader {
+                name: "content-type".into(),
+                value: "text/plain".into(),
+            }],
+            connection_nominated_headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stream_mode_requires_only_one_byte_of_payload_capacity() {
+        let mut described = DescribedChainEntry {
+            entry: ChainEntry {
+                name: "response".into(),
+                implementation: "test/response".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            service: None,
+            binding: None,
+            max_payload_bytes: 1,
+            timeout: Duration::from_millis(500),
+        };
+
+        let modes = permitted_body_modes(&input(), &described);
+        assert!(modes.contains(&(HttpResponseBodyMode::StreamBytes as i32)));
+
+        described.max_payload_bytes = 0;
+        let modes = permitted_body_modes(&input(), &described);
+        assert!(!modes.contains(&(HttpResponseBodyMode::StreamBytes as i32)));
+    }
 }

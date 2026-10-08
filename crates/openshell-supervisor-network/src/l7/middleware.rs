@@ -17,14 +17,19 @@ use openshell_supervisor_middleware::{
     HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
-/// How long the sandbox may stop sending a request body while a STREAM
-/// request middleware session is held. STREAM has no total deadline, so this
-/// bounds a paused upload; it matches the WebSocket message-assembly limit.
+/// How long the sandbox may stop sending a request body while a request
+/// middleware session is held. A held session occupies one of the
+/// supervisor's middleware sessions, and neither STREAM nor a legacy request
+/// stage bounds the upload in total, so this bounds a paused upload. Only
+/// gaps without client bytes count, so a slow upload that keeps sending is
+/// not cut off. It matches the WebSocket message-assembly limit.
+///
+/// HTTP protocol 1 (0.1): 0.1.x had no such limit, so a stalled upload
+/// to a legacy request stage held its work slot until the client went away.
 pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum MiddlewareApplyResult {
@@ -448,23 +453,41 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
 }
 
 fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, operation: &str) {
-    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    ocsf_emit!(middleware_session_capacity_exhausted_event(
+        &ctx.policy_name,
+        &ctx.host,
+        operation
+    ));
+}
+
+/// Every persistent middleware session of the supervisor was in use.
+pub(super) fn middleware_session_capacity_exhausted_event(
+    policy: &str,
+    host: &str,
+    operation: &str,
+) -> openshell_ocsf::OcsfEvent {
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
             "openshell.middleware.session_capacity_exhausted",
             "Supervisor middleware session capacity exhausted",
         ))
-        .evidence_pairs(&[
-            ("policy", ctx.policy_name.as_str()),
-            ("host", ctx.host.as_str()),
-            ("operation", operation),
-        ])
+        .evidence_pairs(&[("policy", policy), ("host", host), ("operation", operation)])
         .message("Persistent middleware session admission was refused at process capacity")
-        .build();
-    ocsf_emit!(event);
+        .build()
 }
 
-fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+/// The shared middleware work queue was full, so the HTTP message in
+/// `direction` was shed.
+pub(super) fn middleware_admission_exhausted_event(
+    policy: &str,
+    host: &str,
+    direction: openshell_supervisor_middleware::HttpDirection,
+) -> openshell_ocsf::OcsfEvent {
+    let message = match direction {
+        openshell_supervisor_middleware::HttpDirection::Request => "HTTP request",
+        openshell_supervisor_middleware::HttpDirection::Response => "HTTP response",
+    };
     DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -472,17 +495,23 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
             "Supervisor middleware admission exhausted",
         ))
         .evidence_pairs(&[
-            ("policy", ctx.policy_name.as_str()),
-            ("host", ctx.host.as_str()),
-            ("operation", "http_request"),
+            ("policy", policy),
+            ("host", host),
+            ("operation", direction.as_str()),
             ("disposition", "shed"),
         ])
-        .message("HTTP request shed because middleware work admission was exhausted")
+        .message(format!(
+            "{message} shed because middleware work admission was exhausted"
+        ))
         .build()
 }
 
 fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    ocsf_emit!(middleware_admission_exhausted_event(ctx));
+    ocsf_emit!(middleware_admission_exhausted_event(
+        &ctx.policy_name,
+        &ctx.host,
+        openshell_supervisor_middleware::HttpDirection::Request
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -695,7 +724,6 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         });
     }
 
-    let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
     let (output, mut outputs) = mpsc::channel(4);
     let collect = async move {
         let mut late = Vec::new();
@@ -723,9 +751,10 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         &mut reader,
         client,
         generation_guard,
-        progress,
+        REQUEST_CLIENT_PROGRESS_TIMEOUT,
         output,
         transformed_body_policy,
+        std::future::pending(),
     );
     let (result, collected) = tokio::join!(run, collect);
     let (mut finish, (late, body)) = match (result, collected) {
@@ -813,41 +842,80 @@ enum BodyRunError {
     Middleware(HttpMiddlewareFailure),
     /// The sandbox sent no body bytes for [`REQUEST_CLIENT_PROGRESS_TIMEOUT`].
     ClientTimeout,
-    /// Reading the client failed, or the policy generation changed.
+    /// Reading the client failed.
     Client(miette::Report),
+    /// The policy generation changed. The connection closes without a
+    /// response.
+    PolicyReload(miette::Report),
 }
 
-/// Feed a request body to `session` while it runs. Dropping the future
-/// cancels every stage.
+/// Feed a request body to `session` while it runs, ending the stages with
+/// the reason `abort` resolves to if it resolves first, with
+/// `POLICY_RELOAD` as soon as the policy generation changes, or with the
+/// reason reading the client failed for. Dropping the future cancels every
+/// stage.
+#[allow(clippy::too_many_arguments)]
 async fn run_request_body<C: AsyncRead + Unpin>(
     session: HttpRequestSession,
     reader: &mut crate::l7::rest::RequestBodyReader,
     client: &mut C,
     generation_guard: &PolicyGenerationGuard,
-    progress: Option<Duration>,
+    progress: Duration,
     output: mpsc::Sender<HttpBodyOutput>,
     body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    abort: impl Future<Output = MiddlewareSessionEndReason>,
 ) -> std::result::Result<HttpPipelineFinish, BodyRunError> {
     let limit = session.input_unit_limit();
     let (input, inputs) = mpsc::channel(4);
-    let run = async {
-        session
-            .run_with_body_policy(inputs, output, body_policy)
-            .await
-            .map_err(BodyRunError::Middleware)
+    let (client_failed, client_failure) = oneshot::channel();
+    let abort = async {
+        tokio::select! {
+            reason = abort => reason,
+            reason = policy_reload(generation_guard) => reason,
+            Ok(reason) = client_failure => reason,
+        }
     };
-    let feed = feed_request_body(reader, client, generation_guard, limit, progress, input);
-    let (finish, ()) = tokio::try_join!(run, feed)?;
-    Ok(finish)
+    let mut run = std::pin::pin!(session.run_until(inputs, output, body_policy, abort));
+    let feed = feed_request_body(
+        reader,
+        client,
+        generation_guard,
+        limit,
+        progress,
+        input,
+        client_failed,
+    );
+    let (run_result, feed_result) = tokio::select! {
+        biased;
+        // The stages stopped; the rest of the body is not needed.
+        finish = &mut run => (finish, Ok(())),
+        // Once the body is fed, or cannot be, the stages end on their own.
+        result = feed => (run.await, result),
+    };
+    match (run_result, feed_result) {
+        (Ok(finish), Ok(())) => Ok(finish),
+        // The reload, not the input it cut short, ended the run.
+        _ if generation_guard.is_stale() => Err(BodyRunError::PolicyReload(
+            generation_guard
+                .ensure_current()
+                .expect_err("a stale guard fails its check"),
+        )),
+        (_, Err(error)) => Err(error),
+        (Err(failure), Ok(())) => Err(BodyRunError::Middleware(failure)),
+    }
 }
 
+/// Feed the client's body to the pipeline `input`. When reading the client
+/// fails, `client_failed` receives the stages' end reason before the input
+/// closes, so they end with it rather than for their missing input.
 async fn feed_request_body<C: AsyncRead + Unpin>(
     reader: &mut crate::l7::rest::RequestBodyReader,
     client: &mut C,
     generation_guard: &PolicyGenerationGuard,
     limit: usize,
-    progress: Option<Duration>,
+    progress: Duration,
     input: mpsc::Sender<HttpBodyInput>,
+    client_failed: oneshot::Sender<MiddlewareSessionEndReason>,
 ) -> std::result::Result<(), BodyRunError> {
     let mut client = ClientProgress::new(client, progress);
     loop {
@@ -858,7 +926,13 @@ async fn feed_request_body<C: AsyncRead + Unpin>(
         {
             Ok(unit) => unit,
             Err(_) if client.timed_out => return Err(BodyRunError::ClientTimeout),
-            Err(error) => return Err(BodyRunError::Client(error)),
+            Err(error) if generation_guard.is_stale() => {
+                return Err(BodyRunError::PolicyReload(error));
+            }
+            Err(error) => {
+                let _ = client_failed.send(client_failure_reason(&error));
+                return Err(BodyRunError::Client(error));
+            }
         };
         let Some(unit) = unit else {
             break;
@@ -876,19 +950,47 @@ async fn feed_request_body<C: AsyncRead + Unpin>(
     Ok(())
 }
 
+/// `DOWNSTREAM_DISCONNECT` when the client's connection closed or failed
+/// before its body ended, and `PROTOCOL_ERROR` when its body framing is
+/// malformed.
+fn client_failure_reason(error: &miette::Report) -> MiddlewareSessionEndReason {
+    if error
+        .downcast_ref::<crate::l7::rest::RequestBodyDisconnected>()
+        .is_some()
+    {
+        MiddlewareSessionEndReason::DownstreamDisconnect
+    } else {
+        MiddlewareSessionEndReason::ProtocolError
+    }
+}
+
+/// Resolves with `POLICY_RELOAD` once the policy generation changes.
+async fn policy_reload(generation_guard: &PolicyGenerationGuard) -> MiddlewareSessionEndReason {
+    generation_guard.reloaded().await;
+    MiddlewareSessionEndReason::PolicyReload
+}
+
+/// Resolves with `UPSTREAM_FAILURE` once writing to the upstream fails.
+async fn upstream_failure(mut failed: watch::Receiver<bool>) -> MiddlewareSessionEndReason {
+    if failed.wait_for(|failed| *failed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    MiddlewareSessionEndReason::UpstreamFailure
+}
+
 /// Client reader that fails when the sandbox sends nothing for `idle` while
 /// the reader waits for it. Time spent not reading, such as under middleware
 /// backpressure, does not count.
 struct ClientProgress<'a, C> {
     inner: &'a mut C,
-    idle: Option<Duration>,
+    idle: Duration,
     deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
     waiting: bool,
     timed_out: bool,
 }
 
 impl<'a, C> ClientProgress<'a, C> {
-    fn new(inner: &'a mut C, idle: Option<Duration>) -> Self {
+    fn new(inner: &'a mut C, idle: Duration) -> Self {
         Self {
             inner,
             idle,
@@ -916,14 +1018,11 @@ impl<C: AsyncRead + Unpin> AsyncRead for ClientProgress<'_, C> {
             this.waiting = false;
             return result;
         }
-        let Some(idle) = this.idle else {
-            return result;
-        };
         if !this.waiting {
             this.waiting = true;
             this.deadline
                 .as_mut()
-                .reset(tokio::time::Instant::now() + idle);
+                .reset(tokio::time::Instant::now() + this.idle);
         }
         if this.deadline.as_mut().poll(cx).is_ready() {
             this.timed_out = true;
@@ -1011,6 +1110,15 @@ impl RequestEvents {
                 );
                 Err(error)
             }
+            BodyRunError::PolicyReload(error) => {
+                self.emit(
+                    false,
+                    "middleware_cancelled: policy_reload",
+                    None,
+                    HttpStageDiagnostics::default(),
+                );
+                Err(error)
+            }
         }
     }
 }
@@ -1049,27 +1157,26 @@ impl RequestBodyStream {
     /// `output`. A middleware failure or client timeout is a
     /// [`crate::l7::rest::LiveRequestFailure`]. The caller sets
     /// `upstream_failed` before it stops reading `output` because writing to
-    /// the upstream failed, so the stages' cancellation is recorded with that
-    /// reason.
+    /// the upstream failed, so the stages end with `UPSTREAM_FAILURE`.
     pub(crate) async fn run_to<C: AsyncRead + Unpin>(
         &mut self,
         client: &mut C,
         output: mpsc::Sender<HttpBodyOutput>,
-        upstream_failed: &AtomicBool,
+        upstream_failed: &watch::Sender<bool>,
     ) -> Result<HttpPipelineFinish> {
         let session = self
             .session
             .take()
             .ok_or_else(|| miette!("request middleware body already ran"))?;
-        let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
         let error = match run_request_body(
             session,
             &mut self.reader,
             client,
             &self.generation_guard,
-            progress,
+            REQUEST_CLIENT_PROGRESS_TIMEOUT,
             output,
             openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            upstream_failure(upstream_failed.subscribe()),
         )
         .await
         {
@@ -1082,8 +1189,7 @@ impl RequestBodyStream {
         };
         let error = match error {
             BodyRunError::Middleware(failure)
-                if failure.end_reason == MiddlewareSessionEndReason::Cancellation
-                    && upstream_failed.load(Ordering::Acquire) =>
+                if failure.end_reason == MiddlewareSessionEndReason::UpstreamFailure =>
             {
                 self.events.emit(
                     false,
@@ -1101,7 +1207,7 @@ impl RequestBodyStream {
                 denial: failure.denial.clone(),
             },
             BodyRunError::ClientTimeout => crate::l7::rest::LiveRequestFailure::ClientTimeout,
-            BodyRunError::Client(_) => {
+            BodyRunError::Client(_) | BodyRunError::PolicyReload(_) => {
                 return self.events.body_failed(error).map(|_| unreachable!());
             }
         };
@@ -1481,8 +1587,12 @@ mod tests {
             ..Default::default()
         };
 
-        let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
-            .expect("serialize admission event");
+        let serialized = serde_json::to_string(&middleware_admission_exhausted_event(
+            &ctx.policy_name,
+            &ctx.host,
+            openshell_supervisor_middleware::HttpDirection::Request,
+        ))
+        .expect("serialize admission event");
         assert!(serialized.contains("openshell.middleware.admission_exhausted"));
         assert!(serialized.contains("api-policy"));
         assert!(serialized.contains("api.example.test"));
@@ -1852,6 +1962,7 @@ mod request_event_tests {
         HttpStageInvocation {
             config_name: config_name.into(),
             implementation: format!("example/{config_name}"),
+            protocol: Some(openshell_supervisor_middleware::HttpProtocol::V2),
             outcome,
             input_bytes: 0,
             output_bytes: None,

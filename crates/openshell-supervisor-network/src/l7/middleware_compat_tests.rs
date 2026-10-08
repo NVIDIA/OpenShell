@@ -429,6 +429,96 @@ async fn sse_through_stream_bytes_is_delivered_incrementally() {
         .expect("relay result");
 }
 
+struct OcsfCapture(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OcsfCapture {
+    fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(event) = openshell_ocsf::tracing_layers::clone_current_event() {
+            self.0
+                .lock()
+                .expect("events")
+                .push(serde_json::to_value(&event).expect("serialize event"));
+        }
+    }
+}
+
+/// Every 0.1.x invocation record of a legacy stream stage reaches OCSF once,
+/// with its body unit sequence, as 0.1.x emitted it: the selected mode, each
+/// unit, the empty final unit, and the trailers. The stage pipeline's own
+/// records of the stage are left out.
+#[tokio::test]
+async fn legacy_stream_invocations_are_emitted_once_per_record() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const CHILD: &str = "OPENSHELL_TEST_LEGACY_RESPONSE_EVENTS_CHILD";
+    // Tracing callsite interest is process-wide, so concurrent tests with
+    // other subscribers can disable this thread's capture. Run in an isolated
+    // test process.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "l7::middleware_compat_tests::legacy_stream_invocations_are_emitted_once_per_record",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(OcsfCapture(std::sync::Arc::clone(&events))),
+    );
+    let (_fixture, supervisor) = stream_guard(uppercase_units, "fail_closed").await;
+    let exchange = supervisor
+        .exchange(
+            b"GET /v1/events HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n",
+        )
+        .await;
+    assert!(exchange.relay.is_ok(), "{:?}", exchange.relay);
+    assert_eq!(dechunk(body_of(&exchange.client)), b"ONETWO");
+
+    let events = events.lock().expect("events");
+    let records: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("HTTP_RESPONSE_MIDDLEWARE"))
+        })
+        .map(|event| {
+            (
+                event["unmapped"]["response_middleware_outcome"]
+                    .as_str()
+                    .expect("outcome")
+                    .to_string(),
+                event["unmapped"]["sequence"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        records,
+        [
+            ("stream", Some(0)),
+            ("transform", Some(1)),
+            ("transform", Some(2)),
+            ("passthrough", Some(3)),
+            ("trailers", Some(0)),
+        ]
+        .map(|(outcome, sequence)| (outcome.to_string(), sequence)),
+        "{events:#?}"
+    );
+}
+
 /// An HTTP/1.0 upstream has no chunked framing, so 0.1.x streams the
 /// transformed body close-delimited with `Connection: close`. A failure after
 /// commit is indistinguishable from the end of the body for this client.

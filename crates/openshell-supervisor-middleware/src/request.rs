@@ -127,6 +127,22 @@ impl HttpRequestSession {
             .await
     }
 
+    /// [`Self::run_with_body_policy`], ending the exchange when `abort`
+    /// resolves first, as when the upstream stops accepting the body: every
+    /// open stage receives the returned reason, and the run fails with
+    /// `middleware_cancelled`.
+    pub async fn run_until(
+        self,
+        input: mpsc::Receiver<HttpBodyInput>,
+        output: mpsc::Sender<HttpBodyOutput>,
+        body_policy: TransformedBodyPolicy<'_>,
+        abort: impl Future<Output = MiddlewareSessionEndReason>,
+    ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
+        self.pipeline
+            .run_with_body_policy_until(input, output, body_policy, abort)
+            .await
+    }
+
     /// End every stage without sending the body.
     pub async fn end(self, reason: MiddlewareSessionEndReason) {
         self.pipeline.end(reason).await;

@@ -730,6 +730,217 @@ async fn silent_client_mid_upload_gets_408_and_cancels_the_stages() {
     relay.await.expect("relay task").expect("relay");
 }
 
+/// Stages whose input stops because the client's connection closed end with
+/// `DOWNSTREAM_DISCONNECT`, and with `PROTOCOL_ERROR` when the client's body
+/// framing is malformed.
+#[tokio::test]
+async fn client_read_failures_end_the_stages_with_their_cause() {
+    for (framing, body, expected) in [
+        (
+            "Content-Length: 10",
+            &b"hello"[..],
+            MiddlewareSessionEndReason::DownstreamDisconnect,
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            &b"5\r\nhello\r\n"[..],
+            MiddlewareSessionEndReason::DownstreamDisconnect,
+        ),
+        (
+            "Transfer-Encoding: chunked",
+            &b"5\r\nhello\r\nzz\r\n"[..],
+            MiddlewareSessionEndReason::ProtocolError,
+        ),
+    ] {
+        let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
+        let supervisor = Supervisor::with_stages(std::slice::from_ref(&stage)).await;
+        let Tunnel {
+            mut app,
+            upstream: _upstream,
+            relay,
+        } = supervisor.connect();
+        app.write_all(
+            format!("POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\n{framing}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("head");
+        app.write_all(body).await.expect("partial body");
+        app.shutdown().await.expect("client half-close");
+
+        assert_eq!(stage.session_end().await, expected, "{framing} {body:?}");
+        let _ = within(relay).await.expect("relay task");
+    }
+}
+
+/// A policy reload while request middleware streams a body ends every stage
+/// with `POLICY_RELOAD` at once, without waiting for more of the body, and
+/// closes the connection without a response.
+#[tokio::test]
+async fn a_policy_reload_mid_upload_ends_the_stages_with_policy_reload() {
+    let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
+    let supervisor = Supervisor::with_stages(std::slice::from_ref(&stage)).await;
+    let Tunnel {
+        mut app,
+        mut upstream,
+        relay,
+    } = supervisor.connect();
+    app.write_all(
+        b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 10\r\n\r\nhello",
+    )
+    .await
+    .expect("partial request");
+    read_head(&mut upstream).await;
+    assert_eq!(
+        read_chunk(&mut upstream).await.as_deref(),
+        Some(&b"hello!"[..])
+    );
+
+    supervisor
+        .engine
+        .reload(TEST_POLICY, &policy_yaml(&["test/append"]))
+        .expect("policy reload");
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::PolicyReload
+    );
+    let _ = within(relay).await.expect("relay task");
+    let mut response = Vec::new();
+    within(app.read_to_end(&mut response))
+        .await
+        .expect("client EOF");
+    assert!(
+        response.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let mut rest = Vec::new();
+    within(upstream.read_to_end(&mut rest))
+        .await
+        .expect("upstream EOF");
+    assert!(
+        rest.is_empty(),
+        "upstream received {rest:?} after the reload"
+    );
+}
+
+/// HTTP protocol 1 (0.1): request middleware that allows every request.
+struct LegacyAllow;
+
+#[tonic::async_trait]
+impl InProcessMiddleware for LegacyAllow {
+    async fn describe(&self) -> MiddlewareManifest {
+        MiddlewareManifest {
+            name: "test/legacy".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 1024,
+                ..Default::default()
+            }],
+            expected_audience: String::new(),
+            extension: Some(extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "test/legacy",
+                "test",
+                [],
+            )),
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        _middleware_name: &str,
+        _config: &prost_types::Struct,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: HttpRequestView<'_>,
+    ) -> miette::Result<HttpRequestResult> {
+        Ok(HttpRequestResult {
+            decision: Decision::Allow as i32,
+            ..Default::default()
+        })
+    }
+}
+
+/// A request middleware session holds one of the supervisor's sessions, so
+/// a silent client gets the 408 whatever the stages selected: a version 2
+/// BUFFERED stage, or legacy stages, whose adapter buffers the body. 0.1.x
+/// put no limit on a stalled upload to legacy stages, which held a work
+/// slot until the client went away. The stalled request releases both.
+#[tokio::test(start_paused = true)]
+async fn silent_client_of_a_buffering_chain_gets_408_and_releases_its_slots() {
+    let services: [(Arc<dyn InProcessMiddleware>, &str); 2] = [
+        (
+            Arc::new(RequestStage::new("test/whole", Mode::WholeBodyAppend)),
+            "test/whole",
+        ),
+        (Arc::new(LegacyAllow), "test/legacy"),
+    ];
+    for (service, name) in services {
+        let supervisor = Supervisor::start(vec![service], &[name]).await;
+        let Tunnel {
+            mut app,
+            mut upstream,
+            relay,
+        } = supervisor.connect();
+        let started = tokio::time::Instant::now();
+        app.write_all(
+            b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 10\r\n\r\nhello",
+        )
+        .await
+        .expect("partial request");
+
+        let response = tokio::time::timeout(
+            crate::l7::middleware::REQUEST_CLIENT_PROGRESS_TIMEOUT + IO_TIMEOUT,
+            read_response(&mut app),
+        )
+        .await
+        .expect("the stalled upload times out");
+        assert!(
+            response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+            "{name}: {response}"
+        );
+        assert!(
+            started.elapsed() >= crate::l7::middleware::REQUEST_CLIENT_PROGRESS_TIMEOUT,
+            "{name}"
+        );
+        relay.await.expect("relay task").expect("relay");
+        let mut forwarded = Vec::new();
+        upstream
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("upstream EOF");
+        assert!(forwarded.is_empty(), "{name}: nothing reaches upstream");
+
+        let runner = supervisor
+            .engine
+            .middleware_runner()
+            .expect("installed middleware runner");
+        let mut work = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
+            let mut reserve = Box::pin(runner.reserve_middleware_work());
+            match futures::poll!(reserve.as_mut()) {
+                std::task::Poll::Ready(Ok(
+                    openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
+                        admission,
+                    ),
+                )) if !admission.saturated() => work.push(admission),
+                _ => panic!("{name}: the stalled request still holds a work slot"),
+            }
+        }
+        assert_eq!(
+            work.len(),
+            openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn silent_client_on_a_withheld_stream_body_gets_408() {
     let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
@@ -980,6 +1191,48 @@ async fn stream_rejection_before_any_response_returns_the_denial() {
         stage.session_end().await,
         MiddlewareSessionEndReason::MiddlewareDenial
     );
+}
+
+/// Each stage's late mutations are held to the per-stage limits on their
+/// own. Together they may exceed them: the third stage's head and the
+/// upstream head carry every earlier stage's late mutations.
+#[tokio::test]
+async fn late_mutations_of_every_stage_reach_upstream_beyond_one_stages_limit() {
+    let writes = |stage: &str| -> Vec<HeaderMutation> {
+        (0..40)
+            .map(|index| write(&format!("x-{stage}-{index}"), "1"))
+            .collect()
+    };
+    for mode in [Mode::AppendPerChunk, Mode::WholeBodyAppend] {
+        let stages = ["test/first", "test/second", "test/third"]
+            .map(|name| RequestStage::new(name, mode).late(writes(&name[5..])));
+        let supervisor = Supervisor::with_stages(&stages).await;
+        let Tunnel {
+            mut app,
+            mut upstream,
+            relay,
+        } = supervisor.connect();
+        app.write_all(
+            b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .await
+        .expect("request");
+
+        let head = within(read_head(&mut upstream)).await;
+        assert_eq!(
+            head.lines().filter(|line| line.starts_with("x-")).count(),
+            120,
+            "{mode:?}: {head}"
+        );
+        upstream.write_all(NO_CONTENT).await.expect("response");
+        assert!(
+            within(read_response(&mut app))
+                .await
+                .starts_with("HTTP/1.1 204"),
+            "{mode:?}"
+        );
+        within(relay).await.expect("relay task").expect("relay");
+    }
 }
 
 #[tokio::test]
@@ -1257,6 +1510,95 @@ async fn early_upstream_answer_survives_a_failed_body_write() {
     within(relay).await.expect("relay task").expect("relay");
 }
 
+/// Upstream connection whose writes fail once `failing` is set, while its
+/// read side stays open, as when the upstream stops accepting a body before
+/// it answers.
+struct FailingWrites {
+    inner: DuplexStream,
+    failing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for FailingWrites {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FailingWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.failing.load(std::sync::atomic::Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Stages still running when writing the body to the upstream fails end with
+/// `UPSTREAM_FAILURE`, not as a cancellation.
+#[tokio::test]
+async fn a_failed_body_write_ends_running_stages_with_upstream_failure() {
+    let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
+    let supervisor = Supervisor::with_stages(std::slice::from_ref(&stage)).await;
+    let (config, tunnel, ctx) = supervisor.tunnel();
+    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+    let (relay_upstream, mut upstream) = tokio::io::duplex(8192);
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut relay_upstream = FailingWrites {
+        inner: relay_upstream,
+        failing: Arc::clone(&failing),
+    };
+    let relay = tokio::spawn(async move {
+        relay_with_inspection(
+            &config,
+            tunnel,
+            &mut relay_client,
+            &mut relay_upstream,
+            &ctx,
+        )
+        .await
+    });
+    app.write_all(
+        b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 4096\r\n\r\nhello",
+    )
+    .await
+    .expect("partial request");
+    within(read_head(&mut upstream)).await;
+    assert_eq!(
+        within(read_chunk(&mut upstream)).await.as_deref(),
+        Some(b"hello!".as_slice())
+    );
+    failing.store(true, std::sync::atomic::Ordering::Release);
+    app.write_all(b"world").await.expect("more of the body");
+
+    assert_eq!(
+        stage.session_end().await,
+        MiddlewareSessionEndReason::UpstreamFailure
+    );
+    relay.abort();
+}
+
 /// A client that sends its whole body before it reads the answer still gets
 /// an early answer larger than the connection buffers: the relay keeps
 /// reading and discarding the body while it delivers the answer.
@@ -1309,16 +1651,25 @@ async fn early_upstream_answer_reaches_a_client_still_sending_its_body() {
     within(relay).await.expect("relay task").expect("relay");
 }
 
-/// Stages cancelled because the upstream stopped accepting the body are
-/// recorded with that reason rather than as a closed pipeline output.
+/// Stages cancelled because the upstream stopped accepting the body end with
+/// `UPSTREAM_FAILURE` and are recorded with that reason rather than as a
+/// closed pipeline output.
 #[tokio::test]
 async fn upstream_write_failures_are_recorded_with_their_own_reason() {
-    let supervisor =
-        Supervisor::with_stages(&[RequestStage::new("test/append", Mode::AppendPerChunk)]).await;
-    for (upstream_failed, expected) in [
-        (true, "middleware_cancelled: upstream_write_failed"),
-        (false, "middleware_cancelled: output_closed"),
+    for (upstream_failed, expected, end_reason) in [
+        (
+            true,
+            "middleware_cancelled: upstream_write_failed",
+            MiddlewareSessionEndReason::UpstreamFailure,
+        ),
+        (
+            false,
+            "middleware_cancelled: output_closed",
+            MiddlewareSessionEndReason::Cancellation,
+        ),
     ] {
+        let stage = RequestStage::new("test/append", Mode::AppendPerChunk);
+        let supervisor = Supervisor::with_stages(std::slice::from_ref(&stage)).await;
         let (_config, tunnel, ctx) = supervisor.tunnel();
         let chain = tunnel
             .query_middleware_chain(&crate::l7::middleware::middleware_network_input(&ctx))
@@ -1329,9 +1680,9 @@ async fn upstream_write_failures_are_recorded_with_their_own_reason() {
             target: "/v1/upload".into(),
             query_params: std::collections::HashMap::new(),
             raw_header:
-                b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 5\r\n\r\n"
+                b"POST /v1/upload HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 10\r\n\r\n"
                     .to_vec(),
-            body_length: crate::l7::provider::BodyLength::ContentLength(5),
+            body_length: crate::l7::provider::BodyLength::ContentLength(10),
         };
         let applied = crate::l7::middleware::apply_middleware_chain_with_request_id_and_delivery(
             request,
@@ -1350,17 +1701,19 @@ async fn upstream_write_failures_are_recorded_with_their_own_reason() {
         else {
             panic!("STREAM request middleware streams the body");
         };
+        // Half the body, so the stage is still running when its output fails.
         app.write_all(b"hello").await.expect("body");
         let (output, outputs) = mpsc::channel(4);
         drop(outputs);
         body.run_to(
             &mut relay_client,
             output,
-            &std::sync::atomic::AtomicBool::new(upstream_failed),
+            &tokio::sync::watch::channel(upstream_failed).0,
         )
         .await
         .expect_err("the output closed");
         assert_eq!(body.terminal_reason(), Some(expected));
+        assert_eq!(stage.session_end().await, end_reason);
     }
 }
 

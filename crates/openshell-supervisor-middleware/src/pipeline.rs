@@ -132,6 +132,9 @@ pub enum HttpStageOutcome {
 pub struct HttpStageInvocation {
     pub config_name: String,
     pub implementation: String,
+    /// Protocol of the entry's binding. `None` for an entry with no
+    /// registered binding.
+    pub protocol: Option<HttpProtocol>,
     pub outcome: HttpStageOutcome,
     pub input_bytes: usize,
     pub output_bytes: Option<usize>,
@@ -141,6 +144,21 @@ pub struct HttpStageInvocation {
     pub reason_code: Option<String>,
     /// Platform-owned failure reason.
     pub failure_reason: Option<String>,
+}
+
+impl HttpStageInvocation {
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    ///
+    /// Failure category the `fail_open` finding of a stage that failed open
+    /// reports, as 0.1.x reported it for a response stage.
+    #[must_use]
+    pub fn fail_open_category(&self) -> Option<&'static str> {
+        (self.outcome == HttpStageOutcome::FailOpen).then(|| {
+            crate::legacy::response::failure_category(
+                self.failure_reason.as_deref().unwrap_or_default(),
+            )
+        })
+    }
 }
 
 /// Findings, metadata, invocations, and stage reports for one exchange.
@@ -528,6 +546,7 @@ pub async fn preflight(
                     chain_clock: chain_clock.clone(),
                     reports: reports.clone(),
                     original_response: spec.original_response.clone(),
+                    runner: runner.clone(),
                 });
                 let (transport, control) = opened.map_or((None, None), |stage| {
                     (Some(stage.transport), stage.response)
@@ -569,7 +588,12 @@ pub async fn preflight(
             })),
         };
         let stage_deadline = Instant::now() + entry.timeout();
-        let (deadline, timeout_reason) = if chain_deadline <= stage_deadline {
+        let (deadline, timeout_reason) = if legacy.is_some() {
+            (
+                Instant::now() + hooks::preflight_backstop(entry),
+                "middleware_timeout",
+            )
+        } else if chain_deadline <= stage_deadline {
             (chain_deadline, "middleware_chain_timeout")
         } else {
             (stage_deadline, "middleware_timeout")
@@ -862,7 +886,7 @@ impl Pipeline {
         input: mpsc::Receiver<HttpBodyInput>,
         output: mpsc::Sender<HttpBodyOutput>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
-        self.run_inner(
+        self.run_with_body_policy_until(
             input,
             output,
             TransformedBodyPolicy::NotPolicyRelevant,
@@ -881,7 +905,7 @@ impl Pipeline {
         output: mpsc::Sender<HttpBodyOutput>,
         body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
-        self.run_inner(input, output, body_policy, std::future::pending())
+        self.run_with_body_policy_until(input, output, body_policy, std::future::pending())
             .await
     }
 
@@ -894,7 +918,7 @@ impl Pipeline {
         output: mpsc::Sender<HttpBodyOutput>,
         external_abort: impl Future<Output = MiddlewareSessionEndReason>,
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
-        self.run_inner(
+        self.run_with_body_policy_until(
             input,
             output,
             TransformedBodyPolicy::NotPolicyRelevant,
@@ -903,7 +927,9 @@ impl Pipeline {
         .await
     }
 
-    async fn run_inner(
+    /// [`Self::run_with_body_policy`] that ends the exchange as
+    /// [`Self::run_until`] does.
+    pub async fn run_with_body_policy_until(
         self,
         input: mpsc::Receiver<HttpBodyInput>,
         output: mpsc::Sender<HttpBodyOutput>,
@@ -1994,9 +2020,17 @@ async fn drive_stream(
     upstream: UpstreamStart,
     begin_head: Vec<HttpHeader>,
 ) -> Result<StageDone, StageError> {
-    let Stage { entry, stream, .. } = stage;
+    let Stage {
+        entry,
+        stream,
+        legacy,
+        ..
+    } = stage;
     let entry = &*entry;
-    let idle = shared.spec.timeouts.stream_idle;
+    let idle = match legacy {
+        Some(_) => hooks::stall_backstop(entry, shared.spec.timeouts.stream_idle),
+        None => shared.spec.timeouts.stream_idle,
+    };
     send_until(
         shared,
         entry,
@@ -2476,6 +2510,7 @@ pub fn invocation(
     HttpStageInvocation {
         config_name: entry.entry.name.clone(),
         implementation: entry.entry.implementation.clone(),
+        protocol: entry.http_protocol(),
         outcome,
         input_bytes: 0,
         output_bytes: None,

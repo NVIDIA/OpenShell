@@ -12,8 +12,8 @@ use prost::Message as _;
 use openshell_core::proto::{
     Finding, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBufferedBody,
     HttpBufferedMode, HttpBufferedResult, HttpHeader, HttpInputChunk, HttpInputEnd, HttpInspect,
-    HttpPreflight, HttpResponsePreflightHead, MiddlewareSessionEndReason, RemoveHeader,
-    header_mutation, http_buffered_result, http_event, http_inspect, http_preflight,
+    HttpPreflight, HttpResponsePreflightHead, MiddlewareSessionEnd, MiddlewareSessionEndReason,
+    RemoveHeader, header_mutation, http_buffered_result, http_event, http_inspect, http_preflight,
     http_preflight_result, http_result,
 };
 use openshell_supervisor_middleware_wire_fixture::proto::middleware::{
@@ -31,6 +31,7 @@ use super::{
     Out, StageDriver, connect, context, entry, fail_open_reasons, headers, registration,
     reports_for, target, transcode,
 };
+use crate::legacy::hooks::LegacyResponseControl as _;
 use crate::legacy::response::adapter::{LegacyResponseExchange, LegacyResponseStage};
 use crate::{
     ChainEntry, ChainRunner, ContractFailureKind, DescribedChainEntry, HttpResponseInvocation,
@@ -249,6 +250,7 @@ fn invocations(reports: &[StageReport]) -> Vec<HttpResponseInvocation> {
 }
 
 fn stage_for(
+    runner: &ChainRunner,
     described: &DescribedChainEntry,
     case: &ResponseCase,
     reports: &Arc<StageReports>,
@@ -258,6 +260,7 @@ fn stage_for(
         LegacyResponseExchange {
             reports: reports.clone(),
             original: Arc::new(case.original()),
+            runner: runner.clone(),
         },
     )
     .expect("legacy response entry")
@@ -303,7 +306,7 @@ fn end_reason(result: &Out) -> MiddlewareSessionEndReason {
 async fn drive(runner: &ChainRunner, chain_entry: ChainEntry, case: &ResponseCase) -> Drive {
     let described = describe(runner, &[chain_entry]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], case, &reports);
+    let stage = stage_for(runner, &described[0], case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     driver
         .send(http_event::Event::Preflight(
@@ -550,7 +553,7 @@ async fn offers_come_from_the_original_head_not_the_current_one() {
     let case = ResponseCase::ok("application/json", &[b"{}"]);
     let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], &case, &reports);
+    let stage = stage_for(&runner, &described[0], &case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     let current = headers(&[("content-type", "text/event-stream")]);
     driver
@@ -725,7 +728,7 @@ async fn whole_body_overflow_follows_on_error() {
     {
         let described = describe(&runner, &[chain(on_error)]).await;
         let reports = Arc::new(StageReports::default());
-        let stage = stage_for(&described[0], &case, &reports);
+        let stage = stage_for(&runner, &described[0], &case, &reports);
         let mut driver = StageDriver::open(&stage).await;
         driver
             .send(http_event::Event::Preflight(
@@ -1422,7 +1425,7 @@ async fn replacements_are_released_within_the_output_chunk_limit() {
     let case = ResponseCase::ok("text/plain", &[b"in"]);
     let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], &case, &reports);
+    let stage = stage_for(&runner, &described[0], &case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     let mut preflight = case.preflight(&described[0], &case.headers);
     preflight.limits.as_mut().expect("limits").max_chunk_bytes = 16;
@@ -1459,7 +1462,7 @@ async fn completed_stages_receive_the_pipelines_session_end() {
     let case = ResponseCase::ok("text/plain", &[b"body"]);
     let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], &case, &reports);
+    let stage = stage_for(&runner, &described[0], &case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     driver
         .send(http_event::Event::Preflight(
@@ -1534,7 +1537,7 @@ async fn mixed_stream_and_whole_body_chain_runs_in_policy_order() {
 
     let mut drivers = Vec::new();
     for entry in &described {
-        let stage = stage_for(entry, &case, &reports);
+        let stage = stage_for(&runner, entry, &case, &reports);
         let mut driver = StageDriver::open(&stage).await;
         driver
             .send(http_event::Event::Preflight(
@@ -1664,8 +1667,8 @@ async fn a_stream_stage_after_a_whole_body_stage_withholds_output_until_the_end(
         let described = describe(&runner, &chain).await;
         let case = ResponseCase::ok("text/plain", &[body]);
         let reports = Arc::new(StageReports::default());
-        let whole_stage = stage_for(&described[0], &case, &reports);
-        let stream_stage = stage_for(&described[1], &case, &reports);
+        let whole_stage = stage_for(&runner, &described[0], &case, &reports);
+        let stream_stage = stage_for(&runner, &described[1], &case, &reports);
         let mut whole_driver = StageDriver::open(&whole_stage).await;
         let mut stream_driver = StageDriver::open(&stream_stage).await;
         for (driver, entry) in [
@@ -1765,7 +1768,7 @@ async fn withheld_output_keeps_the_0_1_x_retained_body_budget() {
     for on_error in [OnError::FailClosed, OnError::FailOpen] {
         let described = describe(&runner, &[chain(on_error)]).await;
         let reports = Arc::new(StageReports::default());
-        let stage = stage_for(&described[0], &case, &reports);
+        let stage = stage_for(&runner, &described[0], &case, &reports);
         stage.withhold_output_until_end();
         let mut driver = StageDriver::open(&stage).await;
         driver
@@ -1815,6 +1818,69 @@ async fn withheld_output_keeps_the_0_1_x_retained_body_budget() {
     }
 }
 
+/// A stage that withholds its output holds at most the 0.1.x retained-body
+/// budget. Output that passes through beyond it, as after an earlier
+/// whole-body stage failed open and passed a large body on, starts streaming,
+/// as 0.1.x resumed streaming then.
+#[tokio::test]
+async fn withheld_output_streams_once_it_reaches_the_0_1_x_budget() {
+    const UNIT: usize = 64 * 1024;
+    let fixture = inspect(HttpResponseBodyMode::StreamBytes)
+        .on_response_body(|unit| results::body_pass_through(unit.sequence).into())
+        .with_binding(http_response_binding(UNIT as u64))
+        .spawn()
+        .await
+        .expect("spawn response fixture");
+    let runner = connect(vec![registration(GUARD, &fixture, UNIT as u64)]).await;
+    let case = ResponseCase::ok("application/octet-stream", &[]);
+    let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
+    let reports = Arc::new(StageReports::default());
+    let stage = stage_for(&runner, &described[0], &case, &reports);
+    stage.withhold_output_until_end();
+    let mut driver = StageDriver::open(&stage).await;
+    driver
+        .send(http_event::Event::Preflight(
+            case.preflight(&described[0], &case.headers),
+        ))
+        .await;
+    driver.result().await;
+
+    let units = crate::MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES / UNIT + 1;
+    let sends: Vec<_> = std::iter::once(http_event::Event::Begin(HttpBegin::default()))
+        .chain((0..units).map(|_| {
+            http_event::Event::InputChunk(HttpInputChunk {
+                data: vec![b'x'; UNIT],
+            })
+        }))
+        .map(|event| driver.send(event))
+        .collect();
+    let feeder = tokio::spawn(async move {
+        for send in sends {
+            send.await;
+        }
+    });
+    let Out::Result(http_result::Result::OutputStart(start)) = driver.result().await else {
+        panic!("output starts before the body ends");
+    };
+    assert_eq!(start.output_body_bytes, None);
+    let mut released = 0;
+    while released < units * UNIT {
+        match driver.result().await {
+            Out::Result(http_result::Result::OutputChunk(chunk)) => released += chunk.data.len(),
+            other => panic!("expected output, got {other:?}"),
+        }
+    }
+    feeder.await.expect("feed the body");
+    driver
+        .send(http_event::Event::InputEnd(HttpInputEnd::default()))
+        .await;
+    assert!(matches!(
+        driver.result().await,
+        Out::Result(http_result::Result::Finish(_))
+    ));
+    driver.end(MiddlewareSessionEndReason::Normal).await;
+}
+
 /// Findings from every unit and the trailers are reported as each step
 /// completes, so neither the version 2 per-result limits nor a later failure
 /// can drop them.
@@ -1862,7 +1928,7 @@ async fn a_buffered_selection_never_exceeds_the_offer() {
     let case = ResponseCase::ok("text/plain", &[b"small"]);
     let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], &case, &reports);
+    let stage = stage_for(&runner, &described[0], &case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     let mut preflight = case.preflight(&described[0], &case.headers);
     preflight
@@ -1898,7 +1964,7 @@ async fn a_selected_mode_the_pipeline_did_not_offer_fails_the_stage_closed() {
     let case = ResponseCase::ok("text/plain", &[b"body"]);
     let described = describe(&runner, &[chain(OnError::FailOpen)]).await;
     let reports = Arc::new(StageReports::default());
-    let stage = stage_for(&described[0], &case, &reports);
+    let stage = stage_for(&runner, &described[0], &case, &reports);
     let mut driver = StageDriver::open(&stage).await;
     let mut preflight = case.preflight(&described[0], &case.headers);
     preflight.permitted_body_modes = vec![HttpBodyMode::Buffered as i32];
@@ -1923,7 +1989,7 @@ async fn a_pipeline_that_goes_away_still_ends_the_legacy_stream() {
     for (index, finish) in [false, true].into_iter().enumerate() {
         let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
         let reports = Arc::new(StageReports::default());
-        let stage = stage_for(&described[0], &case, &reports);
+        let stage = stage_for(&runner, &described[0], &case, &reports);
         let mut driver = StageDriver::open(&stage).await;
         driver
             .send(http_event::Event::Preflight(
@@ -1955,6 +2021,49 @@ async fn a_pipeline_that_goes_away_still_ends_the_legacy_stream() {
             })
         );
     }
+}
+
+/// A pipeline that ends the stage during an exchange stops reading results
+/// before the exchange returns. The legacy stream still ends with the
+/// pipeline's reason, as 0.1.x ended a stage with the response's reason.
+#[tokio::test]
+async fn a_session_end_during_an_exchange_reaches_the_service() {
+    let (fixture, runner) = guard(
+        inspect(HttpResponseBodyMode::StreamBytes)
+            .on_response_body(|unit| pass_through(unit).after(Duration::from_millis(200))),
+    )
+    .await;
+    let case = ResponseCase::ok("text/plain", &[b"body"]);
+    let described = describe(&runner, &[chain(OnError::FailClosed)]).await;
+    let reports = Arc::new(StageReports::default());
+    let stage = stage_for(&runner, &described[0], &case, &reports);
+    let mut driver = StageDriver::open(&stage).await;
+    driver
+        .send(http_event::Event::Preflight(
+            case.preflight(&described[0], &case.headers),
+        ))
+        .await;
+    driver.result().await;
+    driver
+        .send(http_event::Event::Begin(HttpBegin::default()))
+        .await;
+    driver.result().await;
+    driver
+        .send(http_event::Event::InputChunk(HttpInputChunk {
+            data: b"body".to_vec(),
+        }))
+        .await;
+    driver
+        .send(http_event::Event::SessionEnd(MiddlewareSessionEnd {
+            reason: MiddlewareSessionEndReason::PolicyReload as i32,
+            protocol_error: None,
+        }))
+        .await;
+    drop(driver);
+    assert_eq!(
+        session_end(&fixture, 0).await,
+        Some(LegacyEndReason::PolicyReload)
+    );
 }
 
 /// A trailers failure after a whole-body transform keeps the replacement and

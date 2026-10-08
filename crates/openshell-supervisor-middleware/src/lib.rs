@@ -21,10 +21,8 @@ mod runtime;
 mod stage;
 mod websocket;
 
-pub use legacy::response::engine::{
-    HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
-    HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightOutcome,
-    HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
+pub use legacy::response::{
+    HttpResponseInvocation, HttpResponseInvocationOutcome, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
     MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
 };
 
@@ -39,8 +37,7 @@ pub use request::{
 };
 pub use response::{
     HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
-    HttpResponsePreflightInput, http_response_uses_pipeline,
-    is_stale_http_response_integrity_header,
+    HttpResponsePreflightInput, is_stale_http_response_integrity_header,
 };
 pub use runtime::{
     ContractFailure, ContractFailureKind, FailOpenNotApplied, MiddlewareRuntimeObserver,
@@ -1856,22 +1853,6 @@ impl ChainRunner {
     /// interval.
     pub fn take_reconciliation_request(&self) -> bool {
         self.runtime.take_reconciliation_request()
-    }
-
-    /// Record a contract failure on `entry`, which the caller fails closed.
-    fn report_contract_failure(
-        &self,
-        entry: &DescribedChainEntry,
-        direction: HttpDirection,
-        kind: ContractFailureKind,
-    ) {
-        self.runtime.contract_failure(&ContractFailure {
-            config_name: entry.entry.name.clone(),
-            implementation: entry.entry.implementation.clone(),
-            direction,
-            protocol: entry.http_protocol().unwrap_or(HttpProtocol::Legacy),
-            kind,
-        });
     }
 
     /// Reserve one unit of short-lived middleware work.

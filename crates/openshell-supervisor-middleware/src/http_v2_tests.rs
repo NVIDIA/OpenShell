@@ -19,18 +19,19 @@ use openshell_core::proto::middleware::v1::http_response_pre_return_server::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
 use openshell_core::proto::{
-    HttpContinue, HttpHeader, HttpPreflight, HttpPreflightResult, HttpRequestPreflightHead,
-    HttpRequestResult, HttpRequestTarget, HttpResponseBodyMode, HttpResponseEvent,
-    HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
-    HttpResponsePreflightSkip, HttpResult, RequestContext, WebSocketSessionEvent, http_event,
-    http_preflight, http_preflight_result, http_response_event, http_response_event_result,
-    http_response_preflight_result, http_result,
+    HttpContinue, HttpPreflight, HttpPreflightResult, HttpRequestPreflightHead, HttpRequestResult,
+    HttpResponseBodyMode, HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflightInspect,
+    HttpResponsePreflightResult, HttpResponsePreflightSkip, HttpResult, WebSocketSessionEvent,
+    http_event, http_preflight, http_preflight_result, http_response_event,
+    http_response_event_result, http_response_preflight_result, http_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 use super::*;
-use crate::compat_tests::harness::{RequestChains, RequestInput};
+use crate::compat_tests::harness::{
+    RequestChains, RequestInput, ResponseCase, preflight_response, run_response,
+};
 
 const MAX_PAYLOAD_BYTES: u64 = 4096;
 
@@ -330,27 +331,6 @@ fn request_input() -> RequestInput {
         headers: Vec::new(),
         connection_nominated_headers: Vec::new(),
         body: b"hello".to_vec(),
-    }
-}
-
-fn response_input() -> HttpResponsePreflightInput {
-    HttpResponsePreflightInput {
-        context: RequestContext::default(),
-        target: HttpRequestTarget {
-            scheme: "https".into(),
-            host: "api.example.com".into(),
-            port: 443,
-            method: "GET".into(),
-            path: "/v1".into(),
-            query: String::new(),
-        },
-        status_code: 200,
-        declared_body_length: None,
-        headers: vec![HttpHeader {
-            name: "content-type".into(),
-            value: "application/json".into(),
-        }],
-        connection_nominated_headers: Vec::new(),
     }
 }
 
@@ -696,16 +676,15 @@ async fn version_2_stages_never_reach_legacy_rpcs() {
     assert!(outcome.allowed, "{}", outcome.reason);
     assert!(!outcome.applied[0].failed);
 
-    // The legacy response engine cannot run it and fails it closed.
-    let preflight = runner
-        .preflight_http_response(&entries, response_input())
-        .await
-        .expect("preflight");
-    assert!(!preflight.allowed);
-    assert_eq!(
-        preflight.reason,
-        "middleware_failed: http_v2_stage_not_executable"
-    );
+    // The response pipeline runs it over EvaluateHttp too.
+    let (observed, held) = preflight_response(
+        &runner,
+        &entries,
+        &ResponseCase::ok("application/json", &[]),
+    )
+    .await;
+    assert!(observed.preflight_allowed(), "{:?}", observed.failure);
+    held.end().await;
     assert_eq!(service.legacy_calls(), 0);
 }
 
@@ -1038,24 +1017,25 @@ async fn unimplemented_legacy_response_rpc_fails_closed_under_fail_open() {
         );
     service.switch_to(Build::V2Only);
 
-    let outcome = runner
-        .preflight_http_response(
-            &[entry("guard", "guard-service", OnError::FailOpen)],
-            response_input(),
-        )
-        .await
-        .expect("preflight");
-    assert!(!outcome.allowed);
+    let (response, _held) = preflight_response(
+        &runner,
+        &[entry("guard", "guard-service", OnError::FailOpen)],
+        &ResponseCase::ok("application/json", &[]),
+    )
+    .await;
     assert_eq!(
-        outcome.reason,
+        response
+            .failure
+            .expect("a contract failure fails closed")
+            .reason,
         "middleware_failed: middleware_contract_failure_unimplemented"
     );
     assert_eq!(
-        outcome.invocations[0].outcome,
+        response.records[0].outcome,
         HttpResponseInvocationOutcome::FailClosed
     );
     assert_eq!(
-        outcome.invocations[0].failure_category.as_deref(),
+        response.records[0].failure_category.as_deref(),
         Some("contract_failure")
     );
     assert_eq!(
@@ -1337,20 +1317,21 @@ async fn legacy_response_result_that_does_not_decode_on_the_wire_fails_closed_un
             .expect("registry"),
         );
 
-    let outcome = runner
-        .preflight_http_response(
-            &[entry("guard", "guard-service", OnError::FailOpen)],
-            response_input(),
-        )
-        .await
-        .expect("preflight");
-    assert!(!outcome.allowed, "a decode failure fails closed");
+    let (response, _held) = preflight_response(
+        &runner,
+        &[entry("guard", "guard-service", OnError::FailOpen)],
+        &ResponseCase::ok("application/json", &[]),
+    )
+    .await;
     assert_eq!(
-        outcome.reason,
+        response
+            .failure
+            .expect("a decode failure fails closed")
+            .reason,
         "middleware_failed: middleware_contract_failure_decode_failure"
     );
     assert_eq!(
-        outcome.invocations[0].outcome,
+        response.records[0].outcome,
         HttpResponseInvocationOutcome::FailClosed
     );
     assert_eq!(
@@ -1370,19 +1351,17 @@ async fn legacy_response_stream_decode_failure_fails_closed_under_fail_open() {
     }))
     .with_runtime_observer(observer.clone());
 
-    let mut session = runner
-        .preflight_http_response(
-            &[entry("guard", "example/guard", OnError::FailOpen)],
-            response_input(),
-        )
-        .await
-        .expect("preflight")
-        .session
-        .expect("STREAM_BYTES session");
-    let failure = session
-        .push_body(b"body".to_vec())
-        .await
-        .expect_err("a decode failure must not pass the body through");
+    let response = run_response(
+        &runner,
+        &[entry("guard", "example/guard", OnError::FailOpen)],
+        ResponseCase::ok("application/json", &[b"body"]),
+    )
+    .await;
+    assert!(response.inspected, "STREAM_BYTES session");
+    assert!(response.body().is_empty());
+    let failure = response
+        .failure
+        .expect("a decode failure must not pass the body through");
     assert_eq!(
         failure.reason,
         "middleware_failed: middleware_contract_failure_decode_failure"
@@ -1399,21 +1378,18 @@ async fn ordinary_legacy_response_stream_failure_keeps_fail_open() {
     let runner = ChainRunner::new(Arc::new(FailingStreamService {
         status: TonicStatus::internal("service error"),
     }));
-    let mut session = runner
-        .preflight_http_response(
-            &[entry("guard", "example/guard", OnError::FailOpen)],
-            response_input(),
-        )
-        .await
-        .expect("preflight")
-        .session
-        .expect("STREAM_BYTES session");
+    let observed = run_response(
+        &runner,
+        &[entry("guard", "example/guard", OnError::FailOpen)],
+        ResponseCase::ok("application/json", &[b"body"]),
+    )
+    .await;
+    assert!(observed.inspected, "STREAM_BYTES session");
+    assert!(observed.failure.is_none(), "{:?}", observed.failure);
     assert_eq!(
-        session
-            .push_body(b"body".to_vec())
-            .await
-            .expect("fail_open passes the unit on"),
-        [b"body".to_vec()]
+        observed.released,
+        [b"body".to_vec()],
+        "fail_open passes the unit on"
     );
     assert!(!runner.take_reconciliation_request());
 }
