@@ -82,6 +82,11 @@ mod linux {
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
+    // Three stdio pipes require six descriptors before fork, and Rust's
+    // process launcher may briefly need additional bookkeeping descriptors.
+    // Reclaim closed mediated sockets before each serialized spawn so stale
+    // socket sources cannot consume that bounded launch budget.
+    const EXEC_SPAWN_DESCRIPTOR_HEADROOM: usize = 16;
 
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
@@ -2185,6 +2190,14 @@ mod linux {
             }
             requests.reserve(request_id, expires_at)?;
             drop(requests);
+            self.network_broker
+                .ensure_descriptor_headroom(EXEC_SPAWN_DESCRIPTOR_HEADROOM)
+                .map_err(|error| {
+                    guest_error(
+                        BoundaryErrorKind::Unavailable,
+                        format!("exec descriptor headroom unavailable: {error}"),
+                    )
+                })?;
             let session = self
                 .process_runtime
                 .block_on(executor.exec(spec.into()))

@@ -185,6 +185,8 @@ pub struct NetworkBroker {
     workload_frozen: Arc<AtomicBool>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
+    registry: Arc<Mutex<SocketRegistry>>,
+    descriptor_soft_limit: usize,
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
 }
@@ -248,6 +250,7 @@ impl NetworkBroker {
         };
         let healthy = Arc::new(AtomicBool::new(true));
         let broker_healthy = healthy.clone();
+        let broker_registry = Arc::clone(&registry);
         std::thread::Builder::new()
             .name("openshell-network-broker".to_string())
             .spawn(move || {
@@ -272,7 +275,7 @@ impl NetworkBroker {
                     // broker keeps mediating the rest.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dispatch_notification(
-                            Arc::clone(&registry),
+                            Arc::clone(&broker_registry),
                             Arc::clone(&listener),
                             notification,
                             queues.clone(),
@@ -314,9 +317,19 @@ impl NetworkBroker {
             workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
+            registry,
+            descriptor_soft_limit,
             dns_address,
             healthy,
         })
+    }
+
+    /// Reclaim closed workload sockets before an operation that needs several
+    /// descriptors at once. Socket creation already protects its own
+    /// descriptor, but exec startup creates multiple pipes without first
+    /// issuing another mediated socket syscall.
+    pub(crate) fn ensure_descriptor_headroom(&self, required: usize) -> io::Result<()> {
+        ensure_descriptor_headroom(&self.registry, self.descriptor_soft_limit, required)
     }
 
     /// Record whether the boundary has stopped the workload for supervisor
@@ -721,11 +734,12 @@ fn open_descriptor_count() -> io::Result<usize> {
     std::fs::read_dir("/proc/self/fd").map(Iterator::count)
 }
 
-fn descriptor_headroom_exhausted(soft_limit: usize, open_descriptors: usize) -> bool {
-    open_descriptors
-        .saturating_add(SOCKET_FD_HEADROOM)
-        .saturating_add(1)
-        > soft_limit
+fn descriptor_headroom_exhausted(
+    soft_limit: usize,
+    open_descriptors: usize,
+    required: usize,
+) -> bool {
+    open_descriptors.saturating_add(required) > soft_limit
 }
 
 fn prepare_registry_for_socket(
@@ -735,22 +749,41 @@ fn prepare_registry_for_socket(
     // Descriptor use changes after broker startup as control streams and execs
     // come and go. Recompute it for each socket request so retained pre-connect
     // sockets cannot consume the headroom reserved for those control paths.
-    prepare_registry_for_socket_with_count(registry, descriptor_soft_limit, open_descriptor_count)
+    ensure_descriptor_headroom_with_count(
+        registry,
+        descriptor_soft_limit,
+        SOCKET_FD_HEADROOM.saturating_add(1),
+        open_descriptor_count,
+    )
 }
 
-fn prepare_registry_for_socket_with_count(
+fn ensure_descriptor_headroom(
     registry: &Mutex<SocketRegistry>,
     descriptor_soft_limit: usize,
+    required: usize,
+) -> io::Result<()> {
+    ensure_descriptor_headroom_with_count(
+        registry,
+        descriptor_soft_limit,
+        required,
+        open_descriptor_count,
+    )
+}
+
+fn ensure_descriptor_headroom_with_count(
+    registry: &Mutex<SocketRegistry>,
+    descriptor_soft_limit: usize,
+    required: usize,
     mut open_descriptors: impl FnMut() -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut registry = lock(registry);
     if registry.is_full()
-        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?)
+        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
     {
         collect_closed_socket_entries_locked(&mut registry)?;
     }
     if registry.is_full()
-        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?)
+        || descriptor_headroom_exhausted(descriptor_soft_limit, open_descriptors()?, required)
     {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
@@ -1776,10 +1809,10 @@ mod tests {
 
     #[test]
     fn descriptor_budget_reserves_process_headroom_from_current_usage() {
-        assert!(!descriptor_headroom_exhausted(1_024, 959));
-        assert!(descriptor_headroom_exhausted(1_024, 960));
-        assert!(descriptor_headroom_exhausted(64, 0));
-        assert!(!descriptor_headroom_exhausted(usize::MAX, 4_096));
+        assert!(!descriptor_headroom_exhausted(1_024, 959, 65));
+        assert!(descriptor_headroom_exhausted(1_024, 960, 65));
+        assert!(descriptor_headroom_exhausted(64, 0, 65));
+        assert!(!descriptor_headroom_exhausted(usize::MAX, 4_096, 65));
     }
 
     #[test]
@@ -1810,7 +1843,43 @@ mod tests {
 
         let registry = Mutex::new(registry);
         let mut observed = std::collections::VecDeque::from([64, 63]);
-        prepare_registry_for_socket_with_count(&registry, 128, || {
+        ensure_descriptor_headroom_with_count(&registry, 128, 65, || {
+            observed
+                .pop_front()
+                .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
+        })
+        .unwrap();
+
+        assert!(lock(&registry).is_empty());
+    }
+
+    #[test]
+    fn exec_headroom_reclaims_stale_socket_before_pipe_allocation() {
+        // SAFETY: socket returns one newly owned descriptor on success.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry.commit(tentative).unwrap();
+
+        let registry = Mutex::new(registry);
+        let mut observed = std::collections::VecDeque::from([120, 112]);
+        ensure_descriptor_headroom_with_count(&registry, 128, 16, || {
             observed
                 .pop_front()
                 .ok_or_else(|| io::Error::other("unexpected descriptor recount"))
@@ -1854,7 +1923,7 @@ mod tests {
         assert_eq!(registry.retained_preconnect_count(), 0);
 
         let registry = Mutex::new(registry);
-        prepare_registry_for_socket_with_count(&registry, 128, || Ok(32)).unwrap();
+        ensure_descriptor_headroom_with_count(&registry, 128, 65, || Ok(32)).unwrap();
 
         assert_eq!(lock(&registry).len(), 1);
     }
