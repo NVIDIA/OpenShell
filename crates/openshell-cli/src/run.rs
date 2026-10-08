@@ -4,8 +4,7 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_annotation_pairs, parse_credential_expiry_cli_value, parse_env_from_pairs,
-    parse_env_pairs,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
     parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
