@@ -3,8 +3,8 @@
 
 //! `PostgreSQL` tests of the mutation advisory locks: exclusion between two
 //! stores (as between two gateway replicas), exclusion against the legacy
-//! global key, cleanup after timed-out and cancelled acquisitions, the
-//! lock-pool bound and its in-use gauge, and lock connections that
+//! global key, cleanup after timed-out and cancelled acquisitions, a stalled
+//! holder, the lock-pool bound and its in-use gauge, and lock connections that
 //! `PostgreSQL` does not open.
 //!
 //! Advisory locks are database-wide, not per schema, so every test uses
@@ -1075,6 +1075,125 @@ async fn postgres_mutation_lock_connections_gauge_tracks_checked_out_connections
     raw_unlock(&mut holder, sandbox_key).await;
     holder.close().await.expect("close the raw session");
     fixture.finish(vec![store]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_mutation_lock_stalled_holder_fails_waiters_by_their_deadline() {
+    let fixture = LockFixture::new().await;
+    let store_a = fixture.store(MUTATION_LOCK_POOL_MAX_CONNECTIONS).await;
+    let store_b = fixture.store(MUTATION_LOCK_POOL_MAX_CONNECTIONS).await;
+    let workspace = random_id("ws");
+    let stalled = random_id("sb");
+
+    // Nothing bounds a hold, so this holder keeps its locks until the test
+    // drops it, like one blocked in a compute driver or middleware call.
+    let holder = acquire_proceeds(
+        &store_a,
+        MutationScope::sandbox(&workspace, &stalled),
+        "the stalled holder",
+    )
+    .await;
+
+    // Waiters that conflict with it on the other store fail with
+    // PostgreSQL's lock timeout by their own deadline. They run one at a
+    // time, so a queued exclusive request cannot hold up the next one.
+    for (scope, what) in [
+        (
+            MutationScope::sandbox(&workspace, &stalled),
+            "the stalled sandbox",
+        ),
+        (
+            MutationScope::Workspace(&workspace),
+            "the stalled sandbox's workspace",
+        ),
+        (MutationScope::Global, "the global scope"),
+    ] {
+        wait_for_idle_lock_connection(&store_b).await;
+        let started = Instant::now();
+        acquire_times_out(&store_b, scope, what).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < EXPECTED_TIMEOUT + CLIENT_BACKSTOP_GRACE,
+            "{what}: failed after {waited:?}"
+        );
+    }
+    drop(
+        acquire_proceeds(
+            &store_b,
+            MutationScope::sandbox(&workspace, &random_id("sb")),
+            "another sandbox in the stalled sandbox's workspace",
+        )
+        .await,
+    );
+    drop(
+        acquire_proceeds(
+            &store_b,
+            MutationScope::Workspace(&random_id("ws")),
+            "another workspace",
+        )
+        .await,
+    );
+    assert_eq!(
+        fixture
+            .lock_count(MutationLockKey::Sandbox(&stalled).advisory_key())
+            .await,
+        1,
+        "the holder keeps its key after every waiter gave up"
+    );
+
+    // Stalled holders that check out every lock connection of store A make
+    // its next acquisition fail by its deadline, while store B keeps working.
+    let mut fillers = Vec::new();
+    for _ in 1..MUTATION_LOCK_POOL_MAX_CONNECTIONS {
+        fillers.push(
+            acquire_proceeds(
+                &store_a,
+                MutationScope::sandbox(&random_id("ws"), &random_id("sb")),
+                "a holder that fills store A's lock pool",
+            )
+            .await,
+        );
+    }
+    let started = Instant::now();
+    match acquire(
+        &store_a,
+        MutationScope::sandbox(&random_id("ws"), &random_id("sb")),
+        EXPECTED_TIMEOUT,
+    )
+    .await
+    {
+        Err(PersistenceError::LockTimeout(detail)) => {
+            assert_eq!(detail, "waiting for a mutation lock connection");
+        }
+        Err(error) => panic!("expected a lock timeout from a full pool, got {error:?}"),
+        Ok(_) => panic!("a full lock pool handed out another connection"),
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited < EXPECTED_TIMEOUT + CLIENT_BACKSTOP_GRACE,
+        "store A failed after {waited:?}"
+    );
+    drop(
+        acquire_proceeds(
+            &store_b,
+            MutationScope::sandbox(&random_id("ws"), &random_id("sb")),
+            "store B while store A's lock pool is full",
+        )
+        .await,
+    );
+
+    drop(fillers);
+    drop(holder);
+    drop(
+        acquire_proceeds(
+            &store_b,
+            MutationScope::sandbox(&workspace, &stalled),
+            "the stalled sandbox after its holder releases",
+        )
+        .await,
+    );
+    fixture.finish(vec![store_a, store_b]).await;
 }
 
 #[tokio::test]

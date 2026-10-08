@@ -575,6 +575,24 @@ idle advisory-lock sessions while validation and writes use separate data
 connections. Neither an idle duration nor a matching `client_addr` proves
 that a holder is orphaned, even when it blocks a timed-out request.
 
+Guarded work has no time limit of its own. A holder slowed by a compute
+driver, credential backend, middleware, or provider profile source call keeps
+its locks until that call returns, and conflicting acquisitions on every
+replica time out after 10 seconds. When it releases a lock held longer than
+10 seconds, its gateway logs
+`mutation lock held longer than the lock wait timeout` with `scope` and
+`held_ms`, and `openshell_server_mutation_lock_hold_seconds` records every
+hold by scope. Neither reports a hold that is still in progress. Before treating a long-held
+advisory lock as orphaned, check the gateway pod at its `client_addr` for
+these warnings and for slow dependency calls. A pod that logs them is still
+running slow guarded work, so fix that dependency or stop the pod instead of
+terminating its lock sessions:
+
+```bash
+kubectl -n openshell logs <gateway-pod> --since=1h \
+  | grep 'mutation lock held longer than the lock wait timeout'
+```
+
 Before using `SELECT pg_terminate_backend(<pid>)`, conclusively map that
 backend to its owning gateway process and confirm that process has stopped
 or can no longer write. If the owner is still running, stop it first and
@@ -1144,7 +1162,7 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
-| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, the `pg_locks` query in Step 6 |
+| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
 | Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |

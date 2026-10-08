@@ -279,11 +279,35 @@ pub struct LocalMutationGuard {
 /// Local and, on `PostgreSQL`, distributed keys of one guarded mutation.
 #[must_use = "dropping the guard releases the mutation locks"]
 pub struct MutationGuard {
-    // Field order is drop order: the database guard goes first so its
-    // connection returns to the lock pool (and is unlocked) as early as
-    // possible.
+    // Field order is drop order: the hold is recorded while the keys are
+    // still held, then the database guard goes so its connection returns to
+    // the lock pool (and is unlocked) as early as possible.
+    _hold: HoldTimer,
     _distributed: DistributedMutationGuard,
     _local: LocalMutationGuard,
+}
+
+/// Times one [`MutationGuard`] from acquisition to release. Guarded work has
+/// no time limit of its own, so a hold longer than the wait timeout means
+/// conflicting acquisitions may have timed out behind it.
+struct HoldTimer {
+    scope: LockScope,
+    acquired: tokio::time::Instant,
+    warn_after: Duration,
+}
+
+impl Drop for HoldTimer {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        gateway_metrics::record_lock_hold(self.scope, held);
+        if held > self.warn_after {
+            warn!(
+                scope = self.scope.label(),
+                held_ms = duration_millis(held),
+                "mutation lock held longer than the lock wait timeout"
+            );
+        }
+    }
 }
 
 impl ComputeRuntime {
@@ -298,14 +322,23 @@ impl ComputeRuntime {
     /// left fails with [`PersistenceError::Database`]. Timeouts count in
     /// `openshell_server_mutation_lock_timeouts_total` and other failures in
     /// `openshell_server_mutation_lock_errors_total`.
+    ///
+    /// Nothing bounds how long the guard is held. Dropping it records the
+    /// hold in `openshell_server_mutation_lock_hold_seconds`, and logs a
+    /// warning when the hold outlasted the wait timeout.
     pub(crate) async fn mutation_guard(
         &self,
         scope: MutationScope<'_>,
     ) -> PersistenceResult<MutationGuard> {
         let started = tokio::time::Instant::now();
-        let deadline = started + self.mutation_locks.timeout();
+        let timeout = self.mutation_locks.timeout();
         let result = self
-            .acquire_mutation_guard(&scope.lock_set(), deadline)
+            .acquire_mutation_guard(
+                &scope.lock_set(),
+                started + timeout,
+                scope.lock_scope(),
+                timeout,
+            )
             .await;
         match &result {
             Ok(_) => gateway_metrics::record_lock_wait(scope.lock_scope(), started.elapsed()),
@@ -331,10 +364,14 @@ impl ComputeRuntime {
         result
     }
 
+    /// Acquire `set` by `deadline`. The guard's hold is labeled `scope` and
+    /// warns past `warn_after`.
     async fn acquire_mutation_guard(
         &self,
         set: &MutationLockSet,
         deadline: tokio::time::Instant,
+        scope: LockScope,
+        warn_after: Duration,
     ) -> PersistenceResult<MutationGuard> {
         let local = tokio::time::timeout_at(deadline, self.mutation_locks.acquire(set))
             .await
@@ -346,6 +383,11 @@ impl ComputeRuntime {
             .acquire_distributed_mutation_guard(set, deadline)
             .await?;
         Ok(MutationGuard {
+            _hold: HoldTimer {
+                scope,
+                acquired: tokio::time::Instant::now(),
+                warn_after,
+            },
             _distributed: distributed,
             _local: local,
         })
@@ -874,6 +916,98 @@ mod tests {
         }
         assert_eq!(metrics.value(TIMEOUTS), None);
         assert_eq!(metrics.value(ERRORS), Some(1));
+    }
+
+    /// Formatted log output of the current thread's tracing subscriber.
+    #[derive(Clone, Default)]
+    struct LogLines(Arc<StdMutex<Vec<u8>>>);
+
+    impl LogLines {
+        fn count(&self, message: &str) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .matches(message)
+                .count()
+        }
+    }
+
+    impl std::io::Write for LogLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_hold_is_recorded_when_a_stalled_guard_is_released() {
+        const HOLDS: &str = "openshell_server_mutation_lock_hold_seconds_count{scope=\"sandbox\"}";
+        // Holds no longer than the 50 ms wait timeout.
+        const SHORT_HOLDS: &str =
+            "openshell_server_mutation_lock_hold_seconds_bucket{scope=\"sandbox\",le=\"0.05\"}";
+        const HELD_TOO_LONG: &str = "mutation lock held longer than the lock wait timeout";
+        let metrics = MetricsCapture::install();
+        let logs = LogLines::default();
+        let _logs = crate::otel_tracing::test_exporter::install_scoped(
+            tracing_subscriber::fmt()
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .with_ansi(false)
+                .finish(),
+        );
+        let runtime = test_runtime().await;
+        let timeout = Duration::from_millis(50);
+        runtime.set_mutation_lock_timeout_for_tests(timeout);
+
+        drop(
+            runtime
+                .mutation_guard(MutationScope::sandbox("w", "a"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(metrics.value(HOLDS), Some(1));
+        assert_eq!(metrics.value(SHORT_HOLDS), Some(1));
+        assert_eq!(logs.count(HELD_TOO_LONG), 0, "a short hold does not warn");
+
+        // A stalled holder: a waiter on its scope times out behind it, and the
+        // hold is recorded only once the holder releases.
+        let stalled = runtime
+            .mutation_guard(MutationScope::sandbox("w", "a"))
+            .await
+            .unwrap();
+        let waiter = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .mutation_guard(MutationScope::sandbox("w", "a"))
+                    .await
+                    .map(drop)
+            })
+        };
+        let result = waiter.await.expect("waiter task");
+        assert!(
+            matches!(result, Err(PersistenceError::LockTimeout(_))),
+            "{result:?}"
+        );
+        tokio::time::sleep(timeout).await;
+        assert_eq!(
+            metrics.value(HOLDS),
+            Some(1),
+            "a failed acquisition holds nothing"
+        );
+
+        drop(stalled);
+        assert_eq!(metrics.value(HOLDS), Some(2));
+        assert_eq!(
+            metrics.value(SHORT_HOLDS),
+            Some(1),
+            "the stalled hold outlasted the wait timeout"
+        );
+        assert_eq!(logs.count(HELD_TOO_LONG), 1);
     }
 
     /// Workspaces and sandboxes the random scope mix draws from.

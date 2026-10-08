@@ -212,7 +212,7 @@ configuration, and access control.
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
 | Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Spikes of `grpc_code="unavailable"` during rollouts are expected. Do not use as an HPA target. |
-| Lock contention | `openshell_server_mutation_lock_wait_seconds`, `openshell_server_mutation_lock_timeouts_total` | Alert on any timeout. |
+| Lock contention | `openshell_server_mutation_lock_wait_seconds`, `openshell_server_mutation_lock_hold_seconds`, `openshell_server_mutation_lock_timeouts_total` | Alert on any timeout. Long holds on a scope make its waiters wait, and holds longer than 10 seconds make them time out. |
 | Lock errors | `openshell_server_mutation_lock_errors_total` | Alert on any increase, separately from timeouts. PostgreSQL ran out of connection slots, restarted, or became unreachable. Readiness can stay healthy, because it uses established data connections. |
 | Lock pool | `openshell_server_mutation_lock_connections_in_use`, `openshell_server_mutation_lock_connections_capacity` | PostgreSQL only. Graph in use over capacity per replica. Values that stay near 1 mean that guarded operations on this replica hold their lock connections, or wait in PostgreSQL for a lock held elsewhere, often by another replica, and lock waits and timeouts follow. |
 
@@ -251,6 +251,10 @@ histogram_quantile(0.99, sum by (le, scope) (rate(openshell_server_mutation_lock
 # Mutation lock timeouts by scope. Alert on any increase.
 sum by (scope) (increase(openshell_server_mutation_lock_timeouts_total[10m]))
 
+# 99th percentile time a mutation lock is held, by replica and scope.
+# Conflicting acquisitions time out after 10 seconds.
+histogram_quantile(0.99, sum by (namespace, pod, le, scope) (rate(openshell_server_mutation_lock_hold_seconds_bucket[5m])))
+
 # Mutation lock acquisitions that failed without timing out. Timeouts do not
 # include them, so alert on any increase here as well.
 sum by (namespace, pod, scope) (increase(openshell_server_mutation_lock_errors_total[10m]))
@@ -275,7 +279,11 @@ supervisors reconnect to the other replicas, so watch
 receiving replicas. Rising waits or any timeout mean that those replicas
 receive reconnects faster than they can absorb them, or that slow compute
 driver, credential backend, middleware, or provider profile source calls during
-sandbox and provider changes hold their locks longer.
+sandbox and provider changes hold their locks longer. Guarded work has no time
+limit of its own, so such a call holds its lock until it returns:
+`openshell_server_mutation_lock_hold_seconds` shows how long, and the replica
+logs `mutation lock held longer than the lock wait timeout` when it releases a
+lock held longer than 10 seconds.
 
 ## Scale the Gateway
 

@@ -39,6 +39,7 @@ pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_err
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
 pub const MUTATION_LOCK_WAIT_SECONDS: &str = "openshell_server_mutation_lock_wait_seconds";
+pub const MUTATION_LOCK_HOLD_SECONDS: &str = "openshell_server_mutation_lock_hold_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -56,10 +57,11 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 3] = [
+const BUCKETED_HISTOGRAMS: [&str; 4] = [
     RELAY_CLAIM_DURATION_SECONDS,
     PEER_REQUEST_DURATION_SECONDS,
     MUTATION_LOCK_WAIT_SECONDS,
+    MUTATION_LOCK_HOLD_SECONDS,
 ];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
@@ -301,6 +303,11 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         Unit::Seconds,
         "Time spent acquiring the mutation lock for a scope."
     );
+    describe_histogram!(
+        MUTATION_LOCK_HOLD_SECONDS,
+        Unit::Seconds,
+        "Time a mutation lock was held, from acquisition to release, including requests cancelled while holding it."
+    );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
@@ -417,6 +424,12 @@ pub fn record_relay_claimed(waited: Duration) {
 /// on success only.
 pub fn record_lock_wait(scope: LockScope, waited: Duration) {
     histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => scope.label()).record(waited);
+}
+
+/// How long one mutation guard was held, recorded when it is released. Holds longer than the
+/// top bucket count only in `+Inf`; the hold warning logs their duration.
+pub fn record_lock_hold(scope: LockScope, held: Duration) {
+    histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => scope.label()).record(held);
 }
 
 /// A guard acquisition that timed out: a local wait, a full lock pool, too little time left to
@@ -719,6 +732,7 @@ mod tests {
         )
         .record(sample);
         histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
+        histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
         histogram!(
             "openshell_server_grpc_request_duration_seconds",
             "method" => "ListSandboxes",
