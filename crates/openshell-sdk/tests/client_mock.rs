@@ -322,6 +322,13 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn check_gateway_upgrade(
+        &self,
+        _: tonic::Request<proto::CheckGatewayUpgradeRequest>,
+    ) -> Result<Response<proto::CheckGatewayUpgradeResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn update_provider_profiles(
         &self,
         _: tonic::Request<proto::UpdateProviderProfilesRequest>,

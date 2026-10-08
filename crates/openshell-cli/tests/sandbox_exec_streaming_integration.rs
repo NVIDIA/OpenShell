@@ -222,6 +222,7 @@ mock_gateway! {
         health(proto::HealthRequest) -> proto::HealthResponse;
         get_current_user(proto::GetCurrentUserRequest) -> proto::GetCurrentUserResponse;
         get_gateway_info(proto::GetGatewayInfoRequest) -> proto::GetGatewayInfoResponse;
+        check_gateway_upgrade(proto::CheckGatewayUpgradeRequest) -> proto::CheckGatewayUpgradeResponse;
         create_sandbox(proto::CreateSandboxRequest) -> proto::SandboxResponse;
         begin_rootfs_tar_staging(proto::BeginRootfsTarStagingRequest) -> proto::BeginRootfsTarStagingResponse;
         list_sandboxes(proto::ListSandboxesRequest) -> proto::ListSandboxesResponse;

@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, profile management, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, profile list, profile describe, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, profile management, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, profile list, profile describe, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select, gateway upgrade-check.
 ---
 
 # OpenShell CLI
@@ -830,6 +830,13 @@ openshell status
 ```
 
 `openshell gateway info` reports the immutable startup snapshot for compute drivers, credential drivers, gateway interceptors, and supervisor middleware. Use each entry's protocol version, implementation version, supported capabilities, and gateway requirements when diagnosing extension skew; implementation versions do not identify underlying Docker, Kubernetes, or credential backends.
+
+Before a minor upgrade, run the admin-only, read-only upgrade check. It reports registered middleware services and stored global and sandbox policies that the target release rejects or treats differently, and exits non-zero when any finding is blocking. Restart the gateway after upgrading a middleware service so the check sees its new manifest, fix policies with `openshell policy set`, and follow the published upgrade guide for each finding kind:
+
+```bash
+openshell gateway upgrade-check --to 0.2
+openshell gateway upgrade-check --to 0.2 -o json
+```
 
 Register or remove gateways:
 

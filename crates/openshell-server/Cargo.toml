@@ -21,6 +21,7 @@ openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }

@@ -18,7 +18,8 @@ use crate::commands::common::{
 };
 pub use crate::commands::gateway::{
     gateway_add, gateway_info, gateway_info_not_configured, gateway_list, gateway_login,
-    gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
+    gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_upgrade_check,
+    gateway_use,
 };
 
 use crate::commands::provider::fetch_provider_profile_catalog;

@@ -145,6 +145,16 @@ Use structured output when scripting against live runtime info:
 openshell gateway info -o json
 ```
 
+Before upgrading to a new minor release, check whether registered middleware
+services and stored policies rely on behavior that release removes. The check
+is read-only, requires admin privileges, and exits with a non-zero status when
+it reports blocking findings. [Upgrade to OpenShell 0.2.0](/upgrade/0-2-0)
+explains each finding.
+
+```shell
+openshell gateway upgrade-check --to 0.2
+```
+
 Remove a local CLI registration without stopping the gateway service:
 
 ```shell

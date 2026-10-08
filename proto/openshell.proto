@@ -44,6 +44,16 @@ service OpenShell {
     };
   }
 
+  // Check registered middleware and stored policies against the rules of a
+  // later OpenShell release. Read-only.
+  rpc CheckGatewayUpgrade(CheckGatewayUpgradeRequest) returns (CheckGatewayUpgradeResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      global_role: "platform_admin"
+    };
+  }
+
   // Create a new sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -989,6 +999,113 @@ message GpuResourceCapabilities {
   bool default_selection_supported = 1;
   // The driver accepts an explicit `gpu.count` request.
   bool count_selection_supported = 2;
+}
+
+// Gateway upgrade check request.
+message CheckGatewayUpgradeRequest {
+  // Release line to check against, such as "0.2". A leading "v" and a ".0"
+  // patch suffix are accepted. Empty selects the next release line this
+  // gateway can check. Other values are rejected with INVALID_ARGUMENT.
+  string target_version = 1;
+}
+
+// Result of checking registered middleware and stored policies against a
+// later release, using the manifests the gateway described at startup.
+//
+// When a global policy is set it is the effective policy of every sandbox, so
+// the check covers it instead of the sandbox policies it overrides.
+message CheckGatewayUpgradeResponse {
+  // Release line the check applied, such as "0.2".
+  string target_version = 1;
+  // Version of the gateway that ran the check.
+  string gateway_version = 2;
+  // Findings, blocking first. At most 1000 are listed; the counts below
+  // include findings that were not listed.
+  repeated GatewayUpgradeFinding findings = 3;
+  // Number of blocking findings. Upgrading with any of them breaks a gateway
+  // registration or the configuration of at least one sandbox.
+  uint32 blocking_count = 4;
+  // Number of warning findings.
+  uint32 warning_count = 5;
+  // Number of sandboxes the check covered, including sandboxes whose policy
+  // could not be resolved.
+  uint32 checked_sandbox_count = 6;
+  // True when a global policy overrides every sandbox policy.
+  bool global_policy_active = 7;
+}
+
+enum GatewayUpgradeFindingKind {
+  GATEWAY_UPGRADE_FINDING_KIND_UNSPECIFIED = 0;
+  // A registered middleware service serves HTTP over the legacy middleware
+  // protocol, which the target release refuses.
+  GATEWAY_UPGRADE_FINDING_KIND_LEGACY_HTTP_SERVICE = 1;
+  // A policy entry uses middleware that is not registered.
+  GATEWAY_UPGRADE_FINDING_KIND_UNREGISTERED_MIDDLEWARE = 2;
+  // A policy entry uses a registered service that serves HTTP over the legacy
+  // middleware protocol.
+  GATEWAY_UPGRADE_FINDING_KIND_LEGACY_HTTP_MIDDLEWARE = 3;
+  // A policy entry sets `on_error: fail_open` on middleware where no binding
+  // honors it, so its HTTP stages already fail closed.
+  GATEWAY_UPGRADE_FINDING_KIND_FAIL_OPEN_NOT_APPLIED = 4;
+  // A policy entry sets `on_error: fail_open` on middleware with legacy HTTP
+  // bindings, whose HTTP stages fail closed in the target release.
+  GATEWAY_UPGRADE_FINDING_KIND_HTTP_FAIL_OPEN = 5;
+  // A policy entry relies on `on_error: fail_open` to allow traffic that no
+  // middleware can inspect, a fallback the target release removes.
+  GATEWAY_UPGRADE_FINDING_KIND_ON_UNINSPECTABLE_FALLBACK = 6;
+  // A policy entry sets `on_uninspectable: allow` for a `tls: skip` endpoint
+  // without `on_error: fail_open`. Supervisors that predate
+  // `on_uninspectable` reject the policy.
+  GATEWAY_UPGRADE_FINDING_KIND_ON_UNINSPECTABLE_NEEDS_CURRENT_SUPERVISOR = 7;
+  // A sandbox that uses middleware runs on a compute driver that keeps its
+  // supervisor when the gateway is upgraded.
+  GATEWAY_UPGRADE_FINDING_KIND_SANDBOX_KEEPS_SUPERVISOR = 8;
+  // A stored policy could not be checked.
+  GATEWAY_UPGRADE_FINDING_KIND_POLICY_UNCHECKED = 9;
+  // A policy entry sets `on_error: fail_open` on middleware that requires HTTP
+  // middleware protocol version 2 and has a WebSocket binding. Supervisors
+  // that predate version 2 cannot run that middleware and skip it under
+  // `fail_open`, for HTTP and WebSocket traffic alike. The target release
+  // accepts the setting for the WebSocket binding, so the finding blocks the
+  // upgrade but not admission once the target release runs.
+  GATEWAY_UPGRADE_FINDING_KIND_FAIL_OPEN_ON_HTTP_V2_ONLY = 10;
+}
+
+enum GatewayUpgradeFindingSeverity {
+  GATEWAY_UPGRADE_FINDING_SEVERITY_UNSPECIFIED = 0;
+  // The upgrade changes behavior or needs a follow-up step.
+  GATEWAY_UPGRADE_FINDING_SEVERITY_WARNING = 1;
+  // Fix before upgrading.
+  GATEWAY_UPGRADE_FINDING_SEVERITY_BLOCKING = 2;
+}
+
+enum GatewayUpgradeFindingScope {
+  GATEWAY_UPGRADE_FINDING_SCOPE_UNSPECIFIED = 0;
+  // A middleware registration. `middleware_name` identifies it.
+  GATEWAY_UPGRADE_FINDING_SCOPE_MIDDLEWARE_SERVICE = 1;
+  // The global policy.
+  GATEWAY_UPGRADE_FINDING_SCOPE_GLOBAL_POLICY = 2;
+  // One sandbox. `workspace` and `sandbox` identify it.
+  GATEWAY_UPGRADE_FINDING_SCOPE_SANDBOX = 3;
+}
+
+// One gateway upgrade check finding.
+message GatewayUpgradeFinding {
+  GatewayUpgradeFindingKind kind = 1;
+  GatewayUpgradeFindingSeverity severity = 2;
+  GatewayUpgradeFindingScope scope = 3;
+  // Workspace of the sandbox. Set only for the sandbox scope.
+  string workspace = 4;
+  // Sandbox name. Set only for the sandbox scope.
+  string sandbox = 5;
+  // Key of the policy's `network_middlewares` entry, when the finding concerns
+  // one entry.
+  string config_name = 6;
+  // Built-in middleware name or operator-owned registration name, when the
+  // finding concerns one middleware.
+  string middleware_name = 7;
+  // What fails or changes in the target release and how to fix it.
+  string message = 8;
 }
 
 // Public sandbox resource exposed by the OpenShell API.

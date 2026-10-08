@@ -4943,6 +4943,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",
+ "openshell-policy-schema",
  "openshell-prover",
  "openshell-providers",
  "openshell-supervisor-middleware",

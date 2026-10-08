@@ -26,6 +26,7 @@ const (
 	OpenShell_Health_FullMethodName                        = "/openshell.v1.OpenShell/Health"
 	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
 	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
+	OpenShell_CheckGatewayUpgrade_FullMethodName           = "/openshell.v1.OpenShell/CheckGatewayUpgrade"
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
 	OpenShell_BeginRootfsTarStaging_FullMethodName         = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
@@ -126,6 +127,9 @@ type OpenShellClient interface {
 	GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(ctx context.Context, in *GetGatewayInfoRequest, opts ...grpc.CallOption) (*GetGatewayInfoResponse, error)
+	// Check registered middleware and stored policies against the rules of a
+	// later OpenShell release. Read-only.
+	CheckGatewayUpgrade(ctx context.Context, in *CheckGatewayUpgradeRequest, opts ...grpc.CallOption) (*CheckGatewayUpgradeResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
@@ -369,6 +373,16 @@ func (c *openShellClient) GetGatewayInfo(ctx context.Context, in *GetGatewayInfo
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetGatewayInfoResponse)
 	err := c.cc.Invoke(ctx, OpenShell_GetGatewayInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) CheckGatewayUpgrade(ctx context.Context, in *CheckGatewayUpgradeRequest, opts ...grpc.CallOption) (*CheckGatewayUpgradeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckGatewayUpgradeResponse)
+	err := c.cc.Invoke(ctx, OpenShell_CheckGatewayUpgrade_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1220,6 +1234,9 @@ type OpenShellServer interface {
 	GetCurrentUser(context.Context, *GetCurrentUserRequest) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error)
+	// Check registered middleware and stored policies against the rules of a
+	// later OpenShell release. Read-only.
+	CheckGatewayUpgrade(context.Context, *CheckGatewayUpgradeRequest) (*CheckGatewayUpgradeResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error)
 	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
@@ -1447,6 +1464,9 @@ func (UnimplementedOpenShellServer) GetCurrentUser(context.Context, *GetCurrentU
 }
 func (UnimplementedOpenShellServer) GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetGatewayInfo not implemented")
+}
+func (UnimplementedOpenShellServer) CheckGatewayUpgrade(context.Context, *CheckGatewayUpgradeRequest) (*CheckGatewayUpgradeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckGatewayUpgrade not implemented")
 }
 func (UnimplementedOpenShellServer) CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
@@ -1756,6 +1776,24 @@ func _OpenShell_GetGatewayInfo_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).GetGatewayInfo(ctx, req.(*GetGatewayInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_CheckGatewayUpgrade_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckGatewayUpgradeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).CheckGatewayUpgrade(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_CheckGatewayUpgrade_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).CheckGatewayUpgrade(ctx, req.(*CheckGatewayUpgradeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3120,6 +3158,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetGatewayInfo",
 			Handler:    _OpenShell_GetGatewayInfo_Handler,
+		},
+		{
+			MethodName: "CheckGatewayUpgrade",
+			Handler:    _OpenShell_CheckGatewayUpgrade_Handler,
 		},
 		{
 			MethodName: "CreateSandbox",

@@ -1482,6 +1482,60 @@ async fn on_error_scope_rejects_fail_open_only_where_it_has_no_effect() {
 }
 
 #[tokio::test]
+async fn binding_summaries_report_each_middleware_protocol() {
+    let summary =
+        |name: &str, http_protocols: &[HttpProtocol], websocket| MiddlewareBindingSummary {
+            name: name.into(),
+            source: MiddlewareSource::InProcess,
+            http_protocols: http_protocols.to_vec(),
+            websocket,
+            honors_fail_open: websocket || http_protocols.contains(&HttpProtocol::Legacy),
+            requires_http_v2: false,
+        };
+    assert_eq!(
+        scope_registry()
+            .await
+            .binding_summaries()
+            .await
+            .expect("summaries"),
+        [
+            summary("example/v2-http", &[HttpProtocol::V2], false),
+            summary("example/v2-http-and-websocket", &[HttpProtocol::V2], true),
+            summary("example/legacy-http", &[HttpProtocol::Legacy], false),
+            summary("example/websocket", &[], true),
+        ]
+    );
+
+    let mut manifest = manifest_with(
+        vec![binding(SupervisorMiddlewareOperation::HttpRequest, 2)],
+        extension_metadata_with_requirements(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/v2-only-http",
+            "1.0.0",
+            [],
+            [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+        ),
+    );
+    manifest.name = "example/v2-only-http".into();
+    let summaries = MiddlewareRegistry::connect_services_with_http_v2(
+        vec![Arc::new(ManifestService(manifest))],
+        Vec::new(),
+    )
+    .await
+    .expect("registry")
+    .binding_summaries()
+    .await
+    .expect("summaries");
+    assert_eq!(
+        summaries,
+        [MiddlewareBindingSummary {
+            requires_http_v2: true,
+            ..summary("example/v2-only-http", &[HttpProtocol::V2], false)
+        }]
+    );
+}
+
+#[tokio::test]
 async fn stale_fail_open_on_version_2_binding_runs_fail_closed_with_a_report() {
     let observer = Arc::new(RecordingObserver::default());
     let runner = ChainRunner::default()

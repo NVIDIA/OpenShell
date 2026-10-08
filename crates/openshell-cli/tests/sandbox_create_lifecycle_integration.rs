@@ -167,6 +167,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn check_gateway_upgrade(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CheckGatewayUpgradeRequest>,
+    ) -> Result<Response<openshell_core::proto::CheckGatewayUpgradeResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_sandbox(
         &self,
         request: tonic::Request<CreateSandboxRequest>,

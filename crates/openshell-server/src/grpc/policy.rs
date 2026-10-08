@@ -14,7 +14,10 @@ mod endpoint_status;
 mod provisioning_clock;
 #[cfg(test)]
 mod token_grant_owners_tests;
+mod upgrade_check;
 pub use provisioning_clock::configuration_change;
+pub(super) use upgrade_check::handle_check_gateway_upgrade;
+pub use upgrade_check::log_gateway_upgrade_check;
 
 pub(super) use endpoint_status::{
     handle_peer_report_endpoint_status, handle_report_endpoint_status,
@@ -27,6 +30,7 @@ pub use endpoint_status::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, require_platform_admin};
+use crate::middleware_audit::{MiddlewareCatalog, RevalidationMode, admission_error, check_policy};
 use crate::pagination::Pagination;
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
@@ -2743,6 +2747,11 @@ pub(super) async fn handle_get_sandbox_config(
                     .and_then(|status| status.configuration_admission.as_ref())
                     .map_or_else(String::new, |admission| admission.instance_id.clone()),
                 workspace: sandbox.object_workspace().to_string(),
+                policy_validation_failure_mode: state
+                    .config
+                    .policy_validation_failure_mode
+                    .as_str()
+                    .to_string(),
                 ..Default::default()
             }))
         }
@@ -2956,14 +2965,27 @@ pub(super) async fn load_sandbox_config(
     }
 
     if let Some(policy) = policy.as_ref() {
-        state
-            .middleware_registry
-            .ensure_policy_middlewares_registered(policy)
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "effective policy middleware registration is invalid: {error}"
-                ))
-            })?;
+        match state.middleware_revalidation {
+            RevalidationMode::Audit => state
+                .middleware_registry
+                .ensure_policy_middlewares_registered(policy)
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "effective policy middleware registration is invalid: {error}"
+                    ))
+                })?,
+            // Unregistered middleware is one of the blocking findings, so it
+            // is refused through admission rather than as an RPC error.
+            RevalidationMode::Admission => {
+                if !policy.network_middlewares.is_empty() && configuration_error.is_empty() {
+                    let catalog =
+                        MiddlewareCatalog::from_registry(&state.middleware_registry).await?;
+                    if let Some(error) = admission_error(&check_policy(policy, &catalog)) {
+                        configuration_error = bounded_configuration_diagnostic(&error);
+                    }
+                }
+            }
+        }
     }
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
@@ -8417,6 +8439,59 @@ mod tests {
             "{}",
             repaired.configuration_error
         );
+    }
+
+    #[tokio::test]
+    async fn unadmitted_sandbox_config_carries_the_configured_failure_mode() {
+        use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("test state is uniquely owned")
+            .config
+            .policy_validation_failure_mode =
+            openshell_core::PolicyValidationFailureMode::RetainLastValid;
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_middlewares.insert(
+            "guard".to_string(),
+            NetworkMiddlewareConfig {
+                middleware: "example/unregistered".to_string(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".to_string()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+        let sandbox_id = "sb-unregistered-middleware";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "unregistered-middleware",
+                policy,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "unregistered-middleware".to_string(),
+                    workspace_scope: None,
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("sandbox callers receive a not-admitted configuration")
+        .into_inner();
+
+        assert!(!config.configuration_admitted);
+        assert!(config.configuration_error.contains("middleware"));
+        assert_eq!(config.policy_validation_failure_mode, "retain_last_valid");
     }
 
     fn security_notes_for_host(host: &str) -> String {

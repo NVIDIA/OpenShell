@@ -1762,6 +1762,75 @@ impl MiddlewareRegistry {
     pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
         &self.negotiated_extensions
     }
+
+    /// Summarize the protocols each registered middleware's bindings use, in
+    /// registration order, for checks that run outside a chain such as
+    /// stored-policy re-validation.
+    pub async fn binding_summaries(&self) -> Result<Vec<MiddlewareBindingSummary>> {
+        let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
+        manifests
+            .iter()
+            .map(|(state, manifest)| {
+                let name = ChainRunner::attachment_name(state, manifest).to_string();
+                let source = format!("middleware '{name}'");
+                let mut http_protocols = Vec::new();
+                for binding in &manifest.bindings {
+                    if let Some(protocol) = binding_http_protocol(&source, binding)?
+                        && !http_protocols.contains(&protocol)
+                    {
+                        http_protocols.push(protocol);
+                    }
+                }
+                Ok(MiddlewareBindingSummary {
+                    name,
+                    source: match state.service {
+                        MiddlewareDispatch::InProcess(_) => MiddlewareSource::InProcess,
+                        MiddlewareDispatch::Grpc(_) => MiddlewareSource::Registered,
+                    },
+                    http_protocols,
+                    websocket: manifest.bindings.iter().any(|binding| {
+                        binding.operation == SupervisorMiddlewareOperation::WebsocketMessage as i32
+                    }),
+                    honors_fail_open: manifest.bindings.iter().any(binding_honors_fail_open),
+                    requires_http_v2: manifest_requires_http_v2(manifest),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Where a registered middleware implementation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewareSource {
+    /// Supplied in process by the composition root, so it ships with the
+    /// gateway or supervisor that runs it.
+    InProcess,
+    /// An operator-registered external service.
+    Registered,
+}
+
+/// Protocols one registered middleware's bindings use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiddlewareBindingSummary {
+    /// Built-in middleware name or operator-owned registration name.
+    pub name: String,
+    pub source: MiddlewareSource,
+    /// Distinct HTTP protocols across the HTTP bindings, in binding order.
+    pub http_protocols: Vec<HttpProtocol>,
+    /// The middleware has a WebSocket binding.
+    pub websocket: bool,
+    /// `on_error: fail_open` affects at least one binding.
+    pub honors_fail_open: bool,
+    /// The service requires peers to execute HTTP protocol version 2, so
+    /// supervisors that predate it cannot run it.
+    pub requires_http_v2: bool,
+}
+
+impl MiddlewareBindingSummary {
+    #[must_use]
+    pub fn uses_http_protocol(&self, protocol: HttpProtocol) -> bool {
+        self.http_protocols.contains(&protocol)
+    }
 }
 
 impl Default for ChainRunner {

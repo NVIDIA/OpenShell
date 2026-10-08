@@ -20,7 +20,11 @@ use openshell_bootstrap::{
     save_active_gateway, store_gateway_metadata,
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
-use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
+use openshell_core::proto::{
+    CheckGatewayUpgradeRequest, CheckGatewayUpgradeResponse, ExtensionKind, GatewayUpgradeFinding,
+    GatewayUpgradeFindingKind, GatewayUpgradeFindingScope, GatewayUpgradeFindingSeverity,
+    GetGatewayInfoRequest, HealthRequest, ServiceStatus,
+};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -545,6 +549,210 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
             "required_capabilities": &extension.required_capabilities,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Check whether registered middleware and stored policies are ready for a
+/// later release. Fails when the gateway reports blocking findings, after
+/// printing the report.
+pub async fn gateway_upgrade_check(
+    server: &str,
+    tls: &TlsOptions,
+    target_version: &str,
+    output: &str,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let report = client
+        .check_gateway_upgrade(CheckGatewayUpgradeRequest {
+            target_version: target_version.to_string(),
+        })
+        .await
+        .map_err(|err| match err.code() {
+            Code::Unimplemented => {
+                miette!("gateway upgrade-check is not supported by this gateway version")
+            }
+            Code::PermissionDenied => {
+                miette!("gateway upgrade-check requires admin privileges: {err}")
+            }
+            Code::InvalidArgument => miette!("{}", err.message()),
+            _ => miette!("check_gateway_upgrade failed: {err}"),
+        })?
+        .into_inner();
+
+    if !crate::output::print_output_single(output, &report, upgrade_check_to_json)? {
+        print!("{}", format_upgrade_check(&report));
+    }
+    upgrade_check_outcome(&report)
+}
+
+fn upgrade_check_outcome(report: &CheckGatewayUpgradeResponse) -> Result<()> {
+    if report.blocking_count > 0 {
+        return Err(miette!(
+            "{} blocking finding{} must be fixed before upgrading to OpenShell {}",
+            report.blocking_count,
+            if report.blocking_count == 1 { "" } else { "s" },
+            report.target_version
+        ));
+    }
+    Ok(())
+}
+
+/// Lower-case enum label without the type prefix, for example
+/// `fail_open_not_applied`.
+fn upgrade_enum_label(name: &str, prefix: &str) -> String {
+    name.strip_prefix(prefix)
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+}
+
+fn upgrade_finding_kind(finding: &GatewayUpgradeFinding) -> String {
+    GatewayUpgradeFindingKind::try_from(finding.kind).map_or_else(
+        |_| "unknown".to_string(),
+        |kind| upgrade_enum_label(kind.as_str_name(), "GATEWAY_UPGRADE_FINDING_KIND_"),
+    )
+}
+
+fn upgrade_finding_severity(finding: &GatewayUpgradeFinding) -> String {
+    GatewayUpgradeFindingSeverity::try_from(finding.severity).map_or_else(
+        |_| "unknown".to_string(),
+        |severity| upgrade_enum_label(severity.as_str_name(), "GATEWAY_UPGRADE_FINDING_SEVERITY_"),
+    )
+}
+
+fn upgrade_finding_scope(finding: &GatewayUpgradeFinding) -> String {
+    GatewayUpgradeFindingScope::try_from(finding.scope).map_or_else(
+        |_| "unknown".to_string(),
+        |scope| upgrade_enum_label(scope.as_str_name(), "GATEWAY_UPGRADE_FINDING_SCOPE_"),
+    )
+}
+
+fn upgrade_finding_subject(finding: &GatewayUpgradeFinding) -> String {
+    match GatewayUpgradeFindingScope::try_from(finding.scope) {
+        Ok(GatewayUpgradeFindingScope::MiddlewareService) => {
+            format!("middleware {}", finding.middleware_name)
+        }
+        Ok(GatewayUpgradeFindingScope::GlobalPolicy) => "global policy".to_string(),
+        Ok(GatewayUpgradeFindingScope::Sandbox) => {
+            format!("sandbox {}/{}", finding.workspace, finding.sandbox)
+        }
+        Ok(GatewayUpgradeFindingScope::Unspecified) | Err(_) => "gateway".to_string(),
+    }
+}
+
+fn upgrade_check_to_json(report: &CheckGatewayUpgradeResponse) -> serde_json::Value {
+    serde_json::json!({
+        "target_version": &report.target_version,
+        "gateway_version": &report.gateway_version,
+        "blocking_count": report.blocking_count,
+        "warning_count": report.warning_count,
+        "checked_sandbox_count": report.checked_sandbox_count,
+        "global_policy_active": report.global_policy_active,
+        "findings": report.findings.iter().map(|finding| serde_json::json!({
+            "kind": upgrade_finding_kind(finding),
+            "severity": upgrade_finding_severity(finding),
+            "scope": upgrade_finding_scope(finding),
+            "workspace": &finding.workspace,
+            "sandbox": &finding.sandbox,
+            "config_name": &finding.config_name,
+            "middleware_name": &finding.middleware_name,
+            "message": &finding.message,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Drop control characters from gateway-provided text before it reaches a
+/// terminal. Findings quote policy entry names, which policy authors choose.
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
+fn format_upgrade_check(report: &CheckGatewayUpgradeResponse) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    let _ = writeln!(text, "{}", "Gateway Upgrade Check".cyan().bold());
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "  {} OpenShell {}",
+        "Target:".dimmed(),
+        printable(&report.target_version)
+    );
+    let _ = writeln!(
+        text,
+        "  {} {}",
+        "Gateway:".dimmed(),
+        printable(&report.gateway_version)
+    );
+    let scope = if report.global_policy_active {
+        " (all use the global policy)"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        text,
+        "  {} {} checked{scope}",
+        "Sandboxes:".dimmed(),
+        report.checked_sandbox_count
+    );
+    let _ = writeln!(
+        text,
+        "  {} {} blocking, {} warning{}",
+        "Findings:".dimmed(),
+        report.blocking_count,
+        report.warning_count,
+        if report.warning_count == 1 { "" } else { "s" }
+    );
+
+    for (severity, heading) in [
+        (GatewayUpgradeFindingSeverity::Blocking, "Blocking"),
+        (GatewayUpgradeFindingSeverity::Warning, "Warnings"),
+    ] {
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == severity as i32)
+            .collect();
+        if findings.is_empty() {
+            continue;
+        }
+        let _ = writeln!(text);
+        let heading = if severity == GatewayUpgradeFindingSeverity::Blocking {
+            heading.red().bold().to_string()
+        } else {
+            heading.yellow().bold().to_string()
+        };
+        let _ = writeln!(text, "{heading}");
+        for finding in findings {
+            let _ = writeln!(
+                text,
+                "  {}",
+                printable(&upgrade_finding_subject(finding)).bold()
+            );
+            let _ = writeln!(text, "    {}", printable(&finding.message));
+        }
+    }
+
+    let total = u64::from(report.blocking_count) + u64::from(report.warning_count);
+    if total > report.findings.len() as u64 {
+        let _ = writeln!(text);
+        let _ = writeln!(
+            text,
+            "Listed {} of {total} findings.",
+            report.findings.len()
+        );
+    }
+    if report.blocking_count == 0 {
+        let _ = writeln!(text);
+        let _ = writeln!(
+            text,
+            "{} No blocking findings for OpenShell {}.",
+            "✓".green().bold(),
+            printable(&report.target_version)
+        );
+    }
+    text
 }
 
 /// Set the active gateway.
@@ -1592,12 +1800,17 @@ mod tests {
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         plaintext_gateway_is_remote,
     };
+    use super::{format_upgrade_check, upgrade_check_outcome, upgrade_check_to_json};
     use crate::TEST_ENV_LOCK;
     use crate::test_utils::{EnvVarGuard, with_tmp_xdg};
     use hyper::StatusCode;
     use openshell_bootstrap::{
         GatewayMetadata, GatewayMetadataSource, ListedGateway, load_active_gateway,
         load_gateway_metadata, load_user_active_gateway, store_gateway_metadata,
+    };
+    use openshell_core::proto::{
+        CheckGatewayUpgradeResponse, GatewayUpgradeFinding, GatewayUpgradeFindingKind,
+        GatewayUpgradeFindingScope, GatewayUpgradeFindingSeverity,
     };
     use std::fs;
     use std::io::{Read, Write};
@@ -1884,6 +2097,103 @@ mod tests {
             gateway_remote_label(&gateway.metadata).as_deref(),
             Some("user@gateway-alias -> 10.0.0.5")
         );
+    }
+
+    fn upgrade_report() -> CheckGatewayUpgradeResponse {
+        CheckGatewayUpgradeResponse {
+            target_version: "0.2".to_string(),
+            gateway_version: "0.1.4".to_string(),
+            findings: vec![
+                GatewayUpgradeFinding {
+                    kind: GatewayUpgradeFindingKind::LegacyHttpService.into(),
+                    severity: GatewayUpgradeFindingSeverity::Blocking.into(),
+                    scope: GatewayUpgradeFindingScope::MiddlewareService.into(),
+                    middleware_name: "example/guard".to_string(),
+                    message: "registered middleware 'example/guard' serves HTTP over the legacy \
+                              middleware protocol"
+                        .to_string(),
+                    ..Default::default()
+                },
+                GatewayUpgradeFinding {
+                    kind: GatewayUpgradeFindingKind::SandboxKeepsSupervisor.into(),
+                    severity: GatewayUpgradeFindingSeverity::Warning.into(),
+                    scope: GatewayUpgradeFindingScope::Sandbox.into(),
+                    workspace: "team-a".to_string(),
+                    sandbox: "agent".to_string(),
+                    message: "recreate this sandbox after the upgrade".to_string(),
+                    ..Default::default()
+                },
+            ],
+            blocking_count: 1,
+            warning_count: 3,
+            checked_sandbox_count: 4,
+            global_policy_active: false,
+        }
+    }
+
+    #[test]
+    fn upgrade_check_json_uses_short_enum_labels() {
+        let json = upgrade_check_to_json(&upgrade_report());
+
+        assert_eq!(json["target_version"], "0.2");
+        assert_eq!(json["blocking_count"], 1);
+        assert_eq!(json["warning_count"], 3);
+        assert_eq!(json["checked_sandbox_count"], 4);
+        assert_eq!(json["findings"][0]["kind"], "legacy_http_service");
+        assert_eq!(json["findings"][0]["severity"], "blocking");
+        assert_eq!(json["findings"][0]["scope"], "middleware_service");
+        assert_eq!(json["findings"][0]["middleware_name"], "example/guard");
+        assert_eq!(json["findings"][1]["kind"], "sandbox_keeps_supervisor");
+        assert_eq!(json["findings"][1]["scope"], "sandbox");
+        assert_eq!(json["findings"][1]["workspace"], "team-a");
+    }
+
+    #[test]
+    fn upgrade_check_table_groups_findings_by_severity() {
+        let text = format_upgrade_check(&upgrade_report());
+
+        assert!(text.contains("Target: OpenShell 0.2"), "{text}");
+        assert!(text.contains("Findings: 1 blocking, 3 warnings"), "{text}");
+        let blocking = text.find("Blocking").expect("blocking section");
+        let warnings = text.find("Warnings").expect("warnings section");
+        assert!(blocking < warnings);
+        assert!(text.contains("  middleware example/guard\n    registered middleware"));
+        assert!(text.contains("  sandbox team-a/agent\n    recreate this sandbox"));
+        assert!(text.contains("Listed 2 of 4 findings."), "{text}");
+        assert!(!text.contains("No blocking findings"));
+    }
+
+    #[test]
+    fn upgrade_check_table_strips_control_characters() {
+        let mut report = upgrade_report();
+        report.findings[1].sandbox = "agent\u{1b}[2J".to_string();
+        report.findings[1].message =
+            "middleware config 'x\u{1b}]0;title\u{7}' is stale".to_string();
+
+        let text = format_upgrade_check(&report);
+
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text:?}"
+        );
+        assert!(text.contains("sandbox team-a/agent[2J"));
+        assert!(text.contains("middleware config 'x]0;title' is stale"));
+    }
+
+    #[test]
+    fn upgrade_check_fails_only_with_blocking_findings() {
+        let mut report = upgrade_report();
+        assert_eq!(
+            upgrade_check_outcome(&report)
+                .expect_err("blocking findings fail the command")
+                .to_string(),
+            "1 blocking finding must be fixed before upgrading to OpenShell 0.2"
+        );
+
+        report.blocking_count = 0;
+        report.findings.remove(0);
+        upgrade_check_outcome(&report).expect("warnings alone succeed");
+        assert!(format_upgrade_check(&report).contains("No blocking findings for OpenShell 0.2."));
     }
 
     #[test]

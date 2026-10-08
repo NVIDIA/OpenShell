@@ -215,6 +215,12 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn check_gateway_upgrade(
+        &self,
+        _: tonic::Request<openshell_core::proto::CheckGatewayUpgradeRequest>,
+    ) -> Result<Response<openshell_core::proto::CheckGatewayUpgradeResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn create_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSandboxRequest>,

@@ -414,6 +414,7 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell gateway add http://127.0.0.1:8080 --local
   $ openshell gateway select my-gateway
   $ openshell gateway info
+  $ openshell gateway upgrade-check --to 0.2
   $ openshell gateway remove my-gateway
 ";
 
@@ -1392,6 +1393,26 @@ enum GatewayCommands {
     /// Show elevated live gateway runtime information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Check whether registered middleware and stored policies are ready for
+    /// a later release.
+    ///
+    /// The gateway checks its registered middleware services, the global
+    /// policy, and each sandbox's effective policy against the rules of the
+    /// target release, and lists what would break or change. The check is
+    /// read-only and requires gateway admin privileges. The command exits with
+    /// a non-zero status when it reports blocking findings.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    UpgradeCheck {
+        /// Release line to check against, such as `0.2` (defaults to the next
+        /// release line the gateway can check).
+        #[arg(long = "to", value_name = "VERSION")]
+        to: Option<String>,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -2711,6 +2732,18 @@ async fn run_async() -> Result<()> {
                 } else {
                     run::gateway_info_not_configured()?;
                 }
+            }
+            GatewayCommands::UpgradeCheck { to, output } => {
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                run::gateway_upgrade_check(
+                    &ctx.endpoint,
+                    &tls,
+                    to.as_deref().unwrap_or_default(),
+                    output.as_str(),
+                )
+                .await?;
             }
             GatewayCommands::List { output } => {
                 run::gateway_list(&cli.gateway, output.as_str())?;
@@ -4775,6 +4808,41 @@ mod tests {
             Some(Commands::Gateway {
                 command: Some(GatewayCommands::Info {
                     output: OutputFormat::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_upgrade_check_parses_target_and_output() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "gateway",
+            "upgrade-check",
+            "--to",
+            "0.2",
+            "-o",
+            "json",
+        ])
+        .expect("gateway upgrade-check --to 0.2 -o json should parse");
+        match cli.command {
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::UpgradeCheck { to, output }),
+            }) => {
+                assert_eq!(to.as_deref(), Some("0.2"));
+                assert_eq!(output, OutputFormat::Json);
+            }
+            other => panic!("expected gateway upgrade-check, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "gw", "upgrade-check"])
+            .expect("the target and output format are optional");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::UpgradeCheck {
+                    to: None,
+                    output: OutputFormat::Table
                 })
             })
         ));

@@ -148,8 +148,10 @@ mod tests {
     // The HTTP protocol versions the gateway describes add two fields to the
     // public-only SupervisorMiddlewareService, which sandbox config responses
     // compute on demand.
+    // The gateway upgrade check adds a public-only admin RPC whose report is
+    // computed on demand and never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "4630d2ccc3eb1fdbc8e3e62df6ab6a2c7d64e5ca1cfb8406d2f13a84193e1ac5";
+        "02d0ee523159ee3a8cd5683c86d845adc920f73550933f16f9e61b96313d1dd0";
     const DURABLE_SCHEMA_SHA256: &str =
         "f4bb7e2db07e00eb5f64c91550850fba0f2c6dec46a41fde29b6c944636eb066";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -561,12 +563,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            105 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -574,7 +576,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -618,7 +620,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (307, 27),
+                (310, 30),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

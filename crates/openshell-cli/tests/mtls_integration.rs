@@ -10,12 +10,14 @@ use openshell_cli::{
     tls::{TlsOptions, grpc_client},
 };
 use openshell_core::proto::{
-    CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExchangeProviderSubjectTokenRequest,
+    CheckGatewayUpgradeRequest, CheckGatewayUpgradeResponse, CreateProviderRequest,
+    CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
+    DeleteProviderResponse, ExchangeProviderSubjectTokenRequest,
     ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
-    UpdateProviderRequest,
+    GatewayUpgradeFinding, GatewayUpgradeFindingKind, GatewayUpgradeFindingScope,
+    GatewayUpgradeFindingSeverity, GetProviderRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, ServiceStatus, UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use tempfile::tempdir;
@@ -105,6 +107,44 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
     ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
         Err(Status::unimplemented("unused"))
+    }
+
+    async fn check_gateway_upgrade(
+        &self,
+        request: tonic::Request<CheckGatewayUpgradeRequest>,
+    ) -> Result<Response<CheckGatewayUpgradeResponse>, Status> {
+        // "0.2" reports one blocking finding, an empty target none.
+        let blocking = match request.into_inner().target_version.as_str() {
+            "" => false,
+            "0.2" => true,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported upgrade target '{other}'; this gateway can check 0.2"
+                )));
+            }
+        };
+        let findings = if blocking {
+            vec![GatewayUpgradeFinding {
+                kind: GatewayUpgradeFindingKind::FailOpenNotApplied.into(),
+                severity: GatewayUpgradeFindingSeverity::Blocking.into(),
+                scope: GatewayUpgradeFindingScope::Sandbox.into(),
+                workspace: "default".to_string(),
+                sandbox: "agent".to_string(),
+                config_name: "guard".to_string(),
+                middleware_name: "example/guard".to_string(),
+                message: "middleware config 'guard' sets on_error: fail_open".to_string(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(CheckGatewayUpgradeResponse {
+            target_version: "0.2".to_string(),
+            gateway_version: "test".to_string(),
+            blocking_count: u32::from(blocking),
+            findings,
+            checked_sandbox_count: 1,
+            ..Default::default()
+        }))
     }
 
     async fn create_sandbox(
@@ -859,6 +899,55 @@ async fn cli_connects_with_client_cert() {
     let mut client = grpc_client(&endpoint, &tls).await.unwrap();
     let response = client.health(HealthRequest {}).await.unwrap();
     assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+}
+
+/// Start the test gateway and return its endpoint and client TLS options.
+async fn mtls_gateway(dir: &std::path::Path) -> (String, TlsOptions) {
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+
+    let ca_path = dir.join("ca.crt");
+    let cert_path = dir.join("tls.crt");
+    let key_path = dir.join("tls.key");
+    std::fs::write(&ca_path, ca_cert).unwrap();
+    std::fs::write(&cert_path, client_cert).unwrap();
+    std::fs::write(&key_path, client_key).unwrap();
+    (
+        format!("https://localhost:{}", addr.port()),
+        TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path)),
+    )
+}
+
+#[tokio::test]
+async fn gateway_upgrade_check_fails_only_on_blocking_findings() {
+    let _env = EnvVarGuard::set(&[]);
+    let dir = tempdir().unwrap();
+    let (endpoint, tls) = mtls_gateway(dir.path()).await;
+
+    run::gateway_upgrade_check(&endpoint, &tls, "", "json")
+        .await
+        .expect("a report without blocking findings succeeds");
+
+    let error = run::gateway_upgrade_check(&endpoint, &tls, "0.2", "table")
+        .await
+        .expect_err("blocking findings fail the command");
+    assert_eq!(
+        error.to_string(),
+        "1 blocking finding must be fixed before upgrading to OpenShell 0.2"
+    );
+
+    let error = run::gateway_upgrade_check(&endpoint, &tls, "0.9", "table")
+        .await
+        .expect_err("the gateway rejects unsupported targets");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported upgrade target '0.9'"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

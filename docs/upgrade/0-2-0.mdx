@@ -1,0 +1,123 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Upgrade to NVIDIA OpenShell 0.2.0"
+sidebar-title: "0.2.0"
+description: "Check supervisor middleware services and stored policies before upgrading to OpenShell 0.2.0, and fix what the check reports."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migration, Middleware"
+---
+
+<Note>
+This guide is a draft for the upcoming 0.2.0 release. It currently covers the supervisor middleware changes.
+</Note>
+
+OpenShell 0.2.0 removes the legacy HTTP middleware protocol, the effect of `on_error: fail_open` on HTTP middleware, and the `on_error: fail_open` fallback for traffic that middleware cannot inspect. Policies stored on your gateway can rely on any of these. Run the upgrade check on your current release, fix every blocking finding, and then upgrade.
+
+## Run the Upgrade Check
+
+`openshell gateway upgrade-check` asks the gateway to check its registered middleware services, the global policy, and the effective policy of every sandbox against the 0.2 rules. The gateway uses the middleware manifests it described at startup. The check changes nothing and requires gateway admin privileges.
+
+```shell
+openshell gateway upgrade-check --to 0.2
+```
+
+The report lists blocking findings first, then warnings, and names the middleware service, global policy, or sandbox each finding applies to. The command exits with a non-zero status when it reports a blocking finding, so automation can stop an upgrade on it. For structured output, use JSON or YAML:
+
+```shell
+openshell gateway upgrade-check --to 0.2 -o json
+```
+
+When a global policy is set, it is the effective policy of every sandbox, so the check covers it instead of the sandbox policies it overrides. The gateway also runs the check at startup and logs a warning that points to this command when it finds blocking issues.
+
+<Note>
+The gateway reads middleware manifests only at startup. After you upgrade a middleware service, restart the gateway before you run the check again.
+</Note>
+
+## Fix the Findings
+
+Each finding has a kind, shown in JSON output, and a message that describes the fix. The following table lists the kinds and whether they block the upgrade.
+
+| Kind | Blocks the upgrade | Fix |
+|---|---|---|
+| `legacy_http_service` | Yes | [Upgrade the middleware service](#upgrade-legacy-middleware-services). |
+| `legacy_http_middleware` | Yes | [Upgrade the middleware service](#upgrade-legacy-middleware-services) the entry uses. |
+| `unregistered_middleware` | Yes | [Register the service or remove the entry](#register-or-remove-missing-middleware). |
+| `fail_open_not_applied` | Yes | [Remove HTTP fail-open settings](#remove-http-fail-open-settings). |
+| `fail_open_on_http_v2_only` | Yes | [Remove HTTP fail-open settings](#remove-http-fail-open-settings). |
+| `http_fail_open` | Yes, unless the middleware also has a WebSocket binding | [Remove HTTP fail-open settings](#remove-http-fail-open-settings). |
+| `on_uninspectable_fallback` | Yes, when the entry selects a `tls: skip` endpoint | [Set uninspectable traffic handling explicitly](#set-uninspectable-traffic-handling-explicitly). |
+| `on_uninspectable_needs_current_supervisor` | No | [Recreate sandboxes with older supervisors](#set-uninspectable-traffic-handling-explicitly). |
+| `sandbox_keeps_supervisor` | No | [Recreate the sandbox after the upgrade](#recreate-sandboxes-that-keep-their-supervisor). |
+| `policy_unchecked` | Yes, unless the gateway already refuses the policy | [Repair the policy or run the check again](#repair-policies-the-check-cannot-read). |
+
+Repair a sandbox policy by printing its base policy, saving the policy YAML, editing the reported `network_middlewares` entries, and submitting the complete file. [Manage Policies](/how-it-works/policies/manage-policies) describes this workflow. The gateway validates the replacement policy without depending on the stored one.
+
+```shell
+openshell policy get my-sandbox --base
+openshell policy set my-sandbox --policy policy.yaml --wait
+```
+
+Repair the global policy the same way:
+
+```shell
+openshell policy get --global --full
+openshell policy set --global --policy ./global-policy.yaml
+```
+
+### Upgrade Legacy Middleware Services
+
+OpenShell 0.2.0 refuses middleware services whose HTTP bindings use the legacy protocol. Upgrade each reported service to HTTP middleware protocol version 2 before you upgrade the gateway. A service that serves both protocols keeps working with sandboxes that still run older supervisors: it returns version 2 bindings when the caller's Describe request advertises the `openshell.supervisor-middleware.http-v2` capability, and legacy bindings otherwise. The gateway advertises that capability, so the check reports only services that still describe legacy HTTP bindings to it.
+
+Built-in middleware such as `openshell/regex` moves to version 2 with the gateway, so the check does not report it.
+
+### Remove HTTP Fail-Open Settings
+
+HTTP middleware always fails closed in OpenShell 0.2.0, and `on_error: fail_open` applies only to WebSocket bindings. The gateway rejects `fail_open` on an entry whose middleware has no WebSocket binding. A `fail_open_not_applied` finding means the service already serves version 2 HTTP, so the entry's HTTP stages fail closed today. An `http_fail_open` warning means `fail_open` keeps applying to the WebSocket binding but stops applying to HTTP.
+
+Remove `on_error` or set it to `fail_closed`, then choose a replacement for the traffic that `fail_open` used to let through:
+
+- Have the middleware service return `Continue` at preflight for traffic it should pass without inspection.
+- Set `on_uninspectable: allow` for traffic that no middleware can inspect, such as `tls: skip` endpoints.
+
+### Set Uninspectable Traffic Handling Explicitly
+
+An entry that sets `on_error: fail_open` and omits `on_uninspectable` lets traffic that middleware cannot inspect through. OpenShell 0.2.0 removes that fallback, so the traffic is denied, and an entry that selects a `tls: skip` endpoint makes the policy invalid. Set `on_uninspectable: allow` to keep relaying that traffic, or `on_uninspectable: deny` to block it.
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  content-guard:
+    middleware: content-guard
+    on_uninspectable: allow
+    endpoints:
+      include: ["*.example.com"]
+```
+
+Supervisors from releases before `on_uninspectable`, such as 0.1.2, ignore the field and reject a policy where an entry selects a `tls: skip` endpoint without `on_error: fail_open`. On compute drivers that keep sandbox supervisors across gateway upgrades, the check reports such entries as `on_uninspectable_needs_current_supervisor`. While a sandbox still runs an older supervisor, keep `on_error: fail_open` next to `on_uninspectable: allow` on the entry. Recreate the sandbox, then remove `fail_open` before you upgrade.
+
+### Register or Remove Missing Middleware
+
+An entry that uses middleware the gateway does not have registered already blocks the sandbox's configuration. Register the service under `[[openshell.supervisor.middleware]]` in the gateway configuration and restart the gateway, or remove the entry from the policy.
+
+### Recreate Sandboxes That Keep Their Supervisor
+
+Docker and VM sandboxes receive the new supervisor when the gateway restarts. Podman and Kubernetes sandboxes keep the supervisor they started with, so they keep the previous release's middleware behavior after the gateway upgrade. The check lists each such sandbox that uses middleware. Recreate these sandboxes after you upgrade the gateway.
+
+### Repair Policies the Check Cannot Read
+
+A `policy_unchecked` finding means the gateway could not resolve the effective policy of a sandbox or the global policy.
+
+- When the stored policy or its provider attachments are invalid under the current release, the gateway already refuses that configuration, so the finding is a warning. Repair the policy, or the provider attachments the message names, and run the check again.
+- Any other failure, such as a database or provider profile source error, is blocking because the policy was not checked. Run the check again.
+
+## Upgrade in Order
+
+1. On your current release, run `openshell gateway upgrade-check --to 0.2`.
+2. Upgrade the reported middleware services to version 2, or to builds that serve both protocols. Restart the gateway and run the check again.
+3. Fix the reported sandbox and global policies with `openshell policy set`.
+4. Recreate sandboxes that run supervisors from releases before `on_uninspectable`, then remove the `fail_open` settings you kept for them.
+5. Repeat the check until it reports no blocking findings.
+6. Upgrade the gateway, then recreate Podman and Kubernetes sandboxes that use middleware.
+
+## After the Upgrade
+
+OpenShell 0.2.0 checks stored policies again when it serves sandbox configuration. A sandbox whose effective policy has a blocking finding is reported as not admitted, with a configuration error that describes the fix. Its supervisor applies the gateway's `policy_validation_failure_mode`: the default, `fail_closed`, denies the sandbox's network traffic until a valid policy arrives, and `retain_last_valid` keeps the last valid policy active. Other sandboxes are not affected. Repair the policy with `openshell policy set`.

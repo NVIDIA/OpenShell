@@ -208,6 +208,11 @@ mod tests {
                 .check(&id, "/openshell.v1.OpenShell/GetGatewayInfo")
                 .is_err()
         );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/CheckGatewayUpgrade")
+                .is_err()
+        );
     }
 
     #[test]
@@ -238,6 +243,11 @@ mod tests {
         assert!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/CheckGatewayUpgrade")
                 .is_ok()
         );
     }

@@ -29,6 +29,7 @@ mod gateway_ring;
 mod grpc;
 mod http;
 mod middleware;
+mod middleware_audit;
 mod multiplex;
 mod ocsf_log;
 mod otel_tracing;
@@ -333,6 +334,10 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Whether stored policies that the next release rejects are only
+    /// reported or also served as not admitted.
+    pub(crate) middleware_revalidation: middleware_audit::RevalidationMode,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -455,6 +460,7 @@ impl ServerState {
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            middleware_revalidation: middleware_audit::RevalidationMode::default(),
             oidc_cache,
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
@@ -837,6 +843,7 @@ pub(crate) async fn run_server(
                 error.message()
             ))
         })?;
+    tokio::spawn(grpc::policy::log_gateway_upgrade_check(state.clone()));
 
     let gateway_listener = bind_gateway_listener(config.bind_address).await?;
 
