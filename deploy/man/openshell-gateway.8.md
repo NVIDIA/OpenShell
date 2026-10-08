@@ -93,6 +93,14 @@ TLS.
     the Kubernetes compute driver.
     Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
 
+**--enable-operator-auth** *BOOL*
+:   Enable direct mTLS operators with a trusted client certificate containing
+    **OU=operator**. Grants user/platform-admin capabilities across all
+    workspaces and access to runtime credential retrieval. Defaults off.
+    Requires TLS and a client CA, independently of ordinary mTLS user auth
+    and OIDC. Do not combine an operator certificate with bearer headers.
+    Environment: **OPENSHELL_ENABLE_OPERATOR_AUTH**.
+
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
     address is **0.0.0.0** (the RPM default), disabling TLS exposes the

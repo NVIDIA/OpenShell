@@ -762,12 +762,21 @@ bodies. The recovery actions are:
 - `retry`: a network, rate-limit, or temporary issuer failure; the worker retries automatically.
 - `reauthorize`: a user refresh grant is no longer usable, such as `invalid_grant`; obtain a new grant and run `provider refresh configure`.
 - `fix_configuration`: the OAuth client, scopes, grant type, or administrator policy must be corrected.
-- `investigate`: the issuer returned an unrecognized response; the worker retries, but the operator should investigate persistent failures.
+- `investigate`: an unrecognized issuer response or an interrupted mint requires investigation. The worker retries unrecognized issuer responses, but it does not retry an interrupted mint with an uncertain outcome.
 
 The gateway parks `reauthorize` and `fix_configuration` failures instead of
 retrying them every worker tick. A manual `provider refresh rotate` still
 attempts the exchange. The current access token remains available only until
 its recorded expiry, after which credential resolution fails closed.
+
+The `refresh_in_progress` and `refresh_committing` statuses can indicate active
+work. Check gateway health and status again; concurrent refresh requests wait
+for the active mint. If a gateway interruption leaves either marker behind and
+rotation reports an uncertain previous mint, investigate the issuer state and
+run `provider refresh configure` with a valid grant. Obtain a new OAuth grant
+first if the previous refresh token may have been consumed. Repeated rotation
+or direct marker edits cannot recover it. Reconfiguration revokes previous
+workload handles, so restart processes holding them.
 
 Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
 supported. Upgrading from a build that stored refresh material inline requires
