@@ -213,6 +213,8 @@ configuration, and access control.
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
 | Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Spikes of `grpc_code="unavailable"` during rollouts are expected. Do not use as an HPA target. |
 | Lock contention | `openshell_server_mutation_lock_wait_seconds`, `openshell_server_mutation_lock_timeouts_total` | Alert on any timeout. |
+| Lock errors | `openshell_server_mutation_lock_errors_total` | Alert on any increase, separately from timeouts. PostgreSQL ran out of connection slots, restarted, or became unreachable. Readiness can stay healthy, because it uses established data connections. |
+| Lock pool | `openshell_server_mutation_lock_connections_in_use`, `openshell_server_mutation_lock_connections_capacity` | PostgreSQL only. Graph in use over capacity per replica. Values that stay near 1 mean that guarded operations on this replica hold their lock connections, or wait in PostgreSQL for a lock held elsewhere, often by another replica, and lock waits and timeouts follow. |
 
 These queries assume that Prometheus labels each series with `namespace` and
 `pod`:
@@ -248,6 +250,14 @@ histogram_quantile(0.99, sum by (le, scope) (rate(openshell_server_mutation_lock
 
 # Mutation lock timeouts by scope. Alert on any increase.
 sum by (scope) (increase(openshell_server_mutation_lock_timeouts_total[10m]))
+
+# Mutation lock acquisitions that failed without timing out. Timeouts do not
+# include them, so alert on any increase here as well.
+sum by (namespace, pod, scope) (increase(openshell_server_mutation_lock_errors_total[10m]))
+
+# Lock-pool connections in use on each replica, PostgreSQL only. Values that
+# stay near 1 mean the pool is close to full.
+max by (namespace, pod) (max_over_time(openshell_server_mutation_lock_connections_in_use[5m]) / openshell_server_mutation_lock_connections_capacity)
 ```
 
 Relay capacity is used on the replica that owns the sandbox's supervisor
@@ -441,8 +451,16 @@ your other clients and administration.
 
 Raise `database_lock_max_connections` only when mutation lock timeouts on a
 replica come from a full lock pool: the gateway logs them with the detail
-`waiting for a mutation lock connection`. Each extra lock connection adds
-`2 × replicas + surge` to the minimum `max_connections` for a Deployment.
+`waiting for a mutation lock connection`, and
+`openshell_server_mutation_lock_connections_in_use` stays at
+`openshell_server_mutation_lock_connections_capacity`. Also check that the
+replica's own acquisitions are not mostly waiting behind another holder: few
+of its timeouts carry the detail `waiting for a PostgreSQL advisory lock` or
+`canceling statement due to lock timeout`, and `pg_locks` shows the pod's lock
+sessions granted rather than waiting. Otherwise, find the slow holder first,
+because a larger pool only queues more waiters behind it. Each extra lock
+connection adds `2 × replicas + surge` to the minimum `max_connections` for a
+Deployment.
 
 If a connection pooler sits between the gateway and PostgreSQL, use session
 pooling. The gateway holds session-level advisory locks, which transaction

@@ -96,7 +96,9 @@ pub const LOCK_CONNECTION_MIN_BUDGET: Duration = Duration::from_secs(1);
 /// staying well under the data pool. Each extra slot costs
 /// `2 × replicas + surge` server connections during a rollout, so raise it
 /// for replicas whose guarded operations wait for a lock connection rather
-/// than by default.
+/// than by default. `openshell_server_mutation_lock_connections_in_use`
+/// exports how many are checked out, against the configured size in
+/// `openshell_server_mutation_lock_connections_capacity`.
 pub(super) const MUTATION_LOCK_POOL_MAX_CONNECTIONS: u32 = 4;
 
 /// Domain separator hashed into every derived key.

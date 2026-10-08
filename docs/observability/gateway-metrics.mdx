@@ -180,7 +180,10 @@ Mutation locks:
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `openshell_server_mutation_lock_wait_seconds` | Histogram | `scope` | Time to acquire a mutation lock, recorded for successful acquisitions. |
-| `openshell_server_mutation_lock_timeouts_total` | Counter | `scope` | Acquisitions that waited longer than 10 seconds, including background work such as supervisor disconnect handling and provider credential refresh. API requests fail with `UNAVAILABLE` and reason `MUTATION_LOCK_TIMEOUT`, and [API Errors](/sdk/api-errors) describes how to retry them. A lock connection that PostgreSQL does not open, although at least a second of the wait remained, is not counted. |
+| `openshell_server_mutation_lock_timeouts_total` | Counter | `scope` | Acquisitions that waited longer than 10 seconds, including background work such as supervisor disconnect handling and provider credential refresh. API requests fail with `UNAVAILABLE` and reason `MUTATION_LOCK_TIMEOUT`, and [API Errors](/sdk/api-errors) describes how to retry them. A lock connection that PostgreSQL does not open, although at least a second of the wait remained, counts in `openshell_server_mutation_lock_errors_total` instead. |
+| `openshell_server_mutation_lock_errors_total` | Counter | `scope` | Acquisitions that failed without timing out: PostgreSQL did not open a lock connection, or a lock statement failed. API requests fail with `INTERNAL`. |
+| `openshell_server_mutation_lock_connections_in_use` | Gauge | None | PostgreSQL lock-pool connections checked out on this replica: holding mutation locks, waiting for a PostgreSQL lock, or being returned to the pool, which can take up to 5 seconds. Exported only with PostgreSQL. |
+| `openshell_server_mutation_lock_connections_capacity` | Gauge | None | Lock-pool size per replica, `4` unless [`database_lock_max_connections`](/how-it-works/gateways/configuration#database-pool) sets it. Exported only with PostgreSQL. |
 
 The labels take these values:
 
@@ -220,7 +223,9 @@ The labels take these values:
 - `scope` is `global`, `workspace`, or `sandbox`.
 
 Gauges and counters exist from startup. They start at `0`, except
-`openshell_server_relay_pending_capacity`, which starts at its limit. `openshell_server_routed_request_attempts_total` starts with seven
+`openshell_server_relay_pending_capacity` and
+`openshell_server_mutation_lock_connections_capacity`, which start at their
+limits. `openshell_server_routed_request_attempts_total` starts with seven
 `outcome="success", grpc_code="ok"` series: four relay kind and route
 combinations, and three other peer operations with `relay_kind="none"`. Other outcomes and codes,
 and every histogram, appear after their first sample, so write alert expressions

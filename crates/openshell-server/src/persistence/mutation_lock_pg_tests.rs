@@ -4,7 +4,8 @@
 //! `PostgreSQL` tests of the mutation advisory locks: exclusion between two
 //! stores (as between two gateway replicas), exclusion against the legacy
 //! global key, cleanup after timed-out and cancelled acquisitions, the
-//! lock-pool bound, and lock connections that `PostgreSQL` does not open.
+//! lock-pool bound and its in-use gauge, and lock connections that
+//! `PostgreSQL` does not open.
 //!
 //! Advisory locks are database-wide, not per schema, so every test uses
 //! random workspace and sandbox ids, and `mise run test:rust:postgres` runs
@@ -23,6 +24,7 @@ use super::{
     map_db_error,
 };
 use crate::compute::MutationScope;
+use crate::gateway_metrics::{MUTATION_LOCK_CONNECTIONS_IN_USE, MetricsCapture};
 use sqlx::{Connection, PgConnection, PgPool};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -505,6 +507,28 @@ async fn raw_unlock(session: &mut PgConnection, key: i64) {
     assert!(released, "the raw session held the key");
 }
 
+/// Wait until `openshell_server_mutation_lock_connections_in_use` reads
+/// `expected`. A lock connection goes back to the pool from a background
+/// task, and stays counted until then.
+async fn wait_for_lock_connections_in_use(
+    in_use: &(dyn Fn() -> Option<i64> + Send + Sync),
+    expected: i64,
+    what: &str,
+) {
+    let until = Instant::now() + PROCEEDS_WITHIN;
+    loop {
+        let value = in_use();
+        if value == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "{what}: {value:?} lock connections in use, expected {expected}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Spawn one holder per lock set, spread over `stores`, each keeping its
 /// locks for [`HOLD`]; returns how long all of them took.
 async fn hold_concurrently(stores: &[Store], sets: Vec<MutationLockSet>) -> Duration {
@@ -973,6 +997,84 @@ async fn postgres_mutation_lock_pool_never_exceeds_configured_size() {
         stores.push(store);
     }
     fixture.finish(stores).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_mutation_lock_connections_gauge_tracks_checked_out_connections() {
+    // A current-thread runtime runs the tasks that return lock connections
+    // on this thread, so their gauge updates reach the capture.
+    let metrics = MetricsCapture::install();
+    let in_use = metrics.value_reader(MUTATION_LOCK_CONNECTIONS_IN_USE);
+    let fixture = LockFixture::new().await;
+    let store = fixture.store(2).await;
+    wait_for_lock_connections_in_use(&*in_use, 0, "after warming the pool").await;
+
+    // Two holders on disjoint sandboxes check out the whole pool.
+    let workspace = random_id("ws");
+    let first = acquire_proceeds(
+        &store,
+        MutationScope::sandbox(&workspace, &random_id("sb")),
+        "the first holder",
+    )
+    .await;
+    let second = acquire_proceeds(
+        &store,
+        MutationScope::sandbox(&workspace, &random_id("sb")),
+        "the second holder",
+    )
+    .await;
+    assert_eq!(in_use(), Some(2));
+    drop(first);
+    drop(second);
+    wait_for_lock_connections_in_use(&*in_use, 0, "after both holders released").await;
+
+    // The raw session holds only the sandbox key, so the store's only
+    // checked-out connection is the waiting acquisition's.
+    let workspace = random_id("ws");
+    let sandbox = sandbox_id_locked_last(&workspace);
+    let sandbox_key = MutationLockKey::Sandbox(&sandbox).advisory_key();
+    let mut holder = fixture.raw_session().await;
+    raw_lock(&mut holder, sandbox_key)
+        .await
+        .expect("the raw session takes the sandbox key");
+
+    // A wait for a PostgreSQL lock keeps its connection checked out until
+    // the lock timeout (55P03) returns it.
+    let deadline = Instant::now() + INTERRUPTED_DEADLINE;
+    let (acquisition, _) = fixture
+        .spawn_waiting_acquisition(&store, &workspace, &sandbox, deadline)
+        .await;
+    assert_eq!(in_use(), Some(1), "a waiting acquisition is counted");
+    let result = tokio::time::timeout_at(
+        deadline + CLIENT_BACKSTOP_GRACE + RELEASED_WITHIN,
+        acquisition,
+    )
+    .await
+    .expect("the acquisition returns by its deadline")
+    .expect("acquisition task");
+    assert!(
+        matches!(result, Err(PersistenceError::LockTimeout(_))),
+        "{result:?}"
+    );
+    wait_for_lock_connections_in_use(&*in_use, 0, "after the lock timeout").await;
+
+    // A cancelled acquisition stays counted until its session is closed.
+    let deadline = Instant::now() + INTERRUPTED_DEADLINE;
+    let (acquisition, _) = fixture
+        .spawn_waiting_acquisition(&store, &workspace, &sandbox, deadline)
+        .await;
+    assert_eq!(in_use(), Some(1), "a waiting acquisition is counted");
+    acquisition.abort();
+    let Err(error) = acquisition.await else {
+        panic!("the cancelled acquisition should not finish");
+    };
+    assert!(error.is_cancelled());
+    wait_for_lock_connections_in_use(&*in_use, 0, "after the cancellation").await;
+
+    raw_unlock(&mut holder, sandbox_key).await;
+    holder.close().await.expect("close the raw session");
+    fixture.finish(vec![store]).await;
 }
 
 #[tokio::test]

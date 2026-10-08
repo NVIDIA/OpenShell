@@ -10,6 +10,7 @@ use super::{
     PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
     map_migrate_error,
 };
+use crate::gateway_metrics::GaugeSlot;
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
@@ -135,24 +136,28 @@ impl Drop for PostgresAdvisoryLockGuard {
     }
 }
 
-/// Counts one checked-out lock-pool connection in [`LockPoolUsage`] until
-/// dropped. Its holder drops it only after the connection's pool permit is
-/// released.
+/// Counts one checked-out lock-pool connection in [`LockPoolUsage`] and in
+/// `openshell_server_mutation_lock_connections_in_use` until dropped. Its
+/// holder drops it only after the connection's pool permit is released.
 #[derive(Default)]
-struct LockConnectionCheckout(Option<Arc<LockPoolUsage>>);
+struct LockConnectionCheckout(Option<(Arc<LockPoolUsage>, GaugeSlot)>);
 
 impl LockConnectionCheckout {
     fn new(usage: &Arc<LockPoolUsage>) -> Self {
         if usage.in_use.fetch_add(1, Ordering::AcqRel) + 1 >= usage.max {
             usage.became_full.fetch_add(1, Ordering::AcqRel);
         }
-        Self(Some(Arc::clone(usage)))
+        Self(Some((
+            Arc::clone(usage),
+            GaugeSlot::mutation_lock_connection(),
+        )))
     }
 }
 
 impl Drop for LockConnectionCheckout {
     fn drop(&mut self) {
-        if let Some(usage) = self.0.take() {
+        // The gauge slot drops with the tuple, so both counts move together.
+        if let Some((usage, _slot)) = self.0.take() {
             usage.in_use.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -515,6 +520,11 @@ impl PostgresStore {
         } else {
             PersistenceError::Database(LOCK_CONNECTION_NOT_OPENED.into())
         }
+    }
+
+    /// Connections the lock pool may open, as configured.
+    pub(super) fn lock_connection_capacity(&self) -> u32 {
+        self.lock_usage.max
     }
 
     /// Connections the lock pool holds, idle or in use.
@@ -2166,6 +2176,35 @@ mod tests {
             store.lock_connection_timeout(start, LOCK_CONNECTION_MIN_BUDGET)
         ));
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn lock_connection_checkout_tracks_the_in_use_gauge() {
+        const IN_USE: &str = "openshell_server_mutation_lock_connections_in_use";
+        let metrics = crate::gateway_metrics::MetricsCapture::install();
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            2,
+        );
+        let usage = &store.lock_usage;
+
+        let first = LockConnectionCheckout::new(usage);
+        let second = LockConnectionCheckout::new(usage);
+        assert_eq!(metrics.value(IN_USE), Some(2));
+        assert_eq!(usage.in_use.load(Ordering::Acquire), 2);
+
+        // A guard moves its checkout out with `std::mem::take`; the empty
+        // checkout left behind must not decrement again.
+        let mut moved = first;
+        let taken = std::mem::take(&mut moved);
+        drop(moved);
+        assert_eq!(metrics.value(IN_USE), Some(2));
+
+        drop(taken);
+        assert_eq!(metrics.value(IN_USE), Some(1));
+        drop(second);
+        assert_eq!(metrics.value(IN_USE), Some(0));
+        assert_eq!(usage.in_use.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

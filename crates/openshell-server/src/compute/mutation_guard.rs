@@ -295,7 +295,9 @@ impl ComputeRuntime {
     /// [`PersistenceError::LockTimeout`]: the mutation lock was not acquired,
     /// so the caller's guarded writes did not run. A lock connection that
     /// `PostgreSQL` does not open with at least `LOCK_CONNECTION_MIN_BUDGET`
-    /// left fails with [`PersistenceError::Database`].
+    /// left fails with [`PersistenceError::Database`]. Timeouts count in
+    /// `openshell_server_mutation_lock_timeouts_total` and other failures in
+    /// `openshell_server_mutation_lock_errors_total`.
     pub(crate) async fn mutation_guard(
         &self,
         scope: MutationScope<'_>,
@@ -316,12 +318,15 @@ impl ComputeRuntime {
                     "mutation lock acquisition timed out"
                 );
             }
-            Err(error) => warn!(
-                scope = scope.lock_scope().label(),
-                waited_ms = duration_millis(started.elapsed()),
-                error = %error,
-                "mutation lock acquisition failed"
-            ),
+            Err(error) => {
+                gateway_metrics::record_lock_error(scope.lock_scope());
+                warn!(
+                    scope = scope.lock_scope().label(),
+                    waited_ms = duration_millis(started.elapsed()),
+                    error = %error,
+                    "mutation lock acquisition failed"
+                );
+            }
         }
         result
     }
@@ -809,6 +814,7 @@ mod tests {
     async fn lock_metrics_record_wait_and_timeout() {
         const WAITS: &str = "openshell_server_mutation_lock_wait_seconds_count{scope=\"sandbox\"}";
         const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+        const ERRORS: &str = "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}";
         let metrics = MetricsCapture::install();
         let runtime = test_runtime().await;
         runtime.set_mutation_lock_timeout_for_tests(Duration::from_millis(50));
@@ -826,6 +832,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(metrics.value(TIMEOUTS), Some(1));
+        assert_eq!(
+            metrics.value(ERRORS),
+            None,
+            "a timeout is not also an error"
+        );
         assert_eq!(metrics.value(WAITS), Some(1));
 
         drop(runtime.lock_sandbox_local("b").await);
@@ -834,8 +845,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_connection_failure_is_not_counted_as_a_timeout() {
+    async fn lock_connection_failure_counts_as_a_lock_error_not_a_timeout() {
         const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+        const ERRORS: &str = "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}";
         let metrics = MetricsCapture::install();
         let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
         let store = crate::persistence::PostgresStore::connect_lazy_for_tests(&url, 1);
@@ -861,6 +873,7 @@ mod tests {
             Ok(_) => panic!("nothing listens, yet the guard was acquired"),
         }
         assert_eq!(metrics.value(TIMEOUTS), None);
+        assert_eq!(metrics.value(ERRORS), Some(1));
     }
 
     /// Workspaces and sandboxes the random scope mix draws from.

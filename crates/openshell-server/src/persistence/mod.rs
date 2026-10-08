@@ -316,6 +316,15 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Configured size of the `PostgreSQL` mutation lock pool, or `None` on
+    /// `SQLite`, which has no lock pool.
+    pub fn mutation_lock_connections(&self) -> Option<u32> {
+        match self {
+            Self::Postgres(store) => Some(store.lock_connection_capacity()),
+            Self::Sqlite(_) => None,
+        }
+    }
+
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local
