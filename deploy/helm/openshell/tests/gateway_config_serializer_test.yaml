@@ -399,6 +399,17 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)^\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_closed"\ngrpc_endpoint = "http://governance\.ns\.svc\.cluster\.local:18081"\nname = "governance"\norder = 0\n\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_open"\ngrpc_endpoint = "http://audit\.ns\.svc\.cluster\.local:18081"\nname = "audit"\norder = 1$'
 
+  - it: renders the CI extension lists as separate ordered interceptor and middleware tables
+    values:
+      - ../ci/values-gateway-extensions.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[\[openshell\.gateway\.interceptors\]\]\nallow_insecure_transport = true\nfailure_policy = "fail_closed"\ngrpc_endpoint = "http://governance\.ns\.svc\.cluster\.local:18081"\nname = "governance"\norder = 0\n\[\[openshell\.gateway\.interceptors\]\]\nallow_insecure_transport = true\nfailure_policy = "fail_open"\ngrpc_endpoint = "http://audit\.ns\.svc\.cluster\.local:18081"\nname = "audit"\norder = 1$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[\[openshell\.supervisor\.middleware\]\]\nallow_insecure_transport = true\ngrpc_endpoint = "http://content-guard\.ns\.svc\.cluster\.local:18082"\nmax_payload_bytes = 262144\nname = "content-guard"\ntimeout = "500ms"\n\[\[openshell\.supervisor\.middleware\]\]\nallow_insecure_transport = true\ngrpc_endpoint = "http://request-audit\.ns\.svc\.cluster\.local:18082"\nmax_payload_bytes = 262144\nname = "request-audit"\ntimeout = "1s"$'
+
   - it: rejects non-map entries in a top-level array of tables
     set:
       gatewayConfig:
