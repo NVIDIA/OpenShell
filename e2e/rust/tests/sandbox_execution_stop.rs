@@ -87,6 +87,28 @@ async fn stale_execution_cannot_stop_restart_or_same_name_recreation() {
     })
     .await
     .expect("deleted sandbox disappears");
+    // Gateway deletion and Kubernetes resource deletion complete separately.
+    // Wait for the compute resource before recreating the same name.
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT").unwrap();
+    let namespace = std::env::var("OPENSHELL_E2E_KUBE_NAMESPACE").unwrap();
+    let deletion = tokio::process::Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "--namespace",
+            &namespace,
+            "wait",
+            "--for=delete",
+            &format!("sandboxes.agents.x-k8s.io/default--{name}"),
+            "--timeout=120s",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        deletion.status.success(),
+        "Kubernetes deletion: {deletion:?}"
+    );
     let mut replacement = SandboxGuard::create_with_gateway_default(&["--name", &name])
         .await
         .unwrap();
