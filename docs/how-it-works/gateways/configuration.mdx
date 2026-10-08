@@ -181,6 +181,12 @@ image_preparation_timeout_seconds = 1800
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
 
+# How sandboxes receive policy, settings, and provider credentials: "poll" or
+# "push". Push requires a single-replica gateway. See Configuration Delivery.
+config_delivery_mode = "poll"
+# Push only: seconds between checks that repair a missed change (5-86400).
+config_consistency_check_interval_seconds = 60
+
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
 # service URLs under that domain.
@@ -316,6 +322,31 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Configuration Delivery
+
+`config_delivery_mode` controls how sandbox supervisors receive their policy,
+settings, and provider credentials.
+
+- `poll` (default): each supervisor asks the gateway for its configuration
+  every 10 seconds. A change takes up to 10 seconds to reach a sandbox, and the
+  gateway rebuilds every sandbox's configuration on every poll.
+- `push`: the gateway sends configuration over the supervisor's existing
+  session when it changes, so a change reaches the sandbox as soon as it is
+  committed. The supervisor stops polling while the session pushes. The gateway
+  rebuilds a sandbox's configuration only when something it depends on changes,
+  and every `config_consistency_check_interval_seconds` to repair a missed
+  change. An unchanged check sends nothing and does not call credential
+  backends.
+
+Push requires a single-replica gateway that uses SQLite. A gateway configured
+with `push` and a PostgreSQL database refuses to start. Supervisors from
+releases without push support, and supervisors whose session is down, keep
+polling, so you can switch modes in either direction by changing this setting
+and restarting the gateway.
+
+`openshell_server_config_*` metrics show the work each mode does. See
+[Gateway Metrics](/observability/gateway-metrics).
 
 ## OCSF JSONL Output
 

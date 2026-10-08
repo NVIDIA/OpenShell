@@ -217,6 +217,19 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+Configuration delivery is also set in `gateway.toml`. With the default
+`config_delivery_mode = "poll"`, supervisors fetch `GetSandboxConfig` every 10
+seconds. With `"push"`, the gateway pushes changes over each supervisor session
+and the supervisor stops polling while that session lasts. Push requires a
+single-replica (SQLite) gateway; a PostgreSQL gateway configured for push fails
+at startup. To check delivery, scrape the gateway metrics endpoint:
+`openshell_server_config_push_sessions` counts sessions receiving pushed
+configuration, `openshell_server_config_results_total` shows supervisor
+outcomes, and a steady rise in `openshell_server_config_ack_timeouts_total` or
+`openshell_server_config_results_rejected_total` means supervisors are not
+answering pushed updates. Switching back to `"poll"` and restarting the gateway
+returns every supervisor to polling.
+
 The published supervisor image uses a shell-free distroless Debian 13 base.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
@@ -1041,6 +1054,8 @@ credential failures.
 | Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
 | Gateway or extension rejects its peer before serving health | Missing peer metadata, incompatible protocol major, or unmet `required_capabilities` | Gateway and extension startup logs; compare `PeerMetadata`; legacy-to-current migration requires a coordinated gateway and extension outage |
 | Policy mutation returns `FAILED_PRECONDITION` for endpoint ambiguity | Equally specific effective endpoint selectors disagree on connection or request-processing metadata | CLI error, base and provider-composed policy, affected profile attachments; confirm no new revision was stored |
+| Gateway exits with `config_delivery_mode = "push" requires a single-replica gateway` | Push was enabled on a PostgreSQL-backed gateway | Set `config_delivery_mode = "poll"` for multi-replica gateways |
+| Policy changes do not reach a sandbox in push mode | The session's builds are failing (gateway logs `pushed configuration build failed`), or the supervisor is not answering (`openshell_server_config_ack_timeouts_total` rising) | Gateway logs for the sandbox ID, `openshell_server_config_results_total`, supervisor logs for `configuration:` lines; restarting the sandbox's supervisor session sends a fresh initial snapshot |
 | Supervisor enters policy quarantine | A runtime candidate failed validation while `policy_validation_failure_mode = "fail_closed"` | Sandbox OCSF config/finding events, validation rationale, active generation, `previous_policy_active` |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |

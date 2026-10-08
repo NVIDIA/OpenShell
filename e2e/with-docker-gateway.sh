@@ -18,6 +18,8 @@
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
 #   SANDBOX_IMAGE=... (trusted sandbox runtime override)
+# Configuration delivery:
+#   OPENSHELL_E2E_CONFIG_DELIVERY_MODE=poll|push (default poll)
 # Supervisor image overrides:
 #   SUPERVISOR_IMAGE=... (common test-wrapper override)
 #   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
@@ -546,6 +548,17 @@ fi
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
+METRICS_PORT=$(e2e_pick_port)
+CONFIG_DELIVERY_MODE="${OPENSHELL_E2E_CONFIG_DELIVERY_MODE:-poll}"
+case "${CONFIG_DELIVERY_MODE}" in
+  poll|push) ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_CONFIG_DELIVERY_MODE must be poll or push" >&2
+    exit 2
+    ;;
+esac
+export OPENSHELL_E2E_CONFIG_DELIVERY_MODE="${CONFIG_DELIVERY_MODE}"
+export OPENSHELL_E2E_GATEWAY_METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
@@ -606,6 +619,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 2\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n'
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
+  printf 'config_delivery_mode = %s\n' "$(toml_string "${CONFIG_DELIVERY_MODE}")"
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
     e2e_write_gateway_mtls_auth_config
@@ -656,6 +670,7 @@ GATEWAY_ARGS=(
   --bind-address "${GATEWAY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
+  --metrics-port "${METRICS_PORT}"
   --compute-driver docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"

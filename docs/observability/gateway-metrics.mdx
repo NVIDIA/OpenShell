@@ -138,8 +138,8 @@ curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessi
 
 ## Histograms and Summaries
 
-The multi-replica latency metrics and the configuration build metric are
-Prometheus histograms with `_bucket`, `_sum`, and `_count` series and buckets
+The multi-replica latency metrics and the configuration build and wait metrics
+are Prometheus histograms with `_bucket`, `_sum`, and `_count` series and buckets
 from 1 millisecond to 15 seconds, so `histogram_quantile` can aggregate them
 across replicas. The older
 `*_duration_seconds` metrics and the interceptor latency metric are summaries
@@ -235,22 +235,45 @@ The gateway also records every API request and its background database check:
 ## Sandbox Configuration Metrics
 
 The gateway builds each sandbox's configuration in two parts: policy and
-settings, and the provider environment. These metrics measure that work:
+settings, and the provider environment. These metrics measure that work and,
+with [`config_delivery_mode = "push"`](/how-it-works/gateways/configuration#configuration-delivery),
+its delivery:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `openshell_server_config_build_duration_seconds` | Histogram | `part`, `trigger`, `outcome` | Time to build one configuration part, including its database reads and credential resolution. |
+| `openshell_server_config_push_sessions` | Gauge | None | Supervisor sessions on this replica that receive pushed configuration. |
+| `openshell_server_config_builds_waiting` | Gauge | None | Push sessions with a recorded change waiting for a build. |
+| `openshell_server_config_build_wait_seconds` | Histogram | `lane` | Time from the first change recorded for a session to the start of its build. |
+| `openshell_server_config_updates_sent_total` | Counter | `part`, `kind` | Configuration parts pushed to supervisors. |
+| `openshell_server_config_unchanged_total` | Counter | `part` | Rebuilt parts not pushed because the supervisor already has them. |
+| `openshell_server_config_results_total` | Counter | `part`, `outcome` | Supervisor answers to pushed parts. |
+| `openshell_server_config_results_rejected_total` | Counter | `part`, `reason` | Supervisor answers rejected because they did not match the pushed part. |
+| `openshell_server_config_ack_timeouts_total` | Counter | `part` | Pushed parts not answered within 60 seconds, which the gateway sends again. |
 
 The labels take these values:
 
 - `part` is `sandbox_config` for policy and settings, or `provider_environment`
   for provider credentials and files.
 - `trigger` is `request` when an API call asked for the part, such as a
-  supervisor's configuration poll or a provider status query.
-- `outcome` is `ok` or `error`.
+  supervisor's configuration poll or a provider status query, or `push` when
+  the gateway built it to push.
+- `outcome` on the build histogram is `ok` or `error`. On the results counter
+  it is the supervisor's apply outcome: `applied`, `ignored_duplicate`,
+  `ignored_stale`, `retained_local_override`, `degraded`,
+  `failed_retained_last_known_good`, `failed_closed`, `unsupported`, or
+  `awaiting_component`.
+- `kind` is `initial` for a session's first snapshot, otherwise `update`.
+- `lane` is `sandbox` for a change to one sandbox, an initial snapshot, or a
+  repair, and `fanout` for a change to a workspace, a provider, every sandbox,
+  or a consistency check. Sandbox builds have reserved capacity.
+- `reason` is `unknown_delivery`, `identity_mismatch`, `not_admitted`, or
+  `invalid_outcome`.
 
-Use the rate of `openshell_server_config_build_duration_seconds_count` to see
-how many builds the gateway runs.
+The two gauges start at `0`. The counters and histograms appear after their
+first sample. Use the rate of
+`openshell_server_config_build_duration_seconds_count` to compare how many
+builds each delivery mode runs for the same fleet.
 
 ## Gateway Interceptor Metrics
 
