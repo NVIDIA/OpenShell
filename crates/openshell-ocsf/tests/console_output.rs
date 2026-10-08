@@ -129,3 +129,35 @@ fn concurrent_console_formats_submit_complete_records() {
     }
     assert_eq!(json_count, 8 * 50);
 }
+
+#[test]
+fn non_json_console_records_preserve_physical_line_boundaries() {
+    let records = Records::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(OcsfShorthandLayer::new(records.clone()))
+        .with(OcsfJsonlLayer::new(records.clone()).with_console_format());
+    let message = "first\r\nsecond\nthird\rfourth";
+    let event = openshell_ocsf::ConfigStateChangeBuilder::new(&context())
+        .message(message)
+        .build();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "console\r\ncontinued", message = message);
+        ocsf_emit!(event);
+    });
+    let records = records.0.lock().unwrap();
+    assert_eq!(records.len(), 3);
+    for record in records.iter() {
+        assert_eq!(
+            record.iter().position(|byte| *byte == b'\n'),
+            Some(record.len() - 1)
+        );
+        assert!(!record.contains(&b'\r'));
+        assert_eq!(record.last(), Some(&b'\n'));
+        let line = std::str::from_utf8(record).unwrap();
+        if line.contains(" OCSF-JSON ") {
+            assert_eq!(payload(record)["message"], message);
+        } else {
+            assert!(line.contains("first\\r\\nsecond\\nthird\\rfourth"));
+        }
+    }
+}
