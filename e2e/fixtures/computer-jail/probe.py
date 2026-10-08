@@ -73,4 +73,18 @@ result = run("python -c \"print('x' * 2000000)\"")
 assert len(result["stdout"]) == 1048576 and result["stdout_truncated"], result
 result = run("sleep 20 & wait", timeout=1)
 assert result["timed_out"] and result["duration_ms"] < 5000, result
+# Closing a turn must stop its command before scratch/socket cleanup.
+import time
+
+with socket.socket(socket.AF_UNIX) as cancelled:
+    cancelled.connect("/tmp/openshell-bwrap-launcher.sock")
+    cancelled.sendall(json.dumps({
+        "protocol_version": 3, "command": "sleep 2; touch /agent/cancelled-alive",
+        "agent_root": str(root), "turn_socket": str(turn_socket),
+        "cwd": "agent", "timeout_seconds": 30,
+    }).encode() + b"\n")
+    time.sleep(0.3)
+time.sleep(3)
+assert not (root / "agent/cancelled-alive").exists()
+
 print(json.dumps({"computer_jail": "passed", "uid": os.getuid()}))

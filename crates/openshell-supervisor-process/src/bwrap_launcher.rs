@@ -540,7 +540,7 @@ fn capped_output(mut input: impl Read) -> Result<(String, bool)> {
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
-fn run_shell(request: ShellRequest) -> Result<Value> {
+fn run_shell(request: ShellRequest, stream: &UnixStream) -> Result<Value> {
     let mut command = Command::new("/usr/bin/bwrap");
     command.args([
         "--unshare-all",
@@ -634,8 +634,22 @@ fn run_shell(request: ShellRequest) -> Result<Value> {
         if let Some(status) = child.try_wait().into_diagnostic()? {
             break status;
         }
-        if started.elapsed() >= request.timeout {
-            timed_out = true;
+        // A cancelled turn closes its connection. Reap its namespace before
+        // the runtime removes the per-turn socket and scratch directory.
+        let mut byte = 0_u8;
+        #[allow(unsafe_code)]
+        // SAFETY: the stream owns this live fd and recv writes at most one byte
+        // into the valid local buffer. MSG_DONTWAIT cannot block this poll loop.
+        let disconnected = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                std::ptr::from_mut(&mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            ) == 0
+        };
+        if started.elapsed() >= request.timeout || disconnected {
+            timed_out = !disconnected;
             match nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(i32::try_from(child.id()).into_diagnostic()?),
                 nix::sys::signal::Signal::SIGKILL,
@@ -720,7 +734,7 @@ fn handle_request(stream: &UnixStream) -> Result<Value> {
     let request = read_request(stream)?;
     let request: Value = serde_json::from_slice(&request).into_diagnostic()?;
     if request.get("protocol_version").and_then(Value::as_u64) == Some(SHELL_PROTOCOL_VERSION) {
-        return run_shell(parse_shell_request(&request)?);
+        return run_shell(parse_shell_request(&request)?, stream);
     }
     run_code(request)
 }
