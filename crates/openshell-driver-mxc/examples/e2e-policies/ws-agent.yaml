@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# WebSocket-agent policy fixture ported from windows.
+# Stage the workload under the read-only directory; adapt the path before use.
+# Managed ingress uses the always-present Windows sandbox boundary and host
+# supervisor, not an optional relay binary or a driver-owned network proxy.
+# No network_policies means no authorized outbound destinations. This fixture
+# does not itself exercise a live WebSocket session or prove network fencing.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only:
+    - "C:/work/openshell-mxc-ws"
+  read_write: []

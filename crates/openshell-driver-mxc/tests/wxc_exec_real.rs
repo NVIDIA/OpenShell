@@ -854,6 +854,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let output_path_string = output_path.to_string_lossy().into_owned();
     let certificate_path_string = certificate_path.to_string_lossy().into_owned();
     let cmd_string = cmd.to_string_lossy().into_owned();
+    let curl_string = curl.to_string_lossy().into_owned();
     let script = format!(
         "type \"%CURL_CA_BUNDLE%\" 1>NUL && \
          \"{}\" --fail --silent --show-error --cacert \"%CURL_CA_BUNDLE%\" \
@@ -861,12 +862,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
          --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\"",
         curl.display()
     );
-    let command = vec![
-        cmd_string.clone(),
-        "/d".to_string(),
-        "/c".to_string(),
-        script,
-    ];
+    let command = vec![cmd_string, "/d".to_string(), "/c".to_string(), script];
     let serde_json::Value::Object(driver_config) = serde_json::json!({
         "command": command,
         "cwd": output_dir_string,
@@ -894,7 +890,8 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: cmd_string }],
+                // curl owns the socket; cmd only launches it (#4199).
+                binaries: vec![NetworkBinary { path: curl_string }],
             },
         )]),
         ..Default::default()

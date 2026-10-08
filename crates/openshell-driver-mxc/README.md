@@ -158,7 +158,10 @@ from Cargo's passed count.
 The E2E runner uses native release artifacts (override with `-BinaryDir`), OpenSSL
 on PATH for disposable Ed25519 keys, and per-run writable fixtures under
 `target/windows-e2e-results`. It preserves the tracked gateway TOML and isolates
-CLI registration via `XDG_CONFIG_HOME`. Signing keys have an owner-only DACL,
+CLI registration via disposable APPDATA, LOCALAPPDATA, and XDG directories.
+Inherited gateway overrides are cleared for the run and restored exactly
+(including empty versus absent entries). The caller's gateway aliases are not
+modified. Signing keys have an owner-only DACL,
 remain outside result bundles, and are removed unless `-KeepRunning` is requested.
 
 E2E runs real MXC only: there is no mock mode, and an inherited
@@ -181,3 +184,14 @@ mode, exposes a named endpoint with `openshell service expose`, and verifies two
 unique GET responses through gateway host-based routing. It deletes the endpoint
 and requires HTTP 404 afterward. Requests connect only to the gateway with the
 exposed URL's Host header, so no wildcard DNS setup is required.
+
+The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
+branch's workload grants. `inference.yaml` is a template: replace its filesystem,
+curl executable, inference host, and port placeholders before use. Authorize
+curl, which owns the network socket, not its cmd launcher. These policies have
+parser/mapper regression coverage; they do not add live WebSocket, OpenClaw,
+or provider-backed inference scenarios to the six-scenario E2E runner.
+
+With `-KeepRunning`, the runner restores the caller's environment but retains
+the disposable CLI/runtime directory for the live gateway and prints its path.
+Remove that directory only after stopping the gateway.

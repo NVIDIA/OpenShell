@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenClaw gateway policy fixture ported from windows.
+# Stage Node, OpenClaw, home, temporary files, and logs under this writable path.
+# Node loads user32/gdi32: explicitly permit graphical UI to disable MXC 1.0
+# win32k lockdown. Clipboard and input injection remain disabled.
+# The host supervisor governs the Node outbound grant. Managed ingress uses the
+# Windows sandbox boundary; neither path needs a driver-owned proxy or relay.
+# Fixture validation is not live OpenClaw coverage or verified exclusive fencing.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/openshell-openclaw"
+
+ui:
+  allow_graphical_ui: true
+  clipboard: none
+  allow_input_injection: false
+
+network_policies:
+  qualification_allowed:
+    name: qualification-allowed
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: tcp
+    binaries:
+      - path: "C:/openshell-openclaw/node.exe"

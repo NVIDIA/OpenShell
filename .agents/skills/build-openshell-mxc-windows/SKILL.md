@@ -456,6 +456,12 @@ skill or design doc.
 
 ## Final Report Checklist
 
+When syncing from the `windows` branch, consult the selective integration
+checkpoint in `crates/openshell-driver-mxc/WINDOWS-INTEGRATION.md`. Preserve
+the host-supervisor/Windows-boundary architecture rather than restoring legacy
+relay/proxy demo wrappers. The WebSocket, OpenClaw, and inference policy fixtures
+have parser/mapper tests; do not report them as live runtime scenarios.
+
 Every substantial Windows build run should report:
 
 | Item | Required detail |

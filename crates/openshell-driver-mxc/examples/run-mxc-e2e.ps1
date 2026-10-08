@@ -76,11 +76,119 @@ if (-not $BinaryDir) {
     $BinaryDir = Join-Path $targetRoot "$target/release"
 }
 $savedEnv = @{}
-foreach ($name in @("OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY", "OPENSHELL_MXC_MOCK_WXC", "OPENSHELL_WXC_EXEC_PATH", "OPENSHELL_COMPUTE_DRIVER", "OPENSHELL_MXC_SHARE_DIR", "XDG_CONFIG_HOME")) {
-    $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+$processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+foreach ($name in @("OPENSHELL_MXC_MOCK_WXC", "OPENSHELL_WXC_EXEC_PATH", "OPENSHELL_COMPUTE_DRIVER", "OPENSHELL_MXC_SHARE_DIR")) {
+    $exists = $processEnvironment.Contains($name)
+    $savedEnv[$name] = [pscustomobject]@{
+        Exists = $exists
+        Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+    }
 }
 $secretDir = Join-Path $resultsRoot "keys-$stamp-$([guid]::NewGuid().ToString('N'))"
 $transcriptStarted = $false
+
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+    "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+    "OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+    "OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY_NAME"
+)
+
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [Parameter(Mandatory = $true)]
+        [bool] $Exists,
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if (-not $Exists) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Value.Length -eq 0) {
+        # Windows PowerShell 5.1 maps an empty value passed through
+        # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+        # so an inherited empty entry remains distinguishable from absence.
+        if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+        }
+        if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+        }
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Enter-IsolatedCliEnvironment {
+    $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+    foreach ($name in $cliEnvironmentNames) {
+        $exists = $processEnvironment.Contains($name)
+        $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+        }
+    }
+    $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-e2e-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $isolatedPaths = @{
+        APPDATA = Join-Path $script:cliStateRoot "appdata"
+        LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+        XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+        XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+        XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+        foreach ($entry in $isolatedPaths.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Exit-IsolatedCliEnvironment
+        throw
+    }
+}
+
+function Exit-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        if (-not $script:cliEnvironmentSnapshot.ContainsKey($name)) { continue }
+        $snapshot = $script:cliEnvironmentSnapshot[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
+    if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+        if ($KeepRunning -and $gw -and -not $gw.HasExited) {
+            Write-Host "Retaining isolated CLI/runtime state for live gateway: $script:cliStateRoot"
+            return
+        }
+        # Resolve the generated target before recursive cleanup; never remove an
+        # arbitrary caller path or the temporary directory itself.
+        $cleanupPath = [IO.Path]::GetFullPath($script:cliStateRoot)
+        $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $cleanupPath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path $cleanupPath -Leaf) -notmatch '^openshell-mxc-(e2e|ocsf)-cli-[0-9]+-[0-9a-f]{32}$') {
+            throw "refusing unsafe CLI state cleanup: $cleanupPath"
+        }
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Step([string]$m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Info([string]$m)  { Write-Host "    $m" }
@@ -247,14 +355,13 @@ function Stop-Gw($p) {
 
 function Register-Cli {
     if ($script:registered) { return }
-    $env:OPENSHELL_GATEWAY = ""
 
     $addResult = Invoke-NativeCaptured $cli @(
         "gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName
     )
     $addText = ($addResult.Output -join "`n")
     if ($addText) { $addResult.Output | ForEach-Object { Info $_ } }
-    if ($addResult.ExitCode -ne 0 -and $addText -notmatch '(?i)already exists') {
+    if ($addResult.ExitCode -ne 0) {
         throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
     }
 
@@ -510,6 +617,7 @@ $backendProbe = @{ Live = $false; Reason = "not probed" }
 $runId = Get-Date -Format 'MMddHHmmss'
 
 try {
+    Enter-IsolatedCliEnvironment
     # Start the transcript inside the guarded region so a Start-Transcript failure
     # is caught and the results bundle is still produced. Pre-flight runs
     # immediately below, so the transcript still captures the whole run.
@@ -541,7 +649,6 @@ try {
 
     # Capture the pristine TOML once; every scenario renders a fresh copy from this.
     $tomlBase = Get-Content $tomlTemplate -Raw
-    $env:XDG_CONFIG_HOME = Join-Path $resultDir "cli-config"
     $openssl = (Get-Command openssl -ErrorAction Stop).Source
     New-Item -ItemType Directory $secretDir | Out-Null
     $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -929,7 +1036,11 @@ ingress works, not that direct host ingress is blocked.
         }
         if (Test-Path $secretDir) { Remove-Item -LiteralPath $secretDir -ErrorAction SilentlyContinue }
     }
-    foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name], "Process") }
+    Exit-IsolatedCliEnvironment
+    foreach ($name in $savedEnv.Keys) {
+        $snapshot = $savedEnv[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
 }
 
 if ($harnessError -or $failCount -gt 0) {
