@@ -8429,6 +8429,7 @@ process:
                             seconds: 1,
                             nanos: 0,
                         }),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -8525,6 +8526,7 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -8637,6 +8639,7 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(

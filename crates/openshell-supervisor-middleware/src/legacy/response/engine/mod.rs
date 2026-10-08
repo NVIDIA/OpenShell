@@ -30,10 +30,11 @@ use openshell_core::proto::{
     http_response_preflight_result,
 };
 
-use super::{
-    ChainEntry, ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
-    MAX_MIDDLEWARE_HEADER_BYTES, MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES, MAX_MIDDLEWARE_HEADERS,
+use crate::{
+    ChainEntry, ChainRunner, ContractFailureKind, DescribedChainEntry, HttpDirection,
+    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_FINDING_BYTES,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_HEADER_BYTES,
+    MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES, MAX_MIDDLEWARE_HEADERS,
     MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_REASON_BYTES,
     MAX_MIDDLEWARE_REASON_CODE_BYTES, MAX_MIDDLEWARE_TARGET_BYTES, MiddlewareDiagnosticPolicy,
     MiddlewareSessionAdmission, MiddlewareSessionPermit, NamespacedFinding, OnError, headers,
@@ -109,7 +110,7 @@ pub struct HttpResponseInvocation {
 pub struct HttpResponsePreflightOutcome {
     pub allowed: bool,
     pub reason: String,
-    pub denial: Option<super::MiddlewareDenial>,
+    pub denial: Option<crate::MiddlewareDenial>,
     pub headers: Vec<HttpHeader>,
     pub session: Option<HttpResponseSession>,
     pub findings: Vec<NamespacedFinding>,
@@ -121,7 +122,7 @@ pub struct HttpResponsePreflightOutcome {
 #[derive(Debug)]
 pub struct HttpResponseMiddlewareFailure {
     pub reason: String,
-    pub denial: Option<super::MiddlewareDenial>,
+    pub denial: Option<crate::MiddlewareDenial>,
     /// Exchange diagnostics collected before a consuming operation failed.
     pub diagnostics: HttpResponseDiagnostics,
 }
@@ -163,7 +164,7 @@ pub struct HttpResponseDiagnostics {
 
 struct HttpResponseStageTransport {
     sender: mpsc::Sender<HttpResponseEvent>,
-    responses: super::HttpResponseResultStream,
+    responses: crate::HttpResponseResultStream,
 }
 
 impl HttpResponseStageTransport {
@@ -693,7 +694,7 @@ impl HttpResponseSession {
                     .await;
                 Err(HttpResponseMiddlewareFailure {
                     reason: denial_reason,
-                    denial: Some(super::MiddlewareDenial {
+                    denial: Some(crate::MiddlewareDenial {
                         config_name,
                         reason_code,
                     }),
@@ -710,8 +711,8 @@ impl HttpResponseSession {
         sequence: Option<u64>,
         original: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, HttpResponseMiddlewareFailure> {
+        let fail_open = self.stage_fails_open(index, reason);
         let stage = &mut self.stages[index];
-        let fail_open = stage.entry.on_error() == OnError::FailOpen;
         let outcome = if fail_open {
             HttpResponseInvocationOutcome::FailOpen
         } else {
@@ -746,6 +747,17 @@ impl HttpResponseSession {
                 diagnostics: HttpResponseDiagnostics::default(),
             })
         }
+    }
+
+    /// Contract failures fail closed whatever the stage's `on_error` says.
+    fn stage_fails_open(&self, index: usize, reason: &str) -> bool {
+        let entry = &self.stages[index].entry;
+        if let Some(kind) = ContractFailureKind::from_reason(reason) {
+            self.runner
+                .report_contract_failure(entry, HttpDirection::Response, kind);
+            return false;
+        }
+        entry.on_error() == OnError::FailOpen
     }
 
     async fn end_all(&mut self, reason: MiddlewareSessionEndReason) {
@@ -848,8 +860,8 @@ impl HttpResponseSession {
         reason: &str,
         original: Vec<HttpHeader>,
     ) -> Result<Vec<HttpHeader>, HttpResponseMiddlewareFailure> {
+        let fail_open = self.stage_fails_open(index, reason);
         let stage = &mut self.stages[index];
-        let fail_open = stage.entry.on_error() == OnError::FailOpen;
         self.invocations.push(HttpResponseInvocation {
             config_name: stage.entry.entry.name.clone(),
             implementation: stage.entry.entry.implementation.clone(),
@@ -911,6 +923,9 @@ async fn exchange(
     {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => {
+            if let Some(kind) = ContractFailureKind::from_status(&error) {
+                return Err(kind.reason().into());
+            }
             let policy = stage
                 .entry
                 .service
@@ -983,7 +998,7 @@ fn collect_diagnostics(
         metadata.clear();
         for finding in &mut findings {
             finding.r#type = format!("{}.finding", stage.entry.entry.implementation);
-            finding.label = super::EXTERNAL_FINDING_LABEL.to_string();
+            finding.label = crate::EXTERNAL_FINDING_LABEL.to_string();
             finding.confidence.clear();
             finding.severity = "medium".into();
         }
@@ -1042,8 +1057,31 @@ fn collect_preflight_failure(
     fail_closed.then(|| format!("middleware_failed: {reason}"))
 }
 
+/// Record a contract failure, which fails closed whatever `on_error` says.
+fn collect_contract_failure(
+    entry: &DescribedChainEntry,
+    kind: ContractFailureKind,
+    invocations: &mut Vec<HttpResponseInvocation>,
+) -> String {
+    invocations.push(HttpResponseInvocation {
+        config_name: entry.entry.name.clone(),
+        implementation: entry.entry.implementation.clone(),
+        outcome: HttpResponseInvocationOutcome::FailClosed,
+        sequence: None,
+        input_size: 0,
+        output_size: None,
+        failed: true,
+        stage_disabled: true,
+        reason_code: None,
+        failure_category: Some(response_failure_category(kind.reason()).into()),
+    });
+    format!("middleware_failed: {}", kind.reason())
+}
+
 fn response_failure_category(reason: &str) -> &'static str {
-    if reason == "middleware_session_capacity_exhausted" {
+    if ContractFailureKind::from_reason(reason).is_some() {
+        "contract_failure"
+    } else if reason == "middleware_session_capacity_exhausted" {
         "session_capacity"
     } else if reason.contains("over_capacity") {
         "payload_capacity"
@@ -1105,7 +1143,7 @@ fn failed_preflight_outcome(
 
 fn blocked_preflight_outcome(
     headers: Vec<HttpHeader>,
-    denial: super::MiddlewareDenial,
+    denial: crate::MiddlewareDenial,
     findings: Vec<NamespacedFinding>,
     metadata: BTreeMap<String, BTreeMap<String, String>>,
     invocations: Vec<HttpResponseInvocation>,
@@ -1243,7 +1281,7 @@ mod tests {
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for RemoteResponseService
     {
-        type EvaluateWebSocketSessionStream = super::super::WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = crate::WebSocketResponseStream;
 
         async fn describe(
             &self,
@@ -1291,7 +1329,8 @@ mod tests {
     impl openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturn
         for RemoteResponseService
     {
-        type EvaluateStream = super::super::HttpResponseResultStream;
+        type EvaluateStream = crate::HttpResponseResultStream;
+        type EvaluateHttpStream = crate::HttpResultStream;
 
         async fn evaluate(
             &self,
@@ -1351,6 +1390,13 @@ mod tests {
             });
             Ok(tonic::Response::new(Box::pin(ReceiverStream::new(receiver))))
         }
+
+        async fn evaluate_http(
+            &self,
+            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> Result<tonic::Response<Self::EvaluateHttpStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("legacy HTTP response service"))
+        }
     }
 
     #[tonic::async_trait]
@@ -1375,6 +1421,7 @@ mod tests {
                         openshell_core::time::duration_from_std(Duration::from_millis(10))
                             .expect("test timeout is in protobuf range")
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -1407,7 +1454,7 @@ mod tests {
         async fn open_http_response_pre_return(
             &self,
             mut requests: mpsc::Receiver<HttpResponseEvent>,
-        ) -> Result<super::super::HttpResponseResultStream, tonic::Status> {
+        ) -> Result<crate::HttpResponseResultStream, tonic::Status> {
             let (sender, receiver) = mpsc::channel(4);
             let script = self.script;
             tokio::spawn(async move {
@@ -1616,7 +1663,7 @@ mod tests {
         async fn open_http_response_pre_return(
             &self,
             mut requests: mpsc::Receiver<HttpResponseEvent>,
-        ) -> Result<super::super::HttpResponseResultStream, tonic::Status> {
+        ) -> Result<crate::HttpResponseResultStream, tonic::Status> {
             let (sender, receiver) = mpsc::channel(4);
             let completion_tx = self.completion_tx.clone();
             tokio::spawn(async move {
@@ -1721,6 +1768,7 @@ mod tests {
                 phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -1953,7 +2001,7 @@ mod tests {
         async fn open_http_response_pre_return(
             &self,
             mut requests: mpsc::Receiver<HttpResponseEvent>,
-        ) -> Result<super::super::HttpResponseResultStream, tonic::Status> {
+        ) -> Result<crate::HttpResponseResultStream, tonic::Status> {
             let first = requests.recv().await.expect("initial preflight");
             assert!(matches!(
                 first.event,
@@ -2574,7 +2622,7 @@ mod tests {
                 let _ = shutdown_rx.await;
             });
         let server_task = tokio::spawn(server);
-        let registry = super::super::MiddlewareRegistry::connect_services(
+        let registry = crate::MiddlewareRegistry::connect_services(
             Vec::new(),
             vec![openshell_core::proto::SupervisorMiddlewareService {
                 name: "remote-response".into(),

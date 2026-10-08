@@ -14,6 +14,7 @@ pub mod host;
 pub mod identity;
 pub mod identity_source;
 pub mod l7;
+mod middleware_runtime;
 pub mod opa;
 pub(crate) mod policy_dns;
 pub mod policy_local;

@@ -51,17 +51,23 @@ impl RegexConfig {
 /// Describe the HTTP request and WebSocket message bindings supported by the regex middleware.
 pub fn describe() -> Vec<MiddlewareBinding> {
     vec![
+        // legacy-http-protocol-1: the regex middleware stays on the legacy HTTP
+        // protocol until 0.2.0.
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::HttpRequest as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            http_protocol_version: 0,
+            supported_http_body_modes: Vec::new(),
         },
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            http_protocol_version: 0,
+            supported_http_body_modes: Vec::new(),
         },
     ]
 }

@@ -11,16 +11,22 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent, WebSocketSessionEventResult,
+    HttpEvent, HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget,
+    HttpResponseEvent, HttpResponseEventResult, HttpResult, MiddlewareDescribeRequest,
+    MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
+/// HTTP protocol 1 (0.1). Removed in 0.2.0.
+///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
 >;
+
+/// Transport-neutral result stream for one version 2 HTTP middleware stage.
+pub type HttpResultStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
@@ -47,16 +53,35 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status>;
 
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    #[deprecated(
+        note = "legacy HTTP protocol (0.1), removed in 0.2.0; use open_http_request_stage"
+    )]
     async fn evaluate_http_request(
         &self,
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status>;
+
+    /// Open one version 2 HTTP request stage
+    /// (`HttpRequestPreCredentials.EvaluateHttp`).
+    async fn open_http_request_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement version 2 HTTP request evaluation",
+        ))
+    }
 
     async fn open_websocket_session(
         &self,
         requests: mpsc::Receiver<WebSocketSessionEvent>,
     ) -> Result<WebSocketResponseStream, Status>;
 
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    #[deprecated(
+        note = "legacy HTTP protocol (0.1), removed in 0.2.0; use open_http_response_stage"
+    )]
     async fn open_http_response_pre_return(
         &self,
         _requests: mpsc::Receiver<HttpResponseEvent>,
@@ -65,8 +90,21 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
             "middleware does not implement HTTP response pre-return evaluation",
         ))
     }
+
+    /// Open one version 2 HTTP response stage
+    /// (`HttpResponsePreReturn.EvaluateHttp`).
+    async fn open_http_response_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement version 2 HTTP response evaluation",
+        ))
+    }
 }
 
+/// HTTP protocol 1 (0.1). Removed in 0.2.0.
+///
 /// Borrowed request state exposed to one in-process middleware invocation.
 ///
 /// The view reflects every transformation applied by earlier stages. It is valid
@@ -194,6 +232,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
 ///                 request_timeout: None,
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -244,16 +283,34 @@ pub trait InProcessMiddleware: Send + Sync {
         config: &prost_types::Struct,
     ) -> Result<()>;
 
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    ///
     /// Evaluate one request using borrowed chain state.
     ///
     /// # Errors
     ///
     /// Returns an error when the selected implementation cannot evaluate the
     /// request or its validated configuration.
+    #[deprecated(
+        note = "legacy HTTP protocol (0.1), removed in 0.2.0; use open_http_request_stage"
+    )]
     async fn evaluate_http_request(
         &self,
         request: HttpRequestView<'_>,
     ) -> Result<HttpRequestResult>;
+
+    /// Open one version 2 HTTP request stage.
+    ///
+    /// Implementations without version 2 HTTP request bindings may keep the
+    /// default unsupported response.
+    async fn open_http_request_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement version 2 HTTP request evaluation",
+        ))
+    }
 
     /// Open one persistent WebSocket middleware session.
     ///
@@ -267,15 +324,33 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    ///
     /// Open one HTTP response pre-return stream.
     ///
     /// Request-only implementations may keep the default unsupported response.
+    #[deprecated(
+        note = "legacy HTTP protocol (0.1), removed in 0.2.0; use open_http_response_stage"
+    )]
     async fn open_http_response_pre_return(
         &self,
         _requests: mpsc::Receiver<HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one version 2 HTTP response stage.
+    ///
+    /// Implementations without version 2 HTTP response bindings may keep the
+    /// default unsupported response.
+    async fn open_http_response_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement version 2 HTTP response evaluation",
         ))
     }
 }

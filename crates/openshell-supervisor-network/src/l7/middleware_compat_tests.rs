@@ -98,6 +98,7 @@ fn registration(name: &str, fixture: &RunningFixture) -> SupervisorMiddlewareSer
         tls_ca_cert_pem: Vec::new(),
         audience: String::new(),
         allow_insecure_transport: true,
+        ..Default::default()
     }
 }
 
@@ -569,32 +570,33 @@ async fn stream_failure_mid_body_follows_on_error_at_the_relay() {
     }
 }
 
-/// 0.1.x answers a response stream that fails with `UNIMPLEMENTED` before
-/// commit with the canonical 502 under `fail_closed` and delivers the original
-/// response under `fail_open`. The legacy adapters fail closed on
-/// `UNIMPLEMENTED` regardless of `on_error`, so that cutover changes the
-/// `fail_open` expectation.
+/// 0.1.x delivered the original response when the stream answered
+/// `UNIMPLEMENTED` under `fail_open`. That contract failure now gets the
+/// canonical 502 before commit regardless of `on_error`, and asks the
+/// supervisor to describe its services again.
 #[tokio::test]
-async fn unimplemented_response_stream_follows_on_error_at_the_relay() {
+async fn unimplemented_response_stream_fails_closed_at_the_relay() {
     let request: &[u8] =
         b"GET /v1/data HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n";
     let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
 
-    let (open_fixture, open) = stream_guard(uppercase_units, "fail_open").await;
-    open_fixture.set_unimplemented(LegacyRpc::HttpResponsePreReturn, true);
-    let exchange = open.exchange(request, response).await;
-    assert!(exchange.relay.is_ok(), "{:?}", exchange.relay);
-    assert!(exchange.client.starts_with(b"HTTP/1.1 200 OK\r\n"));
-    assert_eq!(body_of(&exchange.client), b"hello", "0.1.x skips the stage");
-
-    let (closed_fixture, closed) = stream_guard(uppercase_units, "fail_closed").await;
-    closed_fixture.set_unimplemented(LegacyRpc::HttpResponsePreReturn, true);
-    let exchange = closed.exchange(request, response).await;
-    assert!(exchange.client.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
-    assert_eq!(
-        json_body(&exchange.client)["error"],
-        "response_delivery_failed"
-    );
+    for on_error in ["fail_open", "fail_closed"] {
+        let (fixture, supervisor) = stream_guard(uppercase_units, on_error).await;
+        fixture.set_unimplemented(LegacyRpc::HttpResponsePreReturn, true);
+        let exchange = supervisor.exchange(request, response).await;
+        assert!(
+            exchange.client.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+            "{on_error}"
+        );
+        assert_eq!(
+            json_body(&exchange.client)["error"],
+            "response_delivery_failed"
+        );
+        assert!(
+            supervisor.engine.take_middleware_reconciliation_request(),
+            "{on_error}"
+        );
+    }
 }
 
 async fn request_guard(on_error: &str) -> (RunningFixture, Supervisor) {
@@ -695,20 +697,21 @@ async fn over_capacity_request_bodies_depend_on_framing_and_on_error() {
     );
 }
 
-/// 0.1.x skips a legacy stage that answers `UNIMPLEMENTED` under `fail_open`
-/// and denies under `fail_closed`. The legacy adapters fail closed in both
-/// cases, so that cutover changes the `fail_open` expectation.
+/// 0.1.x skipped a legacy stage that answered `UNIMPLEMENTED` under
+/// `fail_open`. That contract failure now denies before upstream contact
+/// regardless of `on_error`, and asks the supervisor to describe its services
+/// again.
 #[tokio::test]
-async fn unimplemented_request_evaluation_follows_on_error_at_the_relay() {
-    let (open_fixture, open) = request_guard("fail_open").await;
-    open_fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
-    let exchange = open.exchange(&post(b"original"), OK_RESPONSE).await;
-    let forwarded = exchange.upstream.expect("request reaches upstream");
-    assert_eq!(body_of(&forwarded), b"original");
-
-    let (closed_fixture, closed) = request_guard("fail_closed").await;
-    closed_fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
-    assert_middleware_failed(&closed.exchange(&post(b"original"), OK_RESPONSE).await);
+async fn unimplemented_request_evaluation_fails_closed_at_the_relay() {
+    for on_error in ["fail_open", "fail_closed"] {
+        let (fixture, supervisor) = request_guard(on_error).await;
+        fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
+        assert_middleware_failed(&supervisor.exchange(&post(b"original"), OK_RESPONSE).await);
+        assert!(
+            supervisor.engine.take_middleware_reconciliation_request(),
+            "{on_error}"
+        );
+    }
 }
 
 /// Each stage sees the head as earlier stages left it, credential headers are

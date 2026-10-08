@@ -480,12 +480,12 @@ async fn service_failures_follow_on_error() {
     }
 }
 
-/// 0.1.x treats `UNIMPLEMENTED` like any other service error: `fail_open`
-/// skips the stage and the manifest is not described again. The legacy
-/// adapters fail closed on `UNIMPLEMENTED` regardless of `on_error`, so that
-/// cutover changes the `fail_open` expectation below.
+/// 0.1.x skipped a stage that answered `UNIMPLEMENTED` under `fail_open`, so
+/// a service swapped to a version 2-only build behind a cached manifest was
+/// silently bypassed. That contract failure now fails closed regardless of
+/// `on_error` and asks the supervisor to describe its services again.
 #[tokio::test]
-async fn unimplemented_evaluate_http_request_follows_on_error() {
+async fn unimplemented_evaluate_http_request_fails_closed_regardless_of_on_error() {
     for engine in Engine::ALL {
         let fixture = LegacyMiddlewareFixture::new("compat/swapped")
             .with_binding(http_request_binding(64))
@@ -497,40 +497,35 @@ async fn unimplemented_evaluate_http_request_follows_on_error() {
         let describes_after_registration = fixture.describe_requests().len();
         fixture.set_unimplemented(LegacyRpc::EvaluateHttpRequest, true);
 
-        let open = run_request(
-            engine,
-            &runner,
-            &[entry("guard", GUARD, 10, OnError::FailOpen)],
-            request(b"original", &[]),
-        )
-        .await;
-        assert!(open.allowed, "{engine:?}: {}", open.reason);
-        assert_eq!(open.body, b"original");
-        assert_eq!(
-            open.stages,
-            vec![StageOutcome {
-                name: "guard".into(),
-                decision: Decision::Allow,
-                transformed: false,
-                failed: true,
-            }]
-        );
-
-        let closed = run_request(
-            engine,
-            &runner,
-            &[entry("guard", GUARD, 10, OnError::FailClosed)],
-            request(b"original", &[]),
-        )
-        .await;
-        assert!(!closed.allowed);
-        // The normalized reason does not distinguish UNIMPLEMENTED from any
-        // other status.
-        assert_eq!(closed.reason, "middleware_failed: external_service_error");
+        for on_error in [OnError::FailOpen, OnError::FailClosed] {
+            let observation = run_request(
+                engine,
+                &runner,
+                &[entry("guard", GUARD, 10, on_error)],
+                request(b"original", &[]),
+            )
+            .await;
+            assert!(!observation.allowed, "{engine:?} {on_error:?}");
+            // The status is classified before diagnostics are normalized.
+            assert_eq!(
+                observation.reason,
+                "middleware_failed: middleware_contract_failure_unimplemented"
+            );
+            assert_eq!(
+                observation.stages,
+                vec![StageOutcome {
+                    name: "guard".into(),
+                    decision: Decision::Deny,
+                    transformed: false,
+                    failed: true,
+                }]
+            );
+            assert!(runner.take_reconciliation_request(), "{on_error:?}");
+        }
         assert_eq!(
             fixture.describe_requests().len(),
             describes_after_registration,
-            "0.1.x keeps the cached manifest"
+            "the supervisor's next poll describes the services again"
         );
         assert!(fixture.http_requests().is_empty());
     }

@@ -3569,6 +3569,7 @@ network_policies:
                         seconds: 1,
                         nanos: 0,
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3775,6 +3776,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -3850,6 +3852,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -4810,6 +4813,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -4963,6 +4967,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await

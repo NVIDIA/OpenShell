@@ -300,11 +300,16 @@ impl OpaEngine {
     fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
+        let middleware_observer = Arc::new(crate::middleware_runtime::OcsfMiddlewareObserver::new(
+            Arc::clone(&generation),
+        ));
         Self {
             engine: Mutex::new(engine),
             binary_identity_required,
             generation,
-            middleware_runner: RwLock::new(ChainRunner::default()),
+            middleware_runner: RwLock::new(
+                ChainRunner::default().with_runtime_observer(middleware_observer),
+            ),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
@@ -905,6 +910,14 @@ impl OpaEngine {
             .read()
             .map(|runner| runner.clone())
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))
+    }
+
+    /// Take a pending request, raised by a middleware contract failure, to
+    /// re-describe every middleware service.
+    pub fn take_middleware_reconciliation_request(&self) -> bool {
+        self.middleware_runner
+            .read()
+            .is_ok_and(|runner| runner.take_reconciliation_request())
     }
 
     /// Test-only: swap the middleware runner without a connected registry, so
@@ -11358,6 +11371,93 @@ network_policies:
             .await
             .expect("describe chain");
         assert!(described[0].is_resolved());
+    }
+
+    /// Legacy response middleware that never implemented the response RPC.
+    struct UnimplementedResponseMiddleware;
+
+    #[async_trait::async_trait]
+    impl openshell_supervisor_middleware::InProcessMiddleware for UnimplementedResponseMiddleware {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/unimplemented".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpResponse
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 1024,
+                    ..Default::default()
+                }],
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "test/unimplemented",
+                    "test",
+                    [],
+                )),
+                ..Default::default()
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_supervisor_middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Err(miette::miette!("response-only test middleware"))
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_contract_failure_requests_registry_reconciliation_across_reloads() {
+        let engine = OpaEngine::from_proto(&test_proto()).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            vec![Arc::new(UnimplementedResponseMiddleware)],
+            Vec::new(),
+        )
+        .await
+        .expect("registry");
+        engine
+            .replace_middleware_registry(registry.clone())
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("replace registry");
+        assert!(!engine.take_middleware_reconciliation_request());
+
+        let outcome = old_runner
+            .preflight_http_response(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "test/unimplemented".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: openshell_supervisor_middleware::OnError::FailOpen,
+                }],
+                openshell_supervisor_middleware::HttpResponsePreflightInput {
+                    context: openshell_core::proto::RequestContext::default(),
+                    target: openshell_core::proto::HttpRequestTarget::default(),
+                    status_code: 200,
+                    declared_body_length: None,
+                    headers: Vec::new(),
+                    connection_nominated_headers: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(!outcome.allowed);
+        assert!(
+            engine.take_middleware_reconciliation_request(),
+            "a runner pinned before the registry swap still requests reconciliation"
+        );
+        assert!(!engine.take_middleware_reconciliation_request());
     }
 
     #[tokio::test]

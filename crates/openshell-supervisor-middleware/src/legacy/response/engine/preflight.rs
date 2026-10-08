@@ -80,6 +80,25 @@ impl ChainRunner {
                 }
                 continue;
             };
+            // This engine speaks only the legacy protocol. A version 2 stage
+            // is never evaluated through it; it fails closed instead.
+            if entry.http_protocol() == Some(crate::HttpProtocol::V2) {
+                if let Some(reason) = collect_preflight_failure(
+                    &entry,
+                    "http_v2_stage_not_executable",
+                    &mut invocations,
+                ) {
+                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+                    return Ok(failed_preflight_outcome(
+                        headers,
+                        reason,
+                        findings,
+                        metadata,
+                        invocations,
+                    ));
+                }
+                continue;
+            }
             let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
             let preflight = HttpResponsePreflight {
                 context: Some(input.context.clone()),
@@ -115,6 +134,18 @@ impl ChainRunner {
             .await;
             let (responses, response) = match opened {
                 Ok(Ok(opened)) => opened,
+                Ok(Err(error)) if let Some(kind) = ContractFailureKind::from_status(&error) => {
+                    self.report_contract_failure(&entry, HttpDirection::Response, kind);
+                    let reason = collect_contract_failure(&entry, kind, &mut invocations);
+                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+                    return Ok(failed_preflight_outcome(
+                        headers,
+                        reason,
+                        findings,
+                        metadata,
+                        invocations,
+                    ));
+                }
                 Ok(Err(error)) => {
                     let reason = if error.code() == tonic::Code::DeadlineExceeded {
                         "middleware_timeout".to_string()

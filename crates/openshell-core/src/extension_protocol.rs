@@ -19,6 +19,15 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Capability for supervisor-middleware peers that execute version 2 of the
+/// HTTP middleware protocol (`EvaluateHttp`).
+///
+/// A service that implements only version 2 requires this capability, so a
+/// peer without version 2 support refuses it at Describe. A service that
+/// implements both protocols returns version 2 HTTP bindings only to callers
+/// that advertise it, and legacy HTTP bindings otherwise.
+pub const SUPERVISOR_MIDDLEWARE_HTTP_V2: &str = "openshell.supervisor-middleware.http-v2";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -107,12 +116,42 @@ pub enum NegotiationError {
     },
 }
 
+/// Optional capabilities every `OpenShell` peer implements for `family`,
+/// beyond the family contract.
+const fn family_capabilities(family: ExtensionFamily) -> &'static [&'static str] {
+    match family {
+        ExtensionFamily::Compute => &[COMPUTE_LAUNCH_AUTHENTICATION],
+        ExtensionFamily::Credentials
+        | ExtensionFamily::GatewayInterceptor
+        | ExtensionFamily::SupervisorMiddleware => &[],
+    }
+}
+
 #[must_use]
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
+    gateway_metadata_with_capabilities(family, [])
+}
+
+/// Gateway or supervisor metadata with additional optional capabilities.
+///
+/// Callers advertise capabilities they implement for `family`, such as
+/// [`SUPERVISOR_MIDDLEWARE_HTTP_V2`] once their middleware runtime executes
+/// version 2 HTTP.
+#[must_use]
+pub fn gateway_metadata_with_capabilities(
+    family: ExtensionFamily,
+    additional_capabilities: impl IntoIterator<Item = String>,
+) -> PeerMetadata {
     let contract = family.contract_capability();
     let mut supported_capabilities = vec![contract.clone()];
-    if family == ExtensionFamily::Compute {
-        supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+    for capability in family_capabilities(family)
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .chain(additional_capabilities)
+    {
+        if !supported_capabilities.contains(&capability) {
+            supported_capabilities.push(capability);
+        }
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
@@ -146,6 +185,34 @@ pub fn extension_metadata(
         supported_capabilities,
         required_capabilities: vec![contract],
     }
+}
+
+/// Extension metadata that also requires `required_capabilities` from the
+/// gateway or supervisor. Each required capability is advertised as supported
+/// too.
+#[must_use]
+pub fn extension_metadata_with_requirements(
+    family: ExtensionFamily,
+    implementation_name: impl Into<String>,
+    implementation_version: impl Into<String>,
+    additional_capabilities: impl IntoIterator<Item = String>,
+    required_capabilities: impl IntoIterator<Item = String>,
+) -> PeerMetadata {
+    let mut metadata = extension_metadata(
+        family,
+        implementation_name,
+        implementation_version,
+        additional_capabilities,
+    );
+    for capability in required_capabilities {
+        if !metadata.supported_capabilities.contains(&capability) {
+            metadata.supported_capabilities.push(capability.clone());
+        }
+        if !metadata.required_capabilities.contains(&capability) {
+            metadata.required_capabilities.push(capability);
+        }
+    }
+    metadata
 }
 
 pub fn negotiate(
@@ -477,6 +544,99 @@ mod tests {
             ),
             Err(NegotiationError::InvalidMetadata { .. })
         ));
+    }
+
+    #[test]
+    fn gateway_metadata_advertises_family_capabilities_once() {
+        let compute = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            compute
+                .supported_capabilities
+                .contains(&COMPUTE_LAUNCH_AUTHENTICATION.to_string())
+        );
+
+        let middleware = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        assert_eq!(
+            middleware.supported_capabilities,
+            vec!["openshell.supervisor-middleware.contract"]
+        );
+        let middleware = gateway_metadata_with_capabilities(
+            ExtensionFamily::SupervisorMiddleware,
+            [
+                SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string(),
+                SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string(),
+            ],
+        );
+        assert_eq!(
+            middleware.supported_capabilities,
+            vec![
+                "openshell.supervisor-middleware.contract",
+                SUPERVISOR_MIDDLEWARE_HTTP_V2
+            ]
+        );
+        assert_eq!(
+            middleware.protocol_version,
+            Some(ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            })
+        );
+    }
+
+    #[test]
+    fn extension_requiring_http_v2_negotiates_only_with_peers_that_advertise_it() {
+        let extension = extension_metadata_with_requirements(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/v2-only",
+            "1.0.0",
+            [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+            [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+        );
+        assert_eq!(
+            extension
+                .supported_capabilities
+                .iter()
+                .filter(|capability| *capability == SUPERVISOR_MIDDLEWARE_HTTP_V2)
+                .count(),
+            1
+        );
+        assert_eq!(
+            extension.required_capabilities,
+            vec![
+                "openshell.supervisor-middleware.contract",
+                SUPERVISOR_MIDDLEWARE_HTTP_V2
+            ]
+        );
+
+        let legacy_peer = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        let error = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "guard",
+            &legacy_peer,
+            Some(extension.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NegotiationError::MissingGatewayCapabilities {
+                family: "supervisor-middleware",
+                name: "guard".to_string(),
+                capabilities: SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string(),
+            }
+        );
+
+        let v2_peer = gateway_metadata_with_capabilities(
+            ExtensionFamily::SupervisorMiddleware,
+            [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+        );
+        let negotiated = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "guard",
+            &v2_peer,
+            Some(extension),
+        )
+        .expect("a peer that advertises http-v2 accepts a v2-only service");
+        assert_eq!(negotiated.protocol_major, PROTOCOL_MAJOR);
     }
 
     #[test]

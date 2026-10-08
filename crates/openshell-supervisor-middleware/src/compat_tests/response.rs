@@ -602,13 +602,12 @@ async fn stream_failure_mid_body_follows_on_error() {
     }
 }
 
-/// 0.1.x treats `UNIMPLEMENTED` from the response stream like any other
-/// failure: `fail_open` delivers the response uninspected and the manifest is
-/// not described again. The legacy adapters fail closed on `UNIMPLEMENTED`
-/// regardless of `on_error`, so that cutover changes the `fail_open`
-/// expectation below.
+/// 0.1.x delivered the response uninspected when the stream answered
+/// `UNIMPLEMENTED` under `fail_open`. That contract failure now fails closed
+/// regardless of `on_error` and asks the supervisor to describe its services
+/// again.
 #[tokio::test]
-async fn unimplemented_response_stream_follows_on_error() {
+async fn unimplemented_response_stream_fails_closed_regardless_of_on_error() {
     for engine in Engine::ALL {
         for remove_service in [false, true] {
             let fixture = inspect(HttpResponseBodyMode::StreamBytes);
@@ -622,27 +621,32 @@ async fn unimplemented_response_stream_follows_on_error() {
             let describes = fixture.describe_requests().len();
             let case = ResponseCase::ok("text/plain", &[b"uninspected"]);
 
-            let open = run_response(engine, &runner, &chain(OnError::FailOpen), case.clone()).await;
-            assert!(
-                open.preflight_allowed(),
-                "{engine:?} remove={remove_service}"
-            );
-            assert!(!open.inspected);
-            assert_eq!(open.body(), b"uninspected");
-            assert_eq!(
-                open.invocations,
-                vec![(
-                    "response-guard".into(),
-                    HttpResponseInvocationOutcome::FailOpen,
-                    true
-                )]
-            );
-
-            let closed = run_response(engine, &runner, &chain(OnError::FailClosed), case).await;
-            assert!(!closed.preflight_allowed());
-            let failure = closed.failure.expect("fail_closed refuses delivery");
-            assert_eq!(failure.step, ResponseStep::Preflight);
-            assert_eq!(failure.reason, "middleware_failed: external_service_error");
+            for on_error in [OnError::FailOpen, OnError::FailClosed] {
+                let observation =
+                    run_response(engine, &runner, &chain(on_error), case.clone()).await;
+                assert!(
+                    !observation.preflight_allowed(),
+                    "{engine:?} remove={remove_service} {on_error:?}"
+                );
+                assert!(!observation.inspected);
+                assert_eq!(
+                    observation.invocations,
+                    vec![(
+                        "response-guard".into(),
+                        HttpResponseInvocationOutcome::FailClosed,
+                        true
+                    )]
+                );
+                let failure = observation
+                    .failure
+                    .expect("a contract failure refuses delivery");
+                assert_eq!(failure.step, ResponseStep::Preflight);
+                assert_eq!(
+                    failure.reason,
+                    "middleware_failed: middleware_contract_failure_unimplemented"
+                );
+                assert!(runner.take_reconciliation_request(), "{on_error:?}");
+            }
             assert_eq!(fixture.describe_requests().len(), describes);
             assert!(fixture.response_sessions().is_empty());
         }

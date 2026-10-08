@@ -2210,8 +2210,19 @@ type SupervisorMiddlewareService struct {
 	// no bearer credential; supervisors must not request one. Intended only for
 	// trusted-network development deployments.
 	AllowInsecureTransport bool `protobuf:"varint,7,opt,name=allow_insecure_transport,json=allowInsecureTransport,proto3" json:"allow_insecure_transport,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Protocol version of the service's HTTP request binding when the gateway
+	// described it: 2 for version 2, and 0 for the legacy protocol or no request
+	// binding. Set by the gateway, never by operators. Version 2 HTTP middleware
+	// always fails closed, so while a supervisor cannot describe the service
+	// itself, entries that use it fail closed for requests when this is not 0,
+	// whatever their on_error says. Supervisors that predate this field ignore
+	// it; they cannot run services that require version 2.
+	HttpRequestProtocolVersion uint32 `protobuf:"varint,8,opt,name=http_request_protocol_version,json=httpRequestProtocolVersion,proto3" json:"http_request_protocol_version,omitempty"`
+	// Protocol version of the service's HTTP response binding, with the same
+	// meaning as http_request_protocol_version.
+	HttpResponseProtocolVersion uint32 `protobuf:"varint,9,opt,name=http_response_protocol_version,json=httpResponseProtocolVersion,proto3" json:"http_response_protocol_version,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *SupervisorMiddlewareService) Reset() {
@@ -2291,6 +2302,20 @@ func (x *SupervisorMiddlewareService) GetAllowInsecureTransport() bool {
 		return x.AllowInsecureTransport
 	}
 	return false
+}
+
+func (x *SupervisorMiddlewareService) GetHttpRequestProtocolVersion() uint32 {
+	if x != nil {
+		return x.HttpRequestProtocolVersion
+	}
+	return 0
+}
+
+func (x *SupervisorMiddlewareService) GetHttpResponseProtocolVersion() uint32 {
+	if x != nil {
+		return x.HttpResponseProtocolVersion
+	}
+	return 0
 }
 
 var File_sandbox_proto protoreflect.FileDescriptor
@@ -2470,7 +2495,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xda\x03\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
@@ -2478,7 +2503,9 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x0frequest_timeout\x18h \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12%\n" +
 	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
 	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
-	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransportJ\x04\b\x04\x10\x05R\atimeout*\x97\x01\n" +
+	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport\x12A\n" +
+	"\x1dhttp_request_protocol_version\x18\b \x01(\rR\x1ahttpRequestProtocolVersion\x12C\n" +
+	"\x1ehttp_response_protocol_version\x18\t \x01(\rR\x1bhttpResponseProtocolVersionJ\x04\b\x04\x10\x05R\atimeout*\x97\x01\n" +
 	"\x0eNetworkTlsMode\x12 \n" +
 	"\x1cNETWORK_TLS_MODE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15NETWORK_TLS_MODE_SKIP\x10\x01\x12\"\n" +

@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use std::ops::Range;
 
 use clap::Parser;
-use openshell_core::middleware::{HttpResponseResultStream, WebSocketResponseStream};
+use openshell_core::middleware::{
+    HttpResponseResultStream, HttpResultStream, WebSocketResponseStream,
+};
 use openshell_core::proto::middleware::v1::http_response_pre_return_server::{
     HttpResponsePreReturn, HttpResponsePreReturnServer,
 };
@@ -241,18 +243,21 @@ impl SupervisorMiddleware for ContentGuard {
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
                     request_timeout: None,
+                    ..Default::default()
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
                     request_timeout: None,
+                    ..Default::default()
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpResponse as i32,
                     phase: SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
                     request_timeout: None,
+                    ..Default::default()
                 },
             ],
             expected_audience: String::new(),
@@ -413,6 +418,7 @@ impl ResponseSessionState {
 #[tonic::async_trait]
 impl HttpResponsePreReturn for ContentGuard {
     type EvaluateStream = HttpResponseResultStream;
+    type EvaluateHttpStream = HttpResultStream;
 
     async fn evaluate(
         &self,
@@ -449,6 +455,15 @@ impl HttpResponsePreReturn for ContentGuard {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn evaluate_http(
+        &self,
+        _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+    ) -> Result<Response<Self::EvaluateHttpStream>, Status> {
+        Err(Status::unimplemented(
+            "this example implements the legacy HTTP response protocol",
+        ))
     }
 }
 

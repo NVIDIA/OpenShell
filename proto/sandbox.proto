@@ -482,4 +482,15 @@ message SupervisorMiddlewareService {
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;
+  // Protocol version of the service's HTTP request binding when the gateway
+  // described it: 2 for version 2, and 0 for the legacy protocol or no request
+  // binding. Set by the gateway, never by operators. Version 2 HTTP middleware
+  // always fails closed, so while a supervisor cannot describe the service
+  // itself, entries that use it fail closed for requests when this is not 0,
+  // whatever their on_error says. Supervisors that predate this field ignore
+  // it; they cannot run services that require version 2.
+  uint32 http_request_protocol_version = 8;
+  // Protocol version of the service's HTTP response binding, with the same
+  // meaning as http_request_protocol_version.
+  uint32 http_response_protocol_version = 9;
 }

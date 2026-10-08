@@ -4560,6 +4560,7 @@ network_policies:
                             seconds: 2,
                             nanos: 0,
                         }),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -4684,6 +4685,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -6548,6 +6550,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6701,6 +6704,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -7152,6 +7156,7 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(

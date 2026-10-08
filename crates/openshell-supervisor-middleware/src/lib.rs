@@ -6,16 +6,25 @@
 #[cfg(test)]
 mod compat_tests;
 pub mod headers;
+#[cfg(test)]
+mod http_v2_tests;
+mod legacy;
 mod remote;
-mod response;
+mod runtime;
+mod stage;
 mod websocket;
 
-pub use response::{
+pub use legacy::response::engine::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
     HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightInput,
     HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
     MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES, is_stale_http_response_integrity_header,
 };
+
+pub use runtime::{
+    ContractFailure, ContractFailureKind, FailOpenNotApplied, MiddlewareRuntimeObserver,
+};
+pub use stage::{HttpDirection, HttpStageTransport, StageReport, StageReportSink, StageReports};
 
 pub use websocket::{
     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
@@ -33,21 +42,24 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_V2, gateway_metadata,
+    gateway_metadata_with_capabilities, negotiate,
 };
+use openshell_core::proto::extension::v1::PeerMetadata;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
+    Decision, Finding, HeaderMutation, HttpBodyMode, HttpEvent, HttpHeader, HttpRequestEvaluation,
+    HttpRequestTarget, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, HttpResultStream, InProcessMiddleware,
+    SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -95,7 +107,7 @@ impl InProcessMiddleware for GeneratedMiddlewareEndpoint {
     async fn describe(&self) -> MiddlewareManifest {
         self.service
             .describe(Request::new(MiddlewareDescribeRequest {
-                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+                gateway: Some(HttpV2Support::BUILD.describe_metadata()),
             }))
             .await
             .expect("generated in-process Describe failed")
@@ -153,7 +165,7 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
     async fn describe(&self) -> MiddlewareManifest {
         self.endpoint
             .describe(Request::new(MiddlewareDescribeRequest {
-                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+                gateway: Some(HttpV2Support::BUILD.describe_metadata()),
             }))
             .await
             .expect("in-process endpoint Describe failed")
@@ -185,11 +197,19 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         &self,
         request: HttpRequestView<'_>,
     ) -> Result<openshell_core::proto::HttpRequestResult> {
+        #[allow(deprecated)] // legacy-http-protocol-1
         self.endpoint
             .evaluate_http_request(Request::new(request_view_to_evaluation(request)))
             .await
             .map(tonic::Response::into_inner)
             .map_err(|error| miette!("{error}"))
+    }
+
+    async fn open_http_request_stage(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        self.endpoint.open_http_request_stage(requests).await
     }
 
     async fn open_websocket_session(
@@ -203,7 +223,15 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         &self,
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        #[allow(deprecated)] // legacy-http-protocol-1
         self.endpoint.open_http_response_pre_return(requests).await
+    }
+
+    async fn open_http_response_stage(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        self.endpoint.open_http_response_stage(requests).await
     }
 }
 
@@ -362,6 +390,72 @@ impl OnError {
     }
 }
 
+/// HTTP middleware protocol a binding implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpProtocol {
+    /// HTTP protocol 1 (0.1). Removed in 0.2.0.
+    Legacy,
+    /// Version 2 (`EvaluateHttp`), negotiated with the `http-v2` capability.
+    V2,
+}
+
+impl HttpProtocol {
+    /// Stable, audit-safe name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+/// Version 2 HTTP operations a registry accepts and executes.
+///
+/// Registration rejects version 2 bindings for any other operation instead of
+/// resolving them to stages that cannot run. `http-v2` is advertised only when
+/// both directions execute version 2, so until then services that implement
+/// both protocols keep returning legacy bindings and version 2-only services
+/// are refused at Describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpV2Support {
+    request: bool,
+    response: bool,
+}
+
+impl HttpV2Support {
+    /// What this build executes.
+    const BUILD: Self = Self {
+        request: false,
+        response: false,
+    };
+
+    #[cfg(any(test, feature = "test-support"))]
+    const ALL: Self = Self {
+        request: true,
+        response: true,
+    };
+
+    const fn supports(self, direction: HttpDirection) -> bool {
+        match direction {
+            HttpDirection::Request => self.request,
+            HttpDirection::Response => self.response,
+        }
+    }
+
+    /// Metadata sent with every Describe call, gateway and supervisor alike.
+    fn describe_metadata(self) -> PeerMetadata {
+        if self.request && self.response {
+            gateway_metadata_with_capabilities(
+                ExtensionFamily::SupervisorMiddleware,
+                [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
+            )
+        } else {
+            gateway_metadata(ExtensionFamily::SupervisorMiddleware)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
     pub name: String,
@@ -419,8 +513,14 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
+    /// Effective failure policy. Version 2 HTTP bindings are always
+    /// fail-closed, whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        self.entry.on_error
+        if self.http_protocol() == Some(HttpProtocol::V2) {
+            OnError::FailClosed
+        } else {
+            self.entry.on_error
+        }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -433,6 +533,74 @@ impl DescribedChainEntry {
     /// imposes no payload-buffering limit on the chain.
     pub fn is_resolved(&self) -> bool {
         self.binding.is_some()
+    }
+
+    /// HTTP protocol of the resolved binding. `None` for unresolved entries
+    /// and WebSocket bindings. A resolved HTTP binding always has a protocol:
+    /// an unsupported version fails registration rather than dropping the
+    /// entry from the chain.
+    #[must_use]
+    pub fn http_protocol(&self) -> Option<HttpProtocol> {
+        let binding = self.binding.as_ref()?;
+        HttpDirection::from_operation(
+            SupervisorMiddlewareOperation::try_from(binding.operation).ok()?,
+        )?;
+        // Chain description rejects every version other than 0 and 2. Any
+        // other value would fail closed as version 2.
+        Some(if binding.http_protocol_version == 0 {
+            HttpProtocol::Legacy
+        } else {
+            HttpProtocol::V2
+        })
+    }
+
+    /// True when the resolved version 2 binding can select `mode`.
+    #[must_use]
+    pub fn supports_http_body_mode(&self, mode: HttpBodyMode) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.supported_http_body_modes.contains(&(mode as i32)))
+    }
+
+    /// True when the resolved version 2 binding can inspect bodies at all.
+    #[must_use]
+    pub fn supports_http_body_processing(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| !binding.supported_http_body_modes.is_empty())
+    }
+
+    /// Transport for this entry's version 2 HTTP stage, or `None` for entries
+    /// that are unresolved or use another protocol. Legacy HTTP entries run on
+    /// the legacy engines until adapters implement [`HttpStageTransport`].
+    #[must_use]
+    pub fn http_stage_transport(&self) -> Option<Arc<dyn HttpStageTransport>> {
+        if self.http_protocol() != Some(HttpProtocol::V2) {
+            return None;
+        }
+        let service = self.service.as_ref()?;
+        let operation =
+            SupervisorMiddlewareOperation::try_from(self.binding.as_ref()?.operation).ok()?;
+        Some(Arc::new(ServiceStageTransport {
+            service: service.service.clone(),
+            direction: HttpDirection::from_operation(operation)?,
+        }))
+    }
+}
+
+/// Transport for a service's own `EvaluateHttp` stream.
+struct ServiceStageTransport {
+    service: MiddlewareDispatch,
+    direction: HttpDirection,
+}
+
+#[tonic::async_trait]
+impl HttpStageTransport for ServiceStageTransport {
+    async fn open(
+        &self,
+        events: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        self.service.open_http_stage(self.direction, events).await
     }
 }
 
@@ -538,7 +706,7 @@ fn apply_on_error(
     reason: &str,
     applied: &mut Vec<MiddlewareInvocation>,
 ) -> OnErrorAction {
-    match entry.entry.on_error {
+    match entry.on_error() {
         OnError::FailOpen => {
             applied.push(MiddlewareInvocation {
                 name: entry.entry.name.clone(),
@@ -577,6 +745,7 @@ fn request_view_to_evaluation(request: HttpRequestView<'_>) -> HttpRequestEvalua
 #[derive(Clone)]
 pub struct ChainRunner {
     registry: Arc<MiddlewareRegistry>,
+    runtime: Arc<runtime::RuntimeHooks>,
 }
 
 #[derive(Clone)]
@@ -590,10 +759,11 @@ enum MiddlewareDispatch {
 impl MiddlewareDispatch {
     async fn describe(
         &self,
+        gateway: PeerMetadata,
     ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
         match self {
             Self::InProcess(service) => Ok(tonic::Response::new(service.describe().await)),
-            Self::Grpc(service) => service.describe().await,
+            Self::Grpc(service) => service.describe(gateway).await,
         }
     }
 
@@ -625,6 +795,7 @@ impl MiddlewareDispatch {
     ) -> std::result::Result<tonic::Response<openshell_core::proto::HttpRequestResult>, tonic::Status>
     {
         match self {
+            #[allow(deprecated)] // legacy-http-protocol-1
             Self::InProcess(service) => service
                 .evaluate_http_request(request)
                 .await
@@ -649,8 +820,30 @@ impl MiddlewareDispatch {
         receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
         match self {
+            #[allow(deprecated)] // legacy-http-protocol-1
             Self::InProcess(service) => service.open_http_response_pre_return(receiver).await,
             Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
+        }
+    }
+
+    async fn open_http_stage(
+        &self,
+        direction: HttpDirection,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        match (self, direction) {
+            (Self::InProcess(service), HttpDirection::Request) => {
+                service.open_http_request_stage(receiver).await
+            }
+            (Self::InProcess(service), HttpDirection::Response) => {
+                service.open_http_response_stage(receiver).await
+            }
+            (Self::Grpc(service), HttpDirection::Request) => {
+                service.open_http_request_stage(receiver).await
+            }
+            (Self::Grpc(service), HttpDirection::Response) => {
+                service.open_http_response_stage(receiver).await
+            }
         }
     }
 }
@@ -731,6 +924,9 @@ impl MiddlewareDiagnosticPolicy {
 pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
+    /// Delivered services this registry could not describe, keyed by
+    /// registration name, with the protocols the gateway described.
+    undescribed_services: Arc<HashMap<String, SupervisorMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
     work_admission: Arc<Semaphore>,
@@ -767,6 +963,7 @@ impl Default for MiddlewareRegistry {
         Self {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
+            undescribed_services: Arc::default(),
             middleware_names: Arc::new(HashSet::new()),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
@@ -849,8 +1046,12 @@ fn middleware_denial_reason(config_name: &str, reason_code: Option<&str>) -> Str
     )
 }
 
-fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
-    if binding.max_payload_bytes == 0 {
+fn validate_payload_limit(
+    source: &str,
+    binding: &MiddlewareBinding,
+    required: bool,
+) -> Result<usize> {
+    if required && binding.max_payload_bytes == 0 {
         return Err(miette!("{source} must advertise a non-zero payload limit"));
     }
     if binding.max_payload_bytes > MAX_MIDDLEWARE_PAYLOAD_BYTES as u64 {
@@ -860,6 +1061,134 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
     }
     usize::try_from(binding.max_payload_bytes)
         .map_err(|_| miette!("{source} reports a payload limit too large for this platform"))
+}
+
+/// Legacy and payload-bearing version 2 bindings need a payload limit. A
+/// version 2 HTTP binding without body modes can only Continue or Reject at
+/// preflight.
+fn binding_requires_payload_limit(
+    binding: &MiddlewareBinding,
+    http_protocol: Option<HttpProtocol>,
+) -> bool {
+    http_protocol != Some(HttpProtocol::V2) || !binding.supported_http_body_modes.is_empty()
+}
+
+/// Select the protocol of one binding. Unset or 0 selects the legacy HTTP
+/// protocol and 2 selects version 2. Any other version is an error, never a
+/// reason to leave the binding out of a chain.
+fn binding_http_protocol(
+    source: &str,
+    binding: &MiddlewareBinding,
+) -> Result<Option<HttpProtocol>> {
+    let http = SupervisorMiddlewareOperation::try_from(binding.operation)
+        .ok()
+        .and_then(HttpDirection::from_operation)
+        .is_some();
+    if !http {
+        if binding.http_protocol_version != 0 || !binding.supported_http_body_modes.is_empty() {
+            return Err(miette!(
+                "{source} sets HTTP protocol fields on a binding that is not an HTTP binding"
+            ));
+        }
+        return Ok(None);
+    }
+    match binding.http_protocol_version {
+        0 => {
+            if !binding.supported_http_body_modes.is_empty() {
+                return Err(miette!(
+                    "{source} advertises HTTP body modes on a legacy HTTP binding; body modes require http_protocol_version 2"
+                ));
+            }
+            Ok(Some(HttpProtocol::Legacy))
+        }
+        2 => {
+            let mut modes = HashSet::with_capacity(binding.supported_http_body_modes.len());
+            for mode in &binding.supported_http_body_modes {
+                if !modes.insert(*mode)
+                    || !matches!(
+                        HttpBodyMode::try_from(*mode).ok(),
+                        Some(HttpBodyMode::Buffered | HttpBodyMode::Stream)
+                    )
+                {
+                    return Err(miette!(
+                        "{source} advertises an invalid or duplicate HTTP body mode"
+                    ));
+                }
+            }
+            Ok(Some(HttpProtocol::V2))
+        }
+        version => Err(miette!(
+            "{source} advertises unsupported HTTP middleware protocol version {version}"
+        )),
+    }
+}
+
+/// True when `on_error: fail_open` can affect `binding`: WebSocket bindings
+/// and, until 0.2.0, legacy HTTP bindings. Version 2 HTTP bindings always fail
+/// closed.
+fn binding_honors_fail_open(binding: &MiddlewareBinding) -> bool {
+    match SupervisorMiddlewareOperation::try_from(binding.operation) {
+        Ok(SupervisorMiddlewareOperation::WebsocketMessage) => true,
+        Ok(
+            SupervisorMiddlewareOperation::HttpRequest
+            | SupervisorMiddlewareOperation::HttpResponse,
+        ) => {
+            // legacy-http-protocol-1
+            binding.http_protocol_version == 0
+        }
+        _ => false,
+    }
+}
+
+/// True when the service requires peers to execute HTTP protocol 2, so peers
+/// that predate it refuse the service at Describe.
+fn manifest_requires_http_v2(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_V2)
+    })
+}
+
+/// Protocol version of the manifest's binding for `direction`, or 0 when it
+/// has none.
+fn described_http_protocol_version(manifest: &MiddlewareManifest, direction: HttpDirection) -> u32 {
+    manifest
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.operation == direction.operation() as i32
+                && binding.phase == direction.phase() as i32
+        })
+        .map_or(0, |binding| binding.http_protocol_version)
+}
+
+/// Reject version 2 bindings for directions the registry cannot execute,
+/// instead of resolving them to stages that cannot run.
+fn ensure_http_v2_supported(
+    source: &str,
+    manifest: &MiddlewareManifest,
+    http_v2: HttpV2Support,
+) -> Result<()> {
+    for binding in &manifest.bindings {
+        if binding.http_protocol_version != 2 {
+            continue;
+        }
+        let Some(direction) = SupervisorMiddlewareOperation::try_from(binding.operation)
+            .ok()
+            .and_then(HttpDirection::from_operation)
+        else {
+            continue;
+        };
+        if !http_v2.supports(direction) {
+            return Err(miette!(
+                "{source} advertises HTTP middleware protocol version 2 for {}, which this OpenShell version does not support yet; serve legacy HTTP bindings to peers that do not advertise {SUPERVISOR_MIDDLEWARE_HTTP_V2}",
+                direction.as_str()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,6 +1235,7 @@ fn validate_manifest_bindings(
     if manifest.bindings.is_empty() {
         return Err(miette!("{source} describes no bindings"));
     }
+    let requires_http_v2 = manifest_requires_http_v2(manifest);
 
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
@@ -915,18 +1245,27 @@ fn validate_manifest_bindings(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let advertised = validate_payload_limit(source, binding)?;
+        let http_protocol = binding_http_protocol(source, binding)?;
+        if requires_http_v2 && http_protocol == Some(HttpProtocol::Legacy) {
+            return Err(miette!(
+                "{source} requires {SUPERVISOR_MIDDLEWARE_HTTP_V2} but advertises a legacy HTTP binding"
+            ));
+        }
+        let payload_limit_required = binding_requires_payload_limit(binding, http_protocol);
+        let advertised = validate_payload_limit(source, binding, payload_limit_required)?;
         if binding.request_timeout.is_some() {
             middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
+        if payload_limit_required
+            && operator_max_payload_bytes.is_some_and(|limit| limit > advertised)
+        {
             return Err(miette!(
                 "{source} max_payload_bytes ({}) exceeds the binding capability ({advertised})",
                 operator_max_payload_bytes.expect("operator limit checked above")
             ));
         }
-        if operator_max_payload_bytes == Some(0) {
+        if payload_limit_required && operator_max_payload_bytes == Some(0) {
             return Err(miette!(
                 "{source} must configure max_payload_bytes for every payload-bearing binding"
             ));
@@ -1110,7 +1449,26 @@ impl MiddlewareRegistry {
         in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
-        Self::connect_services_inner(in_process_services, registrations, None).await
+        Self::connect_services_inner(
+            in_process_services,
+            registrations,
+            None,
+            HttpV2Support::BUILD,
+        )
+        .await
+    }
+
+    /// Connect services as a peer that executes version 2 HTTP in both
+    /// directions, so tests can exercise registration and policy rules before
+    /// this build runs version 2 stages. Version 2 stages fail closed on the
+    /// legacy engines.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn connect_services_with_http_v2(
+        in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
+        registrations: Vec<SupervisorMiddlewareService>,
+    ) -> Result<Self> {
+        Self::connect_services_inner(in_process_services, registrations, None, HttpV2Support::ALL)
+            .await
     }
 
     /// Connect services with optional refreshable credentials keyed by
@@ -1121,32 +1479,42 @@ impl MiddlewareRegistry {
         registrations: Vec<SupervisorMiddlewareService>,
         credentials: &HashMap<String, openshell_extension_core::BearerTokenSlot>,
     ) -> Result<Self> {
-        Self::connect_services_inner(in_process_services, registrations, Some(credentials)).await
+        Self::connect_services_inner(
+            in_process_services,
+            registrations,
+            Some(credentials),
+            HttpV2Support::BUILD,
+        )
+        .await
     }
 
     async fn connect_services_inner(
         in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
         registrations: Vec<SupervisorMiddlewareService>,
         credentials: Option<&HashMap<String, openshell_extension_core::BearerTokenSlot>>,
+        http_v2: HttpV2Support,
     ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
         let mut middleware_names = HashSet::new();
         let mut negotiated_extensions = Vec::new();
-        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        let gateway = http_v2.describe_metadata();
 
         for service in in_process_services {
             let service = MiddlewareDispatch::InProcess(service);
-            let manifest =
-                call_with_timeout(DEFAULT_MIDDLEWARE_TIMEOUT, "Describe", service.describe())
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| {
-                        miette!(
-                            "in-process middleware Describe failed: {}",
-                            safe_reason(&error.to_string())
-                        )
-                    })?;
+            let manifest = call_with_timeout(
+                DEFAULT_MIDDLEWARE_TIMEOUT,
+                "Describe",
+                service.describe(gateway.clone()),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "in-process middleware Describe failed: {}",
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let source = if manifest.name.trim().is_empty() {
                 "in-process middleware service".to_string()
             } else {
@@ -1173,6 +1541,7 @@ impl MiddlewareRegistry {
                 )
                 .map_err(|error| miette!(error.to_string()))?,
             );
+            ensure_http_v2_supported(&source, &manifest, http_v2)?;
             let attachment_name = manifest.name.clone();
             let manifest_cell = OnceCell::new();
             manifest_cell
@@ -1229,16 +1598,20 @@ impl MiddlewareRegistry {
                 )
                 .await?,
             );
-            let manifest = call_with_timeout(operator_timeout, "Describe", service.describe())
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|error| {
-                    miette!(
-                        "middleware registration '{}' Describe failed: {}",
-                        registration.name,
-                        safe_reason(&error.to_string())
-                    )
-                })?;
+            let manifest = call_with_timeout(
+                operator_timeout,
+                "Describe",
+                service.describe(gateway.clone()),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "middleware registration '{}' Describe failed: {}",
+                    registration.name,
+                    safe_reason(&error.to_string())
+                )
+            })?;
             validate_external_manifest(
                 &registration,
                 &manifest,
@@ -1254,6 +1627,22 @@ impl MiddlewareRegistry {
                 )
                 .map_err(|error| miette!(error.to_string()))?,
             );
+            ensure_http_v2_supported(
+                &format!("external middleware registration '{}'", registration.name),
+                &manifest,
+                http_v2,
+            )?;
+            let registration = SupervisorMiddlewareService {
+                http_request_protocol_version: described_http_protocol_version(
+                    &manifest,
+                    HttpDirection::Request,
+                ),
+                http_response_protocol_version: described_http_protocol_version(
+                    &manifest,
+                    HttpDirection::Response,
+                ),
+                ..registration
+            };
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -1272,12 +1661,30 @@ impl MiddlewareRegistry {
         Ok(Self {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
+            undescribed_services: Arc::default(),
             middleware_names: Arc::new(middleware_names),
             negotiated_extensions: Arc::new(negotiated_extensions),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         })
+    }
+
+    /// Keep delivered services this registry could not describe, such as when
+    /// a supervisor starts while they are unreachable. While a service stays
+    /// undescribed, an entry that uses it fails closed in every HTTP direction
+    /// where the gateway described a version 2 binding, instead of following
+    /// its `on_error`. Other entries that use it follow their `on_error`.
+    #[must_use]
+    pub fn with_undescribed_services(mut self, services: &[SupervisorMiddlewareService]) -> Self {
+        self.undescribed_services = Arc::new(
+            services
+                .iter()
+                .filter(|service| !self.middleware_names.contains(&service.name))
+                .map(|service| (service.name.clone(), service.clone()))
+                .collect(),
+        );
+        self
     }
 
     /// Validate implementation-owned configuration for every middleware entry.
@@ -1298,6 +1705,66 @@ impl MiddlewareRegistry {
                         safe_reason(&error.to_string())
                     )
                 })?;
+        }
+        Ok(())
+    }
+
+    /// Reject `on_error: fail_open` where it has no effect, or where older
+    /// supervisors would skip the middleware.
+    ///
+    /// `fail_open` applies to WebSocket bindings and, until 0.2.0, to legacy
+    /// HTTP bindings. Version 2 HTTP bindings always fail closed. Until 0.2.0,
+    /// `fail_open` also governs uninspectable traffic: it is the deprecated
+    /// fallback for an unset `on_uninspectable`, and 0.1.x supervisors gate
+    /// uninspectable traffic on `on_error` alone, so it stays valid unless the
+    /// entry sets `on_uninspectable: deny`.
+    ///
+    /// Until 0.2.0, `fail_open` is also rejected on any middleware that
+    /// requires version 2, even one with a WebSocket binding. Supervisors that
+    /// predate version 2 cannot describe such a service, so they run without
+    /// it and would skip it under `fail_open` for HTTP and WebSocket traffic.
+    /// A service that serves both protocols does not require version 2.
+    ///
+    /// Only the gateway applies this rule to new and updated policies; a
+    /// supervisor runs a stored `fail_open` that no longer applies as
+    /// `fail_closed` instead of rejecting the policy. Unregistered middleware
+    /// is reported by [`Self::validate_policy_configs`].
+    pub async fn validate_on_error_scope(&self, policy: &SandboxPolicy) -> Result<()> {
+        let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
+        let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
+        configs.sort_unstable_by_key(|(name, _)| name.as_str());
+        for (name, config) in configs {
+            if OnError::parse(&config.on_error)? != OnError::FailOpen {
+                continue;
+            }
+            let Some((_, manifest)) = manifests.iter().find(|(state, manifest)| {
+                ChainRunner::attachment_name(state, manifest) == config.middleware
+            }) else {
+                continue;
+            };
+            if manifest_requires_http_v2(manifest) {
+                let websocket = manifest.bindings.iter().any(|binding| {
+                    binding.operation == SupervisorMiddlewareOperation::WebsocketMessage as i32
+                });
+                let remedy = if websocket {
+                    "use fail_closed, or ship a build of the service that serves both HTTP protocols to keep WebSocket fail_open"
+                } else {
+                    "use fail_closed"
+                };
+                return Err(miette!(
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': until 0.2.0, fail_open is not supported on middleware that requires HTTP protocol version 2, because supervisors that predate version 2 cannot run it and would skip it; {remedy}",
+                    config.middleware
+                ));
+            }
+            if manifest.bindings.iter().any(binding_honors_fail_open) {
+                continue;
+            }
+            if config.on_uninspectable == "deny" {
+                return Err(miette!(
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': on_error applies only to WebSocket bindings and, until 0.2.0, legacy HTTP bindings; version 2 HTTP middleware is fail-closed, and on_uninspectable: deny overrides fail_open for uninspectable traffic",
+                    config.middleware
+                ));
+            }
         }
         Ok(())
     }
@@ -1374,12 +1841,14 @@ impl ChainRunner {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
+                undescribed_services: Arc::default(),
                 middleware_names: Arc::new(HashSet::new()),
                 negotiated_extensions: Arc::new(Vec::new()),
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
             }),
+            runtime: Arc::default(),
         }
     }
 
@@ -1395,17 +1864,57 @@ impl ChainRunner {
     pub fn from_registry(registry: MiddlewareRegistry) -> Self {
         Self {
             registry: Arc::new(registry),
+            runtime: Arc::default(),
         }
     }
 
     /// Build a runner for a replacement registry while preserving process-wide
-    /// admission budgets across registry generations.
+    /// admission budgets and runtime hooks across registry generations.
     #[must_use]
     pub fn with_replacement_registry(&self, mut registry: MiddlewareRegistry) -> Self {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
-        Self::from_registry(registry)
+        Self {
+            registry: Arc::new(registry),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Attach the observer that receives this runner's runtime events.
+    /// Replacement registries keep it.
+    #[must_use]
+    pub fn with_runtime_observer(&self, observer: Arc<dyn MiddlewareRuntimeObserver>) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+            runtime: Arc::new(runtime::RuntimeHooks::with_observer(observer)),
+        }
+    }
+
+    /// Take a pending request to re-describe every middleware service.
+    ///
+    /// A contract failure raises it: the service behind a cached manifest no
+    /// longer speaks the protocol its bindings selected. Callers poll this
+    /// once per configuration poll, which limits rebuilds to one per poll
+    /// interval.
+    pub fn take_reconciliation_request(&self) -> bool {
+        self.runtime.take_reconciliation_request()
+    }
+
+    /// Record a contract failure on `entry`, which the caller fails closed.
+    fn report_contract_failure(
+        &self,
+        entry: &DescribedChainEntry,
+        direction: HttpDirection,
+        kind: ContractFailureKind,
+    ) {
+        self.runtime.contract_failure(&ContractFailure {
+            config_name: entry.entry.name.clone(),
+            implementation: entry.entry.implementation.clone(),
+            direction,
+            protocol: entry.http_protocol().unwrap_or(HttpProtocol::Legacy),
+            kind,
+        });
     }
 
     /// Reserve one unit of short-lived middleware work.
@@ -1465,15 +1974,21 @@ impl ChainRunner {
             let manifest = state
                 .manifest
                 .get_or_try_init(|| async {
-                    call_with_timeout(state.operator_timeout, "Describe", state.service.describe())
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(|error| {
-                            miette!(
-                                "middleware Describe failed: {}",
-                                safe_reason(&error.to_string())
-                            )
-                        })
+                    call_with_timeout(
+                        state.operator_timeout,
+                        "Describe",
+                        state
+                            .service
+                            .describe(HttpV2Support::BUILD.describe_metadata()),
+                    )
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })
                 })
                 .await?;
             manifests.push((Arc::clone(state), manifest.clone()));
@@ -1541,6 +2056,24 @@ impl ChainRunner {
             .entries)
     }
 
+    /// True when `implementation` is a delivered service this registry could
+    /// not describe, and the gateway described a version 2 binding for
+    /// `operation`.
+    fn undescribed_http_v2(
+        &self,
+        implementation: &str,
+        operation: SupervisorMiddlewareOperation,
+    ) -> bool {
+        let Some(service) = self.registry.undescribed_services.get(implementation) else {
+            return false;
+        };
+        match HttpDirection::from_operation(operation) {
+            Some(HttpDirection::Request) => service.http_request_protocol_version != 0,
+            Some(HttpDirection::Response) => service.http_response_protocol_version != 0,
+            None => false,
+        }
+    }
+
     async fn describe_chain_for(
         &self,
         entries: &[ChainEntry],
@@ -1557,6 +2090,12 @@ impl ChainRunner {
             let Some((state, manifest)) = manifests.iter().find(|(state, manifest)| {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
+                // Version 2 HTTP middleware is fail-closed also while this
+                // registry cannot describe its service.
+                let mut entry = entry;
+                if self.undescribed_http_v2(&entry.implementation, operation) {
+                    entry.on_error = OnError::FailClosed;
+                }
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
@@ -1566,15 +2105,36 @@ impl ChainRunner {
                 });
                 continue;
             };
-            let Some(binding) = Self::binding(manifest, operation, phase).copied() else {
+            let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
                 // The config remains globally ordered, but it does not
-                // participate in this exact operation/phase chain.
+                // participate in this exact operation/phase chain. Only a
+                // missing operation/phase pair leads here: protocol selection
+                // below never drops an HTTP binding from the chain.
                 unbound.push(entry);
                 continue;
             };
+            let http_protocol =
+                binding_http_protocol(&format!("middleware '{}'", entry.implementation), &binding)?;
+            if http_protocol == Some(HttpProtocol::V2)
+                && entry.on_error == OnError::FailOpen
+                && let Some(direction) = HttpDirection::from_operation(operation)
+            {
+                self.runtime.fail_open_not_applied(&FailOpenNotApplied {
+                    config_name: entry.name.clone(),
+                    implementation: entry.implementation.clone(),
+                    direction,
+                    applies_elsewhere: manifest.bindings.iter().any(binding_honors_fail_open),
+                });
+            }
             let timeout = state.timeout_for_binding(&binding)?;
-            let advertised = validate_payload_limit("middleware manifest", &binding)?;
-            let max_payload_bytes = state.operator_max_payload_bytes.unwrap_or(advertised);
+            let payload_limit_required = binding_requires_payload_limit(&binding, http_protocol);
+            let advertised =
+                validate_payload_limit("middleware manifest", &binding, payload_limit_required)?;
+            let max_payload_bytes = if payload_limit_required {
+                state.operator_max_payload_bytes.unwrap_or(advertised)
+            } else {
+                0
+            };
             described_entries.push(DescribedChainEntry {
                 entry,
                 service: Some(Arc::clone(state)),
@@ -1749,6 +2309,25 @@ impl ChainRunner {
                     }
                 }
             };
+            // This engine speaks only the legacy RPC. A version 2 stage is
+            // never evaluated through it; it fails closed instead.
+            if entry.http_protocol() == Some(HttpProtocol::V2) {
+                match apply_on_error(entry, "http_v2_stage_not_executable", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                            denial: None,
+                        });
+                    }
+                }
+            }
             if body.len() > entry.max_payload_bytes {
                 match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
                     OnErrorAction::FailOpen => continue,
@@ -1822,6 +2401,29 @@ impl ChainRunner {
             {
                 Ok(result) => result.into_inner(),
                 Err(err) => {
+                    // A contract failure means the service no longer speaks the
+                    // protocol its cached binding selected. Failing open here
+                    // would silently skip it, so on_error does not apply.
+                    if let Some(kind) = ContractFailureKind::from_status(&err) {
+                        self.report_contract_failure(entry, HttpDirection::Request, kind);
+                        applied.push(MiddlewareInvocation {
+                            name: entry.entry.name.clone(),
+                            implementation: entry.entry.implementation.clone(),
+                            decision: Decision::Deny,
+                            transformed: false,
+                            failed: true,
+                        });
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason: format!("middleware_failed: {}", kind.reason()),
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                            denial: None,
+                        });
+                    }
                     let reason = if err.code() == tonic::Code::DeadlineExceeded {
                         "middleware_timeout".to_string()
                     } else {
@@ -2233,6 +2835,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: self.advertise_protocol.then(|| {
@@ -2378,6 +2981,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2475,6 +3079,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: Some(proto_duration("10ms")),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2762,6 +3367,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2823,6 +3429,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: self.binding_timeout,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2888,6 +3495,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 256 * 1024,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3164,6 +3772,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3226,6 +3835,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3291,6 +3901,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3602,6 +4213,7 @@ mod tests {
                 }),
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
+            undescribed_services: Arc::default(),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
@@ -3797,6 +4409,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3830,6 +4443,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: u64::MAX,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3852,6 +4466,7 @@ mod tests {
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_payload_bytes: 4096,
             request_timeout: None,
+            ..Default::default()
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -3889,6 +4504,7 @@ mod tests {
                     seconds: 0,
                     nanos: 500_000_000,
                 }),
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3910,6 +4526,7 @@ mod tests {
             phase: phase as i32,
             max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
             request_timeout: Some(proto_duration("500ms")),
+            ..Default::default()
         };
         let mut manifest = MiddlewareManifest {
             name: "example/websocket".into(),
@@ -3943,6 +4560,7 @@ mod tests {
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3973,6 +4591,7 @@ mod tests {
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -4053,6 +4672,7 @@ mod tests {
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_payload_bytes: 4096,
                     request_timeout: Some(proto_duration(timeout)),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -5138,6 +5758,7 @@ mod tests {
                         seconds: 1,
                         nanos: 0,
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(

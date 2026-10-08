@@ -3848,6 +3848,7 @@ mod tests {
                     } as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(

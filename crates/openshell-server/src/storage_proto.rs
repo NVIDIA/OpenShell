@@ -145,8 +145,11 @@ mod tests {
     // Middleware on_uninspectable adds a string to NetworkMiddlewareConfig in
     // both closures. Stored policies decode it empty, which keeps their prior
     // uninspectable-traffic behavior through the on_error fallback.
+    // The HTTP protocol versions the gateway describes add two fields to the
+    // public-only SupervisorMiddlewareService, which sandbox config responses
+    // compute on demand.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "775cbaf6badc79da18bf331129fbd6bd4a079bc752418bf2c7cee58b18441be1";
+        "4630d2ccc3eb1fdbc8e3e62df6ab6a2c7d64e5ca1cfb8406d2f13a84193e1ac5";
     const DURABLE_SCHEMA_SHA256: &str =
         "f4bb7e2db07e00eb5f64c91550850fba0f2c6dec46a41fde29b6c944636eb066";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -558,7 +561,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(

@@ -2591,12 +2591,14 @@ async fn load_policy_with_gateway(
 
             // Install the in-process catalog before any external connection can
             // fail. A newly started sandbox must always be able to resolve built-in
-            // bindings, even while operator-run services are unavailable.
-            install_builtin_middleware_registry(&engine).await?;
+            // bindings, even while operator-run services are unavailable. Entries
+            // that use those services follow their on_error, except in HTTP
+            // directions where the gateway described version 2 bindings.
+            install_builtin_middleware_registry(&engine, &snapshot.supervisor_middleware_services)
+                .await?;
 
             // Connect operator-registered middleware services. A connect/describe
-            // failure keeps the built-in registry active so each request's
-            // `on_error` policy governs matched traffic. The policy poll loop
+            // failure keeps the built-in registry active. The policy poll loop
             // retries the install without waiting for a config change.
             let middleware_services = snapshot.supervisor_middleware_services.clone();
             let middleware_registry_status = if middleware_services.is_empty() {
@@ -2642,7 +2644,7 @@ async fn load_policy_with_gateway(
                         serde_json::json!(middleware_services.len())
                     )
                     .message(format!(
-                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, matched traffic follows on_error except version 2 HTTP middleware, which fails closed [error:{error}]"
                     ))
                     .build()
             );
@@ -3094,6 +3096,28 @@ fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -
 struct TransparentTcpReloadState {
     capable: bool,
     substrate_ready: bool,
+}
+
+/// Re-describe every delivered middleware service after a contract failure.
+///
+/// The failing service no longer speaks the protocol its cached manifest
+/// selected, for example after a swap to a version 2-only build. The rebuild
+/// runs without a policy change. A failed rebuild keeps the last-known-good
+/// registry and is retried on later polls.
+fn request_middleware_reconciliation(status: &mut MiddlewareRegistryStatus) {
+    if *status == MiddlewareRegistryStatus::Synchronized {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Medium)
+                .status(StatusId::Success)
+                .state(StateId::Other, "reconciling")
+                .message(
+                    "Supervisor middleware contract failure, re-describing middleware services"
+                )
+                .build()
+        );
+    }
+    *status = MiddlewareRegistryStatus::NeedsReconciliation;
 }
 
 /// True when the installed middleware registry no longer matches the desired
@@ -3768,12 +3792,16 @@ async fn connect_middleware_registry(
     }
 }
 
-async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
+async fn install_builtin_middleware_registry(
+    opa_engine: &OpaEngine,
+    undescribed: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> Result<()> {
     let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
         openshell_supervisor_middleware_builtins::services(),
         Vec::new(),
     )
-    .await?;
+    .await?
+    .with_undescribed_services(undescribed);
     opa_engine.replace_middleware_registry(registry)
 }
 
@@ -4293,7 +4321,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             result
         } else {
             tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
-            match client.poll_settings(&ctx.sandbox).await {
+            let polled = client.poll_settings(&ctx.sandbox).await;
+            // Checked once per poll, so contract failures trigger at most one
+            // rebuild per poll interval. Checking before any outcome is handled
+            // also ends the runtime observer's reporting interval while the
+            // gateway is unreachable or refuses the configuration.
+            if ctx.opa_engine.take_middleware_reconciliation_request() {
+                request_middleware_reconciliation(&mut middleware_registry_status);
+            }
+            match polled {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
                     result
@@ -8446,7 +8482,7 @@ network_policies:
     async fn assert_gateway_reload_rejects_and_repairs(registry_changed: bool) {
         let policy = proto_provenance_policy_fixture();
         let engine = OpaEngine::from_proto(&policy).expect("build initial gateway policy");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install initial registry");
         let generation = engine.current_generation();
@@ -8641,7 +8677,7 @@ network_policies:
     #[tokio::test]
     async fn failed_external_startup_registry_build_preserves_installed_builtins() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install built-in middleware registry");
         let builtins_generation = engine.current_generation();
@@ -8663,7 +8699,7 @@ network_policies:
     #[tokio::test]
     async fn unavailable_middleware_reload_keeps_last_known_good_runtime_active() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install built-in middleware registry");
         let active_generation = engine.current_generation();
@@ -8876,6 +8912,27 @@ network_policies:
             &no_services,
             &desired_services,
             MiddlewareRegistryStatus::NeedsReconciliation,
+        ));
+    }
+
+    #[test]
+    fn middleware_contract_failure_rebuilds_registry_without_policy_change() {
+        let services = vec![openshell_core::proto::SupervisorMiddlewareService {
+            name: "guard".into(),
+            ..Default::default()
+        }];
+        let mut status = MiddlewareRegistryStatus::Synchronized;
+        assert!(!gateway_policy_runtime_needs_reconciliation(
+            true, "hash-v1", "hash-v1", &services, &services, status,
+        ));
+
+        request_middleware_reconciliation(&mut status);
+        assert_eq!(status, MiddlewareRegistryStatus::NeedsReconciliation);
+        assert!(gateway_policy_runtime_needs_reconciliation(
+            true, "hash-v1", "hash-v1", &services, &services, status,
+        ));
+        assert!(middleware_registry_needs_rebuild(
+            status, &services, &services
         ));
     }
 

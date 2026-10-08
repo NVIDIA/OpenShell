@@ -50,6 +50,7 @@ pub(super) fn registration(
         tls_ca_cert_pem: Vec::new(),
         audience: String::new(),
         allow_insecure_transport: true,
+        ..Default::default()
     }
 }
 
