@@ -16,55 +16,8 @@ The OpenShell gateway reads its configuration from a TOML file when `--config` o
 Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
-## Helm Configuration Boundary
-
-The Kubernetes Helm chart exposes `gatewayConfig` as the non-secret gateway
-application-configuration boundary. Each top-level map key names a TOML table,
-and the chart serializes its fields into the mounted `gateway.toml` ConfigMap.
-New non-secret gateway options therefore do not require a chart-template
-change.
-
-Secret material never belongs in `gatewayConfig` or the ConfigMap. Database
-URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
-through the chart's supported environment-variable, file, or volume wiring.
-The normal precedence above still applies to the resulting mounted TOML file.
-
-During Helm values migration, explicit `gatewayConfig` tables take precedence
-over deprecated aliases. This includes the resource-admission table and the
-Kubernetes Secrets credential namespace, even when a legacy alias still enables
-the credential driver. The global Helm image pull policy applies to runtime
-and supervisor images. Leave the workload's `image_pull_policy` and deprecated
-`sandbox.image.pullPolicy` unset to use Kubernetes defaults for the workload image.
-
-The chart rejects the gateway's `database_url` file field and unambiguous
-inline credential or PEM private-key strings before rendering a ConfigMap. It
-validates Secret references as Kubernetes Secret names, but never reads or
-copies referenced Secret data into `gateway.toml`.
-
-The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
-are omitted; `null` array members are rejected because TOML has no equivalent.
-Strings and booleans retain their TOML types, and numeric values remain TOML
-numbers. Helm normalizes YAML numbers before templates run, so it cannot retain
-the lexical distinction between an integral float such as `1.0` and an integer
-such as `1`; both render as the compact TOML value `1`. Scalar arrays become
-TOML arrays, maps become inline tables, and arrays of maps inside a table become
-arrays of inline tables. A top-level `gatewayConfig` list instead renders an
-ordered TOML array of tables: each list item must be a map and emits one
-`[[table]]` block. Keys are ordered alphabetically within each table, while
-array-of-tables item order follows the YAML list, so equivalent input produces
-the same ConfigMap checksum. String values are serialized literally; Helm
-template expressions inside them are not evaluated.
-
-The implementation intentionally uses only long-standing Helm 3 template and
-Sprig functions (`kindIs`, `keys`, `sortAlpha`, `splitList`, `quote`, and
-`toJson`); it does not rely on a Helm-specific TOML encoder. This preserves the
-chart's documented Helm 3 compatibility while making the serialization rules
-explicit in the chart itself.
-
-Helm retains ownership of Services, workloads, probes, Secrets, certificate
-resources, Routes, RBAC, NetworkPolicies, and mounts. When one of those inputs
-also determines a gateway runtime value, the chart derives it from its resource
-owner instead of exposing two independent settings.
+For Helm deployments, see [Configure Chart Values](/kubernetes/setup#configure-chart-values)
+for setting `gatewayConfig` and chart-owned Kubernetes resources.
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
