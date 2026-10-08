@@ -51,6 +51,7 @@ func TestSandboxFromProto(t *testing.T) {
 	gpuCount := uint32(2)
 	exitCode := int32(0)
 	proto := &pb.Sandbox{
+		HostKeyFingerprint: "SHA256:expected",
 		Metadata: &dm.ObjectMeta{
 			Id:              "sb-1",
 			Name:            "my-sandbox",
@@ -120,6 +121,7 @@ func TestSandboxFromProto(t *testing.T) {
 	}
 
 	s := SandboxFromProto(proto)
+	assert.Equal(t, "SHA256:expected", s.HostKeyFingerprint)
 
 	require.NotNil(t, s)
 	assert.Equal(t, "execution-1", s.Status.ExecutionID)

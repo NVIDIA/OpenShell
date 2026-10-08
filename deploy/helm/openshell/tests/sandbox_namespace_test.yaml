@@ -105,6 +105,22 @@ tests:
             resources: ["persistentvolumeclaims"]
             verbs: ["get"]
 
+  - it: omits shared-workspace resources for the deprecated managed workspace mode
+    template: templates/role.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits shared-workspace resources for the deprecated operator workspace mode
+    template: templates/rolebinding.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - hasDocuments:
+          count: 0
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

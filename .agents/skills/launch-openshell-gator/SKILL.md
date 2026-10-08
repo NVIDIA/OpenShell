@@ -80,6 +80,8 @@ jq -e '.tokens.access_token and .tokens.refresh_token and .tokens.account_id' "$
 
 If this fails, run the local Codex login flow outside the gator launch. If Codex was recently reauthenticated and gateway refresh fails later, relaunch with `--reset-refresh` once.
 
+The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.
@@ -280,6 +282,10 @@ The launcher streams image-build and provisioning output to the terminal. Import
 - `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
 - `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
+- Large PRs use local Git trees for patch identity instead of GitHub's
+  size-limited full-diff endpoint. An unavailable patch ID alone does not block
+  the ledger; it disables rebase-equivalence shortcuts. Reviewers should inspect
+  oversized changes file-by-file locally.
 
 ### Inspect Active Sandboxes
 

@@ -195,6 +195,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
             .expect("auth interceptor token slot poisoned")
             .clone();
         req.metadata_mut().insert("authorization", bearer);
+        #[cfg(feature = "trace-context")]
+        let req =
+            tonic::service::Interceptor::call(&mut openshell_otel::TraceContextInterceptor, req)?;
         Ok(req)
     }
 }
@@ -261,6 +264,34 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
+}
+
+/// Marks the current client span failed unless the call finishes successfully.
+struct ClientSpanStatus {
+    span: tracing::Span,
+    finished: bool,
+}
+
+impl ClientSpanStatus {
+    fn current() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        self.finished = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ClientSpanStatus {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.span.record("otel.status_code", "ERROR");
+        }
+    }
 }
 
 /// Build a Bearer-authenticated channel to the gateway.
@@ -648,14 +679,13 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
         .ok()
         .and_then(|v| v.to_str().ok().map(str::to_string))
         .unwrap_or_default();
-    let bearer = token.strip_prefix("Bearer ").unwrap_or(&token);
     let now_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(i64::MAX);
-    let expires_at = parse_jwt_exp_ms(bearer);
+    let expires_at = parse_jwt_exp_ms(&token);
     if expires_at == Some(0) {
         return None;
     }
@@ -901,13 +931,19 @@ pub async fn fetch_policy(
 /// this snapshot instead of re-fetching metadata after policy construction.
 /// The snapshot also carries the external middleware registrations required
 /// by the policy.
+#[tracing::instrument(
+    name = "supervisor.gateway.fetch_settings_snapshot",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
     sandbox_name: &str,
 ) -> Result<SettingsPollResult> {
+    let status = ClientSpanStatus::current();
     debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
     let mut client = connect(endpoint).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await
+    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await)
 }
 
 async fn fetch_settings_snapshot_with_client(
@@ -1014,19 +1050,30 @@ pub async fn sync_policy(
 }
 
 /// Sync an enriched policy and return the authoritative revision snapshot.
+#[tracing::instrument(
+    name = "supervisor.gateway.sync_policy_and_fetch_snapshot",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn sync_policy_and_fetch_snapshot(
     endpoint: &str,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<SettingsPollResult> {
+    let status = ClientSpanStatus::current();
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await
+    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
 /// the snapshot's instance fence; retain that snapshot across registration retries.
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn report_sandbox_configuration(
     endpoint: &str,
     sandbox_id: &str,
@@ -1035,6 +1082,7 @@ pub async fn report_sandbox_configuration(
     state: crate::proto::ConfigurationAdmissionState,
     error: &str,
 ) -> Result<()> {
+    let status = ClientSpanStatus::current();
     let mut client = connect(endpoint).await?;
     client
         .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
@@ -1056,7 +1104,7 @@ pub async fn report_sandbox_configuration(
         })
         .await
         .map_err(grpc_status_error)?;
-    Ok(())
+    status.finish(Ok(()))
 }
 
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
@@ -1064,10 +1112,16 @@ pub async fn report_sandbox_configuration(
 /// Returns the credential snapshot and its exact readiness identity. An empty
 /// environment represents a sandbox without provider credentials. Transport
 /// failure returns an error so callers can revoke credentials and retry.
+#[tracing::instrument(
+    name = "supervisor.gateway.fetch_provider_environment",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
 ) -> Result<ProviderEnvironmentResult> {
+    let status = ClientSpanStatus::current();
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -1080,7 +1134,7 @@ pub async fn fetch_provider_environment(
         .await
         .map_err(grpc_status_error)?;
 
-    provider_environment_result(response.into_inner())
+    status.finish(provider_environment_result(response.into_inner()))
 }
 
 /// Preserve snapshot authority and reject invalid credential expiration times.
@@ -1181,6 +1235,11 @@ mod provider_environment_tests {
     }
 }
 
+#[tracing::instrument(
+    name = "supervisor.gateway.exchange_provider_subject_token",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn exchange_provider_subject_token(
     endpoint: &str,
     sandbox_id: &str,
@@ -1188,6 +1247,7 @@ pub async fn exchange_provider_subject_token(
     credential_key: &str,
     supervisor_jwt_svid: &str,
 ) -> Result<ProviderSubjectTokenExchangeResult> {
+    let status = ClientSpanStatus::current();
     debug!(
         endpoint = %endpoint,
         sandbox_id = %sandbox_id,
@@ -1216,11 +1276,11 @@ pub async fn exchange_provider_subject_token(
         .map_or(0, |value| {
             i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
         });
-    Ok(ProviderSubjectTokenExchangeResult {
+    status.finish(Ok(ProviderSubjectTokenExchangeResult {
         access_token: inner.access_token,
         expires_in,
         token_type: inner.token_type,
-    })
+    }))
 }
 
 fn provider_subject_token_exchange_status(status: Status) -> miette::Report {

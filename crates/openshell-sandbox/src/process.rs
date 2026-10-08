@@ -105,6 +105,9 @@ pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) 
     paths
 }
 
+/// Prefix of environment variable names reserved for `OpenShell`.
+pub(crate) const RESERVED_ENV_PREFIX: &str = "OPENSHELL_";
+
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::OCI_IMAGE_USER,
     openshell_core::sandbox_env::SANDBOX_UID,
@@ -205,6 +208,21 @@ fn apply_canonical_process_environment(
     interactive: bool,
     user_environment: &HashMap<String, String>,
 ) {
+    // The canonical process inherits the sandbox's environment so the image's
+    // own ENV (PATH, LANG, JAVA_HOME, ...) reaches the workload. Remove the
+    // reserved OPENSHELL_ namespace inherited from the sandbox itself, which
+    // carries its own control state (for example the serialized user
+    // environment and log level), then restore the one marker the workload is
+    // meant to see. The gateway rejects declared variables in this namespace.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with(RESERVED_ENV_PREFIX))
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env(openshell_core::sandbox_env::SANDBOX, "1");
     cmd.envs(user_environment);
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     // Resolve a shell present in the workload image. This code runs inside the
@@ -450,9 +468,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -615,9 +631,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -1120,6 +1134,73 @@ mod tests {
         let expected_shell = openshell_core::shell::detect_login_shell();
         assert_eq!(variables.get("SHELL"), Some(&expected_shell.as_str()));
         assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_drops_inherited_reserved_environment() {
+        // The sandbox's own control variables live in the reserved
+        // OPENSHELL_ namespace and must not reach the workload, while the
+        // image's ordinary ENV must. Run in a fresh copy of the test binary
+        // so the test harness environment is untouched.
+        const CHILD_MARKER: &str = "OPENSHELL_TEST_RESERVED_ENV_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::canonical_process_drops_inherited_reserved_environment",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(openshell_core::sandbox_env::LOG_LEVEL, "debug")
+                .env(openshell_core::sandbox_env::USER_ENVIRONMENT, "{}")
+                .env("IMAGE_LANG", "keep")
+                .status()
+                .expect("run isolated environment test");
+            assert!(status.success(), "isolated environment test failed");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        // Mirror production: inherit the sandbox environment, no env_clear.
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(StdStdio::piped());
+        apply_canonical_process_environment(
+            &mut cmd,
+            &policy,
+            &ResolvedWorkspace::default(),
+            false,
+            &HashMap::from([("DECLARED".into(), "yes".into())]),
+        );
+        let output = runtime
+            .block_on(async { cmd.output().await })
+            .expect("run environment probe");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        let variables: HashMap<_, _> = environment
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        assert!(
+            !variables
+                .keys()
+                .any(|key| key.starts_with(RESERVED_ENV_PREFIX)
+                    && *key != openshell_core::sandbox_env::SANDBOX),
+            "reserved variables reached the workload: {variables:?}"
+        );
+        assert_eq!(
+            variables.get(openshell_core::sandbox_env::SANDBOX),
+            Some(&"1")
+        );
+        assert_eq!(variables.get("IMAGE_LANG"), Some(&"keep"));
+        assert_eq!(variables.get("DECLARED"), Some(&"yes"));
     }
 
     #[cfg(unix)]

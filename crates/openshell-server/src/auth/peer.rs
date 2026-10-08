@@ -9,7 +9,7 @@
 //! the apiserver `TokenReview` API, checks the live pod UID and required labels,
 //! and only then produces a [`Principal::Peer`].
 
-use super::authenticator::Authenticator;
+use super::authenticator::{Authenticator, bearer_credential};
 use super::principal::{PeerPrincipal, Principal};
 use async_trait::async_trait;
 use k8s_openapi::api::{
@@ -93,11 +93,7 @@ impl Authenticator for PeerServiceAccountAuthenticator {
             return Ok(None);
         }
 
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
+        let Some(token) = bearer_credential(headers) else {
             return Ok(None);
         };
 

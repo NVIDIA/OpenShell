@@ -178,10 +178,18 @@ When a non-owner gateway pod stops, Kubernetes removes it from ready Service
 endpoints and new requests go to another replica. Existing requests through the
 stopped pod disconnect and must be retried.
 
-When an owner gateway pod stops, its connected supervisors reconnect through
-the gateway Service and publish new ownership. Other replicas re-read ownership
+When an owner gateway pod stops gracefully, it re-reads gateway membership and
+redirects its connected supervisors to the replicas that now own them,
+including replicas that started moments earlier. After a crash, supervisors
+reconnect through the gateway Service. Either way, they publish new ownership. Other replicas re-read ownership
 while waiting to relay a request. A request fails if no fresh, reachable owner
 appears before its normal deadline.
+
+A stopping owner waits up to five seconds for a redirected supervisor to
+publish its new session before it marks the sandbox not ready, so a sandbox
+stays `Ready` through a graceful handoff. Supervisors reconnect with
+exponential backoff that restarts after each accepted session, so repeated
+gateway restarts do not lengthen later reconnects.
 
 Established streams do not move between gateway replicas. An interrupted exec,
 forwarding, or service stream must reconnect. File sync retries with a new SSH
@@ -287,16 +295,15 @@ With autoscaling enabled, the chart stops setting `spec.replicas` and ignores
 container request, so those targets need a matching `resources.requests`
 entry. A `resources.limits` entry also works, because Kubernetes copies a
 limit into an unset request. The chart rejects an `autoscaling.maxReplicas`
-above `1` without `server.externalDbSecret`. Each scale-down disconnects the
-removed replica's supervisor sessions, and they reconnect to the remaining
-replicas, so the default behavior removes at most one pod every two minutes
+above `1` without `server.externalDbSecret`. Each scale-down hands the removed
+replica's supervisor sessions to the remaining replicas, so the default behavior removes at most one pod every two minutes
 after a five-minute stabilization window. Override it with
 `autoscaling.behavior`, or set `autoscaling.behavior.scaleDown` to `null` to
 drop the default. New replicas do not take existing sessions.
 
 <Note>
-A scale-down disconnects every supervisor session on the removed pod at once,
-and requests through that pod must be retried. To choose when that happens,
+A scale-down moves every supervisor session on the removed pod at once, and
+requests through that pod must be retried. To choose when that happens,
 set `autoscaling.behavior.scaleDown.selectPolicy` to `Disabled` so the
 autoscaler only adds replicas, and remove replicas yourself with
 `kubectl scale` at a quiet time.
@@ -312,9 +319,8 @@ kubectl -n openshell describe hpa openshell
 <Warning>
 Enabling autoscaling on an existing release removes `spec.replicas` from the
 workload in that upgrade. Kubernetes can reset the workload to one replica
-until the HPA scales it back to at least `autoscaling.minReplicas`, which
-disconnects supervisor sessions from the other gateway pods; they reconnect to
-the remaining replica. Enable autoscaling
+until the HPA scales it back to at least `autoscaling.minReplicas`, which moves
+supervisor sessions from the other gateway pods to the remaining replica. Enable autoscaling
 when you install the chart, or during a maintenance window. On an existing
 release, upgrade with `--reset-then-reuse-values`, which needs Helm 3.14 or
 later. With an older Helm, save the values with

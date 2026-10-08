@@ -21,7 +21,7 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		return nil
 	}
 
-	result := &types.Sandbox{}
+	result := &types.Sandbox{HostKeyFingerprint: s.GetHostKeyFingerprint()}
 
 	if m := s.GetMetadata(); m != nil {
 		result.ID = m.GetId()

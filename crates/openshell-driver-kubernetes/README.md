@@ -79,6 +79,12 @@ The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
 
+When the gateway exports OTLP traces, the driver sets
+`OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
+`TRACEPARENT` to the trace context of the operation that created the Pod. The
+supervisor exports its spans there and parents its startup span on that
+context. The endpoint is not configurable in driver TOML.
+
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
 and permits OpenShell supervisor Pods to reach the sandbox TLS port. The

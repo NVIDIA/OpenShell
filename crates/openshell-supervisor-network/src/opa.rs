@@ -2425,6 +2425,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.provider_credentialed {
                         ep["provider_credentialed"] = true.into();
                     }
+                    if !e.token_grant_owner.is_empty() {
+                        // Preserve the gateway's endpoint identity so admission
+                        // can select its grants without reconstructing ownership
+                        // from overlapping host and path selectors.
+                        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
+                    }
                     if is_mcp_protocol(&e.protocol) {
                         // Derive endpoint identity from the policy endpoint while
                         // it is still available. Request handling carries this
@@ -5446,6 +5452,195 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         val == regorus::Value::from(true)
+    }
+
+    fn token_grant_owner_engine(policies: serde_json::Value) -> OpaEngine {
+        // Owner identities are trusted runtime metadata, so these Rego tests
+        // load the already-normalized data that follows policy conversion.
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("policy.rego".into(), TEST_POLICY.into())
+            .expect("load owner admission policy");
+        engine
+            .add_data_json(&serde_json::json!({"network_policies": policies}).to_string())
+            .expect("load normalized owner metadata");
+        OpaEngine::with_engine(engine, true)
+    }
+
+    fn token_grant_owner_endpoint(owner: &str, path: &str, method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host": "api.example.test", "ports": [8080], "path": path,
+            "protocol": "rest", "token_grant_owner": owner,
+            "rules": [{"allow": {"method": method, "path": path}}],
+        })
+    }
+
+    fn eval_token_grant_owners(engine: &OpaEngine, input: &serde_json::Value) -> Vec<String> {
+        let mut engine = engine.engine.lock().expect("owner query engine lock");
+        set_regorus_input(&mut engine, input.clone()).expect("owner query input");
+        let owners = engine
+            .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+            .expect("evaluate admitted grant owners");
+        let regorus::Value::Array(owners) = owners else {
+            panic!("owner query must always return an array, including denial");
+        };
+        owners
+            .iter()
+            .map(|owner| match owner {
+                regorus::Value::String(owner) => owner.to_string(),
+                _ => panic!("owner query must only return string identities"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn l7_token_grant_owners_require_exact_endpoint_admission() {
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "allowed": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-broad", "/a/**", "GET"),
+                    token_grant_owner_endpoint("owner-narrow", "/a/private/**", "POST"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "other_binary": {
+                "endpoints": [token_grant_owner_endpoint("owner-other", "/a/**", "GET")],
+                "binaries": [{"path": "/usr/bin/other-client"}],
+            },
+        }));
+        let input = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(
+            eval_l7(&engine, &input),
+            "broader endpoint permits forwarding"
+        );
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-broad"]);
+
+        let input = l7_input("api.example.test", 8080, "POST", "/a/private/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-narrow"]);
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_union_allow_and_global_deny() {
+        let mut broad = token_grant_owner_endpoint("owner-z", "/a/**", "GET");
+        broad["deny_rules"] = serde_json::json!([{"method": "GET", "path": "/a/private/blocked"}]);
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "broad": {
+                "endpoints": [broad],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "narrow": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-a", "/a/private/**", "GET"),
+                    token_grant_owner_endpoint("owner-z", "/a/private/**", "GET"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let allowed = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(eval_l7(&engine, &allowed));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &allowed),
+            ["owner-a", "owner-z"]
+        );
+
+        let denied = l7_input("api.example.test", 8080, "GET", "/a/private/blocked");
+        assert!(!eval_l7(&engine, &denied));
+        assert!(eval_token_grant_owners(&engine, &denied).is_empty());
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_binary_and_query_restrictions() {
+        let mut endpoint = token_grant_owner_endpoint("owner", "/a/**", "GET");
+        endpoint["rules"][0]["allow"]["query"] = serde_json::json!({"team": {"glob": "prod-*"}});
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [endpoint],
+                "binaries": [{"path": "/opt/tools/*"}],
+            },
+        }));
+        let mut input = l7_input_with_query(
+            "api.example.test",
+            8080,
+            "GET",
+            "/a/item",
+            serde_json::json!({"team": ["prod-east"]}),
+        );
+        input["exec"]["cmdline_paths"] = serde_json::json!(["/opt/tools/client"]);
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "argv cannot grant access"
+        );
+        input["exec"]["ancestors"] = serde_json::json!(["/opt/tools/client"]);
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner"]);
+        input["request"]["query_params"] = serde_json::json!({"team": ["prod-east", "dev"]});
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "every query value must match"
+        );
+    }
+
+    #[test]
+    fn l7_token_grant_owners_exclude_audit_denial_and_missing_metadata() {
+        let mut audit = token_grant_owner_endpoint("owner-audit", "/a/**", "GET");
+        audit["enforcement"] = "audit".into();
+        let mut missing = token_grant_owner_endpoint("", "/b/**", "GET");
+        missing
+            .as_object_mut()
+            .expect("endpoint object")
+            .remove("token_grant_owner");
+        let mut malformed = token_grant_owner_endpoint("", "/c/**", "GET");
+        malformed["token_grant_owner"] = 42.into();
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [audit, missing, malformed, token_grant_owner_endpoint("", "/d/**", "GET")],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let audit_denied = l7_input("api.example.test", 8080, "POST", "/a/item");
+        assert!(!eval_l7(&engine, &audit_denied));
+        assert!(eval_token_grant_owners(&engine, &audit_denied).is_empty());
+        for path in ["/b/item", "/c/item", "/d/item"] {
+            let input = l7_input("api.example.test", 8080, "GET", path);
+            assert!(eval_l7(&engine, &input));
+            assert!(eval_token_grant_owners(&engine, &input).is_empty());
+        }
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_proto_identity() {
+        let mut proto = test_proto();
+        proto.network_policies = std::collections::HashMap::from([(
+            "owner".to_owned(),
+            NetworkPolicyRule {
+                name: "owner".to_owned(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.test".to_owned(),
+                    port: 8080,
+                    path: "/a/**".to_owned(),
+                    protocol: "rest".to_owned(),
+                    token_grant_owner: "gateway-stamped-owner".to_owned(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_owned(),
+                            path: "/a/**".to_owned(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_owned(),
+                }],
+            },
+        )]);
+        let engine = OpaEngine::from_proto(&proto).expect("load stamped proto endpoint");
+        let input = l7_input("api.example.test", 8080, "GET", "/a/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &input),
+            ["gateway-stamped-owner"]
+        );
     }
 
     #[test]

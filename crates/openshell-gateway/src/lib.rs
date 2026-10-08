@@ -264,7 +264,8 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let config = kubernetes_config(context.config_context())?;
+        let mut config = kubernetes_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -325,6 +326,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = docker_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
@@ -386,6 +388,7 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_podman::PodmanComputeDriver::new(config)

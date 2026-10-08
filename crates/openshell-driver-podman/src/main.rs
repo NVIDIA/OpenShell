@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip

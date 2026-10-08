@@ -2,6 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Merge with values.yaml for Skaffold-driven local image builds (see skaffold.yaml).
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    image_pull_policy: if_not_present
+  openshell.gateway.otlp:
+    endpoint: http://openshell-collector.observability.svc.cluster.local:4317
+  openshell.gateway.auth:
+    allow_unauthenticated_users: true
+
 server:
   otlp:
     endpoint: http://openshell-collector.observability.svc.cluster.local:4317

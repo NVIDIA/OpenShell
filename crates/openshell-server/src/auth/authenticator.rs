@@ -47,6 +47,17 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> Result<Option<Principal>, Status>;
 }
 
+/// Bearer credential from the request's `authorization` header, if any.
+///
+/// The scheme is matched case-insensitively. Non-Bearer or non-UTF-8 headers
+/// yield `None` so the chain falls through.
+pub fn bearer_credential(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(openshell_core::auth::strip_bearer_scheme)
+}
+
 /// First-match-wins authenticator chain.
 ///
 /// The chain owns its authenticators behind `Arc` so the entire chain is
@@ -148,6 +159,22 @@ mod tests {
                 provider: IdentityProvider::Oidc,
             },
         })
+    }
+
+    #[test]
+    fn bearer_credential_matches_scheme_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                format!("{scheme} abc").parse().unwrap(),
+            );
+            assert_eq!(bearer_credential(&headers), Some("abc"), "{scheme}");
+        }
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(bearer_credential(&headers), None);
+        headers.insert(http::header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_credential(&headers), None);
     }
 
     #[tokio::test]

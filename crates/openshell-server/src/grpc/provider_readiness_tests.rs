@@ -72,6 +72,8 @@ fn hello() -> SupervisorHello {
         instance_id: Uuid::new_v4().to_string(),
         connection_epoch: 0,
         supports_provider_readiness: true,
+        redirected: false,
+        supports_session_redirect: true,
     }
 }
 

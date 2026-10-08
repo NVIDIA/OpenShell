@@ -91,9 +91,24 @@ struct WriteFacts {
     references: Vec<Reference>,
     refresh: Option<Refresh>,
     global: bool,
+    execution_mismatch: bool,
 }
 
 impl Facts {
+    pub(crate) fn execution_mismatch(&self) -> Result<(), Status> {
+        self.0.lock().map_err(|_| uncertain())?.execution_mismatch = true;
+        Ok(())
+    }
+
+    pub(super) fn rejection(&self) -> Result<Option<super::Rejection>, Status> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| uncertain())?
+            .execution_mismatch
+            .then_some(super::Rejection::StaleExecution))
+    }
+
     pub(crate) fn global(&self) -> Result<(), Status> {
         self.0.lock().map_err(|_| uncertain())?.global = true;
         Ok(())

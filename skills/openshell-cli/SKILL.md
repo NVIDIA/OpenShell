@@ -400,7 +400,7 @@ openshell sandbox download my-sandbox output ./local-output
 
 Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
 
-If `sandbox create --upload` rejects an upload, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
+`sandbox create --upload` checks every upload locally before provisioning and creates no sandbox if one is rejected. If a transfer fails after provisioning, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
 
@@ -492,6 +492,13 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+The sandbox's SSH host identity survives stop/start and runtime restarts.
+API clients can read its public fingerprint from the sandbox resource or
+SSH-session response and pin it to the sandbox ID. Recreating a deleted
+sandbox, even under the same name, creates a different identity. See the
+[sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for verification behavior and release compatibility.
+
 For a response to an event from a specific execution, retain the event's
 execution identity and use `openshell sandbox stop NAME --execution-id ID`.
 The gateway rejects stale identities without stopping a replacement; the CLI
@@ -501,6 +508,12 @@ supervisor JWT claim. Do not substitute a fresh status identity for a delayed
 event. Conditional stop returns an execution receipt and does not manage local
 forwards or poll by name. It currently requires a single SQLite gateway;
 PostgreSQL/multi-replica deployments reject it with `FailedPrecondition`.
+A confirmed stale-target rejection replays for 24 hours with the same request
+ID; uncertain driver failures remain unresolved. Session reconnection preserves
+execution identity; compute replacement changes it. After upgrading legacy
+runtime records, an authorized operator must stop/start affected sandboxes with
+matching runtime releases and verify fresh execution-attested observations
+before enabling automatic responses.
 
 ---
 
@@ -872,6 +885,8 @@ openshell settings set --global --key ocsf_json_enabled --value true
 # OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
 openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
+
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 

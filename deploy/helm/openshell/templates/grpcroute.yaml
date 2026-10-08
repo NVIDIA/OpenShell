@@ -1,23 +1,36 @@
 {{- if .Values.grpcRoute.enabled }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $fullname := include "openshell.fullname" . }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:
-  name: {{ include "openshell.fullname" . }}
+  name: {{ $fullname }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
   parentRefs:
-    - name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
+    - name: {{ default $fullname .Values.grpcRoute.gateway.name }}
       namespace: {{ default .Release.Namespace .Values.grpcRoute.gateway.namespace }}
   {{- if .Values.grpcRoute.hostnames }}
   hostnames:
     {{- toYaml .Values.grpcRoute.hostnames | nindent 4 }}
   {{- end }}
   rules:
+    {{- if (dig "replicaRouting" "enabled" false .Values.grpcRoute) }}
+    {{- range $i := until (int (include "openshell.maxReplicas" $)) }}
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-openshell-replica
+              value: {{ printf "%s-%d" $fullname $i }}
+      backendRefs:
+        - name: {{ printf "%s-replica-%d" $fullname $i }}
+          port: {{ $.Values.service.port }}
+    {{- end }}
+    {{- end }}
     - backendRefs:
-        - name: {{ include "openshell.fullname" . }}
+        - name: {{ $fullname }}
           port: {{ .Values.service.port }}
 {{- end }}

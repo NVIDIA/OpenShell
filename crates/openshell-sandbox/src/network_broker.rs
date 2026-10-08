@@ -30,11 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 const SOCKET_CAPACITY: usize = 4_096;
 const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
-const ACCEPT_WORKER_CAPACITY: usize = 64;
 const DNS_QUEUE_CAPACITY: usize = 256;
 const DNS_WORKER_CAPACITY: usize = 256;
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
     Ipv4Addr::new(127, 0, 0, 53),
     53,
@@ -71,27 +69,6 @@ fn acquire_pending_dns_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingDnsS
         })
         .map(|_| PendingDnsSlot(Arc::clone(active)))
         .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
-}
-
-struct PendingAcceptSlot {
-    active: Arc<AtomicUsize>,
-}
-
-impl Drop for PendingAcceptSlot {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn acquire_pending_accept_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingAcceptSlot> {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < ACCEPT_WORKER_CAPACITY).then_some(current + 1)
-        })
-        .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))?;
-    Ok(PendingAcceptSlot {
-        active: Arc::clone(active),
-    })
 }
 
 fn acquire_pending_open_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingOpenSlot> {
@@ -191,13 +168,12 @@ fn register_dns_socket(
 #[derive(Clone)]
 struct NotificationQueues {
     provider_files: crate::provider_files::ProviderFiles,
+    workload_frozen: Arc<AtomicBool>,
     protected_control_port: Option<u16>,
-    accept_registrar: crate::accept_interrupt::AcceptRegistrar,
     identity_resolver: ProcfsIdentityResolver,
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
-    active_accepts: Arc<AtomicUsize>,
     retained_socket_capacity: usize,
     decision_timeout: Duration,
 }
@@ -206,7 +182,7 @@ struct NotificationQueues {
 #[derive(Clone)]
 pub struct NetworkBroker {
     provider_files: crate::provider_files::ProviderFiles,
-    _accept_monitor: Arc<crate::accept_interrupt::AcceptMonitor>,
+    workload_frozen: Arc<AtomicBool>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
     dns_address: SocketAddr,
@@ -250,28 +226,23 @@ impl NetworkBroker {
         decision_timeout: Duration,
     ) -> io::Result<Self> {
         let listener = Arc::new(listener);
-        let monitor_listener = listener.clone();
-        let accept_monitor = Arc::new(crate::accept_interrupt::AcceptMonitor::start(move |id| {
-            monitor_listener.validate_id(id).is_ok()
-        })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
         let active_opens = Arc::new(AtomicUsize::new(0));
-        let active_accepts = Arc::new(AtomicUsize::new(0));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
         let retained_socket_capacity = retained_socket_capacity()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let provider_files = crate::provider_files::ProviderFiles::default();
+        let workload_frozen = Arc::new(AtomicBool::new(false));
         let queues = NotificationQueues {
             provider_files: provider_files.clone(),
+            workload_frozen: workload_frozen.clone(),
             protected_control_port,
-            accept_registrar: accept_monitor.registrar(),
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
             pending: pending_tx,
             dns_relay,
             active_opens,
-            active_accepts,
             retained_socket_capacity,
             decision_timeout,
         };
@@ -295,33 +266,65 @@ impl NetworkBroker {
                             break;
                         }
                     };
-                    if let Err(error) = dispatch_notification(
-                        Arc::clone(&registry),
-                        Arc::clone(&listener),
-                        notification,
-                        queues.clone(),
-                    ) {
-                        tracing::warn!(
-                            tid = notification.tid,
-                            syscall = notification.syscall,
-                            %error,
-                            "sandbox network notification denied (tid={}, syscall={}): {error}",
-                            notification.tid,
-                            notification.syscall
-                        );
-                        let _ = listener.respond_errno(notification.id, error_to_errno(&error));
+                    // Contain a handler panic so one faulty notification
+                    // cannot silently kill the broker and hang every blocked
+                    // workload syscall. The failing syscall gets an error; the
+                    // broker keeps mediating the rest.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_notification(
+                            Arc::clone(&registry),
+                            Arc::clone(&listener),
+                            notification,
+                            queues.clone(),
+                        )
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                tid = notification.tid,
+                                syscall = notification.syscall,
+                                %error,
+                                "sandbox network notification denied (tid={}, syscall={}): {error}",
+                                notification.tid,
+                                notification.syscall
+                            );
+                            let _ =
+                                listener.respond_errno(notification.id, error_to_errno(&error));
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                tid = notification.tid,
+                                syscall = notification.syscall,
+                                "sandbox network notification handler panicked (tid={}, syscall={})",
+                                notification.tid,
+                                notification.syscall
+                            );
+                            let _ = listener.respond_errno(notification.id, libc::EIO);
+                        }
                     }
                 }
+                // The broker thread is exiting; dependent operations must fail
+                // closed rather than block on a listener no one services.
+                broker_healthy.store(false, Ordering::Release);
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
             provider_files,
-            _accept_monitor: accept_monitor,
+            workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
             dns_address,
             healthy,
         })
+    }
+
+    /// Record whether the boundary has stopped the workload for supervisor
+    /// recovery. While frozen, workload requests to send `SIGCONT` are refused
+    /// so a process that was not yet stopped cannot resume the others. Set
+    /// this before stopping the workload and clear it after resuming it.
+    pub(crate) fn set_workload_frozen(&self, frozen: bool) {
+        self.workload_frozen.store(frozen, Ordering::Release);
     }
 
     pub(crate) async fn accept(&self) -> io::Result<PendingTcpOpen> {
@@ -549,13 +552,18 @@ fn dispatch_notification(
             &listener,
             notification,
             std::process::id(),
+            &queues.workload_frozen,
         );
     }
-    if syscall == libc::SYS_tkill {
+    if matches!(
+        syscall,
+        libc::SYS_tkill | libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo
+    ) {
         return openshell_isolation_interface::linux::process_signal::mediate_thread_signal(
             &listener,
             notification,
             std::process::id(),
+            &queues.workload_frozen,
         );
     }
     if syscall == libc::SYS_socket {
@@ -575,37 +583,49 @@ fn dispatch_notification(
     if syscall == libc::SYS_listen {
         return listen_socket(&registry, &listener, notification);
     }
-    if matches!(syscall, libc::SYS_accept | libc::SYS_accept4) {
-        return accept_socket(
-            registry,
-            listener,
-            notification,
-            queues.active_accepts,
-            queues.accept_registrar,
-        );
-    }
     if matches!(
         syscall,
         libc::SYS_sendto | libc::SYS_sendmsg | libc::SYS_sendmmsg
     ) {
         return classify_send(&registry, &listener, notification, &queues.dns_relay);
     }
-    if syscall == libc::SYS_getpeername {
-        return get_peer_name(&registry, &listener, notification);
-    }
     if syscall == libc::SYS_setsockopt {
         let level = i32::try_from(notification.args[1])
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let option = i32::try_from(notification.args[2])
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        if (level == libc::IPPROTO_TCP && option == libc::TCP_FASTOPEN_CONNECT)
-            || (level == libc::IPPROTO_IPV6 && option == libc::IPV6_ADDRFORM)
-        {
+        if socket_option_is_denied(level, option) {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
         return listener.respond_continue(notification.id);
     }
     Err(io::Error::from_raw_os_error(libc::EPERM))
+}
+
+/// Options the workload may never set, decided from scalar syscall arguments
+/// that another thread cannot replace before the kernel reads them.
+///
+/// Interface-selection options could redirect or unpin a socket's loopback
+/// device binding; the others enable Fast Open or change the address family. The kernel already refuses to change an existing binding
+/// without `CAP_NET_RAW`; denying them here keeps confinement independent of
+/// the capability state of the namespace that owns the network namespace.
+fn socket_option_is_denied(level: i32, option: i32) -> bool {
+    matches!(
+        (level, option),
+        (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT)
+            | (
+                libc::IPPROTO_IPV6,
+                libc::IPV6_ADDRFORM | libc::IPV6_UNICAST_IF | libc::IPV6_MULTICAST_IF
+            )
+            | (
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE | libc::SO_BINDTOIFINDEX
+            )
+            | (
+                libc::IPPROTO_IP,
+                libc::IP_UNICAST_IF | libc::IP_MULTICAST_IF
+            )
+    )
 }
 
 fn create_socket(
@@ -617,7 +637,13 @@ fn create_socket(
     let domain = i32::try_from(notification.args[0])
         .map_err(|_| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?;
     if !matches!(domain, libc::AF_INET | libc::AF_INET6) {
-        return listener.respond_continue(notification.id);
+        // The workload filter already refuses other families. Repeat the
+        // decision here so a filter change cannot let a kernel transport
+        // socket bypass loopback confinement; the domain is a scalar argument.
+        if matches!(domain, libc::AF_UNIX | libc::AF_NETLINK) {
+            return listener.respond_continue(notification.id);
+        }
+        return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
     }
     let raw_kind = i32::try_from(notification.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EPROTONOSUPPORT))?;
@@ -654,6 +680,10 @@ fn create_socket(
     }
     // SAFETY: successful socket returned one owned descriptor.
     let source = unsafe { OwnedFd::from_raw_fd(source) };
+    // Confinement is standing kernel state that must exist before the workload
+    // can observe the descriptor. Natively accepted children inherit it, so
+    // local accept needs no per-connection broker inspection.
+    openshell_isolation_interface::linux::socket_confinement::confine_to_loopback(&source)?;
     let metadata = SocketMetadata {
         family,
         kind,
@@ -773,15 +803,21 @@ fn connect_socket(
     let destination =
         read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
     reject_protected_control_destination(destination, protected_control_port)?;
-    let (kind, socket_identity, nonblocking) = {
+    let (kind, socket_identity, nonblocking, repeated) = {
         let registry = lock(&registry);
         let entry = registry.resolve(notification.tid, fd)?;
         (
             entry.metadata().kind,
             entry.identity(),
             entry.metadata().nonblocking,
+            repeated_connect_outcome(entry.state(), entry.metadata().kind, destination),
         )
     };
+    match repeated {
+        Some(0) => return listener.respond_value(notification.id, 0),
+        Some(errno) => return Err(io::Error::from_raw_os_error(errno)),
+        None => {}
+    }
     if kind == InetKind::DnsUdp && destination.port() == 0 {
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
@@ -798,6 +834,7 @@ fn connect_socket(
         if entry.metadata().family != destination_family {
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
         }
+        listener.validate_id(notification.id)?;
         // glibc and uv use UDP connect(..., port 0), getsockname(), and an
         // AF_UNSPEC disconnect to rank resolved addresses. Bind only to the
         // matching loopback family and report success; never connect the
@@ -820,6 +857,7 @@ fn connect_socket(
             return Err(io::Error::from_raw_os_error(libc::EISCONN));
         }
         let source_fd = entry.retained_preconnect()?.as_raw_fd();
+        listener.validate_id(notification.id)?;
         let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
         let admissions = match kind {
             InetKind::Tcp => &dns_relay.tcp_admissions,
@@ -842,8 +880,21 @@ fn connect_socket(
     if destination.ip().is_loopback()
         && !openshell_core::google_cloud::is_metadata_destination(destination)
     {
+        if kind == InetKind::Tcp {
+            return connect_local_tcp(
+                &registry,
+                &listener,
+                notification,
+                fd,
+                socket_identity,
+                destination,
+                &active_opens,
+            );
+        }
+        // A UDP connect completes immediately.
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
+        listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
         entry.set_state(SocketState::Local { peer: destination });
         entry.release_preconnect();
@@ -926,6 +977,136 @@ fn connect_socket(
         })
         .map_err(|error| io::Error::other(format!("start network-open worker: {error}")))?;
     Ok(())
+}
+
+/// Connect a workload TCP socket to a loopback endpoint without blocking the
+/// notification dispatcher.
+///
+/// The broker connects a duplicate of its retained socket, which shares the
+/// workload's open file, and never holds the registry lock while waiting. A
+/// nonblocking socket gets the native `EINPROGRESS` and the kernel completes
+/// the handshake on the shared socket; a blocking socket waits on a bounded
+/// worker thread. A slow or full local listener therefore cannot stall
+/// mediation of unrelated syscalls. A nonblocking socket is recorded as
+/// connected once the handshake starts, so a repeated `connect` reports
+/// `EISCONN` even while the handshake is still in progress.
+fn connect_local_tcp(
+    registry: &Arc<Mutex<SocketRegistry>>,
+    listener: &Arc<NotificationListener>,
+    notification: Notification,
+    fd: RawFd,
+    socket_identity: SocketIdentity,
+    destination: SocketAddr,
+    active_opens: &Arc<AtomicUsize>,
+) -> io::Result<()> {
+    let connector = {
+        let registry = lock(registry);
+        let entry = registry.resolve(notification.tid, fd)?;
+        rustix::io::fcntl_dupfd_cloexec(entry.retained_preconnect()?, 3)?
+    };
+    listener.validate_id(notification.id)?;
+    // SAFETY: F_GETFL reads the flags of the live shared open file.
+    let flags = unsafe { libc::fcntl(connector.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        let started = with_sockaddr(destination, |pointer, length| {
+            // SAFETY: pointer/length describe a live sockaddr; the connector
+            // is a live duplicate of the workload's socket.
+            if unsafe { libc::connect(connector.as_raw_fd(), pointer, length) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+        let in_progress = started
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EINPROGRESS));
+        if started.is_ok() || in_progress {
+            commit_local_connect(registry, notification.tid, fd, socket_identity, destination);
+        }
+        return match started {
+            Ok(()) => listener.respond_value(notification.id, 0),
+            Err(error) => Err(error),
+        };
+    }
+    let slot = acquire_pending_open_slot(active_opens)?;
+    let registry = Arc::clone(registry);
+    let worker_listener = Arc::clone(listener);
+    std::thread::Builder::new()
+        .name("openshell-local-connect".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            // The duplicate shares the workload's blocking open file; wait
+            // natively without changing its flags.
+            let result = with_sockaddr(destination, |pointer, length| {
+                // SAFETY: pointer/length describe a live sockaddr and the
+                // connector is a live duplicate of the workload's socket.
+                if unsafe { libc::connect(connector.as_raw_fd(), pointer, length) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+            if result.is_ok() {
+                commit_local_connect(
+                    &registry,
+                    notification.tid,
+                    fd,
+                    socket_identity,
+                    destination,
+                );
+            }
+            let _ = match result {
+                Ok(()) => worker_listener.respond_value(notification.id, 0),
+                Err(error) => {
+                    worker_listener.respond_errno(notification.id, error_to_errno(&error))
+                }
+            };
+        })
+        .map_err(|error| io::Error::other(format!("start local-connect worker: {error}")))?;
+    Ok(())
+}
+
+/// Record a completed or in-progress loopback TCP connect, unless the
+/// descriptor now names a different socket.
+fn commit_local_connect(
+    registry: &Mutex<SocketRegistry>,
+    tid: u32,
+    fd: RawFd,
+    socket_identity: SocketIdentity,
+    destination: SocketAddr,
+) {
+    let mut registry = lock(registry);
+    if let Ok(entry) = registry.resolve_mut(tid, fd)
+        && entry.identity() == socket_identity
+    {
+        entry.set_state(SocketState::Local { peer: destination });
+        entry.release_preconnect();
+    }
+}
+
+/// Result for a `connect` on a socket the broker already connected, as the
+/// kernel would report it: `Some(0)` for success, `Some(errno)` for an error,
+/// `None` when the socket is not yet connected.
+///
+/// A notified syscall interrupted by a signal is restarted after the broker
+/// may already have completed it, so a repeat must not depend on the broker's
+/// released pre-connect descriptor.
+fn repeated_connect_outcome(
+    state: &SocketState,
+    kind: InetKind,
+    destination: SocketAddr,
+) -> Option<i32> {
+    match state {
+        SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. } => None,
+        // UDP connect replaces the association; repeating the same one succeeds.
+        SocketState::DnsUdp { relay } if *relay == destination => Some(0),
+        SocketState::Local { peer } if kind == InetKind::DnsUdp && *peer == destination => Some(0),
+        _ if kind == InetKind::Tcp => Some(libc::EISCONN),
+        _ => None,
+    }
 }
 
 const fn tcp_denial_errno(reason: TcpOpenDenial) -> i32 {
@@ -1037,6 +1218,12 @@ fn bind_socket(
     let bind_result = {
         let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
+        // A native bind is never restarted, but a notified one can be after a
+        // signal. Report a repeat of the bind the broker completed as success.
+        if entry.state() == &(SocketState::Bound { local }) {
+            return listener.respond_value(notification.id, 0);
+        }
+        listener.validate_id(notification.id)?;
         bind_exact(entry.retained_preconnect()?.as_raw_fd(), local)
     };
     if bind_result
@@ -1082,6 +1269,8 @@ fn listen_socket(
     let Ok(entry) = registry.resolve_mut(notification.tid, fd) else {
         return listener.respond_continue(notification.id);
     };
+    // listen(2) may be repeated natively, so a restart needs no special case.
+    listener.validate_id(notification.id)?;
     // SAFETY: retained descriptor is the exact registered socket OFD.
     if unsafe { libc::listen(entry.retained_preconnect()?.as_raw_fd(), backlog) } < 0 {
         return Err(io::Error::last_os_error());
@@ -1089,218 +1278,6 @@ fn listen_socket(
     let local = socket_local_addr(entry.retained_preconnect()?.as_raw_fd())?;
     entry.set_state(SocketState::Listening { local });
     listener.respond_value(notification.id, 0)
-}
-
-fn accept_socket(
-    registry: Arc<Mutex<SocketRegistry>>,
-    listener: Arc<NotificationListener>,
-    notification: Notification,
-    active_accepts: Arc<AtomicUsize>,
-    accept_registrar: crate::accept_interrupt::AcceptRegistrar,
-) -> io::Result<()> {
-    let fd = raw_fd(notification.args[0])?;
-    let flags = if i64::from(notification.syscall) == libc::SYS_accept4 {
-        i32::try_from(notification.args[3])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
-    } else {
-        0
-    };
-    if flags & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) != 0 {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
-    }
-    if (notification.args[1] == 0) != (notification.args[2] == 0) {
-        return Err(io::Error::from_raw_os_error(libc::EFAULT));
-    }
-    let (listener_inode, metadata, source) = {
-        let registry = lock(&registry);
-        let Ok(entry) = registry.resolve(notification.tid, fd) else {
-            return listener.respond_continue(notification.id);
-        };
-        if !matches!(entry.state(), SocketState::Listening { .. })
-            || entry.metadata().kind != InetKind::Tcp
-        {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        let source = duplicate_close_on_exec(entry.retained_preconnect()?.as_raw_fd())?;
-        (entry.identity().inode, entry.metadata(), source)
-    };
-    let slot = acquire_pending_accept_slot(&active_accepts)?;
-    let worker_listener = Arc::clone(&listener);
-    std::thread::Builder::new()
-        .name("openshell-local-accept".to_string())
-        .spawn(move || {
-            let _slot = slot;
-            let registration = match accept_registrar.register(notification.id) {
-                Ok(registration) => registration,
-                Err(error) => {
-                    let _ = worker_listener.respond_errno(notification.id, error_to_errno(&error));
-                    return;
-                }
-            };
-            if let Err(error) = accept_and_inject(
-                &registry,
-                &worker_listener,
-                notification,
-                AcceptOperation {
-                    flags,
-                    listener_inode,
-                    metadata,
-                    source,
-                    registration,
-                },
-            ) {
-                let _ = worker_listener.respond_errno(notification.id, error_to_errno(&error));
-            }
-        })
-        .map_err(|error| io::Error::other(format!("start local-accept worker: {error}")))?;
-    Ok(())
-}
-
-struct AcceptOperation {
-    flags: i32,
-    listener_inode: u64,
-    metadata: SocketMetadata,
-    source: OwnedFd,
-    registration: crate::accept_interrupt::AcceptRegistration,
-}
-
-fn accept_and_inject(
-    registry: &Mutex<SocketRegistry>,
-    listener: &NotificationListener,
-    notification: Notification,
-    operation: AcceptOperation,
-) -> io::Result<()> {
-    let AcceptOperation {
-        flags,
-        listener_inode,
-        metadata,
-        source,
-        registration,
-    } = operation;
-    let mut poll = libc::pollfd {
-        fd: source.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: F_GETFL reads the live listener OFD flags.
-    let current_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
-    if current_flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let nonblocking = current_flags & libc::O_NONBLOCK != 0;
-    let timeout = if nonblocking {
-        0
-    } else {
-        i32::try_from(ACCEPT_POLL_INTERVAL.as_millis()).map_err(io::Error::other)?
-    };
-    // Readiness may disappear before accept (another accept or an aborted
-    // connection). The registered watchdog interrupts a blocked syscall when
-    // its notification dies or the broker shuts down. No workload OFD flags
-    // are changed, and no worker can outlive its cancellation registration.
-    loop {
-        registration.ensure_running()?;
-        listener.validate_id(notification.id)?;
-        // SAFETY: poll references one live pollfd for this call.
-        let ready = unsafe { libc::poll(&raw mut poll, 1, timeout) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if ready == 0 {
-            if nonblocking {
-                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
-            }
-            continue;
-        }
-        break;
-    }
-
-    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut length =
-        libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>()).map_err(io::Error::other)?;
-    // Always keep the broker-side descriptor close-on-exec. ADDFD separately
-    // applies the workload's requested descriptor flag.
-    let accepted_flags = flags | libc::SOCK_CLOEXEC;
-    // SAFETY: storage and length are live outputs and source is a listening
-    // socket proven by the registry.
-    let accepted = unsafe {
-        libc::accept4(
-            source.as_raw_fd(),
-            storage.as_mut_ptr().cast(),
-            &raw mut length,
-            accepted_flags,
-        )
-    };
-    if accepted < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Only the blocking accept phase needs asynchronous interruption. Stop
-    // monitoring before ADDFD completes the notification, otherwise a normal
-    // successful response could be mistaken for cancellation during commit.
-    drop(registration);
-    // SAFETY: successful accept4 returned one newly owned descriptor.
-    let accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
-    // SAFETY: accept4 initialized the reported prefix of storage.
-    let peer = decode_sockaddr(
-        unsafe { storage.assume_init() },
-        usize::try_from(length).unwrap_or(0),
-    )?;
-    if !peer.ip().is_loopback() {
-        return Err(io::Error::from_raw_os_error(libc::EACCES));
-    }
-    if notification.args[1] != 0 {
-        write_socket_addr(
-            listener,
-            notification.id,
-            notification.tid,
-            notification.args[1],
-            notification.args[2],
-            peer,
-        )?;
-    }
-
-    let accepted_metadata = SocketMetadata {
-        family: metadata.family,
-        kind: InetKind::Tcp,
-        close_on_exec: flags & libc::SOCK_CLOEXEC != 0,
-        nonblocking: flags & libc::SOCK_NONBLOCK != 0,
-        creator_generation: u64::from(notification.tid),
-    };
-    let mut registry = lock(registry);
-    let notifying_fd = raw_fd(notification.args[0])?;
-    if registry
-        .resolve(notification.tid, notifying_fd)?
-        .identity()
-        .inode
-        != listener_inode
-    {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
-    if registry.is_full() {
-        collect_closed_socket_entries_locked(&mut registry)?;
-    }
-    let tentative = registry.stage(accepted, accepted_metadata)?;
-    listener.add_fd_and_send(
-        notification.id,
-        tentative.source_fd(),
-        accepted_metadata.close_on_exec,
-    )?;
-    registry.commit_with_state(tentative, SocketState::AcceptedLocal { peer })?;
-    Ok(())
-}
-
-fn duplicate_close_on_exec(fd: RawFd) -> io::Result<OwnedFd> {
-    // SAFETY: F_DUPFD_CLOEXEC returns an independent owned descriptor for the
-    // same open-file description.
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful fcntl returned one newly owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 fn classify_send(
@@ -1311,6 +1288,12 @@ fn classify_send(
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     let syscall = i64::from(notification.syscall);
+    // Fast Open turns a send into a connect. Decide from the scalar flags
+    // argument, which another thread cannot replace, so the denial also
+    // covers natively accepted and other unregistered descriptors.
+    if send_flags(syscall, notification.args) & libc::MSG_FASTOPEN != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
     let (state, metadata) = {
         let registry = lock(registry);
         let Ok(entry) = registry.resolve(notification.tid, fd) else {
@@ -1320,10 +1303,8 @@ fn classify_send(
         };
         (entry.state().clone(), entry.metadata())
     };
-    if matches!(
-        &state,
-        SocketState::Connected { .. } | SocketState::AcceptedLocal { .. }
-    ) || (metadata.kind == InetKind::Tcp && matches!(&state, SocketState::Local { .. }))
+    if matches!(&state, SocketState::Connected { .. })
+        || (metadata.kind == InetKind::Tcp && matches!(&state, SocketState::Local { .. }))
     {
         return listener.respond_continue(notification.id);
     }
@@ -1332,9 +1313,6 @@ fn classify_send(
         libc::SYS_sendmsg => vec![read_sendmsg_message(
             notification.tid,
             notification.args[1],
-            i32::try_from(notification.args[2])
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-            None,
         )?],
         libc::SYS_sendmmsg => read_sendmmsg_messages(notification)?,
         _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -1388,58 +1366,52 @@ fn classify_send(
         {
             let entry = registry.resolve_mut(notification.tid, fd)?;
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
+            listener.validate_id(notification.id)?;
             let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
             register_dns_socket(&dns_relay.udp_admissions, peer, entry.identity())?;
             if let Err(error) = connect_exact(source_fd, dns_relay.address) {
                 lock(&dns_relay.udp_admissions).remove(&peer);
                 return Err(error);
             }
-            for message in &messages {
-                send_dns_message(source_fd, message)?;
-                if let Some(length_address) = message.result_length_address {
-                    let length = u32::try_from(message.data.len())
-                        .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-                    listener.write_task_output(
-                        notification.id,
-                        notification.tid,
-                        length_address,
-                        &length.to_ne_bytes(),
-                    )?;
-                }
-            }
+            // The socket is pinned to the relay and bound to loopback. The
+            // kernel performs the send; ancillary data was rejected at read
+            // time and a loopback destination contains any per-message
+            // routing override that races the check.
             entry.set_state(SocketState::DnsUdp {
                 relay: dns_relay.address,
             });
             entry.release_preconnect();
-            let result = if syscall == libc::SYS_sendmmsg {
-                i64::try_from(messages.len()).unwrap_or(i64::MAX)
-            } else {
-                i64::try_from(messages[0].data.len()).unwrap_or(i64::MAX)
-            };
-            listener.respond_value(notification.id, result)
+            listener.respond_continue(notification.id)
         }
         Ok(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
-        // Non-INET sockets and accepted local sockets were never registered.
-        // The mandatory outer fence still prevents an external kernel route.
+        // Non-INET sockets and natively accepted sockets were never
+        // registered. Accepted sockets inherit their listener's loopback
+        // binding, and the mandatory outer fence remains an independent
+        // backstop against an external kernel route.
         Err(_) => listener.respond_continue(notification.id),
     }
 }
 
+fn send_flags(syscall: i64, args: [u64; 6]) -> i32 {
+    let flags = match syscall {
+        libc::SYS_sendmsg => args[2],
+        libc::SYS_sendto | libc::SYS_sendmmsg => args[3],
+        _ => 0,
+    };
+    // Syscall flag arguments are C ints; the kernel ignores the upper word.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the kernel reads only the low 32 bits of the flags argument"
+    )]
+    let flags = flags as u32;
+    flags.cast_signed()
+}
+
 struct SendMessage {
-    data: Vec<u8>,
     destination: Option<SocketAddr>,
-    flags: i32,
-    result_length_address: Option<u64>,
 }
 
 fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
-    let length = usize::try_from(notification.args[2])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-    if u16::try_from(length).is_err() {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = vec![0_u8; length];
-    task_memory::read_exact(notification.tid, notification.args[1], &mut data)?;
     let destination = if notification.args[4] == 0 {
         None
     } else {
@@ -1449,22 +1421,15 @@ fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
             notification.args[5],
         )?)
     };
-    Ok(SendMessage {
-        data,
-        destination,
-        flags: i32::try_from(notification.args[3])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-        result_length_address: None,
-    })
+    Ok(SendMessage { destination })
 }
 
-fn read_sendmsg_message(
-    tid: u32,
-    address: u64,
-    flags: i32,
-    result_length_address: Option<u64>,
-) -> io::Result<SendMessage> {
+fn read_sendmsg_message(tid: u32, address: u64) -> io::Result<SendMessage> {
     let header = read_task_value::<libc::msghdr>(tid, address)?;
+    // Ancillary data can carry a per-message routing override (IP_PKTINFO).
+    // Refuse it rather than continue a send the broker did not inspect; a
+    // loopback destination additionally contains an override that races this
+    // check.
     if header.msg_controllen != 0 {
         return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
     }
@@ -1477,39 +1442,7 @@ fn read_sendmsg_message(
             u64::from(header.msg_namelen),
         )?)
     };
-    #[cfg(target_env = "musl")]
-    let iov_count = usize::try_from(header.msg_iovlen)
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    #[cfg(not(target_env = "musl"))]
-    let iov_count = header.msg_iovlen;
-    if iov_count > 32 {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = Vec::new();
-    for index in 0..iov_count {
-        let offset = index
-            .checked_mul(size_of::<libc::iovec>())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-        let iov = read_task_value::<libc::iovec>(
-            tid,
-            (header.msg_iov as u64)
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-        )?;
-        let start = data.len();
-        let end = start
-            .checked_add(iov.iov_len)
-            .filter(|length| u16::try_from(*length).is_ok())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-        data.resize(end, 0);
-        task_memory::read_exact(tid, iov.iov_base as u64, &mut data[start..end])?;
-    }
-    Ok(SendMessage {
-        data,
-        destination,
-        flags,
-        result_length_address,
-    })
+    Ok(SendMessage { destination })
 }
 
 fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMessage>> {
@@ -1518,8 +1451,6 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
     if count == 0 || count > 32 {
         return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
-    let flags = i32::try_from(notification.args[3])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     (0..count)
         .map(|index| {
             let offset = index
@@ -1528,18 +1459,7 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
             let base = notification.args[1]
                 .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-            read_sendmsg_message(
-                notification.tid,
-                base,
-                flags,
-                Some(
-                    base.checked_add(
-                        u64::try_from(std::mem::offset_of!(libc::mmsghdr, msg_len))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-                ),
-            )
+            read_sendmsg_message(notification.tid, base)
         })
         .collect()
 }
@@ -1550,53 +1470,6 @@ fn read_task_value<T: Copy>(tid: u32, address: u64) -> io::Result<T> {
     // SAFETY: `bytes` contains exactly one copied native value; unaligned read
     // avoids imposing alignment on the task-memory scratch allocation.
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
-}
-
-fn send_dns_message(fd: RawFd, message: &SendMessage) -> io::Result<()> {
-    // SAFETY: `fd` is the retained exact UDP socket and the buffer remains
-    // valid for the duration of the syscall.
-    let sent = unsafe {
-        libc::send(
-            fd,
-            message.data.as_ptr().cast(),
-            message.data.len(),
-            message.flags,
-        )
-    };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if usize::try_from(sent).ok() == Some(message.data.len()) {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(libc::EIO))
-    }
-}
-
-fn get_peer_name(
-    registry: &Mutex<SocketRegistry>,
-    listener: &NotificationListener,
-    notification: Notification,
-) -> io::Result<()> {
-    let fd = raw_fd(notification.args[0])?;
-    let registry = lock(registry);
-    let Ok(entry) = registry.resolve(notification.tid, fd) else {
-        return listener.respond_continue(notification.id);
-    };
-    let peer = match entry.state() {
-        SocketState::Connected { original_peer } => *original_peer,
-        SocketState::Local { peer } | SocketState::AcceptedLocal { peer } => *peer,
-        _ => return Err(io::Error::from_raw_os_error(libc::ENOTCONN)),
-    };
-    write_socket_addr(
-        listener,
-        notification.id,
-        notification.tid,
-        notification.args[1],
-        notification.args[2],
-        peer,
-    )?;
-    listener.respond_value(notification.id, 0)
 }
 
 fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
@@ -1745,50 +1618,6 @@ fn decode_sockaddr(storage: libc::sockaddr_storage, length: usize) -> io::Result
     }
 }
 
-fn write_socket_addr(
-    listener: &NotificationListener,
-    notification_id: u64,
-    tid: u32,
-    address: u64,
-    length_address: u64,
-    value: SocketAddr,
-) -> io::Result<()> {
-    // A LegacyReadOnly listener (kernels < 5.19) cannot safely write into
-    // workload memory: without WAIT_KILLABLE_RECV the notified accept/
-    // getpeername could resume and repurpose these buffers between validation
-    // and the broker write. Fail closed before reading or writing anything, so
-    // this address-writing path is inert in legacy mode. Callers that pass a
-    // null address argument (accept with a null peer address) never reach here.
-    if listener.writes_disabled() {
-        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-    }
-    let mut supplied_length = [0_u8; size_of::<libc::socklen_t>()];
-    task_memory::read_exact(tid, length_address, &mut supplied_length)?;
-    let supplied_length = libc::socklen_t::from_ne_bytes(supplied_length);
-    let (bytes, actual_length) = sockaddr_bytes(value)?;
-    let copied = usize::try_from(supplied_length)
-        .unwrap_or(0)
-        .min(bytes.len());
-    if copied != 0 {
-        listener.write_task_output(notification_id, tid, address, &bytes[..copied])?;
-    }
-    listener.write_task_output(
-        notification_id,
-        tid,
-        length_address,
-        &actual_length.to_ne_bytes(),
-    )
-}
-
-fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {
-    with_sockaddr(address, |native, length| {
-        let length_usize = usize::try_from(length).map_err(io::Error::other)?;
-        // SAFETY: with_sockaddr lends fully initialized storage for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(native.cast::<u8>(), length_usize) };
-        Ok((bytes.to_vec(), length))
-    })
-}
-
 fn with_sockaddr<T>(
     address: SocketAddr,
     operation: impl FnOnce(*const libc::sockaddr, libc::socklen_t) -> io::Result<T>,
@@ -1846,7 +1675,7 @@ fn error_to_errno(error: &io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
+    use openshell_isolation_interface::linux::socket_confinement;
 
     #[test]
     fn provider_files_are_opened_on_demand_and_replaced() {
@@ -2027,25 +1856,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_listener_rejects_socket_addr_write() {
-        // accept-with-address and getpeername both route through
-        // write_socket_addr; on a LegacyReadOnly listener the path must fail
-        // closed (EOPNOTSUPP) before any task-memory access.
-        // SAFETY: dup returns a new descriptor or a negative error.
-        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(dup >= 0, "dup stderr");
-        let listener = NotificationListener::from_fd_with_mode(
-            // SAFETY: successful dup returned a new owned descriptor.
-            unsafe { OwnedFd::from_raw_fd(dup) },
-            ListenerMode::LegacyReadOnly,
-        );
-        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let error = write_socket_addr(&listener, 1, 0, 0, 0, peer)
-            .expect_err("legacy listener must reject socket-address writes");
-        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
-    }
-
-    #[test]
     fn relay_rejects_descriptor_replaced_after_policy_decision() {
         let metadata = SocketMetadata {
             family: InetFamily::V4,
@@ -2056,11 +1866,10 @@ mod tests {
         };
         let mut registry = SocketRegistry::new(1, 2).unwrap();
         let mut create = || {
-            // SAFETY: a successful socket call returns a new owned descriptor.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-            assert!(fd >= 0);
-            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-            let installed = duplicate_close_on_exec(fd).unwrap();
+            let socket = OwnedFd::from(
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap(),
+            );
+            let installed = rustix::io::fcntl_dupfd_cloexec(&socket, 3).unwrap();
             let tentative = registry.stage(socket, metadata).unwrap();
             let identity = registry.commit(tentative).unwrap();
             (installed, identity)
@@ -2383,42 +2192,39 @@ mod tests {
     }
 
     #[test]
-    fn accepted_loopback_stream_is_registered_for_notified_operations() {
+    fn native_accept_inherits_loopback_confinement() {
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let workload = std::thread::spawn(move || {
             launcher
-                .execute(move || -> io::Result<SocketAddr> {
-                    let listener = TcpListener::bind("127.0.0.1:0")?;
-                    ready_tx
-                        .send(listener.local_addr()?)
-                        .map_err(|_| io::Error::other("test client disappeared"))?;
-                    let (stream, _) = listener.accept()?;
-                    let peer = stream.peer_addr()?;
-                    let payload = b"accepted";
-                    let iov = libc::iovec {
-                        iov_base: payload.as_ptr().cast_mut().cast(),
-                        iov_len: payload.len(),
-                    };
-                    let message = libc::msghdr {
-                        msg_name: std::ptr::null_mut(),
-                        msg_namelen: 0,
-                        msg_iov: (&raw const iov).cast_mut(),
-                        msg_iovlen: 1,
-                        msg_control: std::ptr::null_mut(),
-                        msg_controllen: 0,
-                        msg_flags: 0,
-                    };
-                    // SAFETY: message references one live immutable payload;
-                    // the accepted stream remains open for the call.
-                    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, 0) };
-                    if sent != isize::try_from(payload.len()).expect("payload fits isize") {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(peer)
-                })
+                .execute(
+                    move || -> io::Result<(SocketAddr, SocketAddr, Option<Vec<u8>>)> {
+                        let listener = TcpListener::bind("127.0.0.1:0")?;
+                        ready_tx
+                            .send(listener.local_addr()?)
+                            .map_err(|_| io::Error::other("test client disappeared"))?;
+                        // std passes a peer-address buffer; native accept
+                        // fills it directly from the kernel.
+                        let (stream, accepted_peer) = listener.accept()?;
+                        let peer = stream.peer_addr()?;
+                        let device = socket_confinement::bound_device(&stream)?;
+                        // sendmsg with no destination is notified and must
+                        // continue for an untracked accepted stream.
+                        let payload = b"accepted";
+                        let sent = rustix::net::sendmsg(
+                            &stream,
+                            &[io::IoSlice::new(payload)],
+                            &mut rustix::net::SendAncillaryBuffer::default(),
+                            rustix::net::SendFlags::empty(),
+                        )?;
+                        if sent != payload.len() {
+                            return Err(io::Error::from_raw_os_error(libc::EIO));
+                        }
+                        Ok((accepted_peer, peer, device))
+                    },
+                )
                 .expect("launcher result")
         });
 
@@ -2435,14 +2241,360 @@ mod tests {
             .read_exact(&mut payload)
             .expect("read accepted stream");
         assert_eq!(&payload, b"accepted");
-        assert!(
-            workload
-                .join()
-                .expect("join workload")
-                .expect("accepted workload")
-                .ip()
-                .is_loopback()
+        let (accepted_peer, peer, device) = workload
+            .join()
+            .expect("join workload")
+            .expect("accepted workload");
+        let client_address = client.local_addr().unwrap();
+        assert_eq!(accepted_peer, client_address);
+        assert_eq!(peer, client_address);
+        assert_eq!(device.as_deref(), Some(&b"lo"[..]));
+    }
+
+    /// Bound device name and the errno from an attempted rebind.
+    type ConfinementObservation = (Option<Vec<u8>>, Option<i32>);
+
+    #[test]
+    fn workload_sockets_are_bound_to_loopback_and_cannot_be_rebound() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let results = launcher
+            .execute(|| -> io::Result<Vec<ConfinementObservation>> {
+                let mut results = Vec::new();
+                for (domain, kind) in [
+                    (socket2::Domain::IPV4, socket2::Type::STREAM),
+                    (socket2::Domain::IPV4, socket2::Type::DGRAM),
+                    (socket2::Domain::IPV6, socket2::Type::STREAM),
+                ] {
+                    let socket = socket2::Socket::new(domain, kind, None)?;
+                    let device = socket_confinement::bound_device(&socket)?;
+                    let rebind_error = socket
+                        .bind_device(Some(b"eth0"))
+                        .err()
+                        .and_then(|error| error.raw_os_error());
+                    results.push((device, rebind_error));
+                }
+                Ok(results)
+            })
+            .expect("launcher result")
+            .expect("workload sockets");
+        for (device, rebind_error) in results {
+            assert_eq!(device.as_deref(), Some(&b"lo"[..]));
+            assert_eq!(rebind_error, Some(libc::EPERM));
+        }
+    }
+
+    #[test]
+    fn fast_open_sends_are_denied_for_every_descriptor() {
+        let local = TcpListener::bind("127.0.0.1:0").unwrap();
+        local.set_nonblocking(true).unwrap();
+        let address = local.local_addr().unwrap();
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let error = launcher
+            .execute(move || -> io::Result<()> {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                socket
+                    .send_to_with_flags(b"x", &address.into(), libc::MSG_FASTOPEN)
+                    .map(drop)
+            })
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            local.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn send_flags_read_the_scalar_argument_for_each_syscall() {
+        let flags = u64::try_from(libc::MSG_FASTOPEN).unwrap();
+        assert_eq!(
+            send_flags(libc::SYS_sendto, [0, 0, 0, flags, 0, 0]),
+            libc::MSG_FASTOPEN
+        );
+        assert_eq!(
+            send_flags(libc::SYS_sendmsg, [0, 0, flags, 0, 0, 0]),
+            libc::MSG_FASTOPEN
+        );
+        assert_eq!(
+            send_flags(libc::SYS_sendmmsg, [0, 0, 0, flags | (1 << 32), 0, 0]),
+            libc::MSG_FASTOPEN
+        );
+    }
+
+    #[test]
+    fn broker_refuses_socket_families_it_cannot_confine() {
+        // Independent of the static workload filter: the broker continues
+        // only Unix and netlink sockets and creates INET sockets itself.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let results = launcher
+            .execute(|| {
+                [
+                    (libc::AF_UNIX, socket2::Type::STREAM),
+                    (libc::AF_RXRPC, socket2::Type::DGRAM),
+                    (libc::AF_ALG, socket2::Type::SEQPACKET),
+                ]
+                .map(|(domain, kind)| {
+                    socket2::Socket::new(socket2::Domain::from(domain), kind, None)
+                        .map(drop)
+                        .map_err(|error| error.raw_os_error())
+                })
+            })
+            .expect("launcher result");
+        assert_eq!(
+            results,
+            [
+                Ok(()),
+                Err(Some(libc::EAFNOSUPPORT)),
+                Err(Some(libc::EAFNOSUPPORT))
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_connects_report_what_the_kernel_would() {
+        let relay: SocketAddr = "127.0.0.53:53".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        for (state, kind, destination, expected) in [
+            (SocketState::Created, InetKind::Tcp, peer, None),
+            (
+                SocketState::Bound { local: peer },
+                InetKind::Tcp,
+                peer,
+                None,
+            ),
+            (
+                SocketState::Local { peer },
+                InetKind::Tcp,
+                peer,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::Connected {
+                    original_peer: "203.0.113.7:443".parse().unwrap(),
+                },
+                InetKind::Tcp,
+                peer,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::DnsTcp { relay },
+                InetKind::Tcp,
+                relay,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::DnsUdp { relay },
+                InetKind::DnsUdp,
+                relay,
+                Some(0),
+            ),
+            (SocketState::DnsUdp { relay }, InetKind::DnsUdp, other, None),
+            (SocketState::Local { peer }, InetKind::DnsUdp, peer, Some(0)),
+        ] {
+            assert_eq!(
+                repeated_connect_outcome(&state, kind, destination),
+                expected,
+                "{state:?} {kind:?} {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_bind_and_connect_after_completion() {
+        // A signal can restart a syscall the broker already completed. A
+        // repeated connect reports EISCONN; a repeated bind of the same
+        // address succeeds, unlike a native EINVAL, so a restart is safe.
+        let service = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = service.local_addr().unwrap();
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (bind_again, connect_again) = launcher
+            .execute(move || -> io::Result<(io::Result<()>, Option<i32>)> {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                socket.bind(&local.into())?;
+                let bind_again = socket.bind(&local.into());
+                socket.connect(&address.into())?;
+                let connect_again = socket
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                Ok((bind_again, connect_again))
+            })
+            .expect("launcher result")
+            .expect("workload socket");
+        bind_again.expect("repeated bind of the same address");
+        assert_eq!(connect_again, Some(libc::EISCONN));
+    }
+
+    #[test]
+    fn frozen_workload_cannot_resume_processes_with_sigcont() {
+        // A workload process that is not yet stopped when the boundary
+        // freezes must not resume the others, through process-directed
+        // (kill) or thread-directed (tgkill) signals.
+        const CHILD_MARKER: &str = "OPENSHELL_FROZEN_SIGCONT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let errno = |result: nix::Result<()>| result.err().map_or(0, |error| error as i32);
+            let kill = errno(nix::sys::signal::kill(
+                nix::unistd::getpid(),
+                nix::sys::signal::Signal::SIGCONT,
+            ));
+            // SAFETY: tgkill takes scalar arguments naming this thread.
+            let tgkill = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    libc::SIGCONT,
+                )
+            };
+            let tgkill = if tgkill < 0 {
+                io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                0
+            };
+            println!("kill={kill} tgkill={tgkill}");
+            return;
+        }
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let run_workload = |launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher| {
+            let output = launcher
+                .execute(|| {
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "network_broker::tests::frozen_workload_cannot_resume_processes_with_sigcont",
+                            "--nocapture",
+                            "--quiet",
+                        ])
+                        .env(CHILD_MARKER, "1")
+                        .output()
+                })
+                .unwrap()
+                .expect("run workload child");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find(|line| line.starts_with("kill="))
+                .expect("workload child result")
+                .to_string()
+        };
+        broker.set_workload_frozen(true);
+        assert_eq!(
+            run_workload(&launcher),
+            format!("kill={} tgkill={}", libc::EPERM, libc::EPERM)
+        );
+        broker.set_workload_frozen(false);
+        assert_eq!(run_workload(&launcher), "kill=0 tgkill=0");
+    }
+
+    #[test]
+    fn slow_loopback_connect_does_not_stall_other_mediation() {
+        // A listener that never accepts, with a full backlog, makes further
+        // connects wait. Other mediated syscalls must not wait behind them,
+        // whether the pending connect is blocking or nonblocking.
+        let saturated =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        saturated
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        saturated.listen(0).unwrap();
+        let address = saturated.local_addr().unwrap().as_socket().unwrap();
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (blocking_wait, nonblocking_result) = launcher
+            .execute(move || {
+                // Fill the accept queue; later connects to it stall.
+                let filled = TcpStream::connect(address).expect("fill accept queue");
+                let pending = std::thread::spawn(move || TcpStream::connect(address));
+                std::thread::sleep(Duration::from_millis(500));
+                let started = Instant::now();
+                drop(UdpSocket::bind("127.0.0.1:0"));
+                let blocking_wait = started.elapsed();
+                // A nonblocking connect reports progress immediately.
+                let nonblocking = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM.nonblocking(),
+                    None,
+                )
+                .unwrap();
+                let nonblocking_result = nonblocking
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                // Leave the pending connect running; closing the listener when
+                // the test ends resets it.
+                drop(pending);
+                drop(filled);
+                (blocking_wait, nonblocking_result)
+            })
+            .expect("launcher result");
+        assert!(
+            blocking_wait < Duration::from_secs(2),
+            "mediated socket creation waited {blocking_wait:?} behind a slow connect"
+        );
+        assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
+    }
+
+    #[test]
+    fn workload_cannot_bind_a_non_loopback_source_address() {
+        // Workload sockets can only present loopback source addresses. A
+        // non-loopback peer on a loopback-bound workload listener is therefore
+        // a non-workload process in the same network namespace.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let errors = launcher
+            .execute(|| {
+                ["192.0.2.10:0", "[2001:db8::10]:0"].map(|address| {
+                    UdpSocket::bind(address)
+                        .err()
+                        .and_then(|error| error.raw_os_error())
+                })
+            })
+            .expect("launcher result");
+        assert_eq!(errors, [Some(libc::EACCES), Some(libc::EACCES)]);
+    }
+
+    #[test]
+    fn interface_selection_options_are_denied() {
+        for (level, option) in [
+            (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
+            (libc::SOL_SOCKET, libc::SO_BINDTOIFINDEX),
+            (libc::IPPROTO_IP, libc::IP_UNICAST_IF),
+            (libc::IPPROTO_IP, libc::IP_MULTICAST_IF),
+            (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF),
+            (libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF),
+            (libc::IPPROTO_IPV6, libc::IPV6_ADDRFORM),
+            (libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT),
+        ] {
+            assert!(socket_option_is_denied(level, option), "{level}/{option}");
+        }
+        assert!(!socket_option_is_denied(
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR
+        ));
+        assert!(!socket_option_is_denied(
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY
+        ));
+        assert!(!socket_option_is_denied(
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY
+        ));
     }
 
     #[test]
@@ -2552,6 +2704,110 @@ mod tests {
             client.join().expect("join client").expect("DNS client"),
             dns_address
         );
+    }
+
+    #[test]
+    fn udp_dns_after_connect_sends_with_sendmmsg() {
+        // glibc connects the resolver socket to the nameserver, then sends A
+        // and AAAA together with sendmmsg and no destination.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let dns_address = broker.dns_address();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(move || -> io::Result<Vec<Vec<u8>>> {
+                    let socket = UdpSocket::bind("0.0.0.0:0")?;
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    socket.connect(dns_address)?;
+                    let queries = [&b"dns-query-a"[..], &b"dns-query-aaaa"[..]];
+                    let iovecs = queries.map(|query| [io::IoSlice::new(query)]);
+                    let mut controls = [
+                        rustix::net::SendAncillaryBuffer::default(),
+                        rustix::net::SendAncillaryBuffer::default(),
+                    ];
+                    let [first, second] = &mut controls;
+                    let mut messages = [
+                        rustix::net::MMsgHdr::new(&iovecs[0], first),
+                        rustix::net::MMsgHdr::new(&iovecs[1], second),
+                    ];
+                    let sent = rustix::net::sendmmsg(
+                        &socket,
+                        &mut messages,
+                        rustix::net::SendFlags::empty(),
+                    )?;
+                    if sent != 2 {
+                        return Err(io::Error::other("sendmmsg sent too few"));
+                    }
+                    let mut responses = Vec::new();
+                    for _ in 0..2 {
+                        let mut response = [0_u8; 32];
+                        let length = socket.recv(&mut response)?;
+                        responses.push(response[..length].to_vec());
+                    }
+                    responses.sort();
+                    Ok(responses)
+                })
+                .expect("launcher result")
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        for _ in 0..2 {
+            let query = runtime.block_on(broker.accept_dns()).expect("DNS query");
+            let response = if query.request == b"dns-query-a" {
+                b"dns-response-a".to_vec()
+            } else if query.request == b"dns-query-aaaa" {
+                b"dns-response-aaaa".to_vec()
+            } else {
+                panic!("unexpected DNS query: {:?}", query.request);
+            };
+            query.complete(Ok(response)).unwrap();
+        }
+        assert_eq!(
+            client.join().expect("join client").expect("DNS client"),
+            vec![b"dns-response-a".to_vec(), b"dns-response-aaaa".to_vec()]
+        );
+    }
+
+    #[test]
+    fn dns_send_with_ancillary_data_is_refused() {
+        // Ancillary data can carry a per-message routing override such as
+        // IP_PKTINFO. The kernel performs mediated DNS sends, so control data
+        // is refused.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let dns_address = broker.dns_address();
+        let errno = launcher
+            .execute(move || {
+                let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+                let native = socket2::SockAddr::from(dns_address);
+                let payload = *b"dns-query";
+                let mut iov = libc::iovec {
+                    iov_base: payload.as_ptr().cast_mut().cast(),
+                    iov_len: payload.len(),
+                };
+                // Any non-empty control buffer is refused.
+                let mut control = [0_u8; 32];
+                let header = libc::msghdr {
+                    msg_name: native.as_ptr().cast_mut().cast(),
+                    msg_namelen: native.len(),
+                    msg_iov: &raw mut iov,
+                    msg_iovlen: 1,
+                    msg_control: control.as_mut_ptr().cast(),
+                    msg_controllen: control.len(),
+                    msg_flags: 0,
+                };
+                // SAFETY: the header references live local buffers for the call.
+                let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const header, 0) };
+                (sent < 0)
+                    .then(|| io::Error::last_os_error().raw_os_error())
+                    .flatten()
+            })
+            .expect("launcher result");
+        assert_eq!(errno, Some(libc::EOPNOTSUPP));
     }
 
     #[test]

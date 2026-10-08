@@ -7,6 +7,8 @@ import "time"
 
 // Sandbox represents a sandbox instance.
 type Sandbox struct {
+	// HostKeyFingerprint is the stable SSH identity; empty on older runtimes.
+	HostKeyFingerprint          string
 	ID                          string
 	Name                        string
 	CreatedAt                   time.Time

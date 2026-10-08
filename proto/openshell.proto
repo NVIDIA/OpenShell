@@ -1017,6 +1017,10 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only SSH host identity in OpenSSH SHA256:<base64> form. Stable for
+  // this sandbox's lifetime, including runtime restarts. Empty on legacy
+  // runtimes that do not provide a gateway-managed SSH identity.
+  string host_key_fingerprint = 6;
   // Read-only provenance for sandboxes created from a reusable workload template.
   SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
@@ -1475,7 +1479,9 @@ message StopSandboxExecutionRequest {
   // unconditional stop. The comparison is atomic with lifecycle admission.
   string execution_id = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
-  // can be replayed for 24 hours; replay retains the original execution receipt.
+  // and confirmed stale-target rejections can be replayed for 24 hours.
+  // Replay retains the original execution receipt or STALE_EXECUTION result;
+  // other failures remain unresolved. Different payloads cannot reuse the ID.
   string request_id = 4;
 }
 
@@ -1792,7 +1798,8 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
+  // Expected sandbox SSH host identity in OpenSSH SHA256:<base64> form.
+  // Stable for the sandbox's lifetime. Empty only for legacy runtimes.
   string host_key_fingerprint = 7;
 
   // Absolute expiry. Absence means no expiry.
@@ -2351,6 +2358,12 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Output-only gateway-derived endpoint authorities for resolved token grants.
+  // For inspected L7 requests, empty means no endpoint may obtain this grant.
+  // L4 injection uses selectors without checking these authorities.
+  // Profile-authored values are ignored; normal policies name the originating
+  // provider endpoint, while a global policy uses its own endpoint authorities.
+  repeated string token_grant_owners = 11;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -3026,6 +3039,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    SessionRedirect session_redirect = 6;
   }
 }
 
@@ -3040,6 +3054,14 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Set when this connection is the result of following a SessionRedirect. The
+  // receiving gateway serves a redirected hello locally instead of redirecting
+  // again, so a disagreement about membership cannot bounce the supervisor
+  // between replicas. A gateway that is shutting down may still redirect it.
+  bool redirected = 5;
+  // The supervisor understands SessionRedirect. Gateways never redirect a
+  // supervisor that does not set this.
+  bool supports_session_redirect = 6;
 }
 
 // Gateway accepts the supervisor session.
@@ -3056,6 +3078,20 @@ message SessionAccepted {
 message SessionRejected {
   // Human-readable rejection reason.
   string reason = 1;
+}
+
+// Gateway declines to own this session and names the replica that should.
+//
+// Sent instead of SessionAccepted when the placement ring puts the sandbox on
+// a different live replica, and to established sessions when their gateway
+// shuts down. The supervisor reconnects to peer_endpoint once with
+// SupervisorHello.redirected set, and falls back to its configured gateway
+// address if that fails.
+message SessionRedirect {
+  // Peer endpoint of the replica that should own this sandbox.
+  string peer_endpoint = 1;
+  // Replica ID that should own this sandbox, for logging.
+  string owner_replica_id = 2;
 }
 
 // Supervisor heartbeat.

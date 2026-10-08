@@ -3580,7 +3580,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky under concurrent test execution"]
     async fn refresh_worker_records_a_root_span_only_when_a_state_has_work() {
         use crate::otel_tracing::test_exporter;
 
@@ -3621,7 +3620,7 @@ mod tests {
         Box::pin(run_refresh_worker_tick(&store, None, None))
             .await
             .unwrap();
-        test_exporter::assert_is_root(&traced.span_named("refresh.provider_credentials"));
+        test_exporter::assert_is_root(&traced.wait_for_span("refresh.provider_credentials").await);
     }
 
     #[test]

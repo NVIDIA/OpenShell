@@ -97,9 +97,6 @@ pub struct SeccompEvidence {
     pub retained_socket_operation: bool,
     pub proc_fd_identity: bool,
     pub task_memory_read: bool,
-    pub task_memory_write: bool,
-    pub cancellation: bool,
-    pub task_memory_writes_disabled: bool,
 }
 
 /// Mechanism-specific audit evidence for the native Linux sandbox adapter.
@@ -127,6 +124,10 @@ pub struct NativeLinuxSandboxAuditEvidence {
     pub tcp_dns_round_trip: bool,
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
+    /// Workload INET sockets are bound to loopback before injection, the
+    /// binding cannot be changed from sandbox credentials, and accepted
+    /// sockets inherit it. Native local `accept` depends on this property.
+    pub socket_loopback_confinement: bool,
 }
 
 impl NativeLinuxSandboxAuditEvidence {
@@ -146,14 +147,13 @@ impl NativeLinuxSandboxAuditEvidence {
             && self.seccomp.retained_socket_operation
             && self.seccomp.proc_fd_identity
             && self.seccomp.task_memory_read
-            && self.seccomp.task_memory_write
-            && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
             && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip
             && self.tcp_dns_round_trip
             && self.tcp_allow_round_trip
-            && self.tcp_deny_round_trip;
+            && self.tcp_deny_round_trip
+            && self.socket_loopback_confinement;
         if complete {
             Ok(())
         } else {
@@ -178,14 +178,14 @@ impl NativeLinuxSandboxAuditEvidence {
                     && self.udp_dns_round_trip
                     && self.tcp_dns_round_trip
                     && self.tcp_allow_round_trip
-                    && self.tcp_deny_round_trip,
+                    && self.tcp_deny_round_trip
+                    && self.socket_loopback_confinement,
                 "seccomp-notify",
             ),
             request_attribution: EnforcedProperty::new(
                 self.seccomp.id_validation
                     && self.seccomp.proc_fd_identity
-                    && self.seccomp.task_memory_read
-                    && self.seccomp.task_memory_write,
+                    && self.seccomp.task_memory_read,
                 "seccomp-notify-procfs",
             ),
             privilege_floor: EnforcedProperty::new(
@@ -1484,9 +1484,6 @@ mod tests {
                 retained_socket_operation: true,
                 proc_fd_identity: true,
                 task_memory_read: true,
-                task_memory_write: true,
-                cancellation: true,
-                task_memory_writes_disabled: false,
             },
             landlock_abi: 6,
             landlock_allow_deny: true,
@@ -1494,6 +1491,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         }
     }
 
@@ -1518,19 +1516,11 @@ mod tests {
     }
 
     #[test]
-    fn audit_evidence_accepts_legacy_read_only_listener() {
+    fn audit_evidence_requires_socket_loopback_confinement() {
         let mut audit = complete_audit_evidence();
-        audit.seccomp.cancellation = false;
-        audit.seccomp.task_memory_writes_disabled = true;
-        assert!(audit.validate().is_ok());
-    }
-
-    #[test]
-    fn audit_evidence_rejects_plain_listener_with_writes_enabled() {
-        let mut audit = complete_audit_evidence();
-        audit.seccomp.cancellation = false;
-        audit.seccomp.task_memory_writes_disabled = false;
+        audit.socket_loopback_confinement = false;
         assert!(audit.validate().is_err());
+        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]

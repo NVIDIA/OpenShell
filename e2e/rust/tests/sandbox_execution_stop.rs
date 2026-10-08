@@ -54,6 +54,15 @@ async fn stale_execution_cannot_stop_restart_or_same_name_recreation() {
         .unwrap();
     let b = details(&name).await;
     assert_eq!(a["id"], b["id"], "stop/start retains the sandbox");
+    assert!(
+        a["host_key_fingerprint"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        a["host_key_fingerprint"], b["host_key_fingerprint"],
+        "SSH identity survives execution replacement"
+    );
     let execution_b = b["execution_id"].as_str().unwrap().to_string();
     assert_ne!(
         execution_a, execution_b,
@@ -83,6 +92,10 @@ async fn stale_execution_cannot_stop_restart_or_same_name_recreation() {
         .unwrap();
     let c = details(&name).await;
     assert_ne!(b["id"], c["id"], "recreation changes sandbox identity");
+    assert_ne!(
+        b["host_key_fingerprint"], c["host_key_fingerprint"],
+        "recreation receives a new SSH identity"
+    );
     stop_execution(&name, &execution_b, false).await;
     assert_eq!(details(&name).await["phase"], "Ready");
     replacement

@@ -608,6 +608,19 @@ mod tests {
             .await
             .expect("rotate current gateway token");
         assert_ne!(next.gateway_token_id, first.token_id);
+        assert_eq!(
+            execution_id(
+                first.sandbox_id.as_str(),
+                &first.runtime_generation,
+                first.auth_epoch
+            ),
+            execution_id(
+                first.sandbox_id.as_str(),
+                &next.runtime_generation,
+                next.auth_epoch
+            ),
+            "credential refresh preserves execution identity",
+        );
 
         let error = authorize_persisted(&store, &first)
             .await

@@ -22,8 +22,10 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_members;
 mod gateway_metrics;
 mod gateway_ocsf;
+mod gateway_ring;
 mod grpc;
 mod http;
 mod middleware;
@@ -39,6 +41,7 @@ mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
@@ -318,6 +321,15 @@ pub struct ServerState {
     /// relay instead of opening one per request.
     pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
 
+    /// Latest placement ring, refreshed from live gateway membership. Decides
+    /// which replica *should* own a sandbox; the owner record in the store
+    /// remains authoritative for which one does.
+    pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
+
+    /// Peer endpoints of live replicas, keyed by replica ID. Refreshed
+    /// alongside `gateway_ring` so a redirect can name a dialable address.
+    pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -414,6 +426,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
@@ -438,6 +451,8 @@ impl ServerState {
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
+            gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -927,6 +942,7 @@ pub(crate) async fn run_server(
                         return Ok(Vec::new());
                     }
                     let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .await
                         .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&authentication)
                         .map_err(|error| format!("encode launch authentication: {error}"))
@@ -951,6 +967,11 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         );
     }
+    let membership_worker = gateway_members::spawn_membership_worker(
+        state.clone(),
+        gateway_members::MEMBER_REFRESH_INTERVAL,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
@@ -966,11 +987,20 @@ pub(crate) async fn run_server(
     }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // Closing sessions redirect their supervisors through the ring. Let the
+    // membership worker finish pointing it at the remaining replicas first.
+    if let Some(worker) = membership_worker
+        && tokio::time::timeout(gateway_members::SHUTDOWN_MEMBERSHIP_TIMEOUT, worker)
+            .await
+            .is_err()
+    {
+        warn!("Gateway membership worker did not finish leaving the ring before session shutdown");
+    }
     // A stopped supervisor may still have a detached task deleting its owner
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
         .supervisor_sessions
-        .shutdown(Duration::from_secs(10))
+        .shutdown(supervisor_session::SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT)
         .await;
     if let Err(err) = &session_cleanup {
         warn!(error = %err, "Gateway supervisor session cleanup incomplete");

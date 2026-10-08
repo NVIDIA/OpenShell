@@ -618,7 +618,11 @@ impl SandboxGuard {
         for arg in argv {
             cmd.arg(arg);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Never share the test runner's stdin: parallel test processes share
+        // its open file description, and the command needs no input.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let output = cmd
             .output()

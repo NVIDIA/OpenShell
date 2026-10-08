@@ -207,6 +207,25 @@ pub fn validate_workspace_mount_target(target: &str, workspace_root: &str) -> Re
     Ok(())
 }
 
+/// Validate mount targets against a workspace and driver-specific control paths.
+///
+/// Targets must already pass container mount-target validation. This check
+/// applies regardless of their native mount type. Mounts below the workspace
+/// remain valid; control paths reject overlaps in either direction.
+pub fn validate_workspace_mount_targets<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+    workspace_root: &str,
+    control_paths: &[&str],
+) -> Result<(), String> {
+    for target in targets {
+        validate_workspace_mount_target(target, workspace_root)?;
+        for control_path in control_paths {
+            validate_mount_control_path(target, control_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Normalize a validated container-side mount target for semantic comparison.
 pub fn normalize_mount_target(target: &str) -> String {
     if target == "/" {
@@ -242,6 +261,44 @@ mod tests {
         validate_workspace_mount_target("/workspace/cache", "/workspace").unwrap();
         validate_workspace_mount_target("/workspace", "/workspace/project").unwrap_err();
         validate_workspace_mount_target("/workspace-other", "/workspace/project").unwrap();
+    }
+
+    #[test]
+    fn workspace_mount_targets_allow_empty_and_nested_targets() {
+        validate_workspace_mount_targets([], "/workspace", &["/.openshell"]).unwrap();
+        validate_workspace_mount_targets(
+            ["/workspace/cache", "/workspace/data", "/workspace-other"],
+            "/workspace",
+            &["/.openshell"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn workspace_mount_targets_reject_covering_mounts_and_control_paths() {
+        for target in ["/workspace/project/", "/workspace"] {
+            let error = validate_workspace_mount_targets(
+                ["/workspace/project/cache", target],
+                "/workspace/project",
+                &["/.openshell"],
+            )
+            .unwrap_err();
+            assert!(error.contains("reserved for the OpenShell workspace"));
+        }
+        for target in [
+            "/.openshell",
+            "/.openshell/channel",
+            "/custom",
+            "/custom/socket",
+        ] {
+            let error = validate_workspace_mount_targets(
+                ["/workspace/cache", target],
+                "/workspace",
+                &["/.openshell", "/custom/socket"],
+            )
+            .unwrap_err();
+            assert!(error.contains("conflicts with OpenShell control path"));
+        }
     }
 
     #[test]

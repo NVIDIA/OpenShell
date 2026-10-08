@@ -71,7 +71,7 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 
 | Aspect | Detail |
 |---|---|
-| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in `[openshell.drivers.kubernetes]` to enable cluster-wide. |
+| Default | Disabled. Set `gatewayConfig.openshell.drivers.kubernetes.enable_user_namespaces: true` in Helm values to enable cluster-wide. |
 | What you can change | Enable cluster-wide through Helm or gateway config. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
 | Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
@@ -220,7 +220,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 | Aspect | Detail |
 |---|---|
 | Startup prelude | After privileged bootstrap helpers complete, including network setup and provider-token SPIFFE child mount-namespace preparation, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
-| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
+| Socket domains | The filter allows only `AF_UNIX`, `AF_NETLINK`, and the brokered `AF_INET` and `AF_INET6` families. Every other family, including `AF_PACKET`, `AF_VSOCK`, `AF_RXRPC`, `AF_SMC`, `AF_KCM`, and `AF_ALG`, fails with `EPERM`, and `socketpair(2)` is limited to `AF_UNIX`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
@@ -273,9 +273,11 @@ Gateway transport uses TLS, with client certificate checks available where the d
 
 SSH connections to sandboxes travel through the gateway over the sandbox supervisor's authenticated control path. Each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
+Service forwards (`openshell forward`) use the same relay path but carry no session token. The gateway authorizes each forwarded connection against the caller's gateway identity and workspace membership, and the per-sandbox connection limit applies.
+
 | Aspect | Detail |
 |---|---|
-| Default | Session tokens expire after 24 hours. Concurrent connections are limited to 10 per token and 20 per sandbox. |
+| Default | Session tokens expire after 24 hours. Concurrent connections are limited to 3 per token and 20 per sandbox. |
 | What you can change | Configure `ssh_session_ttl_secs`. Set to 0 for no expiry. |
 | Risk if relaxed | Longer TTLs or no expiry increase the window for stolen token reuse. Higher connection limits increase the blast radius of a compromised token. |
 | Recommendation | Keep the 24-hour default. Monitor connection counts through the TUI. |

@@ -59,7 +59,24 @@ struct Admission {
     #[serde(default)]
     target_id: Option<String>,
     success: Option<Success>,
+    #[serde(default)]
+    rejection: Option<Rejection>,
     completed_at_ms: Option<i64>,
+}
+
+/// Only a Gateway-confirmed, effect-free execution mismatch is replayable.
+/// Arbitrary handler or driver errors remain unresolved admissions.
+#[derive(Serialize, Deserialize)]
+pub(super) enum Rejection {
+    StaleExecution,
+}
+
+impl Rejection {
+    fn status(&self) -> Status {
+        match self {
+            Self::StaleExecution => crate::compute::stale_execution_status(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -251,6 +268,7 @@ async fn execute_owned<M: Mutation>(
         workspace_id: scope.workspace_id,
         target_id: scope.target_id,
         success: None,
+        rejection: None,
         completed_at_ms: None,
     };
     // Contention is bounded. Losing a race never authorizes execution.
@@ -266,7 +284,7 @@ async fn execute_owned<M: Mutation>(
             if previous.format_version != 1 {
                 return Err(replay_unavailable());
             }
-            if previous.success.is_some()
+            if (previous.success.is_some() || previous.rejection.is_some())
                 && previous.completed_at_ms.is_some_and(|completed| {
                     current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
                 })
@@ -298,6 +316,14 @@ async fn execute_owned<M: Mutation>(
                 || previous.protection != admission.protection
             {
                 return Err(replay_unavailable());
+            }
+            if let Some(rejection) = previous.rejection {
+                let mut status = rejection.status();
+                status.metadata_mut().insert(
+                    "openshell-replayed",
+                    "true".parse().expect("static metadata"),
+                );
+                return Err(status);
             }
             let success = previous.success.ok_or_else(uncertain)?;
             let mut response = Response::new(M::restore(&state.store, success).await?);
@@ -354,7 +380,15 @@ async fn execute_owned<M: Mutation>(
         }
         let facts = ordinary::Facts::default();
         request.extensions_mut().insert(facts.clone());
-        let mut response = M::execute(state, request).await?;
+        let mut response = match M::execute(state, request).await {
+            Ok(response) => response,
+            Err(status) => {
+                if let Some(rejection) = facts.rejection()? {
+                    completion.complete_rejection(rejection).await?;
+                }
+                return Err(status);
+            }
+        };
         if M::DEFERRED {
             return Ok(response);
         }
@@ -401,6 +435,17 @@ impl Completion {
         let mut admission: Admission =
             serde_json::from_slice(&self.admission).map_err(|_| uncertain())?;
         admission.success = Some(success);
+        self.persist_completion(admission).await
+    }
+
+    async fn complete_rejection(&self, rejection: Rejection) -> Result<(), Status> {
+        let mut admission: Admission =
+            serde_json::from_slice(&self.admission).map_err(|_| uncertain())?;
+        admission.rejection = Some(rejection);
+        self.persist_completion(admission).await
+    }
+
+    async fn persist_completion(&self, mut admission: Admission) -> Result<(), Status> {
         admission.completed_at_ms = Some(current_time_ms());
         let payload = serde_json::to_vec(&admission).map_err(|_| uncertain())?;
         if payload.len() > 64 * 1024 {
@@ -434,7 +479,7 @@ async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
             continue;
         };
         if admission.format_version == 1
-            && admission.success.is_some()
+            && (admission.success.is_some() || admission.rejection.is_some())
             && admission.completed_at_ms.is_some_and(|completed| {
                 current_time_ms() >= completed.saturating_add(SUCCESS_TTL_MS)
             })

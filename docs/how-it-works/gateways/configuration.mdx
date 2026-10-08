@@ -16,6 +16,9 @@ The OpenShell gateway reads its configuration from a TOML file when `--config` o
 Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
+For Helm deployments, see [Configure Chart Values](/kubernetes/setup#configure-chart-values)
+for setting `gatewayConfig` and chart-owned Kubernetes resources.
+
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
 On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
@@ -375,6 +378,10 @@ Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce s
 
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
 
+Sandbox supervisors export spans to the same collector, so the endpoint must also be reachable from sandboxes.
+
+Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. Set the gateway or sandbox log level to `debug` to include them.
+
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
 driver service names remain fixed.
@@ -528,7 +535,7 @@ credential_drivers = ["vault"]
 
 [openshell.credential_drivers.vault]
 address = "https://vault.vault.svc.cluster.local:8200"
-ca_bundle = "/etc/openshell/vault/ca.pem"
+ca_bundle = "/etc/openshell-tls/vault-ca/ca.crt"
 mount = "secret"
 kv_version = "2"
 auth_method = "kubernetes"
@@ -550,7 +557,7 @@ For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secr
 
 For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
-For Helm deployments, set `server.credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and renders `ca_bundle` automatically.
+For Helm deployments, set `credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and derives `ca_bundle` automatically.
 
 Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles. Before OpenShell 0.1.0, OpenShell does not automatically migrate inline refresh material or credential handles between drivers. Reconfigure refresh grants after an upgrade. Before changing credential drivers, remove affected credentials while the original driver is still available, then select the new driver and create them again. Do not run mixed gateway versions against the same refresh records.
 
@@ -1012,6 +1019,10 @@ path is never mounted into or exposed to the workload container.
 ### Podman
 
 Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.
+
+Caller `cdi_devices` entries must be valid CDI qualified names
+(`<vendor>/<class>=<name>`). Host-device paths are rejected. See
+[GPU selection](/how-it-works/sandboxes/overview#gpu-resources).
 
 ```toml
 [openshell]

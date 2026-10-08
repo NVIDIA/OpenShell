@@ -85,6 +85,7 @@ socket2 = "0.6"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }
 toml = "0.8"
 apollo-parser = "0.8.5"
@@ -182,3 +183,8 @@ strip = true
 [profile.dev]
 # Faster compile times for dev builds
 debug = 1
+
+# Executable identity hashes the (100+ MiB) test binary. Unoptimized SHA-256
+# is ~10x slower, which times out broker tests.
+[profile.dev.package.sha2]
+opt-level = 3

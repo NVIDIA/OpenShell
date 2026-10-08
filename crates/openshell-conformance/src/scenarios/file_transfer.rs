@@ -56,6 +56,7 @@ fn run_file_transfer(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
 fn run_round_trip(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
         let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "round-trip").await?;
+        upload_existing_directories(runner, &sandbox_name, &remote_root, local.path()).await?;
         round_trip(runner, &sandbox_name, &remote_root, local.path()).await?;
         download_file(runner, &sandbox_name, &remote_root, local.path()).await?;
         download_directory(runner, &sandbox_name, &remote_root, local.path()).await?;
@@ -129,6 +130,81 @@ async fn delete_sandbox(runner: &mut OpenShellRunner, sandbox_name: &str) -> Res
         .map_err(|error| error.to_string())?;
     delete.require_success()?;
     runner.forget_sandbox(sandbox_name);
+    Ok(())
+}
+
+/// Check remote destination types, not just successful transfer status: tar
+/// can report success after replacing an empty directory with a regular file.
+async fn upload_existing_directories(
+    runner: &OpenShellRunner,
+    sandbox: &str,
+    remote_root: &str,
+    local_root: &Path,
+) -> Result<(), String> {
+    let source = local_root.join("config.json");
+    fs::write(&source, "upload-destination-payload")
+        .map_err(fs_error("write destination fixture"))?;
+    let root = format!("{remote_root}/upload destinations");
+    exec(
+        runner,
+        sandbox,
+        "upload-destinations/prepare",
+        &format!(
+            "mkdir -p '{root}/empty' '{root}/populated' '{root}/target' '{root}/slash' && \
+             printf keep > '{root}/populated/keep.txt' && \
+             ln -s target '{root}/link'"
+        ),
+    )
+    .await?;
+
+    for directory in ["empty", "populated", "link", "slash/"] {
+        let destination = format!("{root}/{directory}");
+        upload(
+            runner,
+            sandbox,
+            &format!("upload-destinations/{directory}/upload"),
+            &source,
+            &destination,
+            true,
+        )
+        .await?;
+        exec(
+            runner,
+            sandbox,
+            &format!("upload-destinations/{directory}/verify"),
+            &format!(
+                "test -d '{destination}' && \
+                 test \"$(cat '{destination}/config.json')\" = upload-destination-payload && \
+                 test \"$(cat '{root}/populated/keep.txt')\" = keep && \
+                 test -L '{root}/link'"
+            ),
+        )
+        .await?;
+    }
+
+    // A missing destination remains an intentional rename; uploading again
+    // must replace that file rather than treating it as a directory.
+    let renamed = format!("{root}/renamed.json");
+    for pass in ["rename", "overwrite"] {
+        upload(
+            runner,
+            sandbox,
+            &format!("upload-destinations/{pass}/upload"),
+            &source,
+            &renamed,
+            true,
+        )
+        .await?;
+        exec(
+            runner,
+            sandbox,
+            &format!("upload-destinations/{pass}/verify"),
+            &format!(
+                "test -f '{renamed}' && test \"$(cat '{renamed}')\" = upload-destination-payload"
+            ),
+        )
+        .await?;
+    }
     Ok(())
 }
 

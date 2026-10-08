@@ -43,6 +43,10 @@ pub struct PodmanComputeConfig {
     /// When empty, the driver selects loopback on Linux or
     /// `host.containers.internal` with Podman Machine, using `gateway_port`.
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
     /// Port the gateway server is actually listening on.
     ///
     /// Used by the driver's auto-detection fallback when `grpc_endpoint`
@@ -493,6 +497,7 @@ impl Default for PodmanComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
