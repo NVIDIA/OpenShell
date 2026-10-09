@@ -22,11 +22,11 @@ use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
     BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
-    BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
-    BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
-    MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
-    ProviderEnvironmentInstallation, ReadyBoundary, RunningBoundary, SandboxContext,
-    TcpOpenDecision, TcpOpenDenial, VerifiedBackendDescriptor,
+    BoundaryInput, BoundaryLoopbackConnector, BoundaryLoopbackListener, BoundaryOutput,
+    BoundaryProcess, BoundarySignal, BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec,
+    IsolationBackend, LoopbackTarget, MediationTiming, NetworkMediationSource, PendingDnsQuery,
+    PendingTcpOpen, ProcessAttachment, ProviderEnvironmentInstallation, ReadyBoundary,
+    RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial, VerifiedBackendDescriptor,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -730,6 +730,70 @@ impl BoundaryLoopbackConnector for RemoteLoopbackConnector {
             Response::PortConnected => Ok(stream),
             response => Err(unexpected_response("port_connected", &response)),
         }
+    }
+
+    async fn listen(
+        &self,
+        target: LoopbackTarget,
+    ) -> Result<Box<dyn BoundaryLoopbackListener>, BackendError> {
+        let (lease, response) = self
+            .client
+            .call_stream(Request::LoopbackListen {
+                host: target.host(),
+                port: target.port(),
+            })
+            .await?;
+        let Response::PortListening {
+            listener_id,
+            address,
+        } = response
+        else {
+            return Err(unexpected_response("port_listening", &response));
+        };
+        Ok(Box::new(RemoteLoopbackListener {
+            client: self.client.clone(),
+            listener_id,
+            address,
+            lease: std::sync::Mutex::new(Some(lease)),
+        }))
+    }
+}
+
+struct RemoteLoopbackListener {
+    client: Arc<BoundaryClient>,
+    listener_id: String,
+    address: std::net::SocketAddr,
+    // Keeping the exchange stream open is the listener lease. Dropping it
+    // closes the boundary listener even if an explicit SSH cancel is lost.
+    lease: std::sync::Mutex<Option<BoundaryDuplexStream>>,
+}
+
+#[async_trait]
+impl BoundaryLoopbackListener for RemoteLoopbackListener {
+    fn local_addr(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    async fn accept(&self) -> Result<(BoundaryDuplexStream, std::net::SocketAddr), BackendError> {
+        let (stream, response) = self
+            .client
+            .call_wait_stream(Request::LoopbackAccept {
+                listener_id: self.listener_id.clone(),
+            })
+            .await?;
+        let Response::PortAccepted { peer } = response else {
+            return Err(unexpected_response("port_accepted", &response));
+        };
+        Ok((stream, peer))
+    }
+}
+
+impl Drop for RemoteLoopbackListener {
+    fn drop(&mut self) {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -2353,6 +2417,13 @@ mod tests {
                             },
                             Request::Resize { .. } => Response::Resized,
                             Request::LoopbackConnect { .. } => Response::PortConnected,
+                            Request::LoopbackListen { .. } => Response::PortListening {
+                                listener_id: "test-listener".to_string(),
+                                address: "127.0.0.1:43210".parse().unwrap(),
+                            },
+                            Request::LoopbackAccept { .. } => Response::PortAccepted {
+                                peer: "127.0.0.1:43211".parse().unwrap(),
+                            },
                             Request::StartAgent {
                                 provider_env_revision,
                                 ..

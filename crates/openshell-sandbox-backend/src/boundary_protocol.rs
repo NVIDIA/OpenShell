@@ -766,6 +766,13 @@ pub enum Request {
         host: std::net::IpAddr,
         port: u16,
     },
+    LoopbackListen {
+        host: std::net::IpAddr,
+        port: u16,
+    },
+    LoopbackAccept {
+        listener_id: String,
+    },
     /// Upgrade one authenticated logical stream into the persistent DNS data
     /// plane.
     OpenMediation,
@@ -885,6 +892,15 @@ impl fmt::Debug for Request {
                 .field("host", host)
                 .field("port", port)
                 .finish(),
+            Self::LoopbackListen { host, port } => formatter
+                .debug_struct("LoopbackListen")
+                .field("host", host)
+                .field("port", port)
+                .finish(),
+            Self::LoopbackAccept { listener_id } => formatter
+                .debug_struct("LoopbackAccept")
+                .field("listener_id", listener_id)
+                .finish(),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
         }
@@ -939,6 +955,13 @@ pub enum Response {
     },
     Resized,
     PortConnected,
+    PortListening {
+        listener_id: String,
+        address: std::net::SocketAddr,
+    },
+    PortAccepted {
+        peer: std::net::SocketAddr,
+    },
     MediationReady,
     NetworkConnected {
         identity: BinaryIdentityWire,

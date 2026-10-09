@@ -417,10 +417,14 @@ struct SshHandler {
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     channels: HashMap<ChannelId, ChannelState>,
+    reverse_forwards: HashMap<std::net::SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
+        for (_, task) in self.reverse_forwards.drain() {
+            task.abort();
+        }
         let Some(main_session) = self.main_session.as_ref() else {
             return;
         };
@@ -449,6 +453,7 @@ impl SshHandler {
             boundary_exec,
             main_session,
             channels: HashMap::new(),
+            reverse_forwards: HashMap::new(),
         }
     }
 }
@@ -590,6 +595,170 @@ impl russh::server::Handler for SshHandler {
         });
 
         Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(ip) = is_loopback_host(address)
+            .then(|| loopback_ip(address))
+            .flatten()
+        else {
+            ocsf_emit!(
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .message(format!(
+                        "tcpip-forward rejected: non-loopback bind address {address}:{port}"
+                    ))
+                    .build()
+            );
+            return Ok(false);
+        };
+        let Ok(requested_port) = u16::try_from(*port) else {
+            ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message(format!(
+                    "tcpip-forward rejected: port {port} exceeds valid TCP range for host {address}"
+                ))
+                .build());
+            return Ok(false);
+        };
+        let requested = std::net::SocketAddr::new(ip, requested_port);
+        if requested_port != 0
+            && let Some(existing) = self.reverse_forwards.get(&requested)
+        {
+            if !existing.is_finished() {
+                return Ok(false);
+            }
+            self.reverse_forwards.remove(&requested);
+        }
+        let target = openshell_isolation_interface::contract::LoopbackTarget::new(
+            requested.ip(),
+            requested.port(),
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let listener =
+            match self.port_forward.listen(target).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .message(format!(
+                        "tcpip-forward failed to bind boundary loopback {requested}: {error}"
+                    ))
+                    .build());
+                    return Ok(false);
+                }
+            };
+        let bound = listener.local_addr();
+        *port = u32::from(bound.port());
+        let handle = session.handle();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut boundary_stream, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .message(format!("tcpip-forward accept failed on {bound}: {error}"))
+                                .build()
+                        );
+                        break;
+                    }
+                };
+                let channel = match handle
+                    .channel_open_forwarded_tcpip(
+                        bound.ip().to_string(),
+                        u32::from(bound.port()),
+                        peer.ip().to_string(),
+                        u32::from(peer.port()),
+                    )
+                    .await
+                {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .message(format!(
+                                "tcpip-forward failed to open forwarded channel for {bound}: {error}"
+                            ))
+                            .build());
+                        break;
+                    }
+                };
+                tokio::spawn(async move {
+                    let mut channel_stream = channel.into_stream();
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut channel_stream, &mut boundary_stream)
+                            .await;
+                });
+            }
+        });
+        self.reverse_forwards.insert(bound, task);
+        ocsf_emit!(
+            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Listen)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message(format!(
+                    "tcpip-forward listening on boundary loopback {bound}"
+                ))
+                .build()
+        );
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(ip) = is_loopback_host(address)
+            .then(|| loopback_ip(address))
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        let Ok(port) = u16::try_from(port) else {
+            return Ok(false);
+        };
+        let address = std::net::SocketAddr::new(ip, port);
+        let Some(task) = self.reverse_forwards.remove(&address) else {
+            return Ok(false);
+        };
+        task.abort();
+        ocsf_emit!(
+            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Close)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message(format!("tcpip-forward closed boundary loopback {address}"))
+                .build()
+        );
+        Ok(true)
     }
 
     async fn pty_request(
@@ -1346,6 +1515,36 @@ mod tests {
 
     pub(super) struct AcceptAnyServerKey;
 
+    struct ReverseForwardClient {
+        forwarded: tokio::sync::mpsc::UnboundedSender<russh::Channel<russh::client::Msg>>,
+    }
+
+    impl russh::client::Handler for ReverseForwardClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn server_channel_open_forwarded_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::client::Msg>,
+            _connected_address: &str,
+            _connected_port: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            reply: russh::client::ChannelOpenHandle,
+            _session: &mut russh::client::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let _ = self.forwarded.send(channel);
+            Ok(())
+        }
+    }
+
     struct PinnedServerKey(String);
 
     impl russh::client::Handler for PinnedServerKey {
@@ -1481,6 +1680,53 @@ mod tests {
                 })?;
             Ok(Box::new(stream))
         }
+
+        async fn listen(
+            &self,
+            target: openshell_isolation_interface::contract::LoopbackTarget,
+        ) -> std::result::Result<
+            Box<dyn openshell_isolation_interface::contract::BoundaryLoopbackListener>,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            let listener = tokio::net::TcpListener::bind((target.host(), target.port()))
+                .await
+                .map_err(|error| {
+                    openshell_isolation_interface::contract::BackendError::Process(
+                        error.to_string(),
+                    )
+                })?;
+            let address = listener.local_addr().map_err(|error| {
+                openshell_isolation_interface::contract::BackendError::Process(error.to_string())
+            })?;
+            Ok(Box::new(TestLoopbackListener { listener, address }))
+        }
+    }
+
+    struct TestLoopbackListener {
+        listener: tokio::net::TcpListener,
+        address: std::net::SocketAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryLoopbackListener for TestLoopbackListener {
+        fn local_addr(&self) -> std::net::SocketAddr {
+            self.address
+        }
+
+        async fn accept(
+            &self,
+        ) -> std::result::Result<
+            (
+                openshell_isolation_interface::contract::BoundaryDuplexStream,
+                std::net::SocketAddr,
+            ),
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            let (stream, peer) = self.listener.accept().await.map_err(|error| {
+                openshell_isolation_interface::contract::BackendError::Process(error.to_string())
+            })?;
+            Ok((Box::new(stream), peer))
+        }
     }
 
     pub(super) struct RejectingExec;
@@ -1555,6 +1801,45 @@ mod tests {
             .expect("auth_none should not error");
         assert!(matches!(auth, russh::client::AuthResult::Success));
         client
+    }
+
+    async fn reverse_forward_test_client() -> (
+        russh::client::Handle<ReverseForwardClient>,
+        tokio::sync::mpsc::UnboundedReceiver<russh::Channel<russh::client::Msg>>,
+    ) {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("host key");
+        let mut server_config = russh::server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            ..Default::default()
+        };
+        server_config.keys.push(host_key);
+        let handler = SshHandler::new(
+            Arc::new(TestLoopbackConnector),
+            Arc::new(RejectingExec),
+            None,
+        );
+        let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(session) =
+                russh::server::run_stream(Arc::new(server_config), server_stream, handler).await
+            {
+                let _ = session.await;
+            }
+        });
+        let (forwarded, forwarded_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_stream,
+            ReverseForwardClient { forwarded },
+        )
+        .await
+        .expect("SSH handshake should complete over the duplex");
+        let auth = client
+            .authenticate_none("sandbox")
+            .await
+            .expect("auth_none should not error");
+        assert!(matches!(auth, russh::client::AuthResult::Success));
+        (client, forwarded_rx)
     }
 
     #[cfg(unix)]
@@ -1663,6 +1948,127 @@ mod tests {
             .expect("forwarded response timeout")
             .expect("read channel");
         assert_eq!(&echoed, b"ping");
+    }
+
+    #[tokio::test]
+    async fn reverse_tcpip_handler_relays_loopback_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (client, mut forwarded) = reverse_forward_test_client().await;
+        let port = client
+            .tcpip_forward("127.0.0.1", 0)
+            .await
+            .expect("loopback reverse forward must be allowed");
+        assert_ne!(port, 0);
+
+        let port = u16::try_from(port).expect("allocated port fits u16");
+        let mut boundary = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to boundary listener");
+        let channel = tokio::time::timeout(Duration::from_secs(5), forwarded.recv())
+            .await
+            .expect("forwarded channel timeout")
+            .expect("forwarded channel");
+        let mut host = channel.into_stream();
+        boundary.write_all(b"ping").await.expect("write boundary");
+        let mut received = [0_u8; 4];
+        host.read_exact(&mut received).await.expect("read host");
+        assert_eq!(&received, b"ping");
+        host.write_all(b"pong").await.expect("write host");
+        boundary
+            .read_exact(&mut received)
+            .await
+            .expect("read boundary");
+        assert_eq!(&received, b"pong");
+    }
+
+    #[tokio::test]
+    async fn reverse_tcpip_handler_rejects_unsafe_bind_addresses_and_ports() {
+        let (client, _forwarded) = reverse_forward_test_client().await;
+        for (host, port) in [("0.0.0.0", 0), ("10.0.0.1", 80), ("127.0.0.1", 65_536)] {
+            let error = client
+                .tcpip_forward(host, port)
+                .await
+                .expect_err("unsafe reverse forward must be refused");
+            assert!(
+                matches!(error, russh::Error::RequestDenied),
+                "unexpected refusal for {host}:{port}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reverse_tcpip_duplicate_does_not_disturb_existing_forward() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (client, mut forwarded) = reverse_forward_test_client().await;
+        let port = client.tcpip_forward("127.0.0.1", 0).await.unwrap();
+        let duplicate = client
+            .tcpip_forward("127.0.0.1", port)
+            .await
+            .expect_err("duplicate listener must be refused");
+        assert!(matches!(duplicate, russh::Error::RequestDenied));
+
+        let port = u16::try_from(port).expect("allocated port fits u16");
+        let mut boundary = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("original listener remains available");
+        let channel = tokio::time::timeout(Duration::from_secs(5), forwarded.recv())
+            .await
+            .expect("forwarded channel timeout")
+            .expect("forwarded channel");
+        let mut host = channel.into_stream();
+        boundary.write_all(b"ok").await.unwrap();
+        let mut received = [0_u8; 2];
+        host.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"ok");
+    }
+
+    #[tokio::test]
+    async fn reverse_tcpip_cancel_releases_listener_port() {
+        let (client, _forwarded) = reverse_forward_test_client().await;
+        let port = client.tcpip_forward("127.0.0.1", 0).await.unwrap();
+        client
+            .cancel_tcpip_forward("127.0.0.1", port)
+            .await
+            .expect("cancel reverse forward");
+
+        let mut rebound = false;
+        for _ in 0..50 {
+            if client.tcpip_forward("127.0.0.1", port).await.is_ok() {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(rebound, "cancelled reverse-forward port was not released");
+    }
+
+    #[tokio::test]
+    async fn reverse_tcpip_disconnect_releases_listener_port() {
+        let (client, _forwarded) = reverse_forward_test_client().await;
+        let port = u16::try_from(client.tcpip_forward("127.0.0.1", 0).await.unwrap())
+            .expect("allocated port fits u16");
+        client
+            .disconnect(russh::Disconnect::ByApplication, "done", "")
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut listener = None;
+        for _ in 0..50 {
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        assert!(
+            listener.is_some(),
+            "SSH disconnect did not release listener"
+        );
     }
 
     async fn next_main_event(

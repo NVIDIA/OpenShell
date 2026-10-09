@@ -836,6 +836,20 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> DuplexStream for T {}
 /// An open connection into a boundary loopback target.
 pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
 
+/// A loopback listener owned by the workload boundary.
+///
+/// The listener remains inside the boundary network namespace. Higher layers
+/// receive only accepted byte streams, so reverse forwarding never requires
+/// exposing a host service on a non-loopback interface.
+#[async_trait]
+pub trait BoundaryLoopbackListener: Send + Sync {
+    /// The loopback address actually bound by the boundary.
+    fn local_addr(&self) -> SocketAddr;
+
+    /// Accept the next boundary-local connection.
+    async fn accept(&self) -> Result<(BoundaryDuplexStream, SocketAddr), BackendError>;
+}
+
 /// Protected connector to services listening inside the boundary.
 ///
 /// Higher layers use this primitive for both end-user port forwarding and
@@ -845,6 +859,16 @@ pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
 pub trait BoundaryLoopbackConnector: Send + Sync {
     /// Connect to `target` inside the boundary.
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
+
+    /// Bind `target` inside the boundary for reverse forwarding.
+    async fn listen(
+        &self,
+        _target: LoopbackTarget,
+    ) -> Result<Box<dyn BoundaryLoopbackListener>, BackendError> {
+        Err(BackendError::Unsupported(
+            "boundary loopback listeners are unavailable".to_string(),
+        ))
+    }
 }
 
 // ============================================================================
