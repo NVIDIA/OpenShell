@@ -106,3 +106,7 @@
   vars:
     openshell_client_gateway_endpoint: https://127.0.0.1:17670
     openshell_client_gateway_name: openshell
+    openshell_client_gateway_config_path: "{{ openshell_gateway_home }}/.config/openshell/gateway.toml"
+    openshell_client_gateway_config_required: false
+    openshell_client_gateway_service_scope: user
+    openshell_client_gateway_network_name: openshell

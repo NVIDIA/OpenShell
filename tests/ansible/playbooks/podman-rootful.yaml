@@ -21,9 +21,53 @@
         - /etc/subuid
         - /etc/subgid
 
+    # Allow fixture clients to use the rootful API without elevating the test runner.
+    - name: Read the packaged Podman tmpfiles rules
+      become: true
+      ansible.builtin.slurp:
+        src: /usr/lib/tmpfiles.d/podman.conf
+      register: podman_rootful_tmpfiles
+
+    - name: Persist rootful Podman runtime directory access across guest boots
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/podman.conf
+        content: >-
+          {{ (podman_rootful_tmpfiles.content | b64decode)
+             | regex_replace('(?m)^D! /run/podman 0700 root root$', 'D! /run/podman 0710 root tmachine') }}
+        mode: "0644"
+
+    - name: Allow the tmachine group to traverse the rootful Podman runtime directory
+      become: true
+      ansible.builtin.file:
+        path: /run/podman
+        state: directory
+        owner: root
+        group: tmachine
+        mode: "0710"
+
+    - name: Create rootful Podman socket override directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/systemd/system/podman.socket.d
+        state: directory
+        mode: "0755"
+
+    - name: Allow the tmachine group to access the rootful Podman socket
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/podman.socket.d/tmachine.conf
+        content: |
+          [Socket]
+          SocketGroup=tmachine
+          SocketMode=0660
+        mode: "0644"
+      register: podman_rootful_socket_override
+
     - name: Enable rootful Podman socket
       become: true
       ansible.builtin.systemd_service:
         name: podman.socket
         enabled: true
-        state: started
+        daemon_reload: true
+        state: "{{ 'restarted' if podman_rootful_socket_override.changed else 'started' }}"
