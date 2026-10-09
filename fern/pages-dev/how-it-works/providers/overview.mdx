@@ -447,6 +447,24 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
 
+### Clients that parse JWT claims
+
+A trusted launcher can wrap an issued placeholder in a JWT-shaped alias when a
+client needs local account metadata. Keep the original placeholder suffix in
+the signature segment:
+
+```text
+base64url(header).base64url(claims).OPENSHELL-RESOLVE-ENV-<issued-placeholder-suffix>
+```
+
+For example, a placeholder beginning `openshell:resolve:env:s` becomes a JWT
+whose signature begins `OPENSHELL-RESOLVE-ENV-s`, retaining the entire handle and
+environment key. Use the placeholder supplied to the running workload; do not
+substitute a bare environment key or manufacture a handle. OpenShell replaces
+the entire alias with the resolved credential and preserves its endpoint,
+authorization-epoch, and expiry checks. The claims supply local metadata only;
+the alias is not a signed identity token or an upstream credential.
+
 ### Fail-closed behavior
 
 If policy allows a request but the credential binding does not include the
