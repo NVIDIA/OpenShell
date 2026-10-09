@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP protocol 2 stage pipeline, shared by request and response evaluation.
+//! v2 HTTP hook stage pipeline, shared by request and response evaluation.
 //!
 //! Preflight runs every selected stage in chain order. Stages that inspect
 //! the body then run concurrently, linked by bounded channels. Each stage
@@ -41,7 +41,7 @@ use openshell_core::proto::{
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpProtocol, HttpResultStream,
+    DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion, HttpResultStream,
     MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
     MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES,
     MAX_MIDDLEWARE_REASON_BYTES, MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial,
@@ -64,12 +64,12 @@ pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
-/// Failure reason for an HTTP protocol 2 stage that ends its stream with
+/// Failure reason for a v2 HTTP hook stage that ends its stream with
 /// `FAILED_PRECONDITION`: it cannot inspect the message.
 pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
-/// Failure reason for a chain that selects HTTP protocol 1 and HTTP protocol 2
-/// stages for the same HTTP message.
-pub const MIDDLEWARE_PROTOCOL_MIXED: &str = "middleware_protocol_mixed";
+/// Failure reason for a chain that selects v1 and v2 HTTP hook stages for the
+/// same HTTP message.
+pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed";
 
 /// Body input to a pipeline: chunks, then exactly one `End`.
 #[derive(Debug)]
@@ -118,7 +118,7 @@ pub enum HttpStageOutcome {
     FailClosed,
     /// The entry did not resolve to a registered binding, and its
     /// `on_error: fail_open` let the message continue without it. Never an
-    /// HTTP protocol 2 entry.
+    /// v2 HTTP hook entry.
     FailOpen,
 }
 
@@ -537,8 +537,8 @@ pub async fn preflight(
     };
     for entry in entries {
         if !entry.is_resolved() {
-            // An unresolved entry follows its on_error, as in HTTP protocol
-            // 1. The gateway rejects fail_open for HTTP protocol 2 services.
+            // An unresolved entry follows its on_error, as with v1 HTTP
+            // hooks. The gateway rejects fail_open for v2 HTTP hook services.
             if entry.on_error() == OnError::FailOpen {
                 state
                     .diagnostics
@@ -550,9 +550,9 @@ pub async fn preflight(
                 .fail(entry_failure(entry, "binding_not_described"))
                 .await;
         }
-        if entry.http_protocol() != Some(HttpProtocol::V2) {
+        if entry.http_hook_version() != Some(HttpHookVersion::V2) {
             return state
-                .fail(entry_failure(entry, MIDDLEWARE_PROTOCOL_MIXED))
+                .fail(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED))
                 .await;
         }
         let offer = head.body_modes(entry);
@@ -1103,7 +1103,7 @@ struct Checkpoint<'p> {
 /// Holds one stage's output until the stage ends, re-checks it with the body
 /// policy when it differs from the stage's input, and then releases it. A
 /// policy denial fails the exchange before the next stage or the output sees
-/// the body, as HTTP protocol 1 re-checks every replacement before the next stage.
+/// the body, as v1 HTTP hooks re-checks every replacement before the next stage.
 async fn run_checkpoint(
     checkpoint: Checkpoint<'_>,
     mut link: mpsc::Receiver<Frame>,
@@ -1854,7 +1854,7 @@ fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMi
         // The stage says it cannot inspect this message. The reason never
         // carries the service's status text.
         tonic::Code::FailedPrecondition => entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT),
-        // The service does not implement the HTTP protocol 2 RPC its binding
+        // The service does not implement the v2 HTTP hook RPC its binding
         // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
         _ => entry_failure(entry, &diagnostic_policy(entry).error_reason(status)),
@@ -1975,7 +1975,7 @@ pub(super) fn validate_diagnostics(
 }
 
 /// Namespace one stage's findings and metadata. External services get the
-/// same normalization as HTTP protocol 1 results: no metadata and no service-chosen
+/// same normalization as v1 HTTP hook results: no metadata and no service-chosen
 /// finding text.
 pub(super) fn collect_diagnostics(
     entry: &DescribedChainEntry,

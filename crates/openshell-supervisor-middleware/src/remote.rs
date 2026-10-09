@@ -119,7 +119,7 @@ impl GrpcMiddlewareService {
         self.service.open_http_response_pre_return(receiver).await
     }
 
-    /// Open a remote HTTP protocol 2 request exchange through the gRPC
+    /// Open a remote v2 HTTP hook request exchange through the gRPC
     /// adapter.
     pub async fn open_http_request_v2(
         &self,
@@ -128,7 +128,7 @@ impl GrpcMiddlewareService {
         self.service.open_http_request_v2(receiver).await
     }
 
-    /// Open a remote HTTP protocol 2 response exchange through the gRPC
+    /// Open a remote v2 HTTP hook response exchange through the gRPC
     /// adapter.
     pub async fn open_http_response_v2(
         &self,

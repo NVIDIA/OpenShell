@@ -13,7 +13,7 @@ use openshell_ocsf::{
     ocsf_emit,
 };
 use openshell_supervisor_middleware::{
-    ChainHttpProtocol, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
+    ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
     HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
 };
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
-    /// HTTP protocol 2 request middleware streams the body. `request` holds
+    /// v2 HTTP hook request middleware streams the body. `request` holds
     /// only the head; the relay commits it on the middleware's final `Start`.
     Streamed {
         request: crate::l7::provider::L7Request,
@@ -48,7 +48,7 @@ pub enum MiddlewareApplyResult {
     RequestTimeout,
 }
 
-/// Whether HTTP protocol 2 request middleware output may stream to the
+/// Whether v2 HTTP hook request middleware output may stream to the
 /// upstream while the client uploads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RequestBodyDelivery {
@@ -173,8 +173,8 @@ impl HttpMiddlewareExchange {
 /// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
 /// protocols without an L7 relay) must be handled for a matching chain.
 ///
-/// HTTP protocol 1 derives this from each entry's `on_error`. HTTP protocol 2
-/// middleware decides itself at an uninspectable preflight; see
+/// v1 HTTP hook entries derive this from their `on_error`. v2 HTTP request
+/// hook middleware decides itself at an uninspectable preflight; see
 /// [`uninspectable_traffic_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninspectableTrafficGate {
@@ -183,10 +183,10 @@ pub enum UninspectableTrafficGate {
     /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
     /// detection finding.
     BypassWithFinding,
-    /// At least one matching entry is `fail_closed`, or an HTTP protocol 2
+    /// At least one matching entry is `fail_closed`, or a v2 HTTP hook
     /// stage rejected or failed: deny.
     Deny,
-    /// Every HTTP protocol 2 stage let the connection continue, and no other
+    /// Every v2 HTTP hook stage let the connection continue, and no other
     /// entry requires inspection.
     Allowed,
 }
@@ -210,7 +210,7 @@ pub fn uninspectable_traffic_gate(
 /// Decide about traffic a matching middleware chain cannot inspect.
 ///
 /// A chain without an entry whose service binds `HTTP_REQUEST_V2` keeps the
-/// HTTP protocol 1 rule of [`uninspectable_traffic_gate`]. Otherwise each such
+/// v1 HTTP hook rule of [`uninspectable_traffic_gate`]. Otherwise each such
 /// entry decides at an uninspectable preflight, in chain order, and other
 /// entries follow their `on_error`. Any failure of a deciding stage denies.
 pub async fn uninspectable_traffic_decision(
@@ -783,8 +783,8 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     .await
 }
 
-/// Describe the request chain and run it on the engine of its HTTP protocol.
-/// A chain that mixes HTTP protocol 1 and HTTP protocol 2 entries fails
+/// Describe the request chain and run it on the engine of its HTTP hook version.
+/// A chain that mixes v1 and v2 HTTP hook entries fails
 /// closed.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
@@ -805,8 +805,8 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
-    match openshell_supervisor_middleware::chain_http_protocol(&chain) {
-        ChainHttpProtocol::V1 => {
+    match openshell_supervisor_middleware::chain_http_hook_version(&chain) {
+        ChainHttpHookVersion::V1 => {
             Box::pin(apply_protocol1_middleware_chain(
                 req,
                 client,
@@ -820,11 +820,11 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
             ))
             .await
         }
-        ChainHttpProtocol::Mixed => {
+        ChainHttpHookVersion::Mixed => {
             emit_mixed_protocol_denial(ctx, &req, &chain);
             Ok(MiddlewareApplyResult::Denied { denial: None })
         }
-        ChainHttpProtocol::V2 => {
+        ChainHttpHookVersion::V2 => {
             // A body-aware policy re-checks every replaced body, so the
             // upstream must not see any of it before the last stage's output
             // is checked.
@@ -853,7 +853,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
     }
 }
 
-/// HTTP protocol 1 request chain, unchanged from 0.1.x.
+/// v1 HTTP hook request chain, unchanged from 0.1.x.
 #[allow(clippy::too_many_arguments)]
 async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -969,7 +969,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
-/// Run an HTTP protocol 2 request chain on the stage pipeline.
+/// Run a v2 HTTP hook request chain on the stage pipeline.
 #[allow(clippy::too_many_arguments)]
 async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -1529,7 +1529,7 @@ pub(super) fn request_client_timeout_event(
         .build()
 }
 
-/// A request chain selected HTTP protocol 1 and HTTP protocol 2 entries for
+/// A request chain selected v1 and v2 HTTP hook entries for
 /// the same message, so it failed closed.
 fn emit_mixed_protocol_denial(
     ctx: &L7EvalContext,
@@ -1549,7 +1549,7 @@ pub(super) fn mixed_protocol_events(
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut diagnostics = HttpStageDiagnostics::default();
     if let Some(entry) = chain.iter().find(|entry| {
-        entry.http_protocol() == Some(openshell_supervisor_middleware::HttpProtocol::V2)
+        entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::V2)
     }) {
         diagnostics
             .invocations
@@ -1563,7 +1563,7 @@ pub(super) fn mixed_protocol_events(
                 failed: true,
                 reason_code: None,
                 failure_reason: Some(
-                    openshell_supervisor_middleware::MIDDLEWARE_PROTOCOL_MIXED.to_string(),
+                    openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED.to_string(),
                 ),
             });
     }
@@ -1574,7 +1574,7 @@ pub(super) fn mixed_protocol_events(
         false,
         &format!(
             "middleware_failed: {}",
-            openshell_supervisor_middleware::MIDDLEWARE_PROTOCOL_MIXED
+            openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED
         ),
         None,
         &diagnostics,

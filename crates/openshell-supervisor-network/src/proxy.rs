@@ -1748,10 +1748,10 @@ fn unsupported_l7_tunnel_protocol_detail(
 
 /// Gate for traffic that would bypass L7 inspection entirely: query the
 /// middleware chain matching this destination and process identity, and
-/// decide whether raw relay is allowed. Under HTTP protocol 1, uninspectable
+/// decide whether raw relay is allowed. Under v1 HTTP hooks, uninspectable
 /// traffic is denied when any matching entry is `fail_closed`, and an
 /// all-`fail_open` chain passes it through with a bypass detection finding.
-/// HTTP protocol 2 middleware decides itself at an uninspectable preflight.
+/// v2 HTTP hook middleware decides itself at an uninspectable preflight.
 async fn middleware_uninspectable_gate(
     opa_engine: &OpaEngine,
     ctx: &crate::l7::relay::L7EvalContext,
@@ -3055,9 +3055,9 @@ async fn handle_mediated_connection(
     );
 
     if effective_tls_skip {
-        // Policy validation rejects fail-closed HTTP protocol 1 middleware
+        // Policy validation rejects fail-closed v1 HTTP hook middleware
         // overlapping `tls: skip` endpoints; this runtime gate is defense in
-        // depth. HTTP protocol 2 middleware decides here at runtime.
+        // depth. v2 HTTP hook middleware decides here at runtime.
         match middleware_uninspectable_gate(
             &opa_engine,
             &ctx,

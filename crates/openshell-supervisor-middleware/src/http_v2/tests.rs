@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP protocol 2 registration rules and stage state machine.
+//! v2 HTTP hook registration rules and stage state machine.
 
 use std::sync::{Arc, Mutex};
 
@@ -58,32 +58,32 @@ fn registration_selects_one_http_protocol_per_service() {
     };
     let cases: Vec<(&str, Vec<MiddlewareBinding>, Option<&str>)> = vec![
         (
-            "protocol 1",
+            "v1 HTTP hook",
             vec![binding(HttpRequest), binding(HttpResponse)],
             None,
         ),
         (
-            "protocol 2 in both directions",
+            "v2 HTTP hook in both directions",
             vec![binding(HttpRequestV2), binding(HttpResponseV2)],
             None,
         ),
         (
-            "protocol 2 with a WebSocket binding",
+            "v2 HTTP hook with a WebSocket binding",
             vec![binding(HttpRequestV2), binding(WebsocketMessage)],
             None,
         ),
         (
-            "mixed protocols in one service",
+            "mixed hook versions in one service",
             vec![binding(HttpRequest), binding(HttpResponseV2)],
-            Some("mixes HTTP protocol 1 and HTTP protocol 2"),
+            Some("mixes v1 and v2 HTTP hook bindings"),
         ),
         (
-            "both protocols for one stage",
+            "both hook versions for one stage",
             vec![binding(HttpRequest), binding(HttpRequestV2)],
-            Some("mixes HTTP protocol 1 and HTTP protocol 2"),
+            Some("mixes v1 and v2 HTTP hook bindings"),
         ),
         (
-            "protocol 2 request operation at the response phase",
+            "v2 HTTP hook request operation at the response phase",
             vec![MiddlewareBinding {
                 phase: SupervisorMiddlewarePhase::PreReturn as i32,
                 ..binding(HttpRequestV2)
@@ -102,7 +102,7 @@ fn registration_selects_one_http_protocol_per_service() {
         }
     }
 
-    // A protocol 2 binding without a payload limit is preflight-only.
+    // A v2 HTTP hook binding without a payload limit is preflight-only.
     let mut preflight_only = binding(HttpRequestV2);
     preflight_only.max_payload_bytes = 0;
     validate_manifest_bindings("test service", &manifest(vec![preflight_only]), Some(0))
@@ -110,13 +110,13 @@ fn registration_selects_one_http_protocol_per_service() {
     let mut payload = binding(HttpRequest);
     payload.max_payload_bytes = 0;
     validate_manifest_bindings("test service", &manifest(vec![payload]), None)
-        .expect_err("a protocol 1 binding needs a payload limit");
+        .expect_err("a v1 HTTP hook binding needs a payload limit");
     validate_manifest_bindings(
         "test service",
         &manifest(vec![binding(HttpRequestV2)]),
         Some(0),
     )
-    .expect_err("a protocol 2 binding with a payload limit needs an operator limit");
+    .expect_err("a v2 HTTP hook binding with a payload limit needs an operator limit");
 }
 
 /// What a scripted stage does at preflight.
@@ -136,7 +136,7 @@ enum Body {
     Uppercase,
 }
 
-/// In-memory HTTP protocol 2 stage with a fixed script.
+/// In-memory v2 HTTP hook stage with a fixed script.
 struct ScriptedStage {
     name: &'static str,
     preflight: Preflight,
@@ -200,7 +200,7 @@ impl InProcessMiddleware for ScriptedStage {
         &self,
         _request: HttpRequestView<'_>,
     ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!("HTTP protocol 2 test stage"))
+        Err(miette::miette!("v2 HTTP hook test stage"))
     }
 
     async fn open_http_request_v2(
@@ -636,7 +636,7 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
     );
 }
 
-/// HTTP protocol 2 service with only a response binding.
+/// v2 HTTP hook service with only a response binding.
 struct ResponseOnlyStage;
 
 #[tonic::async_trait]
@@ -660,7 +660,7 @@ impl InProcessMiddleware for ResponseOnlyStage {
         &self,
         _request: HttpRequestView<'_>,
     ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!("HTTP protocol 2 response-only test stage"))
+        Err(miette::miette!("v2 HTTP hook response-only test stage"))
     }
 }
 

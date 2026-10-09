@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Duplex response relay for HTTP protocol 2 response middleware.
+//! Duplex response relay for v2 HTTP hook response middleware.
 //!
 //! The upstream body feeds the stages while their output streams to the
 //! client. The response head commits on the pipeline's output `Start`, with
@@ -79,7 +79,7 @@ impl BodyRelayError {
     }
 }
 
-/// Relay a response whose chain runs HTTP protocol 2.
+/// Relay a response whose chain runs v2 HTTP hooks.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_response_through_pipeline<U, C>(
     request_method: &str,
@@ -750,7 +750,7 @@ fn http_response_stage_events(
     events
 }
 
-/// One HTTP protocol 2 response stage invocation. Carries no service text.
+/// One v2 HTTP hook response stage invocation. Carries no service text.
 fn http_response_stage_event(
     policy_name: &str,
     target: &HttpRequestTarget,
@@ -796,7 +796,7 @@ fn http_response_stage_event(
             "middleware_implementation",
             invocation.implementation.as_str(),
         )
-        .unmapped("http_protocol", "2")
+        .unmapped("http_hook_version", "2")
         .unmapped("response_middleware_outcome", outcome.as_str())
         .unmapped("input_bytes", invocation.input_bytes)
         .unmapped("failed", failed)

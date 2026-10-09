@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Request bodies routed through HTTP protocol 2 request middleware.
+//! Request bodies routed through v2 HTTP hook request middleware.
 //!
 //! The body reader normalizes one HTTP/1 request body into units for the
 //! stage pipeline without reading past the body, so a pipelined request stays
 //! in the connection. A withheld body is inlined into the rebuilt request, as
-//! HTTP protocol 1 middleware does. A live body streams to the upstream while
+//! v1 HTTP hook middleware does. A live body streams to the upstream while
 //! the client uploads; its head commits on the pipeline's final `Start`.
 
 use std::sync::atomic::{AtomicBool, Ordering};

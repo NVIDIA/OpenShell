@@ -3554,7 +3554,7 @@ network_policies:
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> std::result::Result<Response<Self::EvaluateHttpRequestV2Stream>, Status> {
-            Err(Status::unimplemented("HTTP protocol 1 test service"))
+            Err(Status::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = openshell_core::middleware::HttpResultStream;
@@ -3563,7 +3563,7 @@ network_policies:
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> std::result::Result<Response<Self::EvaluateHttpResponseV2Stream>, Status> {
-            Err(Status::unimplemented("HTTP protocol 1 test service"))
+            Err(Status::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn describe(

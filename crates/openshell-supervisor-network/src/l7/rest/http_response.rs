@@ -3,7 +3,7 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
-mod protocol2;
+mod http_v2;
 
 use super::*;
 
@@ -20,7 +20,7 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
-    /// The client request used HTTP/1.1, so an HTTP protocol 2 response may
+    /// The client request used HTTP/1.1, so a v2 HTTP hook response may
     /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
     pub(crate) client_accepts_chunked: bool,
 }
@@ -345,10 +345,10 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
-    match openshell_supervisor_middleware::chain_http_protocol(&described) {
-        openshell_supervisor_middleware::ChainHttpProtocol::V1 => {}
-        openshell_supervisor_middleware::ChainHttpProtocol::V2 => {
-            return Box::pin(protocol2::relay_response_through_pipeline(
+    match openshell_supervisor_middleware::chain_http_hook_version(&described) {
+        openshell_supervisor_middleware::ChainHttpHookVersion::V1 => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::V2 => {
+            return Box::pin(http_v2::relay_response_through_pipeline(
                 request_method,
                 upstream,
                 client,
@@ -364,10 +364,10 @@ where
             ))
             .await;
         }
-        openshell_supervisor_middleware::ChainHttpProtocol::Mixed => {
+        openshell_supervisor_middleware::ChainHttpHookVersion::Mixed => {
             debug!(
-                reason = openshell_supervisor_middleware::MIDDLEWARE_PROTOCOL_MIXED,
-                "HTTP response middleware chain mixes HTTP protocols"
+                reason = openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED,
+                "HTTP response middleware chain mixes HTTP hook versions"
             );
             emit_http_response_middleware_failure(
                 middleware.policy_name,

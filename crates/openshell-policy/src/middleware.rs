@@ -263,8 +263,8 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
 /// `fail_closed` middleware whose selector may match a `tls: skip` endpoint,
 /// whose traffic no middleware can inspect.
 ///
-/// Middleware for which `decides_uninspectable` returns true, such as HTTP
-/// protocol 2 request middleware, allows or refuses such connections at
+/// Middleware for which `decides_uninspectable` returns true, such as v2
+/// HTTP request hook middleware, allows or refuses such connections at
 /// runtime and is exempt. [`validate`] does not run this rule because the
 /// exemption depends on the middleware's registered bindings; the gateway
 /// runs it with its registry. Whether or not the rule ran, a supervisor

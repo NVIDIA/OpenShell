@@ -150,7 +150,7 @@ run = [
 ]
 
 ["e2e:middleware-http-v2"]
-description = "Run the HTTP protocol 2 content-guard middleware example against the current gateway and Docker supervisor"
+description = "Run the v2 HTTP hooks content-guard middleware example against the current gateway and Docker supervisor"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP protocol 2 request middleware at `PRE_CREDENTIALS`.
+//! v2 HTTP hook request middleware at `PRE_CREDENTIALS`.
 //!
 //! Preflight runs before any request body byte is read. A chain whose stages
 //! all continue at preflight forwards the body untouched; otherwise the
@@ -164,7 +164,7 @@ fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
 }
 
 impl ChainRunner {
-    /// Run HTTP protocol 2 request preflight over a described chain. Returns
+    /// Run v2 HTTP hook request preflight over a described chain. Returns
     /// an error only for a chain over platform capacity.
     pub async fn preflight_described_http_request(
         &self,

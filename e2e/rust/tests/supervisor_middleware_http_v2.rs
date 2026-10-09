@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e-docker")]
 
-//! HTTP middleware protocol 2 end to end.
+//! v2 HTTP hooks end to end.
 //!
 //! Runs the `supervisor-middleware-content-guard` example from this checkout
 //! as an operator-registered middleware service for the current gateway and
@@ -20,7 +20,7 @@
 //! - a preflight rejection never contacts the upstream;
 //! - a `tls: skip` tunnel is denied by default and allowed when the guard is
 //!   configured to allow uninspectable traffic;
-//! - a policy that mixes HTTP protocols on one destination is rejected at
+//! - a policy that mixes HTTP hook versions on one destination is rejected at
 //!   `policy set`.
 
 use std::io::Write as _;
@@ -413,7 +413,7 @@ struct PolicyCase<'a> {
     uninspectable: &'a str,
     /// Port of a `tls: skip` endpoint the attachment also selects.
     tls_skip_port: Option<u16>,
-    /// Also attach `openshell/regex` (HTTP protocol 1) to the same host.
+    /// Also attach `openshell/regex` (v1 HTTP hooks) to the same host.
     mixed: bool,
 }
 
@@ -647,7 +647,7 @@ fn should_run() -> Option<String> {
     let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
     let skip = |reason: &str| {
         assert!(!required, "{REQUIRE_ENV}=1 but {reason}");
-        eprintln!("Skipping HTTP protocol 2 middleware e2e: {reason}");
+        eprintln!("Skipping v2 HTTP hook middleware e2e: {reason}");
         None
     };
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
@@ -671,7 +671,7 @@ fn should_run() -> Option<String> {
 
 #[tokio::test]
 #[serial(supervisor_middleware)]
-async fn http_protocol_2_content_guard_runs_against_the_gateway_and_supervisor() {
+async fn v2_http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
     let Some(binary) = should_run() else {
         return;
     };
@@ -790,7 +790,7 @@ async fn http_protocol_2_content_guard_runs_against_the_gateway_and_supervisor()
         "the guard allows uninspectable traffic when configured to: {stream}"
     );
 
-    // A policy that runs both HTTP protocols for one destination is rejected.
+    // A policy that runs both HTTP hook versions for one destination is rejected.
     let base = write_policy(
         upstream.port,
         &PolicyCase {
@@ -832,7 +832,7 @@ async fn http_protocol_2_content_guard_runs_against_the_gateway_and_supervisor()
     .await;
     assert_ne!(
         exit_code, 0,
-        "a mixed-protocol policy is rejected:\n{output}"
+        "a mixed-version policy is rejected:\n{output}"
     );
     // The CLI wraps long errors across lines.
     let message = output

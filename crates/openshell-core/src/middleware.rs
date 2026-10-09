@@ -17,12 +17,12 @@ use crate::proto::{
     ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one HTTP protocol 2 exchange
+/// Transport-neutral result stream for one v2 HTTP hook exchange
 /// (`EvaluateHttpRequestV2` or `EvaluateHttpResponseV2`).
 pub type HttpResultStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
 
-/// HTTP protocol 1. Removed in 0.2.0.
+/// v1 HTTP hooks. Removed in 0.2.0.
 ///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
@@ -73,23 +73,23 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP protocol 2 request exchange (`EvaluateHttpRequestV2`).
+    /// Open one v2 HTTP hook request exchange (`EvaluateHttpRequestV2`).
     async fn open_http_request_v2(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2 requests",
+            "middleware does not implement v2 HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP protocol 2 response exchange (`EvaluateHttpResponseV2`).
+    /// Open one v2 HTTP hook response exchange (`EvaluateHttpResponseV2`).
     async fn open_http_response_v2(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2 responses",
+            "middleware does not implement v2 HTTP hook responses",
         ))
     }
 }
@@ -306,7 +306,7 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP protocol 2 request exchange (`EvaluateHttpRequestV2`),
+    /// Open one v2 HTTP hook request exchange (`EvaluateHttpRequestV2`),
     /// for a request or for traffic `OpenShell` cannot inspect.
     ///
     /// Implementations without an `HTTP_REQUEST_V2` binding may keep the
@@ -316,11 +316,11 @@ pub trait InProcessMiddleware: Send + Sync {
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2 requests",
+            "middleware does not implement v2 HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP protocol 2 response exchange (`EvaluateHttpResponseV2`).
+    /// Open one v2 HTTP hook response exchange (`EvaluateHttpResponseV2`).
     ///
     /// Implementations without an `HTTP_RESPONSE_V2` binding may keep the
     /// default unsupported response.
@@ -329,7 +329,7 @@ pub trait InProcessMiddleware: Send + Sync {
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2 responses",
+            "middleware does not implement v2 HTTP hook responses",
         ))
     }
 }

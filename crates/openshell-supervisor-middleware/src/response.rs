@@ -1251,7 +1251,7 @@ mod tests {
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status> {
-            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = super::super::HttpResultStream;
@@ -1260,7 +1260,7 @@ mod tests {
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status> {
-            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn describe(
@@ -1932,7 +1932,7 @@ mod tests {
             binding: None,
             max_payload_bytes: 1,
             timeout: Duration::from_millis(500),
-            http_protocol: None,
+            http_hook_version: None,
         };
 
         let modes = permitted_body_modes(&input(200), &described, None);

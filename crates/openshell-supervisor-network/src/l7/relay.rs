@@ -4752,7 +4752,7 @@ network_policies:
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> std::result::Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = openshell_core::middleware::HttpResultStream;
@@ -4762,7 +4762,7 @@ network_policies:
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
         ) -> std::result::Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn describe(
@@ -11485,7 +11485,7 @@ network_policies:
         Missing,
     }
 
-    /// HTTP protocol 2 counterpart of [`McpToolReplacingService`]: a BUFFERED stage
+    /// v2 HTTP hook counterpart of [`McpToolReplacingService`]: a BUFFERED stage
     /// that replaces the tool call and writes the sessionless `Mcp-Name`
     /// mirror as a late mutation in its body result, at preflight, or not at
     /// all.

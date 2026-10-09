@@ -991,7 +991,7 @@ pub(super) fn validate_object_metadata(
 ///
 /// Delegates to [`openshell_policy::validate_sandbox_policy`], adds the
 /// middleware `tls: skip` rule, which needs `middleware_registry` to exempt
-/// HTTP protocol 2 middleware, and converts violations into a gRPC
+/// v2 HTTP hook middleware, and converts violations into a gRPC
 /// `INVALID_ARGUMENT` status.
 pub(super) fn validate_policy_safety(
     policy: &ProtoSandboxPolicy,

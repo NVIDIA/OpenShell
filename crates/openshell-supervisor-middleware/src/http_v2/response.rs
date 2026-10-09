@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP protocol 2 response middleware at `PRE_RETURN`.
+//! v2 HTTP hook response middleware at `PRE_RETURN`.
 //!
 //! Preflight runs on the final upstream response head before the relay reads
 //! any body byte. A chain whose stages all continue at preflight delivers the
@@ -64,7 +64,7 @@ impl HttpResponseDelivery {
     }
 }
 
-/// Outcome of HTTP protocol 2 response preflight.
+/// Outcome of v2 HTTP hook response preflight.
 pub struct HttpResponsePipelinePreflight {
     pub allowed: bool,
     pub reason: String,
@@ -272,7 +272,7 @@ impl StageHead for ResponseHead<'_> {
 }
 
 impl ChainRunner {
-    /// Run HTTP protocol 2 response preflight over a described chain.
+    /// Run v2 HTTP hook response preflight over a described chain.
     /// Returns an error only for a chain over platform capacity.
     pub async fn preflight_http_response_pipeline(
         &self,
@@ -337,7 +337,7 @@ impl ChainRunner {
         })
     }
 
-    /// Fail an HTTP protocol 2 response chain whose head valid HTTP allows
+    /// Fail a v2 HTTP hook response chain whose head valid HTTP allows
     /// but the middleware protocol cannot encode.
     #[must_use]
     pub fn http_response_pipeline_input_unrepresentable(
@@ -389,9 +389,9 @@ mod tests {
     };
 
     use super::ResponseHead;
-    use crate::protocol2::pipeline::StageHead;
+    use crate::http_v2::pipeline::StageHead;
     use crate::{
-        ChainEntry, DescribedChainEntry, HttpProtocol, HttpResponsePreflightInput, OnError,
+        ChainEntry, DescribedChainEntry, HttpHookVersion, HttpResponsePreflightInput, OnError,
     };
 
     fn entry(limit: usize) -> DescribedChainEntry {
@@ -412,7 +412,7 @@ mod tests {
             }),
             max_payload_bytes: limit,
             timeout: std::time::Duration::from_millis(500),
-            http_protocol: Some(HttpProtocol::V2),
+            http_hook_version: Some(HttpHookVersion::V2),
         }
     }
 

@@ -5,7 +5,7 @@ use openshell_core::proto::SandboxPolicy;
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use tonic::Status;
 
-/// Validate implementation-owned middleware config, and the HTTP protocol
+/// Validate implementation-owned middleware config, and the HTTP hook version
 /// rules, before accepting a policy.
 pub async fn validate_policy(
     registry: &MiddlewareRegistry,
@@ -13,7 +13,7 @@ pub async fn validate_policy(
 ) -> Result<(), Status> {
     async {
         registry.validate_policy_configs(policy).await?;
-        registry.validate_http_protocol_rules(policy).await
+        registry.validate_http_hook_rules(policy).await
     }
     .await
     .map_err(|error| {
@@ -32,7 +32,7 @@ mod tests {
     use openshell_supervisor_middleware::{HttpRequestView, InProcessMiddleware};
     use std::sync::Arc;
 
-    /// HTTP protocol 2 middleware with the given HTTP operations, and
+    /// v2 HTTP hook middleware with the given HTTP operations, and
     /// optionally a WebSocket binding.
     struct ProtocolTwoMiddleware {
         name: &'static str,
@@ -90,7 +90,7 @@ mod tests {
             &self,
             _request: HttpRequestView<'_>,
         ) -> miette::Result<HttpRequestResult> {
-            Err(miette::miette!("HTTP protocol 2 test middleware"))
+            Err(miette::miette!("v2 HTTP hook test middleware"))
         }
     }
 
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_is_rejected_on_http_protocol_2_middleware() {
+    async fn fail_open_is_rejected_on_v2_http_hook_middleware() {
         let registry = registry().await;
         for middleware in ["example/guard", "example/guard-with-websocket"] {
             let error = validate_policy(
@@ -159,7 +159,7 @@ mod tests {
                 )]),
             )
             .await
-            .expect_err("HTTP protocol 2 middleware is always fail-closed");
+            .expect_err("v2 HTTP hook middleware is always fail-closed");
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(
                 error.message().contains("cannot use on_error: fail_open"),
@@ -180,7 +180,7 @@ mod tests {
             )]),
         )
         .await
-        .expect("HTTP protocol 1 middleware keeps fail_open");
+        .expect("v1 HTTP hook middleware keeps fail_open");
     }
 
     #[tokio::test]
@@ -195,7 +195,7 @@ mod tests {
             ]),
         )
         .await
-        .expect_err("one HTTP request cannot run both protocols");
+        .expect_err("one HTTP request cannot run both hook versions");
         assert!(
             error
                 .message()
@@ -213,10 +213,10 @@ mod tests {
             ]),
         )
         .await
-        .expect("disjoint selectors may use different protocols");
+        .expect("disjoint selectors may use different hook versions");
 
         // The regex middleware has no response binding, so a response-only
-        // HTTP protocol 2 service may share its selector.
+        // v2 HTTP hook service may share its selector.
         validate_policy(
             &registry,
             &policy(vec![
@@ -228,11 +228,11 @@ mod tests {
             ]),
         )
         .await
-        .expect("no HTTP operation is served by both protocols");
+        .expect("no HTTP operation is served by both hook versions");
     }
 
     #[tokio::test]
-    async fn tls_skip_rule_exempts_registered_http_protocol_2_middleware() {
+    async fn tls_skip_rule_exempts_registered_v2_http_hook_middleware() {
         let registry = registry().await;
         let tls_skip_policy = |middleware: &str| {
             let mut policy = SandboxPolicy {
@@ -268,12 +268,12 @@ mod tests {
         assert_eq!(
             conflicts("example/response-guard").len(),
             1,
-            "a response-only HTTP protocol 2 service is never asked about tls: skip tunnels"
+            "a response-only v2 HTTP hook service is never asked about tls: skip tunnels"
         );
         assert_eq!(
             conflicts(openshell_supervisor_middleware_builtins::BUILTIN_REGEX).len(),
             1,
-            "HTTP protocol 1 fail-closed middleware cannot cover tls: skip"
+            "v1 HTTP hook fail-closed middleware cannot cover tls: skip"
         );
     }
 

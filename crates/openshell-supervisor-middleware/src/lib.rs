@@ -4,19 +4,20 @@
 //! Supervisor middleware registration and chain execution.
 
 pub mod headers;
-mod protocol2;
+mod http_v2;
 mod remote;
 mod response;
 mod websocket;
 
-pub use protocol2::{
-    ChainHttpProtocol, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
+pub use http_v2::{
+    ChainHttpHookVersion, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
     HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish, HttpRequestPreflightInput,
     HttpRequestPreflightOutcome, HttpRequestSession, HttpResponseDelivery,
     HttpResponsePipelinePreflight, HttpResponsePipelineSession, HttpStageDiagnostics,
     HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
-    MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_PROTOCOL_MIXED,
-    UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput, chain_http_protocol,
+    MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
+    UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput,
+    chain_http_hook_version,
 };
 
 pub use response::{
@@ -389,50 +390,50 @@ impl OnError {
     }
 }
 
-/// HTTP middleware protocol of a service's HTTP bindings.
+/// HTTP hook version of a service's HTTP bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HttpProtocol {
-    /// HTTP protocol 1 (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
+pub enum HttpHookVersion {
+    /// v1 HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
     /// Removed in 0.2.0.
     V1,
-    /// HTTP protocol 2 (`EvaluateHttpRequestV2`, `EvaluateHttpResponseV2`).
+    /// v2 HTTP hooks (`EvaluateHttpRequestV2`, `EvaluateHttpResponseV2`).
     /// Always fail-closed.
     V2,
 }
 
-impl HttpProtocol {
+impl HttpHookVersion {
     /// Stable, audit-safe name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V1 => "http_protocol_1",
-            Self::V2 => "http_protocol_2",
+            Self::V1 => "http_hook_v1",
+            Self::V2 => "http_hook_v2",
         }
     }
 }
 
-/// HTTP protocol of an operation: `None` for a WebSocket or unknown
-/// operation. The operation selects the protocol, so peers that predate HTTP
-/// protocol 2 reject its operations at Describe.
-fn operation_http_protocol(operation: i32) -> Option<HttpProtocol> {
+/// HTTP hook version of an operation: `None` for a WebSocket or unknown
+/// operation. The operation selects the hook version, so peers that predate
+/// v2 HTTP hooks reject its operations at Describe.
+fn operation_http_hook_version(operation: i32) -> Option<HttpHookVersion> {
     match SupervisorMiddlewareOperation::try_from(operation) {
         Ok(
             SupervisorMiddlewareOperation::HttpRequest
             | SupervisorMiddlewareOperation::HttpResponse,
-        ) => Some(HttpProtocol::V1),
+        ) => Some(HttpHookVersion::V1),
         Ok(
             SupervisorMiddlewareOperation::HttpRequestV2
             | SupervisorMiddlewareOperation::HttpResponseV2,
-        ) => Some(HttpProtocol::V2),
+        ) => Some(HttpHookVersion::V2),
         _ => None,
     }
 }
 
 /// True when a binding's `operation` serves the `stage` operation's chain.
-/// `HTTP_REQUEST` and `HTTP_RESPONSE` chains also take HTTP protocol 2
+/// `HTTP_REQUEST` and `HTTP_RESPONSE` chains also take v2 HTTP hooks
 /// bindings.
 fn serves_operation(operation: i32, stage: SupervisorMiddlewareOperation) -> bool {
-    let protocol_2 = match stage {
+    let v2_operation = match stage {
         SupervisorMiddlewareOperation::HttpRequest => {
             Some(SupervisorMiddlewareOperation::HttpRequestV2)
         }
@@ -441,16 +442,17 @@ fn serves_operation(operation: i32, stage: SupervisorMiddlewareOperation) -> boo
         }
         _ => None,
     };
-    operation == stage as i32 || protocol_2.is_some_and(|protocol_2| operation == protocol_2 as i32)
+    operation == stage as i32
+        || v2_operation.is_some_and(|v2_operation| operation == v2_operation as i32)
 }
 
-/// Protocol of a described service's HTTP bindings, or `None` when it has no
-/// HTTP binding. Registration guarantees every HTTP binding uses one protocol.
-fn manifest_http_protocol(manifest: &MiddlewareManifest) -> Option<HttpProtocol> {
+/// Hook version of a described service's HTTP bindings, or `None` when it has no
+/// HTTP binding. Registration guarantees every HTTP binding uses one hook version.
+fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookVersion> {
     manifest
         .bindings
         .iter()
-        .find_map(|binding| operation_http_protocol(binding.operation))
+        .find_map(|binding| operation_http_hook_version(binding.operation))
 }
 
 /// The `HTTP_REQUEST_V2` binding, whose `EvaluateHttpRequestV2` exchange also
@@ -462,26 +464,26 @@ fn uninspectable_traffic_binding(manifest: &MiddlewareManifest) -> Option<&Middl
     })
 }
 
-/// A service implements HTTP protocol 1 or HTTP protocol 2, never both.
-fn validate_manifest_http_protocol(source: &str, manifest: &MiddlewareManifest) -> Result<()> {
+/// A service implements v1 HTTP hooks or v2 HTTP hooks, never both.
+fn validate_manifest_http_hook_version(source: &str, manifest: &MiddlewareManifest) -> Result<()> {
     let protocols: HashSet<_> = manifest
         .bindings
         .iter()
-        .filter_map(|binding| operation_http_protocol(binding.operation))
+        .filter_map(|binding| operation_http_hook_version(binding.operation))
         .collect();
     if protocols.len() > 1 {
         return Err(miette!(
-            "{source} mixes HTTP protocol 1 and HTTP protocol 2 bindings; one service implements one HTTP protocol, so serve each protocol from its own registration"
+            "{source} mixes v1 and v2 HTTP hook bindings; one service implements one HTTP hook version, so serve each hook version from its own registration"
         ));
     }
     Ok(())
 }
 
-/// HTTP protocol 1 and WebSocket bindings carry payloads. An HTTP protocol 2
+/// v1 HTTP hooks and WebSocket bindings carry payloads. A v2 HTTP hook
 /// binding that advertises no payload limit is offered no body modes, so it
 /// can only continue or reject at preflight.
 fn binding_requires_payload_limit(binding: &MiddlewareBinding) -> bool {
-    operation_http_protocol(binding.operation) != Some(HttpProtocol::V2)
+    operation_http_hook_version(binding.operation) != Some(HttpHookVersion::V2)
         || binding.max_payload_bytes > 0
 }
 
@@ -530,8 +532,8 @@ pub struct DescribedChainEntry {
     binding: Option<MiddlewareBinding>,
     max_payload_bytes: usize,
     timeout: Duration,
-    /// HTTP protocol of the resolved binding.
-    http_protocol: Option<HttpProtocol>,
+    /// HTTP hook version of the resolved binding.
+    http_hook_version: Option<HttpHookVersion>,
 }
 
 struct DescribedChain {
@@ -544,10 +546,10 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
-    /// Effective failure policy. HTTP protocol 2 entries always fail closed,
+    /// Effective failure policy. v2 HTTP hook entries always fail closed,
     /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        if self.http_protocol == Some(HttpProtocol::V2) {
+        if self.http_hook_version == Some(HttpHookVersion::V2) {
             OnError::FailClosed
         } else {
             self.entry.on_error
@@ -566,11 +568,11 @@ impl DescribedChainEntry {
         self.binding.is_some()
     }
 
-    /// HTTP protocol of the resolved HTTP binding. `None` for WebSocket
+    /// HTTP hook version of the resolved HTTP binding. `None` for WebSocket
     /// bindings and unresolved entries.
     #[must_use]
-    pub fn http_protocol(&self) -> Option<HttpProtocol> {
-        self.http_protocol
+    pub fn http_hook_version(&self) -> Option<HttpHookVersion> {
+        self.http_hook_version
     }
 
     /// Policy-local middleware config name.
@@ -902,7 +904,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     /// Policy configs already warned that `fail_open` does not apply to their
-    /// HTTP protocol 2 service.
+    /// v2 HTTP hook service.
     fail_open_warnings: Arc<std::sync::Mutex<HashSet<String>>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
@@ -1091,7 +1093,7 @@ fn validate_manifest_bindings(
         return Err(miette!("{source} describes no bindings"));
     }
 
-    validate_manifest_http_protocol(source, manifest)?;
+    validate_manifest_http_hook_version(source, manifest)?;
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
         supported_binding(source, binding)?;
@@ -1469,15 +1471,15 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// HTTP protocol of a registered middleware, without a network call.
+    /// HTTP hook version of a registered middleware, without a network call.
     /// `None` when the middleware has no HTTP binding or this registry has
     /// not described it; such an entry follows its `on_error`.
     #[must_use]
-    pub fn http_protocol_of(&self, implementation: &str) -> Option<HttpProtocol> {
+    pub fn http_hook_version_of(&self, implementation: &str) -> Option<HttpHookVersion> {
         self.services.iter().find_map(|state| {
             let manifest = state.manifest.get()?;
             (ChainRunner::attachment_name(state, manifest) == implementation)
-                .then(|| manifest_http_protocol(manifest))
+                .then(|| manifest_http_hook_version(manifest))
                 .flatten()
         })
     }
@@ -1495,20 +1497,20 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// Gateway rules for policies that use HTTP protocol 2 middleware.
+    /// Gateway rules for policies that use v2 HTTP hook middleware.
     ///
-    /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
-    ///   protocol 2, including one with WebSocket bindings. HTTP protocol 2 is
+    /// - `on_error: fail_open` is rejected on an entry whose service runs v2
+    ///   HTTP hooks, including one with WebSocket bindings. v2 HTTP hooks are
     ///   always fail-closed, but a supervisor that cannot describe the
-    ///   service, including one that predates HTTP protocol 2, follows
+    ///   service, including one that predates v2 HTTP hooks, follows
     ///   `on_error` and would skip it under `fail_open`.
     /// - Two entries whose endpoint selectors may overlap must use the same
-    ///   HTTP protocol for every HTTP operation both serve: one HTTP message
-    ///   never runs both protocols.
+    ///   HTTP hook version for every HTTP operation both serve: one HTTP message
+    ///   never runs both hook versions.
     ///
     /// Supervisors do not apply these rules to stored policies; they run an
-    /// HTTP protocol 2 entry fail-closed and refuse a mixed chain at runtime.
-    pub async fn validate_http_protocol_rules(&self, policy: &SandboxPolicy) -> Result<()> {
+    /// v2 HTTP hook entry fail-closed and refuse a mixed chain at runtime.
+    pub async fn validate_http_hook_rules(&self, policy: &SandboxPolicy) -> Result<()> {
         let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
         let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
         configs.sort_unstable_by_key(|(name, _)| name.as_str());
@@ -1525,10 +1527,10 @@ impl MiddlewareRegistry {
                 continue;
             };
             if OnError::parse(&config.on_error)? == OnError::FailOpen
-                && manifest_http_protocol(manifest) == Some(HttpProtocol::V2)
+                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::V2)
             {
                 return Err(miette!(
-                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP protocol 2 middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': v2 HTTP hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
                     config.middleware
                 ));
             }
@@ -1550,7 +1552,7 @@ impl MiddlewareRegistry {
                             .bindings
                             .iter()
                             .find(|binding| serves_operation(binding.operation, operation))
-                            .map(|binding| operation_http_protocol(binding.operation))
+                            .map(|binding| operation_http_hook_version(binding.operation))
                     };
                     let (Some(left_protocol), Some(right_protocol)) =
                         (protocol(left_manifest), protocol(right_manifest))
@@ -1562,16 +1564,16 @@ impl MiddlewareRegistry {
                     {
                         continue;
                     }
-                    let describe = |protocol: Option<HttpProtocol>| match protocol {
-                        Some(HttpProtocol::V2) => "HTTP protocol 2",
-                        _ => "HTTP protocol 1",
+                    let describe = |protocol: Option<HttpHookVersion>| match protocol {
+                        Some(HttpHookVersion::V2) => "v2 HTTP hooks",
+                        _ => "v1 HTTP hooks",
                     };
                     let operation_name = match operation {
                         SupervisorMiddlewareOperation::HttpResponse => "HTTP responses",
                         _ => "HTTP requests",
                     };
                     return Err(miette!(
-                        "middleware configs '{left_name}' ({}) and '{right_name}' ({}) may select the same destination for {operation_name}, and one HTTP message cannot run both protocols; separate their endpoint selectors, or move both services to the same HTTP protocol",
+                        "middleware configs '{left_name}' ({}) and '{right_name}' ({}) may select the same destination for {operation_name}, and one HTTP message cannot run both hook versions; separate their endpoint selectors, or move both services to the same HTTP hook version",
                         describe(left_protocol),
                         describe(right_protocol),
                     ));
@@ -1794,7 +1796,7 @@ impl ChainRunner {
     }
 
     /// The service's binding for one stage. An HTTP stage takes the binding
-    /// of either HTTP protocol; registration allows only one of them.
+    /// of either HTTP hook version; registration allows only one of them.
     fn binding(
         manifest: &MiddlewareManifest,
         operation: SupervisorMiddlewareOperation,
@@ -1861,14 +1863,14 @@ impl ChainRunner {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
                 // An undescribed service follows its on_error. The gateway
-                // rejects fail_open for HTTP protocol 2 services.
+                // rejects fail_open for v2 HTTP hook services.
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
                     binding: None,
                     max_payload_bytes: 0,
                     timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
-                    http_protocol: None,
+                    http_hook_version: None,
                 });
                 continue;
             };
@@ -1878,8 +1880,9 @@ impl ChainRunner {
                 unbound.push(entry);
                 continue;
             };
-            let http_protocol = operation_http_protocol(binding.operation);
-            if http_protocol == Some(HttpProtocol::V2) && entry.on_error == OnError::FailOpen {
+            let http_hook_version = operation_http_hook_version(binding.operation);
+            if http_hook_version == Some(HttpHookVersion::V2) && entry.on_error == OnError::FailOpen
+            {
                 self.warn_fail_open_not_applied(&entry);
             }
             let timeout = state.timeout_for_binding(&binding)?;
@@ -1897,7 +1900,7 @@ impl ChainRunner {
                 binding: Some(binding),
                 max_payload_bytes,
                 timeout,
-                http_protocol,
+                http_hook_version,
             });
         }
         ensure_chain_capacity(described_entries.len())?;
@@ -1907,11 +1910,11 @@ impl ChainRunner {
         })
     }
 
-    /// HTTP protocol of a registered middleware, without a network call. See
-    /// [`MiddlewareRegistry::http_protocol_of`].
+    /// HTTP hook version of a registered middleware, without a network call. See
+    /// [`MiddlewareRegistry::http_hook_version_of`].
     #[must_use]
-    pub fn http_protocol_of(&self, implementation: &str) -> Option<HttpProtocol> {
-        self.registry.http_protocol_of(implementation)
+    pub fn http_hook_version_of(&self, implementation: &str) -> Option<HttpHookVersion> {
+        self.registry.http_hook_version_of(implementation)
     }
 
     /// See [`MiddlewareRegistry::decides_uninspectable_traffic`].
@@ -1921,8 +1924,8 @@ impl ChainRunner {
     }
 
     /// Warn once per policy config that its `fail_open` does not apply to an
-    /// HTTP protocol 2 service. The gateway rejects such policies, but one
-    /// stored before the service moved to HTTP protocol 2 still loads.
+    /// v2 HTTP hook service. The gateway rejects such policies, but one
+    /// stored before the service moved to v2 HTTP hooks still loads.
     fn warn_fail_open_not_applied(&self, entry: &ChainEntry) {
         let key = format!("{}\0{}", entry.name, entry.implementation);
         let first = self
@@ -1935,7 +1938,7 @@ impl ChainRunner {
             tracing::warn!(
                 config = %entry.name,
                 middleware = %entry.implementation,
-                "middleware config sets on_error: fail_open, but its service runs HTTP protocol 2, which always fails closed; HTTP traffic fails closed"
+                "middleware config sets on_error: fail_open, but its service runs v2 HTTP hooks, which always fails closed; HTTP traffic fails closed"
             );
         }
     }
@@ -2036,16 +2039,16 @@ impl ChainRunner {
         admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
-        // This engine runs HTTP protocol 1 only. A chain with an HTTP protocol
-        // 2 entry runs on the protocol 2 pipeline; one that reaches here mixes
-        // both protocols and fails closed.
+        // This engine runs v1 HTTP hooks only. A chain with a v2 HTTP hook
+        // entry runs on the v2 pipeline; one that reaches here mixes both
+        // hook versions and fails closed.
         if let Some(entry) = entries
             .iter()
-            .find(|entry| entry.http_protocol() == Some(HttpProtocol::V2))
+            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::V2))
         {
             return Ok(ChainOutcome {
                 allowed: false,
-                reason: format!("middleware_failed: {MIDDLEWARE_PROTOCOL_MIXED}"),
+                reason: format!("middleware_failed: {MIDDLEWARE_HOOK_VERSIONS_MIXED}"),
                 body: input.body,
                 header_mutations: Vec::new(),
                 findings: Vec::new(),
@@ -3151,7 +3154,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -3161,7 +3164,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn evaluate_web_socket_session(
@@ -3232,7 +3235,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -3242,7 +3245,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn evaluate_web_socket_session(
@@ -3317,7 +3320,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -3327,7 +3330,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn evaluate_web_socket_session(
@@ -3613,7 +3616,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -3623,7 +3626,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn evaluate_web_socket_session(
@@ -3760,7 +3763,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -3770,7 +3773,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn evaluate_web_socket_session(
@@ -5626,7 +5629,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         type EvaluateHttpResponseV2Stream = HttpResultStream;
@@ -5636,7 +5639,7 @@ mod tests {
             _request: Request<tonic::Streaming<HttpEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
         {
-            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+            Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
         async fn describe(

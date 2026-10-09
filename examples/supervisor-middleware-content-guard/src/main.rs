@@ -4,10 +4,10 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP middleware protocol 2
+//! response bodies through v2 HTTP hooks
 //! (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`), and in WebSocket
 //! text messages. Its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2` bindings are
-//! unknown to gateways and supervisors that predate HTTP protocol 2, so they
+//! unknown to gateways and supervisors that predate v2 HTTP hooks, so they
 //! refuse it at Describe.
 
 mod guard;
@@ -130,9 +130,9 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         _request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
-        // HTTP protocol 1. This service implements HTTP protocol 2 only.
+        // v1 HTTP hooks. This service implements v2 HTTP hooks only.
         Err(Status::unimplemented(
-            "content guard implements HTTP middleware protocol 2 only",
+            "content guard implements v2 HTTP hooks only",
         ))
     }
 
@@ -178,7 +178,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn manifest_advertises_http_protocol_2_and_websocket_bindings() {
+    async fn manifest_advertises_v2_http_hook_and_websocket_bindings() {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest {

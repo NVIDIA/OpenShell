@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP middleware protocol 2 (`EvaluateHttpRequestV2` and
-//! `EvaluateHttpResponseV2`).
+//! v2 HTTP hooks (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`).
 //!
-//! HTTP protocol 1 keeps its own engines. A chain runs on exactly one
-//! protocol: every selected entry for one HTTP message must use the same
-//! protocol, and a chain that mixes them fails closed with
-//! [`MIDDLEWARE_PROTOCOL_MIXED`].
+//! v1 HTTP hooks keep their own engines. A chain runs on exactly one hook
+//! version: every selected entry for one HTTP message must use the same
+//! version, and a chain that mixes them fails closed with
+//! [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
 
 mod pipeline;
 mod request;
@@ -23,7 +22,7 @@ pub use pipeline::{
     HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput, HttpBodyOutput,
     HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, HttpStageInvocation,
     HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT,
-    MIDDLEWARE_PROTOCOL_MIXED,
+    MIDDLEWARE_HOOK_VERSIONS_MIXED,
 };
 pub use request::{
     HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
@@ -35,37 +34,37 @@ pub use response::{
 pub use uninspectable::{UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput};
 
 use crate::{
-    DescribedChainEntry, HttpProtocol, MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_HEADER_BYTES,
-    MAX_MIDDLEWARE_HEADERS, MAX_MIDDLEWARE_TARGET_BYTES,
+    DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CONTEXT_BYTES,
+    MAX_MIDDLEWARE_HEADER_BYTES, MAX_MIDDLEWARE_HEADERS, MAX_MIDDLEWARE_TARGET_BYTES,
 };
 
-/// HTTP protocol a described chain runs on.
+/// HTTP hook version a described chain runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChainHttpProtocol {
-    /// Every resolved entry uses HTTP protocol 1, or the chain is empty. The
-    /// chain runs on the HTTP protocol 1 engines, unchanged.
+pub enum ChainHttpHookVersion {
+    /// Every resolved entry uses v1 HTTP hooks, or the chain is empty. The
+    /// chain runs on the v1 HTTP hook engines, unchanged.
     V1,
-    /// At least one entry uses HTTP protocol 2 and none uses HTTP protocol 1.
+    /// At least one entry uses v2 HTTP hooks and none uses v1 HTTP hooks.
     V2,
-    /// Resolved HTTP protocol 1 and HTTP protocol 2 entries select the same
-    /// message. The message fails closed with [`MIDDLEWARE_PROTOCOL_MIXED`].
+    /// Resolved v1 and v2 HTTP hook entries select the same
+    /// message. The message fails closed with [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
     Mixed,
 }
 
 /// Classify a chain described for one HTTP operation by its resolved
 /// entries. An unresolved entry follows its `on_error` on either path.
 #[must_use]
-pub fn chain_http_protocol(entries: &[DescribedChainEntry]) -> ChainHttpProtocol {
+pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHookVersion {
     let v2 = entries
         .iter()
-        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2));
+        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::V2));
     let v1 = entries
         .iter()
-        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V1));
+        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::V1));
     match (v1, v2) {
-        (true, true) => ChainHttpProtocol::Mixed,
-        (false, true) => ChainHttpProtocol::V2,
-        _ => ChainHttpProtocol::V1,
+        (true, true) => ChainHttpHookVersion::Mixed,
+        (false, true) => ChainHttpHookVersion::V2,
+        _ => ChainHttpHookVersion::V1,
     }
 }
 

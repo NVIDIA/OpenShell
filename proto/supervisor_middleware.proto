@@ -19,18 +19,18 @@ service SupervisorMiddleware {
   // ValidateConfig checks service-specific configuration for one binding.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
-  // HTTP protocol 1. Deprecated: removed in 0.2.0; use EvaluateHttpRequestV2.
+  // v1 HTTP hooks. Deprecated: removed in 0.2.0; use EvaluateHttpRequestV2.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request. OpenShell calls it for HTTP_REQUEST bindings.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 
-  // HTTP protocol 2 for HTTP_REQUEST_V2 bindings. One stream per request and
+  // v2 HTTP hooks for HTTP_REQUEST_V2 bindings. One stream per request and
   // middleware stage, or per connection OpenShell cannot inspect. The first
   // event is a preflight whose subject is a request or uninspectable
   // traffic.
   rpc EvaluateHttpRequestV2(stream HttpEvent) returns (stream HttpResult);
 
-  // HTTP protocol 2 for HTTP_RESPONSE_V2 bindings. One stream per response
+  // v2 HTTP hooks for HTTP_RESPONSE_V2 bindings. One stream per response
   // and middleware stage. The first event is a preflight whose subject is a
   // response.
   rpc EvaluateHttpResponseV2(stream HttpEvent) returns (stream HttpResult);
@@ -55,7 +55,7 @@ message MiddlewareDescribeRequest {
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox.
 service HttpResponsePreReturn {
-  // HTTP protocol 1. Deprecated: removed in 0.2.0; use
+  // v1 HTTP hooks. Deprecated: removed in 0.2.0; use
   // SupervisorMiddleware.EvaluateHttpResponseV2.
   // Evaluate starts with preflight and may continue with selected body units
   // and trailers. A body unit marked end_of_stream ends body inspection, not
@@ -120,7 +120,7 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// HTTP protocol 2. One ordered event in an EvaluateHttpRequestV2 or
+// v2 HTTP hooks. One ordered event in an EvaluateHttpRequestV2 or
 // EvaluateHttpResponseV2 stream. Preflight is always first. An inspect result
 // is followed by begin and exactly one body lifecycle: buffered_body for
 // BUFFERED, or input_chunk events ending with input_end for STREAM.
@@ -136,7 +136,7 @@ message HttpEvent {
   }
 }
 
-// HTTP protocol 2. One ordered result in an EvaluateHttpRequestV2 or
+// v2 HTTP hooks. One ordered result in an EvaluateHttpRequestV2 or
 // EvaluateHttpResponseV2 stream. Preflight requires preflight_result or
 // reject. BUFFERED ends with buffered_result or reject. STREAM sends
 // output_start before any output_chunk and ends with finish or reject. An
@@ -161,7 +161,7 @@ message HttpResult {
   }
 }
 
-// HTTP protocol 2 body lifecycle a stage selects at preflight.
+// v2 HTTP hooks body lifecycle a stage selects at preflight.
 enum HttpBodyMode {
   HTTP_BODY_MODE_UNSPECIFIED = 0;
   // One complete body and one terminal result. OpenShell holds the body in
@@ -231,7 +231,7 @@ message UninspectableTraffic {
   UninspectableTrafficReason reason = 4;
 }
 
-// HTTP protocol 2 preflight for one stage: what is evaluated, the body modes
+// v2 HTTP hook preflight for one stage: what is evaluated, the body modes
 // offered, and limits.
 message HttpPreflight {
   oneof subject {
@@ -435,7 +435,7 @@ message MiddlewareDiagnostics {
   map<string, string> metadata = 4;
 }
 
-// HTTP protocol 1. Deprecated: removed in 0.2.0.
+// v1 HTTP hooks. Deprecated: removed in 0.2.0.
 // HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
   // Evaluation phase selected for this request.
@@ -468,7 +468,7 @@ message HttpHeader {
   string value = 2;
 }
 
-// HTTP protocol 1. Deprecated: removed in 0.2.0.
+// v1 HTTP hooks. Deprecated: removed in 0.2.0.
 // One ordered response event. A stream starts with preflight, may continue with
 // body units ending in end_of_stream, may then include trailers, and may end
 // with one best-effort session_end.
@@ -485,7 +485,7 @@ message HttpResponseEvent {
   }
 }
 
-// HTTP protocol 1. Deprecated: removed in 0.2.0.
+// v1 HTTP hooks. Deprecated: removed in 0.2.0.
 // Each preflight, body, and trailers event requires one ordered result.
 // session_end has no result.
 message HttpResponseEventResult {
@@ -788,19 +788,19 @@ message MiddlewareExchangeProtocolError {}
 // Supervisor operation selected for middleware evaluation.
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
-  // HTTP protocol 1 (EvaluateHttpRequest). Deprecated: removed in 0.2.0; use
+  // v1 HTTP hooks (EvaluateHttpRequest). Deprecated: removed in 0.2.0; use
   // HTTP_REQUEST_V2.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
-  // HTTP protocol 1 (HttpResponsePreReturn.Evaluate). Deprecated: removed in
+  // v1 HTTP hooks (HttpResponsePreReturn.Evaluate). Deprecated: removed in
   // 0.2.0; use HTTP_RESPONSE_V2.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;
-  // HTTP protocol 2 (EvaluateHttpRequestV2) for requests, at PRE_CREDENTIALS. Peers
-  // that predate HTTP protocol 2 reject this operation at Describe. A service
-  // implements one HTTP protocol, so it cannot also bind HTTP_REQUEST or
+  // v2 HTTP hooks (EvaluateHttpRequestV2) for requests, at PRE_CREDENTIALS. Peers
+  // that predate v2 HTTP hooks reject this operation at Describe. A service
+  // implements one HTTP hook version, so it cannot also bind HTTP_REQUEST or
   // HTTP_RESPONSE.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST_V2 = 4;
-  // HTTP protocol 2 (EvaluateHttpResponseV2) for responses, at PRE_RETURN.
+  // v2 HTTP hooks (EvaluateHttpResponseV2) for responses, at PRE_RETURN.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE_V2 = 5;
 }
 
@@ -1028,7 +1028,7 @@ message HeaderMutation {
   }
 }
 
-// HTTP protocol 1. Deprecated: removed in 0.2.0.
+// v1 HTTP hooks. Deprecated: removed in 0.2.0.
 // HttpRequestResult contains the decision and optional request mutations.
 message HttpRequestResult {
   // Allow or deny decision for this request.

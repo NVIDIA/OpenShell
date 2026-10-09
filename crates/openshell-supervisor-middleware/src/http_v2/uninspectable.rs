@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP protocol 2 decisions about traffic `OpenShell` cannot inspect.
+//! v2 HTTP hook decisions about traffic `OpenShell` cannot inspect.
 //!
 //! A connection that selects middleware but cannot be shown to it as HTTP
 //! messages (`tls: skip`, h2c, unsupported tunnels, raw TCP, SQL passthrough)
@@ -9,7 +9,7 @@
 //! service binds `HTTP_REQUEST_V2`, in chain order, with an uninspectable
 //! preflight. Each stage continues, which allows the connection, or rejects
 //! it. Any failure or timeout denies.
-//! Other entries keep the HTTP protocol 1 rule: `fail_open` lets the
+//! Other entries keep the v1 HTTP hook rule: `fail_open` lets the
 //! connection through with a finding, `fail_closed` denies it.
 
 use openshell_core::proto::{
@@ -22,7 +22,7 @@ use super::pipeline::{
     PipelineTimeouts, StageHead,
 };
 use crate::{
-    ChainEntry, ChainRunner, DescribedChainEntry, HttpProtocol, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
+    ChainEntry, ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
     MiddlewareDenial, MiddlewareWorkAdmissionOutcome, NamespacedFinding, OnError,
     sort_chain_entries, uninspectable_traffic_binding,
 };
@@ -44,10 +44,10 @@ pub struct UninspectableTrafficInput {
 pub struct UninspectableInvocation {
     pub config_name: String,
     pub implementation: String,
-    /// `Continue`, `Reject`, or `FailClosed` for an HTTP protocol 2 stage;
+    /// `Continue`, `Reject`, or `FailClosed` for a v2 HTTP hook stage;
     /// `FailOpen` or `FailClosed` for another entry, by its `on_error`.
     pub outcome: HttpStageOutcome,
-    pub http_protocol: Option<HttpProtocol>,
+    pub http_hook_version: Option<HttpHookVersion>,
     pub reason_code: Option<String>,
     /// Platform-owned failure reason.
     pub failure_reason: Option<String>,
@@ -60,7 +60,7 @@ pub struct UninspectableOutcome {
     /// Platform-owned reason for a denial: `middleware_denied:<config>[:<code>]`
     /// for a rejection, `middleware_failed: <reason>` otherwise.
     pub reason: String,
-    /// Present only when an HTTP protocol 2 stage rejected the connection.
+    /// Present only when a v2 HTTP hook stage rejected the connection.
     pub denial: Option<MiddlewareDenial>,
     /// One record per evaluated entry, in chain order.
     pub invocations: Vec<UninspectableInvocation>,
@@ -113,7 +113,7 @@ impl ChainRunner {
         let mut work = None;
         for entry in entries {
             if !self.decides_uninspectable_traffic(&entry.implementation) {
-                let protocol = self.http_protocol_of(&entry.implementation);
+                let protocol = self.http_hook_version_of(&entry.implementation);
                 let failed_open = entry.on_error == OnError::FailOpen;
                 outcome.invocations.push(UninspectableInvocation {
                     config_name: entry.name.clone(),
@@ -123,7 +123,7 @@ impl ChainRunner {
                     } else {
                         HttpStageOutcome::FailClosed
                     },
-                    http_protocol: protocol,
+                    http_hook_version: protocol,
                     reason_code: None,
                     failure_reason: Some("traffic_uninspectable".to_string()),
                 });
@@ -189,7 +189,7 @@ impl ChainRunner {
             binding: Some(binding),
             max_payload_bytes: 0,
             timeout,
-            http_protocol: Some(HttpProtocol::V2),
+            http_hook_version: Some(HttpHookVersion::V2),
         })
     }
 }
@@ -208,7 +208,7 @@ fn failed(entry: &ChainEntry, reason: &str) -> UninspectableInvocation {
         config_name: entry.name.clone(),
         implementation: entry.implementation.clone(),
         outcome: HttpStageOutcome::FailClosed,
-        http_protocol: Some(HttpProtocol::V2),
+        http_hook_version: Some(HttpHookVersion::V2),
         reason_code: None,
         failure_reason: Some(reason.to_string()),
     }
@@ -219,7 +219,7 @@ fn record(invocation: HttpStageInvocation) -> UninspectableInvocation {
         config_name: invocation.config_name,
         implementation: invocation.implementation,
         outcome: invocation.outcome,
-        http_protocol: Some(HttpProtocol::V2),
+        http_hook_version: Some(HttpHookVersion::V2),
         reason_code: invocation.reason_code,
         failure_reason: invocation.failure_reason,
     }
