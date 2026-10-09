@@ -1085,13 +1085,36 @@ enum UploadSource {
 }
 
 fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()> {
+    let skipped = build_upload_archive(writer, source)?;
+    if !skipped.is_empty() {
+        eprintln!(
+            "\u{26a0} {} path{} skipped due to permission errors",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+/// Builds the upload tar archive, returning the local paths that were skipped
+/// because they could not be accessed (permission denied).  Skipping keeps a
+/// broad directory upload (e.g. `$HOME`) from aborting all-or-nothing when the
+/// tree contains OS-protected paths (such as macOS TCC-restricted directories).
+fn build_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<Vec<PathBuf>> {
     let mut archive = tar::Builder::new(writer);
+    let mut skipped = Vec::new();
     match source {
         UploadSource::SinglePath {
             local_path,
             tar_name,
         } => {
-            append_upload_path(&mut archive, &local_path, Path::new(&tar_name), false)?;
+            append_upload_path(
+                &mut archive,
+                &local_path,
+                Path::new(&tar_name),
+                false,
+                &mut skipped,
+            )?;
         }
         UploadSource::FileList {
             base_dir,
@@ -1103,12 +1126,22 @@ fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()>
                 let archive_path = archive_prefix
                     .as_ref()
                     .map_or_else(|| PathBuf::from(file), |prefix| prefix.join(file));
-                append_upload_path(&mut archive, &full_path, &archive_path, true)?;
+                append_upload_path(&mut archive, &full_path, &archive_path, true, &mut skipped)?;
             }
         }
     }
     archive.finish().into_diagnostic()?;
-    Ok(())
+    Ok(skipped)
+}
+
+/// Records and warns about a local path skipped during upload packing because
+/// it could not be accessed (permission denied).
+fn warn_skipped_inaccessible(local_path: &Path, skipped: &mut Vec<PathBuf>) {
+    eprintln!(
+        "\u{26a0} skipping (permission denied): {}",
+        local_path.display()
+    );
+    skipped.push(local_path.to_path_buf());
 }
 
 fn append_upload_path<W: Write>(
@@ -1116,10 +1149,15 @@ fn append_upload_path<W: Write>(
     local_path: &Path,
     archive_path: &Path,
     skip_missing: bool,
+    skipped: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let metadata = match fs::symlink_metadata(local_path) {
         Ok(metadata) => metadata,
         Err(err) if skip_missing && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            warn_skipped_inaccessible(local_path, skipped);
+            return Ok(());
+        }
         Err(err) => {
             return Err(err)
                 .into_diagnostic()
@@ -1147,7 +1185,7 @@ fn append_upload_path<W: Write>(
                     archive_path.display()
                 )
             })?;
-        append_upload_dir_contents(archive, local_path, archive_path)?;
+        append_upload_dir_contents(archive, local_path, archive_path, skipped)?;
         return Ok(());
     }
 
@@ -1172,10 +1210,23 @@ fn append_upload_dir_contents<W: Write>(
     archive: &mut tar::Builder<W>,
     local_path: &Path,
     archive_path: &Path,
+    skipped: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(local_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?
+    let read_dir = match fs::read_dir(local_path) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            warn_skipped_inaccessible(local_path, skipped);
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to read directory {}", local_path.display())
+                });
+        }
+    };
+    let mut entries = read_dir
         .collect::<std::io::Result<Vec<_>>>()
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?;
@@ -1184,7 +1235,7 @@ fn append_upload_dir_contents<W: Write>(
     for entry in entries {
         let child_local_path = entry.path();
         let child_archive_path = archive_path.join(entry.file_name());
-        append_upload_path(archive, &child_local_path, &child_archive_path, false)?;
+        append_upload_path(archive, &child_local_path, &child_archive_path, false, skipped)?;
     }
 
     Ok(())
@@ -3532,6 +3583,126 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[cfg(unix)]
+    fn archive_entry_paths(bytes: &[u8]) -> Vec<String> {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        let mut paths = archive
+            .entries()
+            .expect("read archive entries")
+            .map(|entry| {
+                entry
+                    .expect("read archive entry")
+                    .path()
+                    .expect("read archive path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    // Skips a subdirectory whose listing is denied (read_dir -> EPERM), so a
+    // broad upload succeeds and packs the rest instead of aborting. Mirrors
+    // macOS TCC-protected directories like ~/.Trash under a $HOME upload.
+    #[cfg(unix)]
+    #[test]
+    fn single_directory_archive_skips_read_dir_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        fs::create_dir_all(source.join("readable")).expect("create dirs");
+        fs::write(source.join("readable/file.txt"), "file").expect("write file");
+        let locked = source.join("locked");
+        fs::create_dir_all(&locked).expect("create locked dir");
+        fs::write(locked.join("secret.txt"), "secret").expect("write secret");
+        // Deny listing of the locked directory -> read_dir returns EPERM.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        // Permission checks are not enforced for root; skip rather than fail.
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
+            return;
+        }
+
+        let mut bytes = Vec::new();
+        let skipped = build_upload_archive(
+            &mut bytes,
+            UploadSource::SinglePath {
+                local_path: source.clone(),
+                tar_name: "source-dir".into(),
+            },
+        )
+        .expect("build upload archive");
+
+        // Restore permissions so the tempdir can be cleaned up.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore chmod");
+
+        let paths = archive_entry_paths(&bytes);
+        assert!(
+            paths.iter().any(|path| path == "source-dir/readable/file.txt"),
+            "readable content should still be packed: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path == "source-dir/locked/secret.txt"),
+            "contents of the inaccessible directory must not be packed: {paths:?}"
+        );
+        assert_eq!(skipped, vec![locked]);
+    }
+
+    // Skips an entry whose metadata (lstat) is denied because its parent lacks
+    // search permission (symlink_metadata -> EPERM), while still packing its
+    // readable siblings.
+    #[cfg(unix)]
+    #[test]
+    fn single_directory_archive_skips_symlink_metadata_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::write(source.join("visible.txt"), "visible").expect("write file");
+        let noexec = source.join("noexec");
+        fs::create_dir_all(noexec.join("inner")).expect("create inner");
+        fs::write(noexec.join("inner/child.txt"), "child").expect("write child");
+        // Readable (so "inner" is listed) but not searchable, so lstat of the
+        // child entry fails with EPERM.
+        fs::set_permissions(&noexec, fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        // Permission checks are not enforced for root; skip rather than fail.
+        if fs::symlink_metadata(noexec.join("inner")).is_ok() {
+            fs::set_permissions(&noexec, fs::Permissions::from_mode(0o755)).ok();
+            return;
+        }
+
+        let mut bytes = Vec::new();
+        let skipped = build_upload_archive(
+            &mut bytes,
+            UploadSource::SinglePath {
+                local_path: source.clone(),
+                tar_name: "source-dir".into(),
+            },
+        )
+        .expect("build upload archive");
+
+        // Restore permissions so the tempdir can be cleaned up.
+        fs::set_permissions(&noexec, fs::Permissions::from_mode(0o755)).expect("restore chmod");
+
+        let paths = archive_entry_paths(&bytes);
+        assert!(
+            paths.iter().any(|path| path == "source-dir/visible.txt"),
+            "readable sibling should still be packed: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path == "source-dir/noexec/inner/child.txt"),
+            "contents under the stat-denied entry must not be packed: {paths:?}"
+        );
+        assert_eq!(skipped, vec![noexec.join("inner")]);
     }
 
     #[test]
