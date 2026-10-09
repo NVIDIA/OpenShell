@@ -149,8 +149,10 @@ compatibility baseline for the v1beta1 Sandbox API. It does not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
-The `ubuntu-k3s` lane registers the gateway's ClusterIP Service directly, so
-recreating the Service requires reprovisioning the fixture. Before conformance,
+The `ubuntu-k3s` lanes register the gateway's ClusterIP Service directly, so
+recreating the Service requires reprovisioning the fixture. The `k3s-ha-tls`
+lane runs the same conformance suite against three gateway replicas sharing
+PostgreSQL, with the CLI connecting over mTLS. Before conformance,
 every installer waits up to five minutes for a connected gateway; interactive
 shells skip the wait. K3s failures upload diagnostics as `tmachine-diagnostics-*`
 artifacts.
