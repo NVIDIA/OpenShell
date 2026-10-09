@@ -43,8 +43,13 @@ collect() {
   collect 'Endpoint readiness' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get endpointslices \
     -o 'custom-columns=NAME:.metadata.name,PORTS:.ports,ADDRESSES:.endpoints[*].addresses,CONDITIONS:.endpoints[*].conditions'
   collect 'Gateway events' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get events --sort-by=.lastTimestamp
-  collect 'Gateway current logs' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs openshell-0 -c openshell-gateway --tail=300 --timestamps
-  collect 'Gateway previous logs' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs openshell-0 -c openshell-gateway --previous --tail=300 --timestamps
+  # Gateway Pods are named by a StatefulSet or a Deployment, depending on the installer.
+  mapfile -t gateway_pods < <(timeout 10s /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get pods \
+    --selector app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell --output name 2>/dev/null)
+  for pod in "${gateway_pods[@]}"; do
+    collect "Gateway current logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway --tail=300 --timestamps
+    collect "Gateway previous logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell logs "$pod" -c openshell-gateway --previous --tail=300 --timestamps
+  done
   collect 'Memory' free -m
   collect 'Disk' df -h / /var/lib/rancher/k3s
 } | sed -E \

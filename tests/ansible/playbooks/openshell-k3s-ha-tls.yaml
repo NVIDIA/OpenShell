@@ -58,10 +58,13 @@
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
-    - name: Restart gateway forwarder after TLS upgrade
-      ansible.builtin.systemd_service:
-        name: openshell-k3s-port-forward.service
-        state: restarted
+    # The chart's server certificate covers the Service DNS name but not its
+    # ClusterIP, and the node resolver cannot reach cluster DNS.
+    - name: Resolve the gateway Service name to its ClusterIP
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '\sopenshell\.openshell\.svc\.cluster\.local$'
+        line: "{{ k3s_gateway_address.stdout.split(':')[0] }} openshell.openshell.svc.cluster.local"
 
     - name: Read chart client TLS Secret
       ansible.builtin.command:
@@ -99,12 +102,12 @@
         apply:
           become: false
       vars:
-        openshell_client_gateway_endpoint: https://localhost:17670
+        openshell_client_gateway_endpoint: "https://openshell.openshell.svc.cluster.local:{{ k3s_gateway_address.stdout.split(':')[1] }}"
 
     - name: Wait for authenticated gateway API
       become: false
       ansible.builtin.command:
-        argv: [/usr/local/bin/openshell, sandbox, list, --output, json]
+        argv: [timeout, 10s, /usr/local/bin/openshell, sandbox, list, --output, json]
       register: k3s_gateway_api
       until: k3s_gateway_api.rc == 0
       retries: 24
