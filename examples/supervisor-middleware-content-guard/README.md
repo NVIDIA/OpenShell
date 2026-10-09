@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This configured-literal guard applies the same case-sensitive terms to HTTP request bodies, HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
 
-The guard implements [HTTP middleware protocol 2](../../docs/extensibility/supervisor-middleware/http-protocol-2.mdx) (`EvaluateHttp`) only. Gateways and supervisors that predate HTTP protocol 2 do not know its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2` bindings, so they refuse it at startup. The example released with v0.1.2 is the HTTP protocol 1 reference.
+The guard implements [HTTP middleware protocol 2](../../docs/extensibility/supervisor-middleware/http-protocol-2.mdx) (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`) only. Gateways and supervisors that predate HTTP protocol 2 do not know its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2` bindings, so they refuse it at startup. The example released with v0.1.2 is the HTTP protocol 1 reference.
 
 > [!WARNING]
 > This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It matches case-sensitive literal bytes in HTTP bodies and WebSocket text messages, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client WebSocket messages, or adversarial inputs that a production content guard must handle.

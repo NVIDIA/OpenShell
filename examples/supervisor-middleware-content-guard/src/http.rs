@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP middleware protocol 2 (`EvaluateHttp`) for requests, responses, and
-//! uninspectable connections.
+//! HTTP middleware protocol 2 (`EvaluateHttpRequestV2` and
+//! `EvaluateHttpResponseV2`) for requests, responses, and uninspectable
+//! connections.
 //!
 //! The guard selects its configured body mode, BUFFERED by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
@@ -28,7 +29,9 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one `EvaluateHttp` exchange.
+/// Run one HTTP protocol 2 exchange. Both RPCs share this handler: the
+/// preflight subject says whether it is a request, a response, or traffic
+/// OpenShell cannot inspect.
 pub(crate) fn stage_stream<S>(mut events: S) -> HttpResultStream
 where
     S: Stream<Item = Result<HttpEvent, Status>> + Send + Unpin + 'static,

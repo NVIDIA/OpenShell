@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP middleware protocol 2 (`EvaluateHttp`).
+//! HTTP middleware protocol 2 (`EvaluateHttpRequestV2` and
+//! `EvaluateHttpResponseV2`).
 //!
 //! HTTP protocol 1 keeps its own engines. A chain runs on exactly one
 //! protocol: every selected entry for one HTTP message must use the same

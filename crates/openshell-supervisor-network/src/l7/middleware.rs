@@ -209,21 +209,20 @@ pub fn uninspectable_traffic_gate(
 
 /// Decide about traffic a matching middleware chain cannot inspect.
 ///
-/// A chain without HTTP protocol 2 entries keeps the HTTP protocol 1 rule of
-/// [`uninspectable_traffic_gate`]. Otherwise every HTTP protocol 2 entry
-/// decides at an uninspectable preflight, in chain order, and other entries
-/// follow their `on_error`. Any failure of an HTTP protocol 2 stage denies.
+/// A chain without an entry whose service binds `HTTP_REQUEST_V2` keeps the
+/// HTTP protocol 1 rule of [`uninspectable_traffic_gate`]. Otherwise each such
+/// entry decides at an uninspectable preflight, in chain order, and other
+/// entries follow their `on_error`. Any failure of a deciding stage denies.
 pub async fn uninspectable_traffic_decision(
     runner: &openshell_supervisor_middleware::ChainRunner,
     chain: &[openshell_supervisor_middleware::ChainEntry],
     ctx: &L7EvalContext,
     reason: openshell_core::proto::UninspectableTrafficReason,
 ) -> UninspectableTrafficGate {
-    let http_v2 = chain.iter().any(|entry| {
-        runner.http_protocol_of(&entry.implementation)
-            == Some(openshell_supervisor_middleware::HttpProtocol::V2)
-    });
-    if !http_v2 {
+    let decides = chain
+        .iter()
+        .any(|entry| runner.decides_uninspectable_traffic(&entry.implementation));
+    if !decides {
         return uninspectable_traffic_gate(chain);
     }
     let sandbox = openshell_ocsf::ctx::ctx();

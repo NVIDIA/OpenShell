@@ -3548,12 +3548,21 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
-        type EvaluateHttpStream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpRequestV2Stream = openshell_core::middleware::HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> std::result::Result<Response<Self::EvaluateHttpStream>, Status> {
+        ) -> std::result::Result<Response<Self::EvaluateHttpRequestV2Stream>, Status> {
+            Err(Status::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = openshell_core::middleware::HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> std::result::Result<Response<Self::EvaluateHttpResponseV2Stream>, Status> {
             Err(Status::unimplemented("HTTP protocol 1 test service"))
         }
 

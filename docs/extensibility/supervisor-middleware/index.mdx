@@ -53,7 +53,7 @@ Middleware can handle three operations: HTTP requests, HTTP responses, and the t
 
 - Middleware does not inspect WebSocket binary messages or messages that the external service sends to the agent.
 - Response middleware cannot inspect the body of compressed, partial, or `Cache-Control: no-transform` responses.
-- Middleware cannot inspect traffic to endpoints that use `tls: skip`, h2c, unsupported tunnels, raw TCP, or SQL passthrough. HTTP protocol 2 middleware can [allow or refuse](/extensibility/supervisor-middleware/http-protocol-2#uninspectable-traffic) such connections, but cannot see their content.
+- Middleware cannot inspect traffic to endpoints that use `tls: skip`, h2c, unsupported tunnels, raw TCP, or SQL passthrough. HTTP protocol 2 request middleware can [allow or refuse](/extensibility/supervisor-middleware/http-protocol-2#uninspectable-traffic) such connections, but cannot see their content.
 
 If your deployment requires inspection of this traffic, middleware cannot enforce that requirement today.
 

@@ -4745,12 +4745,23 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
-        type EvaluateHttpStream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpRequestV2Stream = openshell_core::middleware::HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpStream>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = openshell_core::middleware::HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -11513,7 +11524,7 @@ network_policies:
             Err(miette!("version 2 test middleware"))
         }
 
-        async fn open_http_stage(
+        async fn open_http_request_v2(
             &self,
             mut requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpEvent>,
         ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>

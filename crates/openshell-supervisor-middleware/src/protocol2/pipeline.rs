@@ -444,13 +444,26 @@ pub(super) async fn open_stage(
     let Some(service) = entry.service.as_ref() else {
         return Err(entry_failure(entry, "binding_not_described"));
     };
+    let is_response = matches!(
+        &event.event,
+        Some(http_event::Event::Preflight(HttpPreflight {
+            subject: Some(http_preflight::Subject::Response(_)),
+            ..
+        }))
+    );
     let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
     let opened = tokio::time::timeout_at(deadline, async {
         sender
             .send(event)
             .await
             .map_err(|_| tonic::Status::unavailable("middleware stage stream closed"))?;
-        let mut results = service.service.open_http_stage(receiver).await?;
+        // A response preflight uses EvaluateHttpResponseV2; a request or an
+        // uninspectable connection uses EvaluateHttpRequestV2.
+        let mut results = if is_response {
+            service.service.open_http_response_v2(receiver).await?
+        } else {
+            service.service.open_http_request_v2(receiver).await?
+        };
         let first = results.next().await;
         Ok::<_, tonic::Status>((results, first))
     })
@@ -1841,8 +1854,8 @@ fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMi
         // The stage says it cannot inspect this message. The reason never
         // carries the service's status text.
         tonic::Code::FailedPrecondition => entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT),
-        // The service does not implement EvaluateHttp, although its binding
-        // selected HTTP protocol 2.
+        // The service does not implement the HTTP protocol 2 RPC its binding
+        // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
         _ => entry_failure(entry, &diagnostic_policy(entry).error_reason(status)),
     }

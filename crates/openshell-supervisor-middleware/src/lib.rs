@@ -61,7 +61,8 @@ pub use openshell_core::middleware::{
 };
 pub type MiddlewareService = dyn SupervisorMiddleware<
         EvaluateWebSocketSessionStream = WebSocketResponseStream,
-        EvaluateHttpStream = HttpResultStream,
+        EvaluateHttpRequestV2Stream = HttpResultStream,
+        EvaluateHttpResponseV2Stream = HttpResultStream,
     >;
 
 struct GeneratedMiddlewareEndpoint {
@@ -218,11 +219,18 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         self.endpoint.open_http_response_pre_return(requests).await
     }
 
-    async fn open_http_stage(
+    async fn open_http_request_v2(
         &self,
         requests: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
-        self.endpoint.open_http_stage(requests).await
+        self.endpoint.open_http_request_v2(requests).await
+    }
+
+    async fn open_http_response_v2(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        self.endpoint.open_http_response_v2(requests).await
     }
 }
 
@@ -387,7 +395,8 @@ pub enum HttpProtocol {
     /// HTTP protocol 1 (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
     /// Removed in 0.2.0.
     V1,
-    /// HTTP protocol 2 (`EvaluateHttp`). Always fail-closed.
+    /// HTTP protocol 2 (`EvaluateHttpRequestV2`, `EvaluateHttpResponseV2`).
+    /// Always fail-closed.
     V2,
 }
 
@@ -442,6 +451,15 @@ fn manifest_http_protocol(manifest: &MiddlewareManifest) -> Option<HttpProtocol>
         .bindings
         .iter()
         .find_map(|binding| operation_http_protocol(binding.operation))
+}
+
+/// The `HTTP_REQUEST_V2` binding, whose `EvaluateHttpRequestV2` exchange also
+/// carries preflights for traffic `OpenShell` cannot inspect.
+fn uninspectable_traffic_binding(manifest: &MiddlewareManifest) -> Option<&MiddlewareBinding> {
+    manifest.bindings.iter().find(|binding| {
+        binding.operation == SupervisorMiddlewareOperation::HttpRequestV2 as i32
+            && binding.phase == SupervisorMiddlewarePhase::PreCredentials as i32
+    })
 }
 
 /// A service implements HTTP protocol 1 or HTTP protocol 2, never both.
@@ -786,13 +804,23 @@ impl MiddlewareDispatch {
         }
     }
 
-    async fn open_http_stage(
+    async fn open_http_request_v2(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
         match self {
-            Self::InProcess(service) => service.open_http_stage(receiver).await,
-            Self::Grpc(service) => service.open_http_stage(receiver).await,
+            Self::InProcess(service) => service.open_http_request_v2(receiver).await,
+            Self::Grpc(service) => service.open_http_request_v2(receiver).await,
+        }
+    }
+
+    async fn open_http_response_v2(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_response_v2(receiver).await,
+            Self::Grpc(service) => service.open_http_response_v2(receiver).await,
         }
     }
 }
@@ -1454,12 +1482,17 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// True when `implementation` runs HTTP protocol 2. The gateway uses it to
-    /// exempt such middleware from the `tls: skip` conflict rule: an HTTP
-    /// protocol 2 service decides about uninspectable traffic itself.
+    /// True when `implementation` binds `HTTP_REQUEST_V2`, whose exchange
+    /// also decides about traffic `OpenShell` cannot inspect. The gateway uses
+    /// it to exempt such middleware from the `tls: skip` conflict rule.
     #[must_use]
-    pub fn is_http_v2(&self, implementation: &str) -> bool {
-        self.http_protocol_of(implementation) == Some(HttpProtocol::V2)
+    pub fn decides_uninspectable_traffic(&self, implementation: &str) -> bool {
+        self.services.iter().any(|state| {
+            state.manifest.get().is_some_and(|manifest| {
+                ChainRunner::attachment_name(state, manifest) == implementation
+                    && uninspectable_traffic_binding(manifest).is_some()
+            })
+        })
     }
 
     /// Gateway rules for policies that use HTTP protocol 2 middleware.
@@ -1879,6 +1912,12 @@ impl ChainRunner {
     #[must_use]
     pub fn http_protocol_of(&self, implementation: &str) -> Option<HttpProtocol> {
         self.registry.http_protocol_of(implementation)
+    }
+
+    /// See [`MiddlewareRegistry::decides_uninspectable_traffic`].
+    #[must_use]
+    pub fn decides_uninspectable_traffic(&self, implementation: &str) -> bool {
+        self.registry.decides_uninspectable_traffic(implementation)
     }
 
     /// Warn once per policy config that its `fail_open` does not apply to an
@@ -3105,12 +3144,23 @@ mod tests {
     impl SupervisorMiddleware for ScriptedService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -3175,12 +3225,23 @@ mod tests {
     impl SupervisorMiddleware for SlowService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -3249,12 +3310,23 @@ mod tests {
     impl SupervisorMiddleware for TwoStageService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -3534,12 +3606,23 @@ mod tests {
     impl SupervisorMiddleware for RecordingService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -3670,12 +3753,23 @@ mod tests {
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 
@@ -5525,12 +5619,23 @@ mod tests {
     impl SupervisorMiddleware for OpenAiRedactionService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpStream = HttpResultStream;
+        type EvaluateHttpRequestV2Stream = HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        {
             Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
         }
 

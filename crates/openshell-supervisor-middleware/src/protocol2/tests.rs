@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::{
     ChainEntry, ChainRunner, HttpBodyInput, HttpBodyOutput, HttpRequestPreflightInput,
     HttpRequestView, HttpResultStream, HttpStageOutcome, InProcessMiddleware, MiddlewareRegistry,
-    OnError, TransformedBodyPolicy, validate_manifest_bindings,
+    OnError, TransformedBodyPolicy, UninspectableTrafficInput, validate_manifest_bindings,
 };
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
@@ -203,7 +203,7 @@ impl InProcessMiddleware for ScriptedStage {
         Err(miette::miette!("HTTP protocol 2 test stage"))
     }
 
-    async fn open_http_stage(
+    async fn open_http_request_v2(
         &self,
         mut events: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, tonic::Status> {
@@ -227,7 +227,10 @@ impl InProcessMiddleware for ScriptedStage {
                     Some(http_event::Event::Preflight(preflight_event)) => {
                         assert!(matches!(
                             preflight_event.subject,
-                            Some(http_preflight::Subject::Request(_))
+                            Some(
+                                http_preflight::Subject::Request(_)
+                                    | http_preflight::Subject::Uninspectable(_)
+                            )
                         ));
                         let buffered_limit = preflight_event
                             .limits
@@ -631,4 +634,75 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
             "example/a-late"
         ]
     );
+}
+
+/// HTTP protocol 2 service with only a response binding.
+struct ResponseOnlyStage;
+
+#[tonic::async_trait]
+impl InProcessMiddleware for ResponseOnlyStage {
+    async fn describe(&self) -> MiddlewareManifest {
+        MiddlewareManifest {
+            name: "example/response-only".into(),
+            ..manifest(vec![binding(SupervisorMiddlewareOperation::HttpResponseV2)])
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        _middleware_name: &str,
+        _config: &prost_types::Struct,
+    ) -> miette::Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: HttpRequestView<'_>,
+    ) -> miette::Result<HttpRequestResult> {
+        Err(miette::miette!("HTTP protocol 2 response-only test stage"))
+    }
+}
+
+#[tokio::test]
+async fn only_request_bindings_decide_about_uninspectable_traffic() {
+    let request_stage = Arc::new(ScriptedStage::new(
+        "example/request",
+        Preflight::Continue,
+        Body::Unchanged,
+    ));
+    let services: Vec<Arc<dyn InProcessMiddleware>> =
+        vec![request_stage, Arc::new(ResponseOnlyStage)];
+    let registry = MiddlewareRegistry::connect_services(services, Vec::new())
+        .await
+        .expect("registry");
+    assert!(registry.decides_uninspectable_traffic("example/request"));
+    assert!(!registry.decides_uninspectable_traffic("example/response-only"));
+
+    let runner = ChainRunner::from_registry(registry);
+    let input = || UninspectableTrafficInput {
+        context: RequestContext::default(),
+        host: "api.example.com".into(),
+        port: 443,
+        endpoint: "api".into(),
+        reason: openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+    };
+    let allowed = runner
+        .evaluate_uninspectable(&[chain_entry("example/request", 0)], input())
+        .await;
+    assert!(allowed.allowed, "{}", allowed.reason);
+
+    // A response-only service is never asked, so its fail-closed entry
+    // denies the connection.
+    let denied = runner
+        .evaluate_uninspectable(
+            &[
+                chain_entry("example/request", 0),
+                chain_entry("example/response-only", 1),
+            ],
+            input(),
+        )
+        .await;
+    assert!(!denied.allowed);
+    assert_eq!(denied.reason, "middleware_failed: traffic_uninspectable");
 }

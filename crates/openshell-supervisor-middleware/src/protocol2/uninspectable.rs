@@ -5,9 +5,10 @@
 //!
 //! A connection that selects middleware but cannot be shown to it as HTTP
 //! messages (`tls: skip`, h2c, unsupported tunnels, raw TCP, SQL passthrough)
-//! opens one `EvaluateHttp` exchange per selected HTTP protocol 2 stage, in
-//! chain order, with an uninspectable preflight. Each stage continues, which
-//! allows the connection, or rejects it. Any failure or timeout denies.
+//! opens one `EvaluateHttpRequestV2` exchange per selected stage whose
+//! service binds `HTTP_REQUEST_V2`, in chain order, with an uninspectable
+//! preflight. Each stage continues, which allows the connection, or rejects
+//! it. Any failure or timeout denies.
 //! Other entries keep the HTTP protocol 1 rule: `fail_open` lets the
 //! connection through with a finding, `fail_closed` denies it.
 
@@ -23,7 +24,7 @@ use super::pipeline::{
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpProtocol, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
     MiddlewareDenial, MiddlewareWorkAdmissionOutcome, NamespacedFinding, OnError,
-    operation_http_protocol, sort_chain_entries,
+    sort_chain_entries, uninspectable_traffic_binding,
 };
 
 /// A connection `OpenShell` cannot show to middleware as HTTP messages.
@@ -94,8 +95,9 @@ impl StageHead for UninspectableHead<'_> {
 
 impl ChainRunner {
     /// Decide whether an uninspectable connection that selects `entries` may
-    /// proceed. Every HTTP protocol 2 stage must continue; other entries
-    /// follow their `on_error`. Evaluation stops at the first denial.
+    /// proceed. Every entry whose service binds `HTTP_REQUEST_V2` must
+    /// continue; other entries follow their `on_error`. Evaluation stops at
+    /// the first denial.
     pub async fn evaluate_uninspectable(
         &self,
         entries: &[ChainEntry],
@@ -110,8 +112,8 @@ impl ChainRunner {
         let chain_deadline = tokio::time::Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
         let mut work = None;
         for entry in entries {
-            let protocol = self.http_protocol_of(&entry.implementation);
-            if protocol != Some(HttpProtocol::V2) {
+            if !self.decides_uninspectable_traffic(&entry.implementation) {
+                let protocol = self.http_protocol_of(&entry.implementation);
                 let failed_open = entry.on_error == OnError::FailOpen;
                 outcome.invocations.push(UninspectableInvocation {
                     config_name: entry.name.clone(),
@@ -169,8 +171,8 @@ impl ChainRunner {
         outcome
     }
 
-    /// Resolve an HTTP protocol 2 entry to its service for an uninspectable
-    /// preflight, using the timeout of its first HTTP binding.
+    /// Resolve an entry to its service for an uninspectable preflight, using
+    /// the timeout of its `HTTP_REQUEST_V2` binding.
     async fn describe_uninspectable_entry(
         &self,
         entry: &ChainEntry,
@@ -179,10 +181,7 @@ impl ChainRunner {
         let (state, manifest) = manifests.iter().find(|(state, manifest)| {
             Self::attachment_name(state, manifest) == entry.implementation
         })?;
-        let binding = *manifest
-            .bindings
-            .iter()
-            .find(|binding| operation_http_protocol(binding.operation) == Some(HttpProtocol::V2))?;
+        let binding = *uninspectable_traffic_binding(manifest)?;
         let timeout = state.timeout_for_binding(&binding).ok()?;
         Some(DescribedChainEntry {
             entry: entry.clone(),

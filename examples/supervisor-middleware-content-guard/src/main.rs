@@ -4,10 +4,11 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP middleware protocol 2 (`EvaluateHttp`), and
-//! in WebSocket text messages. Its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2`
-//! bindings are unknown to gateways and supervisors that predate HTTP
-//! protocol 2, so they refuse it at Describe.
+//! response bodies through HTTP middleware protocol 2
+//! (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`), and in WebSocket
+//! text messages. Its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2` bindings are
+//! unknown to gateways and supervisors that predate HTTP protocol 2, so they
+//! refuse it at Describe.
 
 mod guard;
 mod http;
@@ -62,7 +63,8 @@ fn http_binding(
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
     type EvaluateWebSocketSessionStream = WebSocketResponseStream;
-    type EvaluateHttpStream = HttpResultStream;
+    type EvaluateHttpRequestV2Stream = HttpResultStream;
+    type EvaluateHttpResponseV2Stream = HttpResultStream;
 
     async fn describe(
         &self,
@@ -134,10 +136,17 @@ impl SupervisorMiddleware for ContentGuard {
         ))
     }
 
-    async fn evaluate_http(
+    async fn evaluate_http_request_v2(
         &self,
         request: Request<tonic::Streaming<HttpEvent>>,
-    ) -> Result<Response<Self::EvaluateHttpStream>, Status> {
+    ) -> Result<Response<Self::EvaluateHttpRequestV2Stream>, Status> {
+        Ok(Response::new(http::stage_stream(request.into_inner())))
+    }
+
+    async fn evaluate_http_response_v2(
+        &self,
+        request: Request<tonic::Streaming<HttpEvent>>,
+    ) -> Result<Response<Self::EvaluateHttpResponseV2Stream>, Status> {
         Ok(Response::new(http::stage_stream(request.into_inner())))
     }
 

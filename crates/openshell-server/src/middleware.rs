@@ -260,11 +260,16 @@ mod tests {
         let conflicts = |middleware: &str| {
             openshell_policy::middleware_tls_skip_conflicts(
                 &tls_skip_policy(middleware),
-                |middleware| registry.is_http_v2(middleware),
+                |middleware| registry.decides_uninspectable_traffic(middleware),
             )
         };
 
         assert!(conflicts("example/guard").is_empty());
+        assert_eq!(
+            conflicts("example/response-guard").len(),
+            1,
+            "a response-only HTTP protocol 2 service is never asked about tls: skip tunnels"
+        );
         assert_eq!(
             conflicts(openshell_supervisor_middleware_builtins::BUILTIN_REGEX).len(),
             1,

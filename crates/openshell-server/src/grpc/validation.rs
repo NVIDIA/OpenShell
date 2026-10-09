@@ -1002,7 +1002,7 @@ pub(super) fn validate_policy_safety(
         .unwrap_or_default();
     violations.extend(openshell_policy::middleware_tls_skip_conflicts(
         policy,
-        |middleware| middleware_registry.is_http_v2(middleware),
+        |middleware| middleware_registry.decides_uninspectable_traffic(middleware),
     ));
     if !violations.is_empty() {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();

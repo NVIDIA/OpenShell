@@ -18,7 +18,7 @@ use crate::proto::{
 };
 
 /// Transport-neutral result stream for one HTTP protocol 2 exchange
-/// (`EvaluateHttp`).
+/// (`EvaluateHttpRequestV2` or `EvaluateHttpResponseV2`).
 pub type HttpResultStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
 
@@ -73,13 +73,23 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP protocol 2 exchange (`EvaluateHttp`).
-    async fn open_http_stage(
+    /// Open one HTTP protocol 2 request exchange (`EvaluateHttpRequestV2`).
+    async fn open_http_request_v2(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2",
+            "middleware does not implement HTTP protocol 2 requests",
+        ))
+    }
+
+    /// Open one HTTP protocol 2 response exchange (`EvaluateHttpResponseV2`).
+    async fn open_http_response_v2(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP protocol 2 responses",
         ))
     }
 }
@@ -296,16 +306,30 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP protocol 2 exchange (`EvaluateHttp`).
+    /// Open one HTTP protocol 2 request exchange (`EvaluateHttpRequestV2`),
+    /// for a request or for traffic `OpenShell` cannot inspect.
     ///
-    /// Implementations without HTTP protocol 2 bindings may keep the default
-    /// unsupported response.
-    async fn open_http_stage(
+    /// Implementations without an `HTTP_REQUEST_V2` binding may keep the
+    /// default unsupported response.
+    async fn open_http_request_v2(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP protocol 2",
+            "middleware does not implement HTTP protocol 2 requests",
+        ))
+    }
+
+    /// Open one HTTP protocol 2 response exchange (`EvaluateHttpResponseV2`).
+    ///
+    /// Implementations without an `HTTP_RESPONSE_V2` binding may keep the
+    /// default unsupported response.
+    async fn open_http_response_v2(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP protocol 2 responses",
         ))
     }
 }

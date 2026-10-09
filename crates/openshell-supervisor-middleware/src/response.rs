@@ -1245,12 +1245,21 @@ mod tests {
     {
         type EvaluateWebSocketSessionStream = super::super::WebSocketResponseStream;
 
-        type EvaluateHttpStream = super::super::HttpResultStream;
+        type EvaluateHttpRequestV2Stream = super::super::HttpResultStream;
 
-        async fn evaluate_http(
+        async fn evaluate_http_request_v2(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> Result<tonic::Response<Self::EvaluateHttpStream>, tonic::Status> {
+        ) -> Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+        }
+
+        type EvaluateHttpResponseV2Stream = super::super::HttpResultStream;
+
+        async fn evaluate_http_response_v2(
+            &self,
+            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status> {
             Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
         }
 

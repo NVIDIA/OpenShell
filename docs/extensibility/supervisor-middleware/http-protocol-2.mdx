@@ -4,17 +4,17 @@
 title: "HTTP Protocol 2"
 sidebar-title: "HTTP Protocol 2"
 slug: "extensibility/supervisor-middleware/http-protocol-2"
-description: "Build HTTP request and response middleware with the streaming EvaluateHttp contract, and migrate a service from HTTP protocol 1."
-keywords: "Supervisor Middleware, HTTP, EvaluateHttp, Streaming, Body Modes, Preflight, Uninspectable Traffic, Migration"
+description: "Build HTTP request and response middleware with the streaming EvaluateHttpRequestV2 and EvaluateHttpResponseV2 contract, and migrate a service from HTTP protocol 1."
+keywords: "Supervisor Middleware, HTTP, EvaluateHttpRequestV2, EvaluateHttpResponseV2, Streaming, Body Modes, Preflight, Uninspectable Traffic, Migration"
 ---
 
-HTTP protocol 2 is the middleware contract for HTTP requests and responses. Your service implements one bidirectional streaming RPC, `SupervisorMiddleware.EvaluateHttp`, for both directions. At preflight it decides whether to inspect the body, then receives the body either as one buffered piece or as a stream with no size limit. The same RPC lets your service decide about connections that OpenShell cannot inspect.
+HTTP protocol 2 is the middleware contract for HTTP requests and responses. Your service implements a bidirectional streaming RPC for each direction it binds: `SupervisorMiddleware.EvaluateHttpRequestV2` for requests and `SupervisorMiddleware.EvaluateHttpResponseV2` for responses. Both use the same event and result messages. At preflight your service decides whether to inspect the body, then receives the body either as one buffered piece or as a stream with no size limit. The request RPC also lets your service decide about connections that OpenShell cannot inspect.
 
 HTTP protocol 1, the `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate` RPCs described in [Supported Operations](/extensibility/supervisor-middleware/operations), still works and is deprecated for removal in 0.2.0. WebSocket middleware is the same under both protocols.
 
 ## Declare HTTP Protocol 2
 
-The binding operation selects the protocol. In your `Describe` manifest, declare `HTTP_REQUEST_V2` at `PRE_CREDENTIALS` for requests and `HTTP_RESPONSE_V2` at `PRE_RETURN` for responses. `HTTP_REQUEST` and `HTTP_RESPONSE` select HTTP protocol 1. Gateways and supervisors that predate HTTP protocol 2 do not know the new operations, so they refuse your service at startup instead of calling an HTTP protocol 1 RPC.
+The binding operation selects the protocol. In your `Describe` manifest, declare `HTTP_REQUEST_V2` at `PRE_CREDENTIALS` for requests, which OpenShell sends to `EvaluateHttpRequestV2`, and `HTTP_RESPONSE_V2` at `PRE_RETURN` for responses, which it sends to `EvaluateHttpResponseV2`. `HTTP_REQUEST` and `HTTP_RESPONSE` select HTTP protocol 1. Gateways and supervisors that predate HTTP protocol 2 do not know the new operations, so they refuse your service at startup instead of calling an HTTP protocol 1 RPC.
 
 A binding's `max_payload_bytes` limits the body your service inspects. A binding that sets it to `0` is offered no body modes, so it can only continue or reject.
 
@@ -22,7 +22,7 @@ A service implements one HTTP protocol. The gateway refuses a manifest that has 
 
 ## Exchange Lifecycle
 
-OpenShell opens one `EvaluateHttp` stream for each middleware stage and HTTP message, or uninspectable connection, so a request and its response use separate streams. The first event is always a preflight, and the rest of the exchange depends on the preflight result:
+OpenShell opens one stream for each middleware stage and HTTP message, or uninspectable connection, so a request and its response use separate streams. The first event is always a preflight, and the rest of the exchange depends on the preflight result:
 
 | OpenShell sends | Your service returns |
 | --- | --- |
@@ -97,11 +97,11 @@ A response uses `Content-Length` framing when its output declares a length, and 
 
 ## Uninspectable Traffic
 
-Some connections select middleware but cannot be shown to it as HTTP messages. For each HTTP protocol 2 entry that selects such a connection, OpenShell opens an `EvaluateHttp` exchange with an `uninspectable` preflight. The preflight carries the destination host and port, the network policy name, and one of these reasons: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
+Some connections select middleware but cannot be shown to it as HTTP messages. For each entry that selects such a connection and whose service binds `HTTP_REQUEST_V2`, OpenShell opens an `EvaluateHttpRequestV2` exchange with an `uninspectable` preflight. The preflight carries the destination host and port, the network policy name, and one of these reasons: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
 
-The preflight never permits a body mode. `continue_without_body` allows the connection, and `reject` refuses it. Header mutations, failures, and timeouts refuse it too. OpenShell evaluates entries in chain order and stops at the first denial. HTTP protocol 1 entries in the same chain follow their `on_error`.
+The preflight never permits a body mode. `continue_without_body` allows the connection, and `reject` refuses it. Header mutations, failures, and timeouts refuse it too. OpenShell evaluates entries in chain order and stops at the first denial. Other entries in the same chain, including HTTP protocol 1 entries and protocol 2 services that bind only `HTTP_RESPONSE_V2`, follow their `on_error`.
 
-Because HTTP protocol 2 middleware decides for itself, a policy can attach it to `tls: skip` endpoints. Supervisors released before HTTP protocol 2 reject such a policy, so recreate those sandboxes with a current supervisor first.
+Because HTTP protocol 2 request middleware decides for itself, a policy can attach it to `tls: skip` endpoints. Supervisors released before HTTP protocol 2 reject such a policy, so recreate those sandboxes with a current supervisor first.
 
 ## Failure Behavior
 

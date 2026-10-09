@@ -264,11 +264,11 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
 /// whose traffic no middleware can inspect.
 ///
 /// Middleware for which `decides_uninspectable` returns true, such as HTTP
-/// protocol 2 middleware, allows or refuses such connections at runtime and
-/// is exempt. [`validate`] does not run this rule because the exemption
-/// depends on the middleware's registered protocol; the gateway runs it with
-/// its registry. Whether or not the rule ran, a supervisor denies
-/// uninspectable traffic that a `fail_closed` entry cannot evaluate.
+/// protocol 2 request middleware, allows or refuses such connections at
+/// runtime and is exempt. [`validate`] does not run this rule because the
+/// exemption depends on the middleware's registered bindings; the gateway
+/// runs it with its registry. Whether or not the rule ran, a supervisor
+/// denies uninspectable traffic that a `fail_closed` entry cannot evaluate.
 pub fn tls_skip_conflicts(
     policy: &SandboxPolicy,
     decides_uninspectable: impl Fn(&str) -> bool,

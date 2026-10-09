@@ -32,11 +32,11 @@ For response failures, distinguish a deliberate `middleware_denied` decision fro
 
 ## HTTP protocol 2 failures
 
-HTTP protocol 2 (`EvaluateHttp`) always fails closed, and `on_error` does not apply. Map sandbox OCSF failure reasons as follows:
+HTTP protocol 2 (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`) always fails closed, and `on_error` does not apply. Map sandbox OCSF failure reasons as follows:
 
 - `middleware_protocol_mixed`: one request or response chain selected both protocol 1 and protocol 2 entries. The gateway rejects such policies, so look for a policy stored before a service changed protocol, and separate the selectors.
 - `middleware_cannot_inspect`: the service ended its stream with `FAILED_PRECONDITION`, usually because no body mode was offered (encoded, partial, no-transform, or oversized response).
-- `middleware_unimplemented`: the service declared protocol 2 bindings but does not implement `EvaluateHttp`.
+- `middleware_unimplemented`: the service declared protocol 2 bindings but does not implement the matching `EvaluateHttpRequestV2` or `EvaluateHttpResponseV2` RPC.
 - `middleware_body_timeout` or `middleware_stall_timeout`: a BUFFERED stage exceeded the 2-minute whole-body deadline, or a STREAM stage stalled for 30 seconds.
 - `408 Request Timeout` with `error: request_timeout`: the sandbox stopped sending a request body for 30 seconds while a STREAM stage held it. This is a client problem, not a middleware failure.
 
@@ -61,7 +61,7 @@ WebSocket message sequences are allocated session-wide; each stage receives a st
 | Gateway or middleware rejects its peer before serving health | Missing peer metadata, incompatible protocol major, or unmet `required_capabilities` | Gateway and middleware startup logs; compare `PeerMetadata`; legacy-to-current migration requires a coordinated gateway and middleware outage |
 | Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, fail-closed protocol 1 coverage of `tls: skip`, `fail_open` on an HTTP protocol 2 service, or overlapping selectors that use different HTTP protocols | Policy error, gateway logs, middleware `ValidateConfig`, selector, order, and `on_error` fields, service `Describe` binding operations |
 | Gateway fails with an HTTP protocol error after a middleware upgrade | Protocol 1 and protocol 2 HTTP bindings in one service, or a gateway that predates HTTP protocol 2 rejecting `HTTP_REQUEST_V2`/`HTTP_RESPONSE_V2` as an unsupported operation/phase pair | Service `Describe` manifest and gateway startup logs |
-| HTTP traffic fails with `middleware_protocol_mixed`, `middleware_cannot_inspect`, or `middleware_unimplemented` | HTTP protocol 2 chain failure; always fail-closed | Sandbox OCSF middleware events; policy selectors; service `EvaluateHttp` implementation and logs |
+| HTTP traffic fails with `middleware_protocol_mixed`, `middleware_cannot_inspect`, or `middleware_unimplemented` | HTTP protocol 2 chain failure; always fail-closed | Sandbox OCSF middleware events; policy selectors; service `EvaluateHttpRequestV2`/`EvaluateHttpResponseV2` implementation and logs |
 | Streaming upload returns `408 Request Timeout` | The sandbox paused a request body for 30 seconds while a STREAM stage held it | Client upload behavior; middleware OCSF event with `client_progress_timeout` |
 | HTTP request returns `middleware_failed` or `middleware_denied`, or WebSocket closes with `1008` | Selected stage failed or explicitly denied admitted traffic | Sandbox OCSF logs; policy-local middleware config; service availability; binding operation; `on_error` |
 | HTTP response becomes canonical `403 middleware_denied`, `502 response_delivery_failed`, or closes mid-body | Response middleware blocked, failed before commitment, or stopped delivery after commitment | Sandbox OCSF response middleware events; `HTTP_RESPONSE/PRE_RETURN` binding; `on_error`; `whole_body_accumulation_timeout`; service stream lifecycle |

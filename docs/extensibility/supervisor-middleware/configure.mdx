@@ -183,7 +183,7 @@ HTTP protocol 2 middleware always fails closed. The gateway rejects `fail_open` 
 
 A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
 
-`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an HTTP protocol 1 entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic. An HTTP protocol 2 entry can, because the service [decides](/extensibility/supervisor-middleware/http-protocol-2#uninspectable-traffic) whether to allow such connections.
+`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an HTTP protocol 1 entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic. An entry whose service binds `HTTP_REQUEST_V2` can, because the service [decides](/extensibility/supervisor-middleware/http-protocol-2#uninspectable-traffic) whether to allow such connections.
 
 ## Operate Middleware Services
 

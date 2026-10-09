@@ -119,12 +119,22 @@ impl GrpcMiddlewareService {
         self.service.open_http_response_pre_return(receiver).await
     }
 
-    /// Open a remote HTTP protocol 2 exchange through the gRPC adapter.
-    pub async fn open_http_stage(
+    /// Open a remote HTTP protocol 2 request exchange through the gRPC
+    /// adapter.
+    pub async fn open_http_request_v2(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
-        self.service.open_http_stage(receiver).await
+        self.service.open_http_request_v2(receiver).await
+    }
+
+    /// Open a remote HTTP protocol 2 response exchange through the gRPC
+    /// adapter.
+    pub async fn open_http_response_v2(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        self.service.open_http_response_v2(receiver).await
     }
 }
 
@@ -223,13 +233,27 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         Ok(Box::pin(responses))
     }
 
-    async fn open_http_stage(
+    async fn open_http_request_v2(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         let mut client = self.client.clone();
         let responses = client
-            .evaluate_http(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+            .evaluate_http_request_v2(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
+    }
+
+    async fn open_http_response_v2(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_http_response_v2(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?

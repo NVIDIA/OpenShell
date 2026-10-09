@@ -14,8 +14,8 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST_V2` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttp` |
-| `HTTP_RESPONSE_V2` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttp` |
+| `HTTP_REQUEST_V2` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttpRequestV2` |
+| `HTTP_RESPONSE_V2` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttpResponseV2` |
 | `HTTP_REQUEST` | `PRE_CREDENTIALS` | HTTP protocol 1 request inspection, deprecated for removal in 0.2.0. | `EvaluateHttpRequest` |
 | `HTTP_RESPONSE` | `PRE_RETURN` | HTTP protocol 1 response inspection, deprecated for removal in 0.2.0. | `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
