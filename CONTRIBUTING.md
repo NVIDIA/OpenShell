@@ -27,9 +27,9 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
    will close automatically.
-5. Once vouched, you can submit pull requests.
+5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
-**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.
+**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
 
 ### Finding Work
 
@@ -484,10 +484,17 @@ By making a contribution to this project, I certify that:
 ```
 
 ```bash
-git commit -s -m "feat(sandbox): add new capability"
+git commit --signoff --message "feat(sandbox): add new capability"
 ```
 
-DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
+
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+### PR testing checklist
+
+Only mark a checklist item as complete after you have run and verified it, not as a plan for what you intend to test. Unchecked boxes at submission are fine; they show what still needs verification before merge.
 
 ## CI
 
