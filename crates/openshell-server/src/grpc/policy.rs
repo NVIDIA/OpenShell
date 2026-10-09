@@ -74,7 +74,9 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
+};
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
     compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
@@ -309,6 +311,36 @@ fn emit_gateway_policy_auto_approve_audit_log(
         detail,
         version,
         policy_hash,
+        &extra,
+    ));
+}
+
+/// Actor recorded when the gateway rejects a chunk without a reviewer.
+const AUTO_REJECT_ACTOR: &str = "gateway:auto";
+
+/// Emit `CONFIG:REJECTED` once a chunk is durably rejected, whether a
+/// reviewer or the gateway decided. Unlike the sandbox `/wait` event, this
+/// fires whether or not anyone is watching the chunk.
+fn emit_gateway_policy_reject_audit_log(
+    sandbox: &Sandbox,
+    chunk: &DraftChunkRecord,
+    reason: &str,
+    actor: &str,
+) {
+    let summary = summarize_draft_chunk_rule(chunk)
+        .unwrap_or_else(|_| format!("rule_name:{}", chunk.rule_name));
+    let extra = [
+        ("chunk_id", chunk.id.clone()),
+        ("rejection_reason", sanitize_reason_for_audit(reason)),
+        ("actor", actor.to_string()),
+    ];
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
+        sandbox.object_id(),
+        sandbox.object_name(),
+        "rejected",
+        format!("gateway rejected draft chunk {}: {summary}", chunk.id),
+        0,
+        "",
         &extra,
     ));
 }
@@ -1313,7 +1345,7 @@ async fn refresh_pending_chunk_evaluation(
 /// failing this cleanup pass should not abort the submission flow.
 async fn supersede_other_pending_chunks_for_endpoint(
     state: &Arc<ServerState>,
-    sandbox_id: &str,
+    sandbox: &Sandbox,
     new_chunk_id: &str,
     host: &str,
     port: i32,
@@ -1324,6 +1356,7 @@ async fn supersede_other_pending_chunks_for_endpoint(
     if host.is_empty() || port == 0 || binary.is_empty() {
         return;
     }
+    let sandbox_id = sandbox.object_id();
 
     let pending = match state
         .store
@@ -1367,6 +1400,7 @@ async fn supersede_other_pending_chunks_for_endpoint(
                     binary = %binary,
                     "Auto-rejected pending chunk: superseded by newer submission for same (host, port, binary)"
                 );
+                emit_gateway_policy_reject_audit_log(sandbox, &other, &reason, AUTO_REJECT_ACTOR);
             }
             Err(err) => {
                 warn!(
@@ -1388,7 +1422,7 @@ async fn supersede_other_pending_chunks_for_endpoint(
 /// open for refinement. Only the mechanistic side is asymmetric.
 async fn self_reject_mechanistic_if_already_covered(
     state: &Arc<ServerState>,
-    sandbox_id: &str,
+    sandbox: &Sandbox,
     new_chunk_id: &str,
     host: &str,
     port: i32,
@@ -1397,6 +1431,7 @@ async fn self_reject_mechanistic_if_already_covered(
     if host.is_empty() || port == 0 || binary.is_empty() {
         return;
     }
+    let sandbox_id = sandbox.object_id();
 
     // `put_draft_chunk` dedups mechanistic submissions on `(host, port,
     // binary)` and returns the id of whatever row now owns that key. On a
@@ -1407,8 +1442,8 @@ async fn self_reject_mechanistic_if_already_covered(
     // this path never un-merges the rule (unlike the human reject handler),
     // the live policy would keep enforcing an access the ledger now reports as
     // revoked.
-    match state.store.get_draft_chunk(new_chunk_id).await {
-        Ok(Some(chunk)) if chunk.status == "pending" => {}
+    let incoming = match state.store.get_draft_chunk(new_chunk_id).await {
+        Ok(Some(chunk)) if chunk.status == "pending" => chunk,
         Ok(_) => return,
         Err(err) => {
             warn!(
@@ -1419,7 +1454,7 @@ async fn self_reject_mechanistic_if_already_covered(
             );
             return;
         }
-    }
+    };
 
     let approved = match state
         .store
@@ -1468,6 +1503,7 @@ async fn self_reject_mechanistic_if_already_covered(
                 binary = %binary,
                 "Auto-rejected incoming mechanistic chunk: endpoint already covered by an approved chunk"
             );
+            emit_gateway_policy_reject_audit_log(sandbox, &incoming, &reason, AUTO_REJECT_ACTOR);
         }
         Ok(false) => {
             info!(
@@ -5400,7 +5436,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // out the relationship by structural overlap.
         supersede_other_pending_chunks_for_endpoint(
             state,
-            &sandbox_id,
+            &sandbox,
             &effective_id,
             &record.host,
             record.port,
@@ -5417,7 +5453,7 @@ pub(super) async fn handle_submit_policy_analysis(
         if req.analysis_mode == "mechanistic" {
             self_reject_mechanistic_if_already_covered(
                 state,
-                &sandbox_id,
+                &sandbox,
                 &effective_id,
                 &record.host,
                 record.port,
@@ -5783,6 +5819,7 @@ async fn handle_reject_draft_chunk_inner(
         .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms), persisted_reason)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+    emit_gateway_policy_reject_audit_log(&sandbox, &chunk, &req.reason, &principal.audit_actor());
 
     state.sandbox_watch_bus.notify(&sandbox_id);
     if was_approved {
@@ -20042,8 +20079,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
+    /// Run `run` with a gateway OCSF JSONL log attached and return the events
+    /// it emitted. Needs the default current-thread test runtime, because the
+    /// subscriber is thread-local.
+    async fn capture_ocsf_jsonl<F: Future>(run: F) -> (F::Output, Vec<serde_json::Value>) {
         use tracing_subscriber::prelude::*;
 
         let directory = tempfile::tempdir().unwrap();
@@ -20054,8 +20093,23 @@ mod tests {
         ))
         .unwrap();
         let log = crate::ocsf_log::OcsfLog::start(config).unwrap();
-        let subscriber = tracing_subscriber::registry().with(log.layer());
-        tracing::subscriber::with_default(subscriber, || {
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.layer()));
+        let output = run.await;
+        drop(guard);
+        log.shutdown().await;
+
+        let events = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (output, events)
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
+        let ((), events) = capture_ocsf_jsonl(async {
             emit_gateway_policy_audit_log(
                 "sb-123",
                 "demo-sandbox",
@@ -20073,14 +20127,9 @@ mod tests {
                 "mechanistic",
                 "gateway",
             );
-        });
-        log.shutdown().await;
+        })
+        .await;
 
-        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
@@ -20092,6 +20141,172 @@ mod tests {
         assert_eq!(events[1]["unmapped"]["policy_hash"], "sha256:auto");
         assert_eq!(events[1]["unmapped"]["auto"], "true");
         assert_eq!(events[1]["unmapped"]["resolved_from"], "gateway");
+    }
+
+    async fn seed_ready_sandbox(state: &Arc<ServerState>, name: &str) {
+        use openshell_core::proto::{FilesystemPolicy, SandboxPhase, SandboxPolicy, SandboxSpec};
+
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("sb-{name}"),
+                name: name.to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    /// Submit one `curl` -> `example.com:8080` chunk and return its id.
+    async fn submit_example_chunk(
+        state: &Arc<ServerState>,
+        sandbox_name: &str,
+        analysis_mode: &str,
+    ) -> String {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint};
+
+        let submit = Box::pin(handle_submit_policy_analysis(
+            state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: analysis_mode.to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example_8080".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "allow_example_8080".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "example.com".to_string(),
+                            port: 8080,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+        submit.accepted_chunk_ids[0].clone()
+    }
+
+    fn rejected_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("rejected"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reviewer_reject_emits_config_rejected_without_wait() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "reject-audit").await;
+        let chunk_id = submit_example_chunk(&state, "reject-audit", "agent_authored").await;
+
+        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_reject_draft_chunk(
+            &state,
+            authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "reject-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                reason: "too broad\nscope it down".to_string(),
+            }),
+        )))
+        .await;
+        result.unwrap();
+
+        let rejected = rejected_events(&events);
+        assert_eq!(rejected.len(), 1, "events: {events:?}");
+        let event = rejected[0];
+        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
+        assert_eq!(
+            event["unmapped"]["rejection_reason"],
+            "too broadscope it down"
+        );
+        assert_eq!(event["unmapped"]["actor"], "user:dev-user");
+        assert!(
+            event["message"]
+                .as_str()
+                .unwrap()
+                .contains("example.com:8080"),
+            "message should name the rule: {event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_chunk_emits_config_rejected_from_gateway() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "supersede-audit").await;
+        let older = submit_example_chunk(&state, "supersede-audit", "mechanistic").await;
+
+        let (newer, events) = capture_ocsf_jsonl(submit_example_chunk(
+            &state,
+            "supersede-audit",
+            "agent_authored",
+        ))
+        .await;
+
+        let rejected = rejected_events(&events);
+        assert_eq!(rejected.len(), 1, "events: {events:?}");
+        let event = rejected[0];
+        assert_eq!(event["unmapped"]["chunk_id"], older);
+        assert_eq!(
+            event["unmapped"]["rejection_reason"],
+            format!("superseded by chunk {newer}")
+        );
+        assert_eq!(event["unmapped"]["actor"], AUTO_REJECT_ACTOR);
+    }
+
+    #[tokio::test]
+    async fn covered_mechanistic_chunk_emits_config_rejected_from_gateway() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "covered-audit").await;
+        seed_sandbox_approval_mode(&state, "covered-audit", "auto").await;
+        let approved = submit_example_chunk(&state, "covered-audit", "agent_authored").await;
+
+        let (incoming, events) =
+            capture_ocsf_jsonl(submit_example_chunk(&state, "covered-audit", "mechanistic")).await;
+
+        let rejected = rejected_events(&events);
+        assert_eq!(rejected.len(), 1, "events: {events:?}");
+        let event = rejected[0];
+        assert_eq!(event["unmapped"]["chunk_id"], incoming);
+        assert!(
+            event["unmapped"]["rejection_reason"]
+                .as_str()
+                .unwrap()
+                .contains(&approved),
+            "reason should name the covering chunk: {event}"
+        );
+        assert_eq!(event["unmapped"]["actor"], AUTO_REJECT_ACTOR);
     }
 
     #[test]

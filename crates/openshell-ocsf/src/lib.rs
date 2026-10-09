@@ -30,6 +30,7 @@ pub mod enums;
 pub mod events;
 pub mod format;
 pub mod objects;
+pub mod sanitize;
 pub mod tracing_layers;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -54,6 +55,9 @@ pub use objects::{
     FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
     Product, Remediation, Tactic, Technique, Url,
 };
+
+// --- Sanitizers ---
+pub use sanitize::sanitize_reason_for_audit;
 
 // --- Builders ---
 pub use builders::{
