@@ -219,6 +219,8 @@ Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image
 
 The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
 
+Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
+
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.

@@ -208,6 +208,13 @@ prepared inside the bootstrap VM. The driver checks that a prepared disk
 contains the unpacked rootfs before caching it; on failure it caches nothing
 and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
+Registry pulls in both caches use the resolved digest as an immutable reference.
+The driver verifies the downloaded manifest against that digest before downloading
+layers. For multi-platform images, it verifies the index and then the selected
+platform manifest. Digest-pinned requests retain the caller's digest.
+Cache keys hash source identities to keep cache and staging filenames bounded.
+Bootstrap cache layout v6 and prepared-image layout v4 rebuild older entries on
+first use; older cache files remain on disk but are not reused for registry images.
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
 embedded supervisor. Host-side bootstrap layer assembly preserves relative
