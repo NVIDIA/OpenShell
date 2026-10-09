@@ -60,9 +60,11 @@ with a matching `allow-git` exception in `deny.toml`.
   uppercases the request method, and denies JSON-RPC calls and response
   frames not sent with `POST` before evaluation, matching YAML.
 - `openshell-supervisor-network`'s `cedar_parity_tests` run paired YAML and
-  Cedar policies for REST, JSON-RPC, MCP, and GraphQL through both engines'
-  per-tunnel evaluation, and fail when decisions differ outside a recorded
-  list of known differences.
+  Cedar policies through both engines and fail when outcomes differ outside a
+  recorded list of known differences. They compare per-request decisions,
+  connection decisions, exactly declared hosts, the selected inspection, and
+  policy DNS eligibility, and include ports of every existing YAML decision
+  test that Cedar can express.
 - `@enforcement("audit")` marks an `HttpRequest`-only policy as audit-only.
   An endpoint whose policies are all audit-only gets `enforcement: audit` in its
   L7 config, so the relay logs and forwards denials as it does for YAML. On an

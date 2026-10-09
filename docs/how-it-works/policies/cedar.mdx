@@ -151,6 +151,8 @@ The proxy decides at connect time whether to inspect a connection request by req
 
 Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each request to that endpoint needs a matching `permit`.
 
+Only endpoints named exactly in an `HttpRequest` scope are inspected. A host that a `NetworkConnect` glob allows, such as `resource.host like("*.example.com", ".")`, connects without per-request checks unless an `HttpRequest` policy names that host exactly. YAML can inspect every host that matches a wildcard endpoint; Cedar cannot.
+
 Endpoints are parsed as REST by default. Add `@protocol("json-rpc")`, `@protocol("mcp")`, or `@protocol("graphql")` to an `HttpRequest` policy to inspect that protocol instead. All policies that declare a protocol for one endpoint must agree. `@protocol("sql")` is rejected, because OpenShell does not inspect SQL traffic.
 
 Fields that do not apply to a request are empty strings, `false`, or empty sets.
@@ -269,6 +271,7 @@ when { context.method == "GET" };
 - Incremental `openshell policy update` merges are not available for Cedar policies. Use `openshell policy set` with the full policy.
 - Policy templates are not supported.
 - Query parameter matching, WebSocket message rules, and GraphQL persisted-query registries are not available.
+- Request rules cannot apply to a wildcard host. Name each host to inspect exactly.
 
 ## Next Steps
 
