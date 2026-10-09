@@ -304,14 +304,17 @@ create TAP devices or install nftables/iptables rules.
   `release-vm-kernel.yml`
 
 On Debian-family Linux amd64 and arm64 systems, `install.sh` installs the
-Debian package from the selected `OPENSHELL_VERSION` release tag. That package
-includes `openshell-gateway` and `openshell-driver-vm`, but leaves
+Debian package when the `snap` command is unavailable, automatic selection
+receives an exact `OPENSHELL_VERSION` release tag, or
+`OPENSHELL_INSTALL_METHOD=deb` is set. That package includes
+`openshell-gateway` and `openshell-driver-vm`, but leaves
 `OPENSHELL_COMPUTE_DRIVER` unset so the gateway uses its normal runtime
 auto-detection. Set `OPENSHELL_COMPUTE_DRIVER=vm` to force the VM driver.
 
-On RPM-family Linux x86_64 and aarch64 systems, `install.sh` installs the
-`openshell` and `openshell-gateway` RPM packages from the selected release tag.
-The RPM gateway package is configured for the Podman driver.
+On RPM-family Linux x86_64 and aarch64 systems, the equivalent native path
+installs the `openshell` and `openshell-gateway` RPM packages from the selected
+release tag. Select it explicitly with `OPENSHELL_INSTALL_METHOD=rpm`. The RPM
+gateway package is configured for the Podman driver.
 
 On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
