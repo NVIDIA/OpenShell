@@ -182,14 +182,16 @@ fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
     Ok(())
 }
 
-fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
+fn backend_descriptor(args: &Args, admitted_backend: Option<&str>) -> Result<BackendDescriptor> {
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
     let payload = std::fs::read(path)
         .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
     Ok(BackendDescriptor {
-        backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
+        backend_name: admitted_backend
+            .unwrap_or(openshell_sandbox_backend::BACKEND_NAME)
+            .to_string(),
         payload,
     })
 }
@@ -304,8 +306,10 @@ fn main() -> Result<()> {
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_fd)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
+    let admitted_isolation_backend =
+        std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
-        let descriptor = backend_descriptor(&args)?;
+        let descriptor = backend_descriptor(&args, admitted_isolation_backend.as_deref())?;
         let auth = auth_bundle(&args)?;
         // Install the driver-provisioned session before starting log push or
         // any other gateway client. `run_sandbox` obtains the same Sandbox
@@ -421,8 +425,6 @@ fn main() -> Result<()> {
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
-                let admitted_isolation_backend =
-                    std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
                 Box::pin(openshell_supervisor::run_sandbox(
                     command,
                     workdir,
@@ -519,7 +521,14 @@ mod tests {
         assert_eq!(args.role, SupervisorRole::IsolationBackend);
         assert!(validate_role_arguments(&args).is_ok());
         assert_eq!(
-            backend_descriptor(&args)
+            backend_descriptor(&args, None).unwrap().backend_name,
+            openshell_sandbox_backend::BACKEND_NAME
+        );
+        let admitted = backend_descriptor(&args, Some("openshell-test-backend")).unwrap();
+        assert_eq!(admitted.backend_name, "openshell-test-backend");
+        assert_eq!(admitted.payload, vec![0]);
+        assert_eq!(
+            backend_descriptor(&args, None)
                 .expect("runtime descriptor")
                 .payload,
             vec![0]
@@ -581,6 +590,7 @@ mod tests {
     #[test]
     fn completion_marker_must_be_absolute() {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
-        assert!(validate_main_exit_marker(Some(Path::new("/run/openshell/main-exit"))).is_ok());
+        let absolute = std::env::temp_dir().join("openshell-main-exit");
+        assert!(validate_main_exit_marker(Some(&absolute)).is_ok());
     }
 }

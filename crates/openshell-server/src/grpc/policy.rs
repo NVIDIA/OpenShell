@@ -3532,21 +3532,61 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+/// Resolve the effective create-time policy without exporting credential state.
+/// Provider refresh and secret delivery remain in the supervisor session.
+pub(super) async fn resolve_sandbox_create_runtime_inputs(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<crate::compute::SandboxCreateRuntimeInputs, Status> {
+    let sandbox_id = sandbox.object_id();
+    let workspace = sandbox.object_workspace();
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let (effective_policy, _) = current_effective_policy_from_records(
+        state,
+        &provider_profile_catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await?;
+    let policy_credential_bindings =
+        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+    validate_policy_credential_binding_context(
+        &provider_profile_catalog,
+        &provider_records,
+        &effective_policy,
+        &policy_credential_bindings,
+    )?;
+    Ok(crate::compute::SandboxCreateRuntimeInputs::new(
+        effective_policy,
+    ))
+}
+
 pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
     let environment =
         load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
             .await?;
@@ -7057,17 +7097,17 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
 ) -> Result<SandboxPolicyMergeValidationData, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
-    let ProviderPolicyContext {
-        layers,
-        credentialed_scopes,
-        endpointless_provider_names,
-    } = provider_policy_context_with_catalog(
+    let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_from_records(catalog, &records);
     let provider_layers = if composition_enabled {
         layers
     } else {
@@ -7078,12 +7118,6 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
         provider_layer_count = provider_layers.len(),
         "Composed provider policy and credential context for merge validation"
     );
-    let records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        workspace,
-        provider_names,
-    )
-    .await?;
     Ok(SandboxPolicyMergeValidationData {
         provider_layers,
         catalog: catalog.clone(),
@@ -8531,6 +8565,18 @@ mod tests {
             .expect("test global policy must be present");
         openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
         policy
+    }
+
+    #[tokio::test]
+    async fn create_runtime_inputs_preserve_base_policy_without_credential_sink() {
+        let state = test_server_state().await;
+        let policy = openshell_policy::restrictive_default_policy();
+        let sandbox = test_sandbox("create-policy", "create-policy", policy.clone(), Vec::new());
+        let inputs = resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox)
+            .await
+            .expect("driver-independent effective policy");
+        assert_eq!(inputs.effective_policy, Some(policy));
+        assert!(inputs.launch_authentication.is_none());
     }
 
     #[tokio::test]
@@ -23734,6 +23780,22 @@ mod tests {
             err.code(),
             Code::NotFound,
             "handle_get_sandbox_config must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_get_sandbox_provider_environment ---
+        let err = handle_get_sandbox_provider_environment(
+            &state,
+            non_member_request(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sandbox-other".into(),
+                supports_static_credential_bindings: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_provider_environment must hide cross-workspace sandboxes"
         );
 
         // --- handle_get_sandbox_logs ---

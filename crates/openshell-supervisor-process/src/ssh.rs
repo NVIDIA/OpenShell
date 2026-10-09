@@ -981,15 +981,14 @@ impl russh::server::Handler for SshHandler {
             .is_some_and(|state| state.main_attached)
         {
             let signal = match signal {
-                Sig::HUP => Some(nix::sys::signal::Signal::SIGHUP),
-                Sig::INT => Some(nix::sys::signal::Signal::SIGINT),
-                Sig::KILL => Some(nix::sys::signal::Signal::SIGKILL),
-                Sig::QUIT => Some(nix::sys::signal::Signal::SIGQUIT),
-                Sig::TERM => Some(nix::sys::signal::Signal::SIGTERM),
+                Sig::HUP => Some(openshell_isolation_interface::contract::BoundarySignal::Hup),
+                Sig::INT => Some(openshell_isolation_interface::contract::BoundarySignal::Int),
+                Sig::KILL => Some(openshell_isolation_interface::contract::BoundarySignal::Kill),
+                Sig::TERM => Some(openshell_isolation_interface::contract::BoundarySignal::Term),
                 _ => None,
             };
             if let (Some(signal), Some(main_session)) = (signal, self.main_session.as_ref())
-                && let Err(error) = main_session.signal_group(signal).await
+                && let Err(error) = main_session.signal_boundary_group(signal).await
             {
                 warn!(%error, ?signal, "failed to signal canonical main process group");
             }
@@ -1342,7 +1341,6 @@ fn direct_tcpip_target(
 )]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     pub(super) struct AcceptAnyServerKey;
 
@@ -1923,14 +1921,13 @@ mod tests {
 
     #[tokio::test]
     async fn main_attachment_accepts_declared_session_after_process_exit() {
-        let (main_session, mut slave) = MainSession::terminal_for_test();
+        let main_session = MainSession::inert();
         let mut output = main_session.subscribe();
-        slave.write_all(b"retained output").unwrap();
+        main_session.publish_test_output(b"retained output");
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(5), output.recv()).await.unwrap().unwrap(),
             MainOutput::Stdout(data) if data == b"retained output"[..]
         ));
-        drop(slave);
         assert!(
             tokio::time::timeout(Duration::from_secs(5), main_session.finish(23, true))
                 .await

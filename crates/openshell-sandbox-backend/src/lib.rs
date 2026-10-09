@@ -8,12 +8,13 @@
 //! runtime serves the same protocol using the generated server and shared wire
 //! types in this crate.
 
+pub mod audit;
 pub mod boundary_protocol;
 pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
 
-pub use runtime::OpenShellRuntimeBackend;
+pub use runtime::{BoundaryTransportConnector, OpenShellRuntimeBackend};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = "openshell-sandbox";

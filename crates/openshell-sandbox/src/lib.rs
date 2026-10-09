@@ -3,15 +3,19 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+#[cfg(target_os = "linux")]
 pub mod boundary_exec;
+#[cfg(target_os = "linux")]
 pub mod boundary_io;
 mod boundary_server;
+#[cfg(target_os = "linux")]
 pub mod child_env;
 pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
 #[cfg(target_os = "linux")]
 pub mod main_session;
+#[cfg(target_os = "linux")]
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
@@ -21,7 +25,9 @@ pub mod perf;
 pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
+#[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;

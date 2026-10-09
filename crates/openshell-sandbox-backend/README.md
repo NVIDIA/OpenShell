@@ -24,3 +24,25 @@ the execution outcome unknown.
 
 Exec envelopes without an expiration time are rejected. Update the supervisor
 and sandbox runtime together when deploying this protocol change.
+
+## Boundary audit validation
+
+`OpenShellRuntimeBackend` implements the authenticated host side of the shared
+Sandbox Protocol.
+
+Backend implementations may inject a `BoundaryAuditValidator` to interpret
+their opaque confirmation evidence. The default Linux validator rejects
+incomplete or foreign evidence. Confirmation compares the asserted properties
+with the properties derived by the selected validator; validator injection does
+not bypass generation, session, resource, identity, or outer-fence checks.
+
+Concrete platform validators belong to the implementing backend, not this
+shared transport library.
+
+## Boundary transport establishment
+
+Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
+The shared client retains TLS peer verification, session bearer authentication,
+generation checks, and reconnection handling. The connector is reused for policy
+discovery and attachment; it does not define platform launch configuration or
+replace the isolation interface.

@@ -273,9 +273,10 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
-- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, `--env-from`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default

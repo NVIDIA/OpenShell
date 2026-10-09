@@ -14,6 +14,7 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace,
 };
+use crate::compute::SandboxDeletePreconditions;
 use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
@@ -156,6 +157,37 @@ impl Drop for WatchSandboxStream {
     fn drop(&mut self) {
         let _ = self.stop_producer();
     }
+}
+
+/// Fetch a runtime sandbox ID and authorize its persisted workspace without
+/// revealing whether an inaccessible object exists.
+pub(super) async fn fetch_and_authorize_sandbox(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    sandbox_id: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        principal,
+        sandbox.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(|error| {
+        if error.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            error
+        }
+    })?;
+    Ok(sandbox)
 }
 
 /// Resolve a public sandbox name and authorize its persisted workspace.
@@ -635,12 +667,15 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    let mut runtime_inputs =
+        super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+
     state
         .compute
         .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -670,12 +705,13 @@ async fn handle_create_sandbox_inner(
                 .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
         })
         .transpose()?;
+    runtime_inputs.launch_authentication = launch_authentication;
 
-    let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
+    let sandbox = Box::pin(state.compute.create_sandbox_with_runtime_inputs_and_guards(
         sandbox,
         sandbox_token,
-        launch_authentication,
         await_main_process_attachment,
+        runtime_inputs,
         sandbox_lifecycle_guard,
         sandbox_sync_guard,
     ))
@@ -1661,10 +1697,18 @@ async fn handle_delete_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-
+    // Main's canonical public delete request contains no caller-provided
+    // identity/version fields. The compute layer still binds the resolved
+    // object ID and lifecycle guards before committing deletion.
+    let preconditions = SandboxDeletePreconditions::default();
     let result = state
         .compute
-        .delete_sandbox_allow_missing(&workspace, &name, req.allow_missing)
+        .delete_sandbox_allow_missing_with_preconditions(
+            &workspace,
+            &name,
+            req.allow_missing,
+            preconditions,
+        )
         .await?;
     if !result.sandbox_id.is_empty() {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
@@ -2625,8 +2669,8 @@ pub(super) async fn handle_forward_tcp(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
+    let sandbox_id = sandbox.object_id().to_string();
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
         let Some(relay_stream) =
@@ -2833,13 +2877,15 @@ fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
     }
 }
 
-async fn bridge_forward_tcp_stream(
+async fn bridge_forward_tcp_stream<S>(
     mut inbound: tonic::Streaming<TcpForwardFrame>,
-    relay_stream: tokio::io::DuplexStream,
+    relay_stream: S,
     tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
     sandbox_id: &str,
     channel_id: &str,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
 
     let sandbox_id_in = sandbox_id.to_string();
@@ -5797,6 +5843,68 @@ mod tests {
         assert_eq!(
             state.telemetry.ended_sandbox_sessions(),
             [original.object_id().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_delete_rejects_expected_identity_drift_before_mutation() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = state
+            .compute
+            .delete_sandbox_with_preconditions(
+                "default",
+                "guarded-delete",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-stale".to_string()),
+                    expected_resource_version: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_delete_rejects_resource_version_without_immutable_identity() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = state
+            .compute
+            .delete_sandbox_with_preconditions(
+                "default",
+                "guarded-delete",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: None,
+                    expected_resource_version: Some(17),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

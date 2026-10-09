@@ -40,6 +40,25 @@ use crate::proxy::ProxyHandle;
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_isolation_interface::contract::NetworkMediationSource;
 
+/// Concrete listener options supplied by trusted supervisor composition.
+/// This is not an isolation-backend capability or a serialized launch contract.
+#[derive(Clone)]
+pub struct ProxyListenerConfig {
+    pub bind_addr: SocketAddr,
+    pub authorization: Arc<str>,
+    pub binary_identity: openshell_isolation_interface::contract::BinaryIdentity,
+}
+
+impl std::fmt::Debug for ProxyListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyListenerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("authorization", &"<redacted>")
+            .field("binary_identity", &self.binary_identity)
+            .finish()
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
     pub listeners: Vec<tokio::net::TcpListener>,
@@ -201,6 +220,7 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    proxy_listener: Option<ProxyListenerConfig>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -467,10 +487,15 @@ pub async fn run_networking(
         // originating inside the namespace can reach the proxy. Otherwise the
         // proxy falls back to the policy-declared http_addr (loopback in
         // tests, etc.).
-        let bind_addr = proxy_bind_ip.map(|ip| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ip, port)
-        });
+        let bind_addr = proxy_listener
+            .as_ref()
+            .map(|proxy| proxy.bind_addr)
+            .or_else(|| {
+                proxy_bind_ip.map(|ip| {
+                    let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                    SocketAddr::new(ip, port)
+                })
+            });
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
@@ -491,7 +516,12 @@ pub async fn run_networking(
             mediated_policy_dns
                 .as_ref()
                 .map(|runtime| runtime.store.clone()),
-            None,
+            proxy_listener
+                .as_ref()
+                .map(|proxy| proxy.binary_identity.clone()),
+            proxy_listener
+                .as_ref()
+                .map(|proxy| proxy.authorization.clone()),
         )
         .await?;
         Some(proxy_handle)
