@@ -4,8 +4,9 @@
 //! Driver-agnostic sandbox file-transfer conformance tests.
 
 use openshell_conformance::{
-    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, OpenShellRunner, Scenario,
+    FILE_TRANSFER_CREATE_UPLOAD_SCENARIO, FILE_TRANSFER_GIT_FILTERING_SCENARIO,
+    FILE_TRANSFER_PATH_SAFETY_SCENARIO, FILE_TRANSFER_ROUND_TRIP_SCENARIO, OpenShellRunner,
+    Scenario,
 };
 
 /// Exercise file and directory round trips through the candidate CLI.
@@ -24,6 +25,12 @@ async fn git_filtering() {
 #[tokio::test]
 async fn path_safety() {
     run(FILE_TRANSFER_PATH_SAFETY_SCENARIO).await;
+}
+
+/// Exercise `sandbox create --upload` pre-loading through the candidate CLI.
+#[tokio::test]
+async fn create_upload() {
+    run(FILE_TRANSFER_CREATE_UPLOAD_SCENARIO).await;
 }
 
 async fn run(scenario: Scenario) {

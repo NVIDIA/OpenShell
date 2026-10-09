@@ -24,10 +24,14 @@ use tokio::time::sleep;
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
 pub use scenarios::{
-    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, FILE_TRANSFER_SCENARIO, MECHANISTIC_PROPOSAL_SCENARIO,
-    NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
-    SMOKE_SCENARIO,
+    FILE_TRANSFER_CREATE_UPLOAD_SCENARIO, FILE_TRANSFER_GIT_FILTERING_SCENARIO,
+    FILE_TRANSFER_PATH_SAFETY_SCENARIO, FILE_TRANSFER_ROUND_TRIP_SCENARIO, FILE_TRANSFER_SCENARIO,
+    MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO,
+    PROVIDER_AUTO_CREATE_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
+    SANDBOX_TEMPLATE_DUPLICATE_NAME_SCENARIO, SANDBOX_TEMPLATE_GET_AFTER_DELETE_SCENARIO,
+    SANDBOX_TEMPLATE_LIFECYCLE_SCENARIO, SANDBOX_TEMPLATE_MISSING_TEMPLATE_SCENARIO,
+    SANDBOX_TEMPLATES_SCENARIO, SETTINGS_MANAGEMENT_SCENARIO, SMOKE_SCENARIO,
+    WORKSPACE_LIFECYCLE_SCENARIO, WORKSPACE_TERMINATING_SCENARIO,
 };
 
 /// An installed conformance scenario.
@@ -53,6 +57,11 @@ const SCENARIOS: &[Scenario] = &[
     MECHANISTIC_PROPOSAL_SCENARIO,
     NEW_HOSTNAME_PROPOSAL_SCENARIO,
     POLICY_LOCAL_SCENARIO,
+    PROVIDER_AUTO_CREATE_SCENARIO,
+    SANDBOX_TEMPLATES_SCENARIO,
+    SETTINGS_MANAGEMENT_SCENARIO,
+    WORKSPACE_LIFECYCLE_SCENARIO,
+    WORKSPACE_TERMINATING_SCENARIO,
 ];
 
 /// Returns every scenario compiled into this distribution.
@@ -114,6 +123,28 @@ impl CommandResult {
         self.elapsed
     }
 
+    /// Check combined stdout+stderr for `needle`, normalizing miette's
+    /// line-wrapped, `│`-continued diagnostic text first so phrase matches
+    /// don't depend on the terminal width the CLI detected when rendering.
+    pub fn output_contains(&self, needle: &str) -> bool {
+        self.normalized_output().contains(needle)
+    }
+
+    /// Case-insensitive variant of [`Self::output_contains`].
+    pub fn output_contains_ignore_case(&self, needle: &str) -> bool {
+        self.normalized_output()
+            .to_lowercase()
+            .contains(&needle.to_lowercase())
+    }
+
+    fn normalized_output(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+            .replace(['\n', '│'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, RunnerError> {
         serde_json::from_str(&self.stdout).map_err(|source| RunnerError::InvalidJson {
             context: self.context(),
@@ -128,6 +159,20 @@ impl CommandResult {
             return Ok(());
         }
         Err(self.failure_diagnostic(&self.expectation))
+    }
+
+    /// Assert the command's success matches `expect_success` (`false` asserts
+    /// the command fails, e.g. a rejected duplicate-name or blocked-while-managed case).
+    pub fn require_outcome(&self, expect_success: bool) -> Result<(), String> {
+        if self.success() == expect_success {
+            Ok(())
+        } else {
+            Err(self.failure_diagnostic(if expect_success {
+                "command succeeds"
+            } else {
+                "command fails"
+            }))
+        }
     }
 
     pub fn failure_diagnostic(&self, expectation: &str) -> String {

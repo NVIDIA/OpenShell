@@ -45,11 +45,20 @@ pub const FILE_TRANSFER_PATH_SAFETY_SCENARIO: Scenario = Scenario {
     run: run_path_safety,
 };
 
+/// Certify that `sandbox create --upload` pre-loads files before the
+/// sandbox's command runs.
+pub const FILE_TRANSFER_CREATE_UPLOAD_SCENARIO: Scenario = Scenario {
+    name: "file-transfer/create-upload",
+    description: "Verify `sandbox create --upload` pre-loads files before the command runs.",
+    run: run_create_upload,
+};
+
 fn run_file_transfer(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
         FILE_TRANSFER_ROUND_TRIP_SCENARIO.run(runner).await?;
         FILE_TRANSFER_GIT_FILTERING_SCENARIO.run(runner).await?;
-        FILE_TRANSFER_PATH_SAFETY_SCENARIO.run(runner).await
+        FILE_TRANSFER_PATH_SAFETY_SCENARIO.run(runner).await?;
+        FILE_TRANSFER_CREATE_UPLOAD_SCENARIO.run(runner).await
     })
 }
 
@@ -82,6 +91,174 @@ fn run_path_safety(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
         download_dash_leading_name(runner, &sandbox_name, &remote_root, local.path()).await?;
         delete_sandbox(runner, &sandbox_name).await
     })
+}
+
+fn run_create_upload(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move {
+        create_upload_directory_preserves_source_basename(runner).await?;
+        create_with_multiple_uploads(runner).await?;
+        create_upload_single_file(runner).await
+    })
+}
+
+/// A sandbox created with `--upload <dir>:<dest>` preserves the source
+/// directory's basename under `<dest>`.
+async fn create_upload_directory_preserves_source_basename(
+    runner: &mut OpenShellRunner,
+) -> Result<(), String> {
+    let local =
+        tempfile::tempdir().map_err(fs_error("create create-upload/directory temporary dir"))?;
+    let source = local.path().join("project");
+    fs::create_dir_all(source.join("src")).map_err(fs_error("create project/src"))?;
+    fs::write(source.join("marker.txt"), "upload-create-marker")
+        .map_err(fs_error("write marker.txt"))?;
+    fs::write(source.join("src/main.py"), "print('hello')").map_err(fs_error("write main.py"))?;
+
+    let sandbox_name = format!("ct-{}-cu1", runner.id());
+    create_with_uploads(
+        runner,
+        "create-upload/directory",
+        &sandbox_name,
+        &[(&source, "/sandbox/data")],
+    )
+    .await?;
+
+    let output = exec_capture(
+        runner,
+        &sandbox_name,
+        "create-upload/directory/verify",
+        "cat /sandbox/data/project/marker.txt",
+    )
+    .await?;
+    if !output.contains("upload-create-marker") {
+        return Err(format!(
+            "expected uploaded marker content in sandbox output:\n{output}"
+        ));
+    }
+
+    delete_sandbox(runner, &sandbox_name).await
+}
+
+/// Two `--upload` specs in a single `sandbox create` call both land in the
+/// sandbox before the command runs.
+async fn create_with_multiple_uploads(runner: &mut OpenShellRunner) -> Result<(), String> {
+    let local = tempfile::tempdir().map_err(fs_error("create multiple-uploads temporary dir"))?;
+    let dir_a = local.path().join("alpha");
+    let dir_b = local.path().join("beta");
+    fs::create_dir_all(&dir_a).map_err(fs_error("create alpha"))?;
+    fs::create_dir_all(&dir_b).map_err(fs_error("create beta"))?;
+    fs::write(dir_a.join("a.txt"), "content-alpha").map_err(fs_error("write a.txt"))?;
+    fs::write(dir_b.join("b.txt"), "content-beta").map_err(fs_error("write b.txt"))?;
+
+    let sandbox_name = format!("ct-{}-cu2", runner.id());
+    create_with_uploads(
+        runner,
+        "create-upload/multiple",
+        &sandbox_name,
+        &[(&dir_a, "/sandbox/alpha"), (&dir_b, "/sandbox/beta")],
+    )
+    .await?;
+
+    let output = exec_capture(
+        runner,
+        &sandbox_name,
+        "create-upload/multiple/verify",
+        "cat /sandbox/alpha/alpha/a.txt /sandbox/beta/beta/b.txt",
+    )
+    .await?;
+    if !output.contains("content-alpha") || !output.contains("content-beta") {
+        return Err(format!(
+            "expected both uploaded contents in sandbox output:\n{output}"
+        ));
+    }
+
+    delete_sandbox(runner, &sandbox_name).await
+}
+
+/// `--upload` with a single file (not a directory) works.
+async fn create_upload_single_file(runner: &mut OpenShellRunner) -> Result<(), String> {
+    let local = tempfile::tempdir().map_err(fs_error("create single-file temporary dir"))?;
+    let file_path = local.path().join("config.txt");
+    fs::write(&file_path, "single-file-upload-test").map_err(fs_error("write config.txt"))?;
+
+    let sandbox_name = format!("ct-{}-cu3", runner.id());
+    create_with_uploads(
+        runner,
+        "create-upload/single-file",
+        &sandbox_name,
+        &[(&file_path, "/sandbox")],
+    )
+    .await?;
+
+    let output = exec_capture(
+        runner,
+        &sandbox_name,
+        "create-upload/single-file/verify",
+        "cat /sandbox/config.txt",
+    )
+    .await?;
+    if !output.contains("single-file-upload-test") {
+        return Err(format!(
+            "expected single-file content in sandbox output:\n{output}"
+        ));
+    }
+
+    delete_sandbox(runner, &sandbox_name).await
+}
+
+/// Run `sandbox create --detach --upload <local>:<dest>... --no-git-ignore`.
+async fn create_with_uploads(
+    runner: &mut OpenShellRunner,
+    step: &str,
+    sandbox_name: &str,
+    uploads: &[(&Path, &str)],
+) -> Result<(), String> {
+    runner.track_sandbox(sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.to_string(),
+        "--detach".to_string(),
+    ];
+    for (local, dest) in uploads {
+        let local = local
+            .to_str()
+            .ok_or_else(|| format!("local upload path is not UTF-8: {}", local.display()))?;
+        args.push("--upload".to_string());
+        args.push(format!("{local}:{dest}"));
+    }
+    args.push("--no-git-ignore".to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let result = runner
+        .step(step)
+        .description(format!("sandbox '{sandbox_name}' is created with uploads"))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()
+}
+
+/// Exec a command in the sandbox and return its combined stdout+stderr.
+async fn exec_capture(
+    runner: &OpenShellRunner,
+    sandbox: &str,
+    step: &str,
+    script: &str,
+) -> Result<String, String> {
+    let result = runner
+        .step(step)
+        .description(format!("sandbox '{sandbox}' exec for {step} succeeds"))
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&[
+            "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", script,
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()?;
+    Ok(format!("{}{}", result.stdout(), result.stderr()))
 }
 
 async fn prepare_sandbox(
