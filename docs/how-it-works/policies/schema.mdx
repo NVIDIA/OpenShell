@@ -12,11 +12,6 @@ This reference defines the sandbox policy schema. A policy is a YAML file of at
 most 4 MiB. OpenShell rejects a policy that contains unknown fields or duplicate
 keys.
 
-Object and map fields require objects when present; explicit `null` does not
-mean an empty object. Null values inside a middleware's user-defined `config`
-map remain valid. YAML exports quote reader-sensitive strings, such as MCP
-version dates, so other YAML readers preserve their string type.
-
 ## Top-Level Fields
 
 ```yaml showLineNumbers={false}
