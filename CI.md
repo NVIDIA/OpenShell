@@ -487,7 +487,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs. `Required CI Gates` publishes successful not-applicable statuses for both E2E contexts on merge-group events and subsequent merge-group workflow completions.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
