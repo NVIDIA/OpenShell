@@ -288,6 +288,8 @@ else
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
+# vm_policy_poll_interval asserts that policy changes load within this.
+supervisor_policy_poll_interval_secs = 1
 EOF
 fi
 
@@ -299,6 +301,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
+    --supervisor-policy-poll-interval-secs 1 \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -410,6 +413,7 @@ else
   run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
+  run_e2e_test vm_policy_poll_interval
   run_e2e_test vm_gateway_start
   run_e2e_test vm_corporate_proxy
 fi
