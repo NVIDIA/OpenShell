@@ -35,8 +35,8 @@ closed without falling back to inline values.
 
 ## Refresh coordination
 
-Explicit rotation, background refresh, and operator refresh-on-read share
-`refresh_from_snapshot`:
+Explicit rotation, background refresh, and operator refresh-on-read share the
+same refresh coordination:
 
 - A process-local weak keyed mutex coalesces waiters without retaining deleted
   providers indefinitely.
@@ -50,6 +50,9 @@ Explicit rotation, background refresh, and operator refresh-on-read share
   `refreshed` state, with a unique completed-mint identity in metadata
   annotations. Waiters coalesce against that identity, not bookkeeping changes
   to the resource version.
+- Automatic callers recheck live recovery and retry deadlines under both locks.
+  A failed mint blocks queued automatic exchanges without disabling scheduled
+  worker retries or a separately requested manual rotation.
 - Detached refresh tasks complete despite request cancellation, preserving
   replacement refresh tokens returned by the issuer.
 - Existing generation/CAS fencing remains active for deletion and

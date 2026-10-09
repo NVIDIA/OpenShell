@@ -926,7 +926,35 @@ async fn cleanup_pending_secret_deletions_coordinated(
     Ok(())
 }
 
-/// Cancellation-safe entry point shared by explicit rotation and the worker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshTrigger {
+    Automatic,
+    ExplicitRotation,
+}
+
+/// Automatic callers must honor the live failure schedule, not the eligibility
+/// observed before they queued. Configuration/investigation failures can still
+/// be retried by the worker once due; reauthorization stays parked.
+fn ensure_automatic_refresh_ready(
+    state: &StoredProviderCredentialRefreshState,
+    now_ms: i64,
+) -> Result<(), Status> {
+    if state.recovery_action == ProviderCredentialRefreshRecoveryAction::Reauthorize as i32 {
+        return Err(Status::failed_precondition(
+            "credential refresh requires recovery",
+        ));
+    }
+    if state.recovery_action != ProviderCredentialRefreshRecoveryAction::Unspecified as i32
+        && state.next_refresh_at_ms > now_ms
+    {
+        return Err(Status::unavailable(
+            "credential refresh is in retry backoff",
+        ));
+    }
+    Ok(())
+}
+
+/// Cancellation-safe entry point for a separately requested manual rotation.
 pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
@@ -943,15 +971,40 @@ pub async fn refresh_provider_credential(
     let snapshot = get_refresh_state(store, workspace, provider.object_id(), credential_key)
         .await?
         .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
-    refresh_from_snapshot(store, credentials, compute, snapshot).await
+    refresh_from_snapshot_with_trigger(
+        store,
+        credentials,
+        compute,
+        snapshot,
+        RefreshTrigger::ExplicitRotation,
+    )
+    .await
 }
 
-/// Coalesce against the caller's observed generation, not a name-keyed replacement.
+/// Coalesce an automatic refresh against the caller's observed generation, not
+/// a name-keyed replacement. Recheck recovery/backoff after acquiring the locks.
 pub async fn refresh_from_snapshot(
     store: &Store,
     credentials: &crate::credentials::CredentialRuntime,
     compute: Option<&crate::compute::ComputeRuntime>,
     snapshot: StoredProviderCredentialRefreshState,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    refresh_from_snapshot_with_trigger(
+        store,
+        credentials,
+        compute,
+        snapshot,
+        RefreshTrigger::Automatic,
+    )
+    .await
+}
+
+async fn refresh_from_snapshot_with_trigger(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    snapshot: StoredProviderCredentialRefreshState,
+    trigger: RefreshTrigger,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
     let admission = REFRESH_ADMISSIONS
         .try_acquire()
@@ -1020,6 +1073,9 @@ pub async fn refresh_from_snapshot(
             return Err(Status::failed_precondition(
                 "previous credential mint has an uncertain outcome; reconfigure the refresh grant",
             ));
+        }
+        if trigger == RefreshTrigger::Automatic {
+            ensure_automatic_refresh_ready(&latest, current_time_ms())?;
         }
         refresh_provider_credential_locked(
             &store,
@@ -2318,7 +2374,15 @@ async fn refresh_states(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_from_snapshot(store, credentials, compute, state.clone()).await {
+        let trigger = if rotation_requested {
+            RefreshTrigger::ExplicitRotation
+        } else {
+            RefreshTrigger::Automatic
+        };
+        if let Err(err) =
+            refresh_from_snapshot_with_trigger(store, credentials, compute, state.clone(), trigger)
+                .await
+        {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -2338,9 +2402,9 @@ mod tests {
         MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind, RefreshFailure,
         RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
-        enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
-        list_refresh_states_for_provider, max_lifetime_seconds, new_refresh_state,
-        next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
+        enqueue_pending_secret_deletion, ensure_automatic_refresh_ready, get_refresh_state,
+        list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
+        new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
         refresh_state_name, refresh_status_from_state, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
@@ -3847,6 +3911,48 @@ mod tests {
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    #[test]
+    fn automatic_refresh_honors_recovery_schedule_without_disabling_due_retries() {
+        let now_ms = 10_000;
+        for recovery in [
+            ProviderCredentialRefreshRecoveryAction::Retry,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration,
+            ProviderCredentialRefreshRecoveryAction::Investigate,
+        ] {
+            let mut state = StoredProviderCredentialRefreshState {
+                recovery_action: recovery as i32,
+                next_refresh_at_ms: now_ms + 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                ensure_automatic_refresh_ready(&state, now_ms)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable,
+            );
+            state.next_refresh_at_ms = now_ms;
+            ensure_automatic_refresh_ready(&state, now_ms).unwrap();
+        }
+        let state = StoredProviderCredentialRefreshState {
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
+            next_refresh_at_ms: now_ms,
+            ..Default::default()
+        };
+        assert_eq!(
+            ensure_automatic_refresh_ready(&state, now_ms)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition,
+        );
+        // A healthy credential's proactive schedule must not block an on-read
+        // mint requested to meet a longer minimum remaining lifetime.
+        let state = StoredProviderCredentialRefreshState {
+            next_refresh_at_ms: now_ms + 1,
+            ..Default::default()
+        };
+        ensure_automatic_refresh_ready(&state, now_ms).unwrap();
     }
 
     #[tokio::test]

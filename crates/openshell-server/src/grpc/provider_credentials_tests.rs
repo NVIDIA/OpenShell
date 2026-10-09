@@ -101,9 +101,12 @@ async fn audits_exports_and_invalid_attempts_without_values() {
         .with_writer(move || AuditWriter(writer.clone()))
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
-    handle(&state, authenticated(request(&["ACCESS_TOKEN"])))
-        .await
-        .unwrap();
+    handle(
+        &state,
+        authenticated(request(&["ACCESS_TOKEN", "STATIC_KEY"])),
+    )
+    .await
+    .unwrap();
     let error = handle(
         &state,
         authenticated(request(&["API_KEY=secret-from-invalid-input"])),
@@ -115,12 +118,13 @@ async fn audits_exports_and_invalid_attempts_without_values() {
     assert!(output.contains("operator-test"));
     assert!(output.contains("verified-test-certificate"));
     assert!(output.contains("ACCESS_TOKEN"));
+    assert!(output.contains("STATIC_KEY"));
     assert!(output.contains("delivered"));
     assert!(output.contains("invalid_request"));
     assert!(output.contains("refresh_attempts=0"));
     for secret in [
-        "access-value",
-        "static-value",
+        "old-access-token",
+        "static-secret",
         "must-not-export",
         "secret-from-invalid-input",
     ] {
@@ -360,7 +364,7 @@ async fn missing_static_handle_and_invalid_refresh_driver_fail_closed() {
 }
 
 #[tokio::test]
-async fn bookkeeping_changes_do_not_coalesce_explicit_rotation() {
+async fn bookkeeping_changes_do_not_coalesce_refresh_requests() {
     // Cover both legacy states without a mint identity and states that already
     // have one. Cleanup/metadata updates must not count as another mint.
     for previously_minted in [false, true] {
@@ -554,6 +558,131 @@ async fn coalesces_observed_refresh_generation_and_parks_uncertain_mint() {
     .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     issuer.verify().await;
+}
+
+async fn automatic_waiters_honor_failed_refresh(
+    response: wiremock::ResponseTemplate,
+    expected_code: Code,
+    expected_status: &str,
+    expected_recovery: ProviderCredentialRefreshRecoveryAction,
+) {
+    let (state, provider) = fixture().await;
+    let issuer = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(response.set_delay(Duration::from_millis(100)))
+        .expect(1)
+        .mount(&issuer)
+        .await;
+    let snapshot = refresh_fixture(&state, &provider, issuer.uri()).await;
+    let (a, b) = tokio::join!(
+        crate::provider_refresh::refresh_from_snapshot(
+            state.store.as_ref(),
+            &state.credentials,
+            Some(&state.compute),
+            snapshot.clone(),
+        ),
+        crate::provider_refresh::refresh_from_snapshot(
+            state.store.as_ref(),
+            &state.credentials,
+            Some(&state.compute),
+            snapshot.clone(),
+        ),
+    );
+    assert_eq!(a.unwrap_err().code(), expected_code);
+    assert_eq!(b.unwrap_err().code(), expected_code);
+    issuer.verify().await;
+    let failed = crate::provider_refresh::get_refresh_state(
+        state.store.as_ref(),
+        "other",
+        provider.object_id(),
+        "ACCESS_TOKEN",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(failed.status, expected_status);
+    assert_eq!(failed.recovery_action, expected_recovery as i32);
+    assert!(!failed.failure_code.is_empty());
+    assert!(failed.next_refresh_at_ms > crate::persistence::current_time_ms());
+    if expected_recovery == ProviderCredentialRefreshRecoveryAction::Reauthorize {
+        assert_eq!(failed.next_refresh_at_ms, i64::MAX);
+    }
+    // Both a stale snapshot and a fresh automatic request must respect the
+    // committed failure, without changing its retry deadline or error receipt.
+    for observed in [snapshot, failed.clone()] {
+        let error = crate::provider_refresh::refresh_from_snapshot(
+            state.store.as_ref(),
+            &state.credentials,
+            Some(&state.compute),
+            observed,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), expected_code);
+    }
+    assert_eq!(
+        crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "other",
+            provider.object_id(),
+            "ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        failed,
+    );
+    issuer.verify().await;
+
+    // A separately requested manual rotation can retry a parked grant or
+    // override retry backoff; it still goes through the same coordination.
+    issuer.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"access_token":"manually-refreshed","expires_in":3600}),
+        ))
+        .expect(1)
+        .mount(&issuer)
+        .await;
+    let rotated = crate::provider_refresh::refresh_provider_credential(
+        state.store.as_ref(),
+        "other",
+        &state.credentials,
+        Some(&state.compute),
+        "provider",
+        "ACCESS_TOKEN",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rotated.status, "refreshed");
+    assert_eq!(
+        rotated.recovery_action,
+        ProviderCredentialRefreshRecoveryAction::Unspecified as i32,
+    );
+    issuer.verify().await;
+}
+
+#[tokio::test]
+async fn automatic_waiters_do_not_repeat_unusable_refresh_token_exchange() {
+    automatic_waiters_honor_failed_refresh(
+        wiremock::ResponseTemplate::new(200).set_body_string("not JSON"),
+        Code::FailedPrecondition,
+        "reauthorization_required",
+        ProviderCredentialRefreshRecoveryAction::Reauthorize,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn automatic_waiters_do_not_bypass_rate_limit_backoff() {
+    automatic_waiters_honor_failed_refresh(
+        wiremock::ResponseTemplate::new(429)
+            .set_body_json(serde_json::json!({"error":"temporarily_unavailable"})),
+        Code::Unavailable,
+        "error",
+        ProviderCredentialRefreshRecoveryAction::Retry,
+    )
+    .await;
 }
 
 #[tokio::test]
