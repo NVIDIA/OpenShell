@@ -733,8 +733,15 @@ fn decrypt_bytes(
 ) -> Result<Vec<u8>, Status> {
     let nonce = decode_b64_array::<NONCE_LEN>("nonce", &encrypted.nonce)?;
     let ciphertext = decode_b64_vec("ciphertext", &encrypted.ciphertext)?;
-    openshell_crypto::aead::open(key_bytes, aad, &nonce, &ciphertext)
-        .map_err(|_| Status::data_loss("failed to decrypt default credential storage value"))
+    openshell_crypto::aead::open(key_bytes, aad, &nonce, &ciphertext).map_err(decrypt_error_status)
+}
+
+fn decrypt_error_status(error: openshell_crypto::CryptoError) -> Status {
+    let message = "failed to decrypt default credential storage value";
+    match error {
+        openshell_crypto::CryptoError::Authentication => Status::data_loss(message),
+        _ => Status::internal(message),
+    }
 }
 
 fn dek_aad(id: &str, provider_name: &str, credential_key: &str) -> Vec<u8> {
@@ -934,8 +941,37 @@ mod tests {
             assert_eq!(decrypt_bytes(&key, &aad, &encrypted).unwrap(), plaintext);
             let sealed = encrypt_bytes(&key, &aad, &plaintext).unwrap();
             assert_eq!(decrypt_bytes(&key, &aad, &sealed).unwrap(), plaintext);
-            assert!(decrypt_bytes(&key, b"wrong-aad", &encrypted).is_err());
-            assert!(decrypt_bytes(&[0xff; KEY_LEN], &aad, &encrypted).is_err());
+            assert_eq!(
+                decrypt_bytes(&key, b"wrong-aad", &encrypted)
+                    .unwrap_err()
+                    .code(),
+                Code::DataLoss
+            );
+            assert_eq!(
+                decrypt_bytes(&[0xff; KEY_LEN], &aad, &encrypted)
+                    .unwrap_err()
+                    .code(),
+                Code::DataLoss
+            );
+        }
+    }
+
+    #[test]
+    fn backend_decryption_failures_do_not_report_corrupt_credentials() {
+        use openshell_crypto::CryptoError;
+
+        let authentication = decrypt_error_status(CryptoError::Authentication);
+        assert_eq!(authentication.code(), Code::DataLoss);
+        for error in [
+            CryptoError::Operation,
+            CryptoError::Random,
+            CryptoError::ProviderConflict,
+            CryptoError::UnsupportedPosture,
+        ] {
+            let status = decrypt_error_status(error);
+            assert_eq!(status.code(), Code::Internal);
+            // Diagnostics stay opaque for every backend failure.
+            assert_eq!(status.message(), authentication.message());
         }
     }
 

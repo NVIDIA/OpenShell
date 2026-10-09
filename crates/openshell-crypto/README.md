@@ -52,7 +52,7 @@ explicit context before use; use without initialization fails closed with an
 initialization panic. This mode is for embedders and backend contract tests, not
 an independently runnable OpenShell product configuration.
 
-Integration features (`tls-tonic`, `tls-hyper`, `tls-kube`, `tls-sqlx`) activate
+Integration features (`tls-tonic`, `tls-kube`, `tls-sqlx`) activate
 dependencies. The `aws-lc` feature supplies their AWS-LC choices conditionally.
 These libraries still own their crypto selection internally; they do not consult
 `CryptoContext`. Cargo feature unification does not prevent direct library use.
@@ -76,12 +76,14 @@ changing process state, including in contract tests.
 
 `tls::provider()` constructs the selected context's provider.
 `tls::ensure_default_provider()` retains an existing Rustls process default and
-returns it; it does not attest ownership. OpenShell configurations use facade
-client/server builders instead of Rustls's implicit builders. If a context was
-explicitly selected before facade use, these builders use that context even if
-another library already initialized Rustls. Otherwise they preserve an embedder's
-installed provider. Key loading, custom verification algorithms, and the gateway
-client-certificate verifier use the same configuration-provider policy.
+returns it; it does not attest ownership. Directly constructed OpenShell TLS
+configurations use the facade provider, including the CLI health-check connector.
+The dependency-owned clients listed below retain their own selection paths.
+If a context was explicitly selected before facade use, these configurations use
+that context even if another library already initialized Rustls. Otherwise they
+preserve an embedder's installed provider. Key loading, custom verification
+algorithms, and the gateway client-certificate verifier use the same
+configuration-provider policy.
 Explicit protocol-version constraints remain unchanged. A provider incompatible
 with the requested versions fails during construction rather than falling back.
 This rule controls first-party configs; it cannot override dependency-owned TLS.
@@ -127,6 +129,9 @@ not a whole-application crypto coverage claim:
 
 | Remaining use | Current scope and follow-up |
 | --- | --- |
+| Reqwest clients (OIDC/JWKS, token exchange, provider refresh, Vault, token grants, telemetry) | These use Rustls's process-default provider after ensuring one exists; they do not necessarily honor an explicitly selected `CryptoContext`. The OpenSSL follow-up must supply compatible preconfigured TLS or another supported transport integration and test actual provider use. |
+| Kubernetes client TLS (`kube-client` 0.99) | The AWS-LC-enabled client attempts to install AWS-LC as the Rustls process default. It does not consult `CryptoContext`; the OpenSSL follow-up must adapt this transport before claiming selected-backend coverage. |
+| Outer-fence evidence digest (`openshell-isolation-interface::contract`) | The digest binds generation and native enforcement evidence using `sha2` through `Sha256Digest::compute`. This security-relevant hash remains outside facade dispatch and must be migrated with failure propagation before claiming exclusive backend ownership. |
 | VM image/archive digest verification and cached supervisor validation (`openshell-driver-vm`) | Security-relevant artifact integrity remains outside this runtime credential migration. Moving it requires covering the streaming readers, embedded-artifact cache, and build-time digest generation together; it must be addressed before claiming exclusive backend ownership. |
 | UUID generation outside Sandbox Protocol request envelopes | Includes runtime identities, authentication nonces, and session identifiers as well as ordinary correlation IDs. These still use the UUID library's entropy source. They are not attested by context posture; a follow-up must classify each use and propagate entropy failure through currently infallible constructors. |
 | DNS policy contract fingerprints (`openshell-supervisor-network::policy_dns`) | These bind cached DNS state to policy and are security-relevant. They remain outside this migration; migrating the cache identity API and its failure handling is required for exclusive backend ownership. |

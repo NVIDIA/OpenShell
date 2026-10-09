@@ -4424,7 +4424,6 @@ name = "openshell-crypto"
 version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
- "hyper-rustls",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
