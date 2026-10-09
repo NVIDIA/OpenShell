@@ -102,7 +102,7 @@ To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_id
 
 ## Docker Driver
 
-[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the gateway host. Docker is also required to build sandbox images from local directories or Dockerfiles.
+[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the gateway host.
 
 ```toml
 [openshell.gateway]
@@ -309,7 +309,7 @@ On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in th
 
 | Driver | Default identity |
 |---|---|
-| Docker, Podman | The image's `USER`. Images without `USER` must set both fields in policy. |
+| Docker, Podman | The image's `USER`, otherwise `1000`. |
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 

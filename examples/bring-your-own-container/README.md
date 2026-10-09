@@ -71,12 +71,13 @@ key requirements are:
   at runtime.
 - **Declare a non-root OCI `USER`** for Docker and Podman. Use a named account
   such as `app`, a numeric UID with a passwd entry that supplies its primary
-  GID, or a numeric pair such as `1500:1500`. You can instead set both
+  GID, or a numeric pair such as `1500:1500`. You can instead set
   `process.run_as_user` and `process.run_as_group` explicitly in policy.
-- **Prepare `/sandbox` as the workspace.** Until OCI working-directory support
-  is added, create `/sandbox` and make it writable by the selected identity.
-  The example does this with `install -d -o app -g app /sandbox`.
-- **Install `iproute2`** for full network namespace isolation.
+  Images without `USER` run as UID and GID `1000`.
+- **Use `/sandbox` or an existing `WORKDIR` as the workspace.** The driver
+  creates `/sandbox` for the selected identity. On Docker, an image `WORKDIR`
+  other than `/` or `/sandbox` becomes the workspace instead, and it must exist
+  and be writable by the selected identity.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.
 
