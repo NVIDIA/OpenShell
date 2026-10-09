@@ -708,7 +708,7 @@ kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.sp
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
-The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
+The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes
