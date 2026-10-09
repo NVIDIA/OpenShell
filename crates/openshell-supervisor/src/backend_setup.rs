@@ -3,6 +3,9 @@
 
 //! Backend-owned launch decoding and client construction for supervisor startup.
 
+mod registration;
+pub use registration::{BackendRegistration, BackendRegistrations};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -27,8 +30,9 @@ pub struct LaunchIdentity {
     pub vm_policy_identity: Option<super::VmPolicyIdentity>,
 }
 
-/// Runtime state remains owned by the supervisor. Backends retain these same
-/// handles so CA publication, provider reload, and bearer rotation stay visible
+/// Runtime state remains owned by the supervisor.
+///
+/// Backends retain these same handles so CA publication, provider reload, and bearer rotation stay visible
 /// after attachment; copying their current contents would lose later updates.
 pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
