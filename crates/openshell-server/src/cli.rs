@@ -858,6 +858,7 @@ fn run_effective_config_preflight(
         };
         let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
+            validate_preflight_isolation_backend(semantic_file, selection.name())?;
             selected_driver = Some(crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
@@ -877,6 +878,7 @@ fn run_effective_config_preflight(
                 if !semantic_file.openshell.drivers.contains_key(driver_name) {
                     continue;
                 }
+                validate_preflight_isolation_backend(semantic_file, driver_name)?;
                 crate::validate_compute_driver_config(
                     compute_drivers,
                     driver_name,
@@ -949,6 +951,22 @@ async fn preflight_host_tools(
         )]),
         None => Ok(Vec::new()),
     }
+}
+
+fn validate_preflight_isolation_backend(file: &ConfigFile, driver_name: &str) -> Result<()> {
+    let gateway = &file.openshell.gateway;
+    if file
+        .isolation_backend(driver_name)
+        .map_err(|error| miette::miette!(error))?
+        .is_some()
+        && gateway.gateway_jwt.is_none()
+        && defaults::complete_local_jwt_config()?.is_none()
+    {
+        return Err(miette::miette!(
+            "external isolation backends require gateway launch signing; configure openshell.gateway.gateway_jwt or the package-managed local signing keys"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_preflight_semantics(
@@ -1984,6 +2002,79 @@ mod tests {
             &matches,
         )
         .expect("paired replayed rate limit must pass preflight");
+    }
+
+    #[test]
+    fn config_preflight_isolation_backend_follows_effective_driver_selection() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _tls_dir = EnvVarGuard::set(
+            "OPENSHELL_LOCAL_TLS_DIR",
+            config_home.path().to_str().unwrap(),
+        );
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        std::fs::write(
+            &config,
+            r#"
+[openshell]
+version = 2
+[openshell.gateway]
+compute_driver = "external"
+disable_tls = true
+[openshell.drivers.external]
+socket_path = "/run/external.sock"
+isolation_backend = "agent-substrate"
+[[openshell.supervisor.isolation_backends]]
+name = "agent-substrate"
+endpoint = { kind = "unix", socket_path = "/run/isolation.sock" }
+"#,
+        )
+        .unwrap();
+        let registry = test_registry("local", true);
+        let preflight = |argv: &[&str]| {
+            let (run, matches) = parse_with_args(argv);
+            super::run_config_preflight_with_drivers(
+                super::ConfigPreflightArgs {
+                    path: Some(config.clone()),
+                    ..Default::default()
+                },
+                run,
+                &matches,
+                &registry,
+            )
+        };
+        // The file-selected external driver needs signing, even without probing its socket.
+        assert!(preflight(&["openshell-gateway"]).is_err());
+        // CLI and environment overrides select the other driver's built-in backend;
+        // the unused external driver's signing requirement must not affect it.
+        assert!(matches!(
+            preflight(&["openshell-gateway", "--compute-driver", "local"]).unwrap(),
+            Some(crate::ConfiguredComputeDriver::Registered(_))
+        ));
+        let _canonical = EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER", "local");
+        assert!(matches!(
+            preflight(&["openshell-gateway"]).unwrap(),
+            Some(crate::ConfiguredComputeDriver::Registered(_))
+        ));
+        assert!(preflight(&["openshell-gateway", "--compute-driver", "external"]).is_err());
+        // Supplying signing configuration makes the same external selection pass.
+        // Preflight checks configuration only; it must not read keys or connect sockets.
+        let signed = format!(
+            "{}\n[openshell.gateway.gateway_jwt]\nsigning_key_path = '/configured/signing.pem'\npublic_key_path = '/configured/public.pem'\nkid_path = '/configured/kid'\n",
+            std::fs::read_to_string(&config).unwrap()
+        );
+        std::fs::write(&config, signed).unwrap();
+        assert!(matches!(
+            preflight(&["openshell-gateway", "--compute-driver", "external"]).unwrap(),
+            Some(crate::ConfiguredComputeDriver::Remote { name }) if name == "external"
+        ));
     }
 
     #[test]

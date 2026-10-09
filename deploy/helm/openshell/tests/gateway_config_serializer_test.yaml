@@ -9,6 +9,30 @@ release:
   namespace: serializer-namespace
 
 tests:
+  - it: renders operator isolation selection and endpoint registrations
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          compute_driver: agent-substrate
+        openshell.drivers.agent-substrate:
+          socket_path: /run/agent-substrate/compute.sock
+          isolation_backend: agent-substrate
+        openshell.supervisor.isolation_backends:
+          - name: agent-substrate
+            endpoint:
+              kind: unix
+              socket_path: /run/agent-substrate/isolation.sock
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[openshell\.drivers\.agent-substrate\]\n(?:[^\[]*\n)*isolation_backend = "agent-substrate"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[\[openshell\.supervisor\.isolation_backends\]\]$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^endpoint = \{ kind = "unix", socket_path = "/run/agent-substrate/isolation\.sock" \}$'
+
   - it: gives gatewayConfig precedence over a deprecated proxy alias
     set:
       upstreamProxy.url: http://legacy-proxy.example:8080

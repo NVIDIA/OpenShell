@@ -63,10 +63,9 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub supervisor: SupervisorFileSection,
 
-    /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
-    /// crate's `Deserialize` impl. Stored as raw [`toml::Value`] so each
-    /// driver can evolve its schema
-    /// independently of this crate.
+    /// `[openshell.drivers.<name>]` tables — passed to each driver crate's
+    /// `Deserialize` impl after removing common gateway controls. Stored as
+    /// raw [`toml::Value`] so each driver can evolve its schema independently.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
 
@@ -297,10 +296,48 @@ pub struct OtlpConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorFileSection {
+    /// Operator-owned external isolation routes, reachable by supervisors.
+    #[serde(default)]
+    pub isolation_backends: Vec<openshell_core::isolation_registration::BackendRegistration>,
     /// Statically registered supervisor middleware services. Registration is
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+impl ConfigFile {
+    /// Resolve the selected driver's exact backend name without sandbox input.
+    pub(crate) fn isolation_backend(
+        &self,
+        driver_name: &str,
+    ) -> Result<Option<&openshell_core::isolation_registration::BackendRegistration>, &'static str>
+    {
+        use openshell_core::isolation_registration::{
+            BUILTIN_BACKEND_NAME, validate_backend_name, validate_registrations,
+        };
+        let registrations = &self.openshell.supervisor.isolation_backends;
+        validate_registrations(registrations)?;
+        let Some(value) = self
+            .openshell
+            .drivers
+            .get(driver_name)
+            .and_then(|driver| driver.get("isolation_backend"))
+        else {
+            return Ok(None);
+        };
+        let name = value
+            .as_str()
+            .ok_or("driver isolation_backend must be a string")?;
+        if name == BUILTIN_BACKEND_NAME {
+            return Ok(None);
+        }
+        validate_backend_name(name)?;
+        registrations
+            .iter()
+            .find(|registration| registration.name == name)
+            .map(Some)
+            .ok_or("selected isolation backend is not registered")
+    }
 }
 
 /// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
@@ -456,6 +493,8 @@ pub enum ConfigFileError {
     },
     #[error("invalid gateway config field `openshell.drivers.{name}`: expected a TOML table")]
     InvalidDriverTable { name: String },
+    #[error("invalid gateway config field `openshell.drivers.{name}.isolation_backend`: {message}")]
+    InvalidIsolationBackend { name: String, message: &'static str },
     #[error(
         "failed to read TLS CA certificate for supervisor middleware '{name}' from '{}': {source}",
         path.display()
@@ -611,6 +650,21 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
     }
 
+    openshell_core::isolation_registration::validate_registrations(
+        &file.openshell.supervisor.isolation_backends,
+    )
+    .map_err(|message| ConfigFileError::InvalidValue {
+        field: "openshell.supervisor.isolation_backends",
+        message,
+    })?;
+    for driver_name in file.openshell.drivers.keys() {
+        file.isolation_backend(driver_name).map_err(|message| {
+            ConfigFileError::InvalidIsolationBackend {
+                name: driver_name.clone(),
+                message,
+            }
+        })?;
+    }
     Ok(file)
 }
 
@@ -658,6 +712,7 @@ fn preflight_error(
         | ConfigFileError::SecretInFile { .. }
         | ConfigFileError::InvalidValue { .. }
         | ConfigFileError::InvalidDriverTable { .. }
+        | ConfigFileError::InvalidIsolationBackend { .. }
         | ConfigFileError::MiddlewareTlsCaRead { .. }
         | ConfigFileError::MiddlewareTlsCaInvalid { .. } => "malformed",
     };
@@ -706,15 +761,22 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
 }
 
 /// Return a driver's table without gateway-level inheritance.
+///
 /// Driver-specific configuration belongs exclusively to
-/// `[openshell.drivers.<name>]` in schema version 2.
+/// `[openshell.drivers.<name>]` in schema version 2. The gateway resolves and
+/// removes the common `isolation_backend` selector before driver decoding.
 pub fn driver_table(
     _driver_name: &str,
     _gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
     match raw {
-        Some(toml::Value::Table(table)) => toml::Value::Table(table.clone()),
+        Some(toml::Value::Table(table)) => {
+            let mut table = table.clone();
+            // Resolved by the gateway, not part of the driver's own schema.
+            table.remove("isolation_backend");
+            toml::Value::Table(table)
+        }
         _ => toml::Value::Table(toml::Table::new()),
     }
 }
@@ -723,6 +785,62 @@ pub fn driver_table(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn isolation_backend_selection_follows_the_driver_and_matches_exactly() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+compute_driver = "external"
+[openshell.drivers.external]
+isolation_backend = "agent-substrate"
+[openshell.drivers.alternative]
+isolation_backend = "other-backend"
+[openshell.drivers.builtin]
+isolation_backend = "openshell-sandbox"
+[[openshell.supervisor.isolation_backends]]
+name = "agent-substrate"
+endpoint = { kind = "tcp", authority = "backend.example:443", addresses = ["127.0.0.1:47000"] }
+[[openshell.supervisor.isolation_backends]]
+name = "other-backend"
+endpoint = { kind = "unix", socket_path = "/run/other.sock" }
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        for (driver, backend) in [
+            ("external", "agent-substrate"),
+            ("alternative", "other-backend"),
+        ] {
+            assert_eq!(
+                file.isolation_backend(driver).unwrap().unwrap().name,
+                backend
+            );
+        }
+        for driver in ["builtin", "absent"] {
+            assert!(file.isolation_backend(driver).unwrap().is_none());
+        }
+        let mut file = file;
+        file.openshell.drivers.get_mut("external").unwrap()["isolation_backend"] =
+            toml::Value::String("Agent-substrate".into());
+        assert!(file.isolation_backend("external").is_err());
+    }
+
+    #[test]
+    fn isolation_backend_invalid_registration_fails_load_and_preflight() {
+        for contents in [
+            "[openshell.gateway]\nisolation_backend = 'agent-substrate'",
+            "[openshell.drivers.external]\nisolation_backend = 'missing'",
+            "[openshell.drivers.unused]\nisolation_backend = ''",
+            "[openshell.drivers.external]\nisolation_backend = 42",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'openshell-sandbox'\nendpoint = { kind = 'unix', socket_path = '/run/backend.sock' }",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'unused'\nendpoint = { kind = 'unix', socket_path = 'relative.sock' }",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'duplicate'\nendpoint = { kind = 'unix', socket_path = '/run/a.sock' }\n[[openshell.supervisor.isolation_backends]]\nname = 'duplicate'\nendpoint = { kind = 'unix', socket_path = '/run/b.sock' }",
+        ] {
+            let tmp = write_tmp(contents);
+            assert!(load(tmp.path()).is_err(), "{contents}");
+            assert!(preflight(tmp.path()).is_err(), "{contents}");
+        }
+    }
 
     fn write_raw_tmp(contents: &str) -> tempfile::NamedTempFile {
         let mut tmp = tempfile::Builder::new()

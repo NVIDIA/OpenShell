@@ -1,7 +1,50 @@
 # OpenShell sandbox backend
 
-This crate implements the supervisor-side isolation backend and the private
+This crate implements the supervisor-side isolation backend and the versioned
 control protocol shared with `openshell-sandbox`.
+
+## Boundary startup and routing
+
+The supervisor uses the generated `IsolationBackend` control service to
+negotiate capabilities and open a boundary before reading image policy. Each
+physical connection repeats that handshake, including credential-epoch changes
+and transport recovery. The launch session and generation identify retries;
+the descriptor must bind to the same provisioned resource. Reopening returns
+the same handle for the runtime's lifetime. Driver deletion terminates the
+runtime and invalidates that handle.
+
+Isolation protocol 1.0 includes boundary routing and requires
+`openshell.isolation.contract` on both peers. The shared extension
+negotiator checks major versions and each peer's required capabilities. The
+built-in runtime does not advertise `openshell.isolation.suspend-resume` and
+returns `UNIMPLEMENTED` for those optional RPCs.
+
+`DelegatedIsolationBoundary.Exchange` and `.Mediate` begin with the handle from
+`OpenBoundary`. The server authenticates the stream's bearer, checks the handle
+against its provisioned sandbox and generation, then accepts data fragments.
+Missing bindings, repeated bindings, and frames without a payload are rejected.
+The fragments retain the existing versioned Sandbox Protocol framing.
+
+Opening a boundary only validates and reserves a route. It neither attaches a
+supervisor nor runs workload code. Policy discovery is followed by the existing
+attach, mediation setup, confirm, and explicit start sequence. The existing
+connection registry continues to govern supervisor replacement and recovery.
+
+Update the supervisor and sandbox runtime together; an older peer fails during
+startup instead of using a fallback path.
+
+## Endpoint-registered backends
+
+`DelegatedRuntimeBackend` uses the same client and lifecycle handles for an
+operator-registered backend. Trusted endpoint registration and `DelegatedLaunch`
+metadata are separate from the driver's opaque descriptor, which crosses
+`OpenBoundary` unchanged. Common confirmation checks bind identity, session,
+generation, resource claims, and outer-fence evidence. Native evidence is
+validated by the registered backend; Linux evidence validation remains in the
+built-in adapter.
+
+The language-neutral contract, generation instructions, and interoperability
+vectors are in [Sandbox Protocol 1.0](../../proto/sandbox_protocol/v1/README.md).
 
 ## Exec recovery
 

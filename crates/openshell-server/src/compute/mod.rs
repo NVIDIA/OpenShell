@@ -63,6 +63,7 @@ use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 
 pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-driver";
+const ISOLATION_BACKEND_ANNOTATION: &str = "internal.openshell.ai/isolation-backend";
 pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
     "internal.openshell.ai/compute-runtime-identity";
 #[cfg(unix)]
@@ -73,6 +74,12 @@ pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+fn supports_isolation_registration(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|capability| {
+        capability == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
+    })
+}
 
 use provisioning_operation::ProvisioningOperationError;
 use traced_driver::TracedDriver;
@@ -506,7 +513,7 @@ impl RemoteComputeDriver {
         self.client.clone()
     }
 
-    async fn verify_admission_policy(&self) -> Result<(), Status> {
+    async fn verify_admission_policy(&self, external_isolation: bool) -> Result<(), Status> {
         let expected = self
             .admission_acknowledgement
             .lock()
@@ -519,9 +526,17 @@ impl RemoteComputeDriver {
                 gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
             })
             .await?
-            .into_inner()
-            .resource_admission_policy;
-        if current != expected {
+            .into_inner();
+        if external_isolation
+            && !current.extension.as_ref().is_some_and(|metadata| {
+                supports_isolation_registration(&metadata.supported_capabilities)
+            })
+        {
+            return Err(Status::failed_precondition(
+                "remote compute driver no longer supports isolation backend registration; restart the gateway after upgrading the driver",
+            ));
+        }
+        if current.resource_admission_policy != expected {
             return Err(Status::failed_precondition(
                 "remote driver admission policy changed; restart gateway after configuring matching policy",
             ));
@@ -567,7 +582,15 @@ impl ComputeDriver for RemoteComputeDriver {
         Status,
     > {
         let mut client = self.client();
-        self.verify_admission_policy().await?;
+        self.verify_admission_policy(
+            request
+                .get_ref()
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.spec.as_ref())
+                .is_some_and(|spec| spec.isolation_backend.is_some()),
+        )
+        .await?;
         client.validate_sandbox_create(request).await
     }
 
@@ -595,7 +618,15 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
     {
         let mut client = self.client();
-        self.verify_admission_policy().await?;
+        self.verify_admission_policy(
+            request
+                .get_ref()
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.spec.as_ref())
+                .is_some_and(|spec| spec.isolation_backend.is_some()),
+        )
+        .await?;
         client.create_sandbox(request).await
     }
 
@@ -614,7 +645,8 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StartSandboxResponse>, Status>
     {
         let mut client = self.client();
-        self.verify_admission_policy().await?;
+        self.verify_admission_policy(request.get_ref().isolation_backend.is_some())
+            .await?;
         client.start_sandbox(request).await
     }
 
@@ -656,6 +688,7 @@ impl ComputeDriver for RemoteComputeDriver {
 
 #[derive(Clone)]
 pub struct ComputeRuntime {
+    isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
@@ -759,6 +792,7 @@ impl ComputeRuntime {
         ));
         rootfs_tar_staging.sweep_orphans();
         Ok(Self {
+            isolation_backend: None,
             driver: TracedDriver::new(driver, driver_name),
             admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
             admission_acknowledgement: capabilities.resource_admission_policy,
@@ -912,6 +946,83 @@ impl ComputeRuntime {
         &self.default_image
     }
 
+    pub(crate) fn with_isolation_backend(
+        mut self,
+        registration: Option<&openshell_core::isolation_registration::BackendRegistration>,
+    ) -> Result<Self, String> {
+        if let Some(registration) = registration
+            && !supports_isolation_registration(
+                &self.driver_info.negotiated_extension.supported_capabilities,
+            )
+        {
+            return Err(format!(
+                "compute driver '{}' does not support operator-selected isolation backend '{}'",
+                self.driver_info.name, registration.name
+            ));
+        }
+        self.isolation_backend = registration
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(str::to_string)?;
+        Ok(self)
+    }
+
+    fn isolation_backend_name(&self) -> &str {
+        self.isolation_backend.as_ref().map_or(
+            openshell_core::isolation_registration::BUILTIN_BACKEND_NAME,
+            |registration| registration.name.as_str(),
+        )
+    }
+
+    fn validate_isolation_backend_binding(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        let admitted = sandbox
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.annotations.get(ISOLATION_BACKEND_ANNOTATION))
+            .map_or(
+                openshell_core::isolation_registration::BUILTIN_BACKEND_NAME,
+                String::as_str,
+            );
+        if admitted != self.isolation_backend_name() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox isolation backend '{admitted}' does not match gateway selection '{}'; restore the gateway selection or create a new sandbox",
+                self.isolation_backend_name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn driver_sandbox_for_launch(&self, sandbox: &Sandbox) -> Result<DriverSandbox, Status> {
+        let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
+        if let Some(spec) = driver_sandbox.spec.as_mut() {
+            spec.isolation_backend.clone_from(&self.isolation_backend);
+        }
+        Ok(driver_sandbox)
+    }
+
+    fn driver_start_request(
+        &self,
+        sandbox: &Sandbox,
+        launch_authentication: Vec<u8>,
+        expected_runtime_identity: String,
+    ) -> Result<StartSandboxRequest, Status> {
+        self.validate_isolation_backend_binding(sandbox)?;
+        if self.isolation_backend.is_some() {
+            self.validate_launch_signer_configured(!launch_authentication.is_empty())?;
+        }
+        Ok(StartSandboxRequest {
+            sandbox_id: sandbox.object_id().to_string(),
+            name: sandbox.object_name().to_string(),
+            generation_id: sandbox_runtime_generation(sandbox)
+                .map_err(Status::failed_precondition)?
+                .into_string(),
+            launch_authentication,
+            expected_runtime_identity,
+            isolation_backend: self.isolation_backend.clone(),
+        })
+    }
+
     /// Validate the budget once at startup. Persisted attempts keep their
     /// original deadline even if the operator changes this value on restart.
     pub(crate) fn with_image_preparation_timeout(mut self, seconds: u32) -> Result<Self, String> {
@@ -1058,8 +1169,7 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
-        let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
-            .map_err(|status| *status)?;
+        let mut driver_sandbox = self.driver_sandbox_for_launch(sandbox)?;
         // Peek, never consume: create runs the same path immediately after and
         // must still find the token.
         if let Some(token) = take_staging_token(&mut driver_sandbox) {
@@ -1109,9 +1219,9 @@ impl ComputeRuntime {
             .any(|capability| {
                 capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
             });
-        if required && !configured {
+        if (required || self.isolation_backend.is_some()) && !configured {
             return Err(Status::failed_precondition(
-                "the selected compute driver requires sandbox launch signing; configure \
+                "the selected runtime requires sandbox launch signing; configure \
                  [openshell.gateway.gateway_jwt] or provide jwt/signing.pem, jwt/public.pem, \
                  and jwt/kid under OPENSHELL_LOCAL_TLS_DIR (default: the OpenShell state \
                  directory's tls/). Listener TLS does not configure sandbox launch signing",
@@ -1169,6 +1279,14 @@ impl ComputeRuntime {
         )?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
+        let metadata = sandbox
+            .metadata
+            .as_mut()
+            .ok_or_else(|| Status::invalid_argument("sandbox metadata is missing"))?;
+        metadata.annotations.insert(
+            ISOLATION_BACKEND_ANNOTATION.into(),
+            self.isolation_backend_name().into(),
+        );
 
         // Strip the staging token from the public sandbox before anything
         // persists it: the object store copy is readable by every member of the
@@ -1179,8 +1297,7 @@ impl ComputeRuntime {
             .map(|token| self.rootfs_tar_staging.consume(&token))
             .transpose()?;
 
-        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
-            .map_err(|status| *status)?;
+        let mut driver_sandbox = self.driver_sandbox_for_launch(&sandbox)?;
         if let Some(staged) = staged.as_ref() {
             set_rootfs_tar_path(&mut driver_sandbox, staged.path());
         }
@@ -1726,6 +1843,10 @@ impl ComputeRuntime {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        self.validate_isolation_backend_binding(&candidate)?;
+        if self.isolation_backend.is_some() {
+            self.validate_launch_signer_configured(authority.is_some())?;
+        }
         provisioning_operation::ensure_operation_settled(&candidate)?;
         if provisioning_deadline::timed_out(&candidate)
             && candidate
@@ -1897,7 +2018,6 @@ impl ComputeRuntime {
             async move {
                 Box::pin(runtime.complete_sandbox_start(
                     sandbox_id,
-                    sandbox_name,
                     previous,
                     starting,
                     lifecycle_guard,
@@ -1918,7 +2038,6 @@ impl ComputeRuntime {
     async fn complete_sandbox_start(
         &self,
         sandbox_id: String,
-        sandbox_name: String,
         previous: Sandbox,
         starting: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
@@ -1930,15 +2049,11 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
-        let generation_id = sandbox_runtime_generation(&starting)
-            .map_err(Status::failed_precondition)?
-            .into_string();
         let expected_runtime_identity = sandbox_compute_runtime_identity(&previous);
         // One owned operation covers both calls. A NotFound response alone
         // does not end ownership while the recovery create can still run.
         let recreate = if provisioning_deadline::timed_out(&previous) {
-            let mut driver_sandbox = driver_sandbox_from_public(&starting, &self.driver_info.name)
-                .map_err(|status| *status)?;
+            let mut driver_sandbox = self.driver_sandbox_for_launch(&starting)?;
             if let Some(spec) = driver_sandbox.spec.as_mut() {
                 spec.launch_authentication
                     .clone_from(&launch_authentication);
@@ -1947,26 +2062,16 @@ impl ComputeRuntime {
         } else {
             None
         };
+        let request =
+            self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)?;
         let driver = self.driver.clone();
         let operation_id = sandbox_id.clone();
         let result = Box::pin(self.await_provisioning_operation(&starting, async move {
-            let request_id = operation_id.clone();
             let response = driver
                 .call_owned(
                     openshell_otel::rpc::START_SANDBOX,
                     Some(&operation_id),
-                    move |driver| async move {
-                        driver
-                            .start_sandbox(Request::new(StartSandboxRequest {
-                                isolation_backend: None,
-                                sandbox_id: request_id,
-                                name: sandbox_name,
-                                launch_authentication,
-                                generation_id,
-                                expected_runtime_identity,
-                            }))
-                            .await
-                    },
+                    move |driver| async move { driver.start_sandbox(Request::new(request)).await },
                 )
                 .await;
             match (response, recreate) {
@@ -3295,6 +3400,11 @@ impl ComputeRuntime {
             if !sandbox_phase_should_be_running(phase) && !recoverable_error {
                 continue;
             }
+            if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
+                warn!(sandbox_id, %error, "Rejected recovered sandbox backend selection");
+                failed += 1;
+                continue;
+            }
 
             if let Err(error) = self.validate_caller_driver_config(
                 sandbox
@@ -3315,16 +3425,12 @@ impl ComputeRuntime {
                 continue;
             }
 
-            let sandbox_name = sandbox.object_name().to_string();
-            let generation_id = match sandbox_runtime_generation(&sandbox) {
-                Ok(generation) => generation.into_string(),
-                Err(error) => {
-                    warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
-                    authentication_failed(sandbox.object_id());
-                    failed += 1;
-                    continue;
-                }
-            };
+            if let Err(error) = sandbox_runtime_generation(&sandbox) {
+                warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                authentication_failed(sandbox.object_id());
+                failed += 1;
+                continue;
+            }
             let launch_authentication = match launch_authentication_for(&sandbox).await {
                 Ok(authentication) => authentication,
                 Err(err) => {
@@ -3348,32 +3454,24 @@ impl ComputeRuntime {
                     continue;
                 }
             };
-            let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
-            let request_id = sandbox_id.clone();
-            let request_name = sandbox_name.clone();
+            let request = match self.driver_start_request(
+                &sandbox,
+                launch_authentication,
+                sandbox_compute_runtime_identity(&sandbox),
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    warn!(sandbox_id, %error, "Rejected recovered sandbox launch");
+                    failed += 1;
+                    continue;
+                }
+            };
             match Box::pin(self.await_provisioning_operation(
                 &sandbox,
                 self.driver.call_owned(
                     openshell_otel::rpc::START_SANDBOX,
                     Some(&sandbox_id),
-                    move |driver| {
-                        let sandbox_id = request_id;
-                        let sandbox_name = request_name;
-                        let launch_authentication = launch_authentication.clone();
-                        let expected_runtime_identity = expected_runtime_identity.clone();
-                        async move {
-                            driver
-                                .start_sandbox(Request::new(StartSandboxRequest {
-                                    isolation_backend: None,
-                                    sandbox_id,
-                                    name: sandbox_name,
-                                    launch_authentication,
-                                    generation_id,
-                                    expected_runtime_identity,
-                                }))
-                                .await
-                        }
-                    },
+                    move |driver| async move { driver.start_sandbox(Request::new(request)).await },
                 ),
             ))
             .await
@@ -3604,6 +3702,10 @@ impl ComputeRuntime {
                     }
                 }
                 SandboxPhase::Starting => {
+                    if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
+                        warn!(%error, "Rejected pending sandbox backend selection");
+                        continue;
+                    }
                     if let Err(error) = self.validate_caller_driver_config(
                         sandbox
                             .spec
@@ -3619,16 +3721,33 @@ impl ComputeRuntime {
                         continue;
                     }
                     let sandbox_id = sandbox.object_id().to_string();
-                    let sandbox_name = sandbox.object_name().to_string();
-                    let driver_sandbox_id = sandbox_id.clone();
-                    let generation_id = match sandbox_runtime_generation(&sandbox) {
-                        Ok(generation) => generation.into_string(),
+                    let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
+                    let launch_authentication = if self.isolation_backend.is_some() {
+                        let authority = self.restart_authority.get().and_then(Option::as_deref);
+                        match self
+                            .encode_persisted_launch_authentication(authority, &sandbox)
+                            .await
+                        {
+                            Ok(authentication) => authentication,
+                            Err(error) => {
+                                warn!(sandbox_id, %error, "Failed to prepare recovered sandbox credentials");
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let request = match self.driver_start_request(
+                        &sandbox,
+                        launch_authentication,
+                        expected_runtime_identity,
+                    ) {
+                        Ok(request) => request,
                         Err(error) => {
-                            warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                            warn!(sandbox_id, %error, "Rejected pending sandbox launch");
                             continue;
                         }
                     };
-                    let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
@@ -3639,16 +3758,7 @@ impl ComputeRuntime {
                                 openshell_otel::rpc::START_SANDBOX,
                                 Some(&sandbox_id),
                                 |driver| async move {
-                                    driver
-                                        .start_sandbox(Request::new(StartSandboxRequest {
-                                            isolation_backend: None,
-                                            sandbox_id: driver_sandbox_id,
-                                            name: sandbox_name,
-                                            launch_authentication: Vec::new(),
-                                            generation_id,
-                                            expected_runtime_identity,
-                                        }))
-                                        .await
+                                    driver.start_sandbox(Request::new(request)).await
                                 },
                             ),
                         )
@@ -4029,6 +4139,8 @@ impl ComputeRuntime {
         }
 
         let sandbox_name = current.object_name().to_string();
+        self.validate_isolation_backend_binding(&current)
+            .map_err(|error| error.to_string())?;
         let authority = self.restart_authority.get().and_then(Option::as_deref);
         let already_claimed = current
             .status
@@ -4131,29 +4243,22 @@ impl ComputeRuntime {
                 let launch_authentication = runtime
                     .encode_persisted_launch_authentication(authority, &armed)
                     .await?;
-                let generation_id = sandbox_runtime_generation(&armed)
-                    .map_err(Status::failed_precondition)?
-                    .into_string();
-                let request_id = operation_id.clone();
-                let start = runtime
-                    .driver
-                    .call_owned(
-                        openshell_otel::rpc::START_SANDBOX,
-                        Some(&operation_id),
-                        move |driver| async move {
-                            driver
-                                .start_sandbox(Request::new(StartSandboxRequest {
-                                    isolation_backend: None,
-                                    sandbox_id: request_id,
-                                    name: operation_name,
-                                    launch_authentication,
-                                    generation_id,
-                                    expected_runtime_identity,
-                                }))
-                                .await
-                        },
-                    )
-                    .await;
+                let request = runtime.driver_start_request(
+                    &armed,
+                    launch_authentication,
+                    expected_runtime_identity,
+                )?;
+                let start =
+                    runtime
+                        .driver
+                        .call_owned(
+                            openshell_otel::rpc::START_SANDBOX,
+                            Some(&operation_id),
+                            move |driver| async move {
+                                driver.start_sandbox(Request::new(request)).await
+                            },
+                        )
+                        .await;
                 Ok(match start {
                     Ok(response) => RestartOutcome::Started(response.into_inner()),
                     Err(status) => RestartOutcome::DriverError("start", status),
@@ -6011,7 +6116,6 @@ fn driver_sandbox_spec_from_public(
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
-        isolation_backend: None,
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
         template: spec
@@ -6045,6 +6149,7 @@ fn driver_sandbox_spec_from_public(
                 .map_or_else(String::new, |process| process.run_as_group.clone()),
         }),
         launch_authentication: Vec::new(),
+        isolation_backend: None,
     })
 }
 
@@ -7320,6 +7425,7 @@ pub fn new_test_runtime_with_driver(
 ) -> ComputeRuntime {
     let supports_sandbox_authentication = driver.sandbox_authentication.is_some();
     ComputeRuntime {
+        isolation_backend: None,
         driver: TracedDriver::new(driver, "test".to_string()),
         admission: openshell_core::resource_admission::DriverAdmissionConfig {
             allow_driver_config: true,
@@ -8414,6 +8520,7 @@ mod tests {
     ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
+            isolation_backend: None,
             driver: TracedDriver::new(driver, "test-driver".to_string()),
             admission: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: true,
@@ -15830,6 +15937,332 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn isolation_backend_operator_selection_reaches_remote_driver_launches() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("compute.sock");
+        let driver = FakeComputeDriver::new()
+            .with_isolation_backend_registration()
+            .with_gateway_manages_lifecycle();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("external", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let file: crate::config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell]
+version = 2
+[openshell.gateway]
+compute_driver = "external"
+[openshell.drivers.external]
+isolation_backend = "agent-substrate"
+[[openshell.supervisor.isolation_backends]]
+name = "agent-substrate"
+endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" }
+"#,
+        )
+        .unwrap();
+        let registration = file.isolation_backend("external").unwrap().unwrap();
+        let expected = openshell_core::proto::compute::v1::IsolationBackendRegistration::try_from(
+            registration,
+        )
+        .unwrap();
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap()
+        .with_isolation_backend(Some(registration))
+        .unwrap();
+        assert!(runtime.validate_launch_signer_configured(false).is_err());
+        let _ = runtime
+            .restart_authority
+            .set(Some(Arc::new(test_session_authority())));
+
+        let mut sandbox = sandbox_record(
+            "external-create",
+            "external-create",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            ISOLATION_BACKEND_ANNOTATION.into(),
+            "workload-forgery".into(),
+        );
+        sandbox
+            .spec
+            .get_or_insert_with(Default::default)
+            .environment
+            .insert(
+                "OPENSHELL_ADMITTED_ISOLATION_BACKEND".into(),
+                "workload-forgery".into(),
+            );
+        runtime.validate_sandbox_create(&sandbox).await.unwrap();
+        runtime
+            .create_sandbox_authenticated(
+                sandbox.clone(),
+                None,
+                Some(test_launch_authentication(&sandbox)),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut launch_calls = 0;
+        for call in driver.calls() {
+            match call {
+                FakeComputeDriverCall::ValidateSandboxCreate {
+                    sandbox: Some(sandbox),
+                }
+                | FakeComputeDriverCall::CreateSandbox {
+                    sandbox: Some(sandbox),
+                } => {
+                    launch_calls += 1;
+                    assert_eq!(
+                        sandbox.spec.unwrap().isolation_backend,
+                        Some(expected.clone())
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            launch_calls, 2,
+            "validation and create must both reach the driver"
+        );
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("external-create")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !format!("{stored:?}").contains("/run/agent-substrate"),
+            "operator endpoint must not persist in the public sandbox"
+        );
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get(ISOLATION_BACKEND_ANNOTATION),
+            Some(&registration.name)
+        );
+
+        let legacy = sandbox_record("legacy", "legacy", SandboxPhase::Stopped);
+        runtime.store.put_message(&legacy).await.unwrap();
+        driver.clear_calls();
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "legacy")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(
+            driver.calls().is_empty(),
+            "legacy built-in resources must not launch through an external backend"
+        );
+
+        let mut stopped = sandbox_record("external-start", "external-start", SandboxPhase::Stopped);
+        stopped.metadata.as_mut().unwrap().annotations.insert(
+            ISOLATION_BACKEND_ANNOTATION.into(),
+            registration.name.clone(),
+        );
+        runtime.store.put_message(&stopped).await.unwrap();
+        driver.clear_calls();
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "external-start")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(driver.calls().is_empty());
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("external-start")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Stopped as i32
+        );
+        runtime
+            .start_sandbox_authenticated(
+                "default",
+                "external-start",
+                Some(&test_session_authority()),
+            )
+            .await
+            .unwrap();
+        assert!(driver.calls().iter().any(|call| matches!(call,
+            FakeComputeDriverCall::StartSandbox { sandbox_id, isolation_backend, .. }
+            if sandbox_id == "external-start" && isolation_backend.as_ref() == Some(&expected))));
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("external-start")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Starting as i32
+        );
+
+        let mut bad_pending = sandbox_record("bad-pending", "bad-pending", SandboxPhase::Starting);
+        let annotations = &mut bad_pending.metadata.as_mut().unwrap().annotations;
+        annotations.clear();
+        annotations.insert(
+            ISOLATION_BACKEND_ANNOTATION.into(),
+            registration.name.clone(),
+        );
+        runtime.store.put_message(&bad_pending).await.unwrap();
+
+        driver.clear_calls();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |sandbox| {
+                    let auth = test_launch_authentication(sandbox);
+                    async move { Ok(auth) }
+                },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let starts: Vec<_> = driver
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                FakeComputeDriverCall::StartSandbox {
+                    sandbox_id,
+                    isolation_backend,
+                    launch_authentication,
+                    ..
+                } => {
+                    assert_ne!(
+                        sandbox_id, "bad-pending",
+                        "invalid credentials must not reach the driver"
+                    );
+                    assert!(
+                        !launch_authentication.is_empty(),
+                        "recovery must supply signed launch credentials"
+                    );
+                    Some(isolation_backend)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!starts.is_empty());
+        assert!(
+            starts
+                .iter()
+                .all(|registration| registration.as_ref() == Some(&expected))
+        );
+
+        let mut other = registration.clone();
+        other.name = "other-substrate".into();
+        for selected in [None, Some(&other)] {
+            let other_replica = runtime.clone().with_isolation_backend(selected).unwrap();
+            driver.clear_calls();
+            assert_eq!(
+                other_replica
+                    .start_sandbox("default", "external-start")
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+            other_replica
+                .start_persisted_sandboxes_with_authentication(
+                    |sandbox| {
+                        let name = sandbox.object_name().to_string();
+                        async move { panic!("mismatched backend must be rejected before minting credentials: {name}") }
+                    },
+                    |_| async { Ok(()) },
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(
+                driver.calls().is_empty(),
+                "another replica must not launch a differently bound resource"
+            );
+        }
+        let mut capabilities = driver
+            .get_capabilities(Request::new(GetCapabilitiesRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        capabilities
+            .extension
+            .as_mut()
+            .unwrap()
+            .supported_capabilities
+            .retain(|capability| {
+                capability
+                    != openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
+            });
+        let _ = driver.clone().with_capabilities(capabilities);
+        driver.clear_calls();
+        assert_eq!(
+            runtime
+                .validate_sandbox_create(&sandbox)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(driver.calls(), vec![FakeComputeDriverCall::GetCapabilities]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn isolation_backend_selection_rejects_unsupported_remote_driver_before_launch() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("compute.sock");
+        let driver = FakeComputeDriver::new();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("external", &socket_path)
+            .await
+            .unwrap();
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            Arc::new(Store::connect("sqlite::memory:").await.unwrap()),
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        let registration = openshell_core::isolation_registration::BackendRegistration {
+            name: "agent-substrate".into(),
+            endpoint: openshell_core::isolation_registration::SandboxTransport::Unix {
+                socket_path: "/run/backend.sock".into(),
+            },
+        };
+        assert!(
+            runtime
+                .with_isolation_backend(Some(&registration))
+                .unwrap_err()
+                .contains("does not support")
+        );
+        assert_eq!(driver.calls(), vec![FakeComputeDriverCall::GetCapabilities]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn remote_compute_driver_forwards_lifecycle_calls_over_uds() {
         use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
 
@@ -15934,7 +16367,7 @@ mod tests {
         runtime.start_persisted_sandboxes().await.unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
+            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name, .. }]
                 if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
         ));
         driver.clear_calls();
