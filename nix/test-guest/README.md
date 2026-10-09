@@ -78,10 +78,10 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
-Store installation experiments. Combine it with `docker` to reproduce the
-system-Docker canary, or use it alone to verify that `install.sh` fails safely
-when Docker is absent.
+The `snapd` configuration is available for Ubuntu and prepares snapd to
+reproduce `install.sh` automatic snap selection. Combine it with `docker` to
+reproduce the system-Docker canary, or use it alone to verify that `install.sh`
+fails safely when Docker is absent.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the

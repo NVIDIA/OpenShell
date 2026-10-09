@@ -157,15 +157,15 @@ for snap_file in \
   assert_not_contains "$snap_file" "default-provider: docker"
 done
 if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
-  echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
+  echo "FAIL: obsolete snap Docker connection hook must not exist" >&2
   exit 1
 fi
 if [[ ! -x "$snap_install_hook" ]]; then
-  echo "FAIL: Snap install hook must be executable" >&2
+  echo "FAIL: snap install hook must be executable" >&2
   exit 1
 fi
 if [[ ! -x "$snap_configure_hook" ]]; then
-  echo "FAIL: Snap configure hook must be executable" >&2
+  echo "FAIL: snap configure hook must be executable" >&2
   exit 1
 fi
 assert_contains "$snapcraft" 'daemon-scope: system'
@@ -173,7 +173,7 @@ assert_contains "$snapcraft" 'daemon-scope: user'
 assert_contains "$snapcraft" 'install-mode: disable'
 assert_not_contains "$snapcraft" 'install-mode: enable'
 if grep -Eq '^  gateway:$' "$snapcraft"; then
-  echo "FAIL: removed Snap gateway app must not remain declared" >&2
+  echo "FAIL: removed snap gateway app must not remain declared" >&2
   exit 1
 fi
 assert_contains "$snapcraft" '  system-gateway:'
@@ -187,7 +187,7 @@ assert_not_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON'
 assert_not_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON'
 assert_contains "$snapcraft" 'refresh-mode: endure'
 if [[ ! -x "$snap_post_refresh_hook" ]]; then
-  echo "FAIL: Snap post-refresh hook must be executable" >&2
+  echo "FAIL: snap post-refresh hook must be executable" >&2
   exit 1
 fi
 assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
@@ -211,7 +211,7 @@ if ! awk '
   }
   END { exit !(in_prover && finished && command && alias && home && plug_count == 1) }
 ' "$snapcraft"; then
-  echo "FAIL: Snap prover app must expose the openshell-prover alias with only home access" >&2
+  echo "FAIL: snap prover app must expose the openshell-prover alias with only home access" >&2
   exit 1
 fi
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
@@ -239,6 +239,7 @@ assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 assert_contains "$snap_canary" "openshell.prover check"
+assert_not_contains "$snap_canary" "OPENSHELL_INSTALL_METHOD"
 assert_not_contains "$snap_canary" "--dangerous"
 assert_not_contains "$snap_canary" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
