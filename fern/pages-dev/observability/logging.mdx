@@ -265,7 +265,7 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 
 Each supervisor file appender is configured with a three-file limit. The shorthand appender's filename prefix also matches JSONL files, so its cleanup can delete JSONL history on filesystems that expose file creation timestamps. Do not rely on independent three-file retention for each format.
 
-File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output.
+File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output. Enabling `ocsf_json_enabled` adds full `OCSF-JSON` records to stderr even without a file sink; see [OCSF JSON collection](/observability/ocsf-json-export#output-location).
 
 Docker and Podman use tmpfs for this directory; Kubernetes uses an `emptyDir` in the supervisor pod. Collect logs externally before rotation or teardown for durable retention. See [Accessing Logs](/observability/accessing-logs#direct-filesystem-access) for driver-specific access and storage lifetimes.
 

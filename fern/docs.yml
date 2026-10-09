@@ -102,6 +102,22 @@ versions:
       <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0" target="_blank"
       rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 redirects:
+- source: /openshell/dev/kubernetes/sandbox-runtime
+  destination: /openshell/dev/kubernetes/setup
+- source: /openshell/dev/about/how-it-works
+  destination: /openshell/dev/about/architecture
+- source: /openshell/dev/extensibility/extension-negotiation
+  destination: /openshell/dev/extensibility/overview#protocol-negotiation
+- source: /openshell/dev/providers/google-vertex-ai
+  destination: /openshell/dev/how-it-works/providers/google#vertex-ai
+- source: /openshell/dev/about/supported-agents
+  destination: /openshell/dev/about/run-your-first-agent
+- source: /openshell/dev/get-started/quickstart
+  destination: /openshell/dev/about/run-your-first-agent
+- source: /openshell/dev/about/why-open-shell
+  destination: /openshell/dev/about/overview
+- source: /openshell/dev/sdk/type-script
+  destination: /openshell/dev/sdk/typescript
 - source: /openshell/latest/kubernetes/sandbox-runtime
   destination: /openshell/latest/kubernetes/setup
 - source: /openshell/latest/about/how-it-works
@@ -138,22 +154,6 @@ redirects:
   destination: /openshell/latest/tutorials
 - source: /openshell/tutorials/:path*
   destination: /openshell/latest/tutorials/:path*
-- source: /openshell/dev/kubernetes/sandbox-runtime
-  destination: /openshell/dev/kubernetes/setup
-- source: /openshell/dev/about/how-it-works
-  destination: /openshell/dev/about/architecture
-- source: /openshell/dev/extensibility/extension-negotiation
-  destination: /openshell/dev/extensibility/overview#protocol-negotiation
-- source: /openshell/dev/providers/google-vertex-ai
-  destination: /openshell/dev/how-it-works/providers/google#vertex-ai
-- source: /openshell/dev/about/supported-agents
-  destination: /openshell/dev/about/run-your-first-agent
-- source: /openshell/dev/get-started/quickstart
-  destination: /openshell/dev/about/run-your-first-agent
-- source: /openshell/dev/about/why-open-shell
-  destination: /openshell/dev/about/overview
-- source: /openshell/dev/sdk/type-script
-  destination: /openshell/dev/sdk/typescript
 - source: /openshell/:path*/index.html
   destination: /openshell/:path*
 - source: /openshell/:path*.html

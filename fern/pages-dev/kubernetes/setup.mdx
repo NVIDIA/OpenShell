@@ -230,6 +230,41 @@ openshell status
 
 ## Configure Chart Values
 
+The Helm chart renders `gatewayConfig` into the mounted `gateway.toml`
+ConfigMap. Each top-level key names a TOML table, and its fields use the names
+in the [gateway configuration reference](/how-it-works/gateways/configuration).
+For example, set the gateway log level with:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set 'gatewayConfig.openshell\.gateway.log_level=debug'
+```
+
+Keep credentials, database URLs, and private keys in Kubernetes Secrets,
+using the chart's environment-variable, file, or volume wiring. The chart
+rejects `database_url`, inline URL credentials, and PEM private keys in
+`gatewayConfig`, but it does not detect every possible secret.
+
+Helm values for Services, probes, TLS certificates, Secret references, RBAC,
+NetworkPolicies, and mounts still control those Kubernetes resources. The
+chart derives their corresponding runtime settings to keep the gateway
+configuration aligned with the deployed resources.
+
+YAML scalar values retain their types, scalar lists become TOML arrays, and
+nested maps become inline tables. Top-level lists become arrays of tables and
+preserve item order. Null fields are omitted; null array elements are invalid.
+Helm template expressions in strings are not evaluated.
+
+Existing application values remain supported as deprecated aliases. Explicit
+`gatewayConfig` fields take precedence, including resource-admission settings
+and the Kubernetes Secrets credential namespace. The global image pull policy
+applies to runtime and supervisor images. Leave `image_pull_policy` and
+`sandbox.image.pullPolicy` unset to use Kubernetes defaults for the workload
+image.
+
 The most commonly changed values are:
 
 | Value | Purpose |

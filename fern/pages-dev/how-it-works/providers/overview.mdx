@@ -141,6 +141,45 @@ does not activate static credentials from a profileless provider because it
 cannot determine which credential definition applies.
 </Warning>
 
+## Retrieve Runtime Credentials
+
+An [mTLS operator](/how-it-works/gateways/authentication#mtls-operators) can call
+`openshell.v1.OpenShell/GetProviderCredentials` through the
+[Python SDK](/sdk/python#retrieve-provider-credentials),
+[TypeScript SDK](/sdk/typescript#retrieve-provider-credentials), or a generated/raw
+gRPC client. Select one explicit workspace, one provider by canonical name, and
+between 1 and 32 runtime environment keys. For example, the request body for a
+GitHub provider is:
+
+```json
+{
+  "workspace_scope": { "workspace": "default" },
+  "name": "my-github",
+  "credential_keys": ["GITHUB_TOKEN"]
+}
+```
+
+The response maps each selected key to its `value` and optional
+`expiration_time`. The gateway returns all selected values or an error. It
+reuses sufficiently valid credentials and refreshes gateway-managed credentials
+when necessary. `minimum_remaining_lifetime` accepts a protobuf duration up to
+24 hours; omission or zero uses a five-minute safety margin. Non-expiring static
+credentials satisfy the lifetime requirement. A credential that cannot meet the
+requested lifetime causes the call to fail.
+
+OAuth refresh-managed credentials return access tokens, never gateway-only
+refresh tokens, client secrets, or signing material. Supervisor-side,
+endpoint-specific, and SPIFFE-bound dynamic grants return `FAILED_PRECONDITION`.
+Refresh effects can persist even if another selected key causes the request to
+fail. An uncertain rotating-token exchange requires reauthorization or refresh
+reconfiguration rather than an automatic retry.
+
+<Warning>
+Retrieval exports real credential values outside sandbox endpoint enforcement.
+Keep them out of logs, command history, and shared output. Ordinary users and
+OIDC admins cannot call this RPC. No dedicated CLI command is provided.
+</Warning>
+
 ## Manage Providers
 
 List, inspect, update, and delete providers from the active gateway.

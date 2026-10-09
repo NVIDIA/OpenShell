@@ -69,9 +69,35 @@ The connection flow:
 5. When mTLS user authentication is enabled, the gateway maps the verified certificate subject to a user principal.
 6. The gateway authorizes the gRPC method.
 
+### mTLS Operators
+
+Enable `[openshell.gateway.mtls_auth] operator_enabled = true` to recognize a
+trusted client certificate whose organizational unit is exactly `operator`
+(`OU=operator`). This creates a distinct operator principal with user and
+platform-admin capabilities across all workspaces, plus permission to call
+`GetProviderCredentials`. Ordinary mTLS users and OIDC admins do not have that
+permission, even with an `operator` claim or `openshell:all`.
+
+Operator authentication requires TLS and a configured client CA. It works
+alongside OIDC and does not require ordinary mTLS user authentication. Connect
+directly to the gateway with the certificate and its private key; do not send an
+`Authorization` header on the same connection. Forwarded certificate headers
+and edge-tunnel authentication cannot establish an operator identity.
+
+Anyone who can issue certificates under the trusted client CA can issue an
+operator certificate. Restrict CA issuance and operator private-key access.
+Normal gateway certificate generation does not grant the operator role.
+Certificate validity and CA changes apply to new TLS handshakes, not requests on
+already-established connections; close existing connections when removing
+trust. The gateway does not provide per-certificate revocation through this
+setting.
+
+See [Providers](/how-it-works/providers/overview#retrieve-runtime-credentials)
+for the credential retrieval contract.
+
 ### OIDC
 
-Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
+Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
 
 OIDC is application-layer authentication. TLS authenticates the gateway and protects the transport; OIDC clients do not need a TLS client certificate. The gateway validates any client certificate they present against the configured client CA.
 
@@ -100,27 +126,25 @@ The same settings are available through environment variables:
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
 | `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. | Empty |
 
-For Helm deployments, set the same values under `server.oidc`:
+For Helm deployments, set the same values in `gatewayConfig` under the
+`openshell.gateway.oidc` TOML table:
 
 ```yaml
-server:
-  oidc:
+gatewayConfig:
+  openshell.gateway.oidc:
     issuer: https://idp.example.com/realms/openshell
     audience: openshell-cli
-    # Only needed when discovery returns a deliberately separate JWKS origin.
-    jwksAllowedOrigins:
-      - https://keys.example.com
-    rolesClaim: realm_access.roles
-    adminRole: openshell-admin
-    userRole: openshell-user
-    scopesClaim: ""
+    roles_claim: realm_access.roles
+    admin_role: openshell-admin
+    user_role: openshell-user
+    scopes_claim: ""
 ```
 
 The gateway requires HTTPS for OIDC discovery and JWKS retrieval, rejects
 redirects, and trusts the issuer origin for JWKS by default. Add a
-`jwksAllowedOrigins` entry only when the identity provider intentionally serves
+`jwks_allowed_origins` entry only when the identity provider intentionally serves
 keys from another trusted origin. For local tests, numeric-loopback HTTP also
-requires `dangerouslyAllowInsecureHttp: true`; this setting never permits an
+requires `dangerously_allow_insecure_http: true`; this setting never permits an
 HTTP hostname or non-loopback address.
 
 Register an OIDC gateway with the CLI:
@@ -215,7 +239,7 @@ The gateway validates OIDC access tokens against the issuer's JWKS endpoint. It 
 
 For EC and OKP keys, `crv` fully determines the algorithm. For RSA keys, the algorithm is selected from the JWK's declared `alg` field when it names one of the six RSA algorithms above; if `alg` is absent (as with Microsoft Entra ID, which omits it entirely), the gateway defaults to RS256. If `alg` names a non-RSA algorithm, the key is treated as contradictory and skipped (see below) rather than falling back to RS256.
 
-The gateway rejects tokens when the JWT header `alg` does not match the algorithm pinned from the JWK. Tokens must include `iss`, `aud`, `exp`, and `sub` claims. The `iss` and `aud` values must match the configured issuer and audience.
+The gateway accepts the `Bearer` scheme in the `Authorization` header in any letter case. It rejects tokens when the JWT header `alg` does not match the algorithm pinned from the JWK. Tokens must include `iss`, `aud`, `exp`, and `sub` claims. The `iss` and `aud` values must match the configured issuer and audience.
 
 JWKs with `use: enc`, an `alg` that genuinely contradicts the derived algorithm (for example an RSA key declaring `ES256`), or `key_ops` that excludes `verify` are skipped. The gateway refreshes the JWKS cache when it encounters an unknown key ID, throttled to at most once per second to bound how much an unknown-`kid` lookup can amplify requests against the issuer. If a refresh yields zero usable keys, the gateway keeps serving the previous key set rather than dropping all signing keys and failing every request, but only for up to three times the configured TTL. If the JWKS is still empty after that grace period, the cached keys are evicted and all tokens are rejected until the issuer recovers.
 
@@ -271,7 +295,10 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 ### Plaintext
 
-When a gateway is deployed with `server.disableTls=true`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+When a gateway is deployed with `disable_tls = true` (set through Helm as
+`server.disableTls=true`), TLS is disabled entirely. The CLI connects over plain
+HTTP/2. This mode is intended for local port-forwarding or gateways behind a
+trusted reverse proxy or tunnel that handles TLS termination externally.
 
 Register a plaintext gateway with an explicit `http://` endpoint:
 
