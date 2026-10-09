@@ -1169,10 +1169,11 @@ async fn run_sandbox_with_backend(
             .allows_gateway_policy_reload()
             .then(|| retained_proto.clone())
             .flatten();
-        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+        let poll_interval_secs: u64 =
+            std::env::var(openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
         let poll_ctx = PolicyPollLoopContext {
             endpoint: poll_endpoint,
             sandbox_id: poll_id,

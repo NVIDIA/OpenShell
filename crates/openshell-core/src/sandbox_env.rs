@@ -29,6 +29,13 @@ pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 /// OTLP/gRPC collector endpoint for supervisor trace export.
 pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 
+/// Seconds between the supervisor's polls for a changed sandbox
+/// configuration (policy and settings). Unset means the supervisor default.
+pub const POLICY_POLL_INTERVAL_SECS: &str = "OPENSHELL_POLICY_POLL_INTERVAL_SECS";
+
+/// Largest policy poll interval a compute driver passes to a supervisor.
+pub const POLICY_POLL_INTERVAL_SECS_MAX: u64 = 600;
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in

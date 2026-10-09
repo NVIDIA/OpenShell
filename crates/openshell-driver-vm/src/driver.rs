@@ -301,6 +301,12 @@ pub struct VmDriverConfig {
     /// Maximum rootfs tar file size in bytes. Defaults to 10 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_tar_max_bytes: Option<u64>,
+    /// Seconds between each supervisor's polls for a changed sandbox
+    /// configuration, passed as `OPENSHELL_POLICY_POLL_INTERVAL_SECS`. The
+    /// supervisor's environment is otherwise cleared, so this is the only way
+    /// to set it. `None` keeps the supervisor default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_policy_poll_interval_secs: Option<u64>,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -363,6 +369,10 @@ impl std::fmt::Debug for VmDriverConfig {
             )
             .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
             .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
+            .field(
+                "supervisor_policy_poll_interval_secs",
+                &self.supervisor_policy_poll_interval_secs,
+            )
             .finish()
     }
 }
@@ -402,6 +412,7 @@ impl Default for VmDriverConfig {
             sandbox_gid: None,
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
+            supervisor_policy_poll_interval_secs: None,
         }
     }
 }
@@ -978,6 +989,7 @@ impl VmDriver {
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
             );
+        apply_supervisor_policy_poll_interval(&mut command, &self.config);
         if let Some(endpoint) = &self.config.supervisor_otlp_endpoint {
             command
                 .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
@@ -7186,6 +7198,17 @@ fn isolate_host_control_environment(command: &mut Command) {
     command.env_clear();
 }
 
+/// Pass the operator's policy poll interval to a supervisor, whose
+/// environment `isolate_host_control_environment` has cleared.
+fn apply_supervisor_policy_poll_interval(command: &mut Command, config: &VmDriverConfig) {
+    if let Some(secs) = config.supervisor_policy_poll_interval_secs {
+        command.env(
+            openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS,
+            secs.to_string(),
+        );
+    }
+}
+
 #[tracing::instrument(
     name = "vm.launch",
     skip(command),
@@ -11471,6 +11494,30 @@ mod tests {
         assert_eq!(
             absolute_state_dir(&absolute).expect("preserve absolute state dir"),
             absolute
+        );
+    }
+
+    #[test]
+    fn supervisor_policy_poll_interval_reaches_the_cleared_environment() {
+        let mut command = Command::new("openshell-sandbox");
+        isolate_host_control_environment(&mut command);
+        apply_supervisor_policy_poll_interval(&mut command, &VmDriverConfig::default());
+        assert_eq!(command.as_std().get_envs().count(), 0);
+
+        let config = VmDriverConfig {
+            supervisor_policy_poll_interval_secs: Some(1),
+            ..VmDriverConfig::default()
+        };
+        apply_supervisor_policy_poll_interval(&mut command, &config);
+        let environment = command.as_std().get_envs().collect::<Vec<_>>();
+        assert_eq!(environment.len(), 1);
+        assert_eq!(
+            environment[0].0,
+            openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            environment[0].1.and_then(std::ffi::OsStr::to_str),
+            Some("1")
         );
     }
 
