@@ -203,6 +203,36 @@ server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
 ```
 
+#### Database PVC storage
+
+Size the gateway database claim and select its StorageClass with
+`server.databaseStorageSize` and `server.databaseStorageClass`. Omitting both
+requests `1Gi` from the cluster's default StorageClass. Set
+`server.databaseStorageClass` on clusters with no default StorageClass,
+otherwise the gateway PVC stays Pending. Both values are ignored under
+`workload.kind=deployment`, which mounts no PVC.
+
+```yaml
+server:
+  databaseStorageSize: 20Gi
+  databaseStorageClass: fast-ssd
+```
+
+`volumeClaimTemplates` is immutable, so set both at install time. To grow an
+existing claim, expand it in place when its StorageClass allows expansion, then
+recreate the StatefulSet so its template matches:
+
+```shell
+kubectl -n openshell patch pvc openshell-data-openshell-0 \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl -n openshell delete statefulset openshell --cascade=orphan
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+  --reuse-values -n openshell --set server.databaseStorageSize=20Gi
+```
+
+A recreated StatefulSet re-adopts existing claims unchanged, so changing
+StorageClass means copying the data to a new claim.
+
 #### External PostgreSQL
 
 Use external PostgreSQL when the gateway should connect to a database managed
@@ -477,6 +507,8 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
 | server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
+| server.databaseStorageClass | string | `""` | Kubernetes StorageClass for the gateway database PVC (StatefulSet workload only). Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the gateway PVC stays Pending. Use a block-backed class, not NFS or other network filesystems. Immutable after install. |
+| server.databaseStorageSize | string | `""` | Storage request for the gateway database PVC (StatefulSet workload only). Uses Kubernetes quantity syntax and requires an explicit unit ("20Gi", not "20"). Empty = built-in default (1Gi). Growing an existing release's claim is PVC expansion, not a values change. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). SQLite runs in WAL mode and needs a local block-backed volume, not NFS or other network filesystems. |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |

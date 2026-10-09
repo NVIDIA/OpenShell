@@ -278,6 +278,8 @@ The most commonly changed values are:
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
+| `server.databaseStorageSize` | Storage request for the gateway database PVC under `workload.kind=statefulset`. Defaults to `1Gi`. Requires an explicit unit, such as `20Gi`. |
+| `server.databaseStorageClass` | `StorageClass` for the gateway database PVC under `workload.kind=statefulset`. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Use a block-backed class, not NFS. |
 | `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Default sandbox image used when a sandbox does not specify one. |
 | `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |
@@ -300,6 +302,10 @@ helm upgrade --install openshell \
   --namespace openshell \
   --values my-values.yaml
 ```
+
+<Warning>
+`server.databaseStorageSize` and `server.databaseStorageClass` feed the gateway StatefulSet's immutable `volumeClaimTemplates`. Set them at install time. Changing them later fails the upgrade and does not move existing data; refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md#database-pvc-storage) for migration steps.
+</Warning>
 
 To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
 in the sandbox namespace and reference its name:

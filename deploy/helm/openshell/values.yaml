@@ -356,6 +356,17 @@ server:
   # in WAL mode and needs a local block-backed volume, not NFS or other network
   # filesystems.
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Storage request for the gateway database PVC (StatefulSet workload only).
+  # Uses Kubernetes quantity syntax and requires an explicit unit ("20Gi", not
+  # "20"). Empty = built-in default (1Gi). Growing an existing release's claim
+  # is PVC expansion, not a values change.
+  databaseStorageSize: ""
+  # -- Kubernetes StorageClass for the gateway database PVC (StatefulSet workload
+  # only). Empty (default) = omit storageClassName, using the cluster's default
+  # StorageClass. Set this on clusters with no default StorageClass, otherwise
+  # the gateway PVC stays Pending. Use a block-backed class, not NFS or other
+  # network filesystems. Immutable after install.
+  databaseStorageClass: ""
   # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
   # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
   # from this Secret instead of using dbUrl. The Secret must contain a
