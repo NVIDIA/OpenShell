@@ -34,6 +34,9 @@ pub mod datamodel {
 
 pub mod sandbox {
     pub use super::generated::openshell::sandbox::v1;
+    pub mod protocol {
+        pub use super::super::generated::openshell::sandbox::protocol::v1;
+    }
 }
 
 pub mod compute {
@@ -42,6 +45,12 @@ pub mod compute {
 
 pub mod extension {
     pub use super::generated::openshell::extension::v1;
+}
+
+pub mod isolation {
+    pub mod backend {
+        pub use super::super::generated::openshell::isolation::backend::v1;
+    }
 }
 
 #[allow(

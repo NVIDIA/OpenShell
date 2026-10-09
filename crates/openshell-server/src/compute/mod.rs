@@ -2084,6 +2084,7 @@ impl ComputeRuntime {
                     move |driver| async move {
                         driver
                             .start_sandbox(Request::new(StartSandboxRequest {
+                                isolation_backend: None,
                                 sandbox_id: request_id,
                                 name: sandbox_name,
                                 launch_authentication,
@@ -3636,6 +3637,7 @@ impl ComputeRuntime {
                         async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
+                                    isolation_backend: None,
                                     sandbox_id,
                                     name: sandbox_name,
                                     launch_authentication,
@@ -3904,6 +3906,7 @@ impl ComputeRuntime {
                                 |driver| async move {
                                     driver
                                         .start_sandbox(Request::new(StartSandboxRequest {
+                                            isolation_backend: None,
                                             sandbox_id: driver_sandbox_id,
                                             name: sandbox_name,
                                             launch_authentication: Vec::new(),
@@ -4405,6 +4408,7 @@ impl ComputeRuntime {
                         move |driver| async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
+                                    isolation_backend: None,
                                     sandbox_id: request_id,
                                     name: operation_name,
                                     launch_authentication,
@@ -6272,6 +6276,7 @@ fn driver_sandbox_spec_from_public(
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
+        isolation_backend: None,
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
         template: spec

@@ -85,3 +85,11 @@ identifies the service being exposed.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.
+
+## Isolation backend protocol
+
+[`isolation_backend.proto`](isolation_backend.proto) and
+[`sandbox_protocol.proto`](sandbox_protocol.proto) are supervisor-to-backend
+contracts, not gateway RPCs. Backend authors can generate bindings independently
+and implement [Sandbox Protocol 1.0](sandbox_protocol/v1/README.md). Its negotiated
+version covers the gRPC services, JSON messages, framing, and lifecycle semantics.

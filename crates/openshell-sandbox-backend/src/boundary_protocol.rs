@@ -276,25 +276,7 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
-/// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
-/// Authentication is configured separately and is identical for every variant.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum SandboxTransport {
-    Unix {
-        socket_path: PathBuf,
-    },
-    Tcp {
-        /// Stable logical Kubernetes Service authority used for diagnostics.
-        authority: String,
-        /// Explicit connection candidates resolved by the compute driver.
-        addresses: Vec<std::net::SocketAddr>,
-    },
-    Vsock {
-        guest_cid: u32,
-        port: u32,
-    },
-}
+pub use openshell_core::isolation_registration::SandboxTransport;
 
 /// Supervisor-side, generation-pinned TLS server authentication.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1460,6 +1442,36 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_protocol_vectors_match_typed_messages_digest_and_framing() {
+        use sha2::Digest as _;
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../proto/sandbox_protocol/v1/vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(vectors["version"], "1.0");
+        for vector in vectors["requests"].as_array().unwrap() {
+            let envelope: RequestEnvelope =
+                serde_json::from_value(vector["envelope"].clone()).unwrap();
+            envelope.validate_payload_digest().unwrap();
+            assert_eq!(serde_json::to_value(&envelope).unwrap(), vector["envelope"]);
+            let canonical = vector["canonical_request"].as_str().unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(canonical.as_bytes())),
+                envelope.payload_digest
+            );
+            let hex = vector["frame_hex"].as_str().unwrap();
+            let frame: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+                .collect();
+            let decoded: RequestEnvelope = decode_frame(&frame).unwrap();
+            assert_eq!(decoded, envelope);
+            let decoded: RequestEnvelope = decode_frame(&encode_frame(&decoded).unwrap()).unwrap();
+            assert_eq!(decoded, envelope);
+        }
+    }
 
     fn complete_audit_evidence() -> NativeLinuxSandboxAuditEvidence {
         NativeLinuxSandboxAuditEvidence {
