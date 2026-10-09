@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Policy template: replace the path, host, and port placeholders before use.
+# Authorize the socket-owning curl executable, not its cmd.exe launcher (#4199).
+# The host supervisor evaluates REST policy and injects provider credentials.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "__OPENSHELL_DEMO_SHARE__"
+
+network_policies:
+  nvidia_inference:
+    name: nvidia-inference
+    endpoints:
+      - host: "__INFERENCE_HOST__"
+        port: __INFERENCE_PORT__
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+    binaries:
+      - path: '__CURL_EXE__'

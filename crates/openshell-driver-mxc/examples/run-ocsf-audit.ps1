@@ -23,9 +23,6 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-ocsf-audit.ps1 `
 #     -WxcExecPath C:\mxc-kit\bin\wxc-exec.exe
 #
-# By default the per-sandbox egress proxy is ON so the full event set (including
-# SandboxProxyConfigured) is produced. Pass -NoProxy to omit only that one event.
-#
 # The deliverable is the OCSF audit log (openshell-ocsf.<date>.log) inside the
 # results-*.zip the script produces. Pass -ShareOut '\\server\share' to also copy
 # the bundle to a shared location (off by default).
@@ -38,8 +35,6 @@ param(
   [string] $ShareDir     = "C:\work\openshell-mxc-demo",
   # How many sandboxes to create (each drives a full event burst).
   [int]    $SandboxCount = 2,
-  # Disable the per-sandbox egress proxy (omits the SandboxProxyConfigured event).
-  [switch] $NoProxy,
   # Gateway bind port (matches the gateway default) + CLI registration name.
   [int]    $Port         = 17670,
   [string] $GatewayName  = "openshell-mxc-ocsf",
@@ -66,6 +61,109 @@ $resultDir = Join-Path $here "results-$stamp"
 New-Item -ItemType Directory -Force $resultDir | Out-Null
 Start-Transcript -Path (Join-Path $resultDir "transcript.txt") -Force | Out-Null
 
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+    "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+    "OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+    "OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY_NAME"
+)
+
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [Parameter(Mandatory = $true)]
+        [bool] $Exists,
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if (-not $Exists) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Value.Length -eq 0) {
+        # Windows PowerShell 5.1 maps an empty value passed through
+        # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+        # so an inherited empty entry remains distinguishable from absence.
+        if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+        }
+        if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+        }
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Enter-IsolatedCliEnvironment {
+    $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+    foreach ($name in $cliEnvironmentNames) {
+        $exists = $processEnvironment.Contains($name)
+        $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+        }
+    }
+    $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-ocsf-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $isolatedPaths = @{
+        APPDATA = Join-Path $script:cliStateRoot "appdata"
+        LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+        XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+        XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+        XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+        foreach ($entry in $isolatedPaths.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Exit-IsolatedCliEnvironment
+        throw
+    }
+}
+
+function Exit-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        if (-not $script:cliEnvironmentSnapshot.ContainsKey($name)) { continue }
+        $snapshot = $script:cliEnvironmentSnapshot[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
+    if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+        if ($KeepRunning -and $gw -and -not $gw.HasExited) {
+            Write-Host "Retaining isolated CLI/runtime state for live gateway: $script:cliStateRoot"
+            return
+        }
+        # Resolve the generated target before recursive cleanup; never remove an
+        # arbitrary caller path or the temporary directory itself.
+        $cleanupPath = [IO.Path]::GetFullPath($script:cliStateRoot)
+        $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $cleanupPath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path $cleanupPath -Leaf) -notmatch '^openshell-mxc-(e2e|ocsf)-cli-[0-9]+-[0-9a-f]{32}$') {
+            throw "refusing unsafe CLI state cleanup: $cleanupPath"
+        }
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Step([string]$m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Info([string]$m) { Write-Host "    $m" }
 function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
@@ -86,6 +184,8 @@ function Get-MxcEtwSessions {
 
 $gateway = Join-Path $here "openshell-gateway.exe"
 $cli     = Join-Path $here "openshell.exe"
+$supervisor = Join-Path $here "openshell-supervisor.exe"
+$sandbox = Join-Path $here "openshell-windows-sandbox.exe"
 $policySrc = Join-Path $here "ocsf-audit.yaml"
 $policy    = Join-Path $resultDir "ocsf-audit.used.yaml"   # disposable policy matching -ShareDir
 $tomlSrc = Join-Path $here "mxc-ocsf-audit.toml"
@@ -95,12 +195,12 @@ $helloPath = Join-Path $ShareDir "hello.txt"
 $gw       = $null
 $gatewayEtwSessions = @()
 $passed   = $true
-$proxyOn  = -not $NoProxy
 
 try {
+  Enter-IsolatedCliEnvironment
   # 1. Validate artifacts + privilege.
   Step "Validate package artifacts"
-  foreach ($f in @($gateway, $cli, $policySrc, $tomlSrc)) {
+  foreach ($f in @($gateway, $cli, $supervisor, $sandbox, $policySrc, $tomlSrc)) {
     if (-not (Test-Path $f)) { throw "missing artifact: $f (run this script from inside the package folder)" }
     Info "found $(Split-Path $f -Leaf)"
   }
@@ -133,12 +233,6 @@ try {
   } else {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`netw_audit = true")
   }
-  $proxyVal = if ($proxyOn) { 'true' } else { 'false' }
-  if ($tomlText -match '(?m)^\s*#?\s*egress_proxy\s*=') {
-    $tomlText = [regex]::Replace($tomlText, '(?m)^\s*#?\s*egress_proxy\s*=.*$', "egress_proxy = $proxyVal")
-  } else {
-    $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`negress_proxy = $proxyVal")
-  }
   Set-Content $toml -Value $tomlText -Encoding UTF8
 
   $shareDirPolicy = $ShareDir.Replace('\', '/')
@@ -168,7 +262,7 @@ try {
     $driverConfig
   }
 
-  Info "backend=process_container  etw_audit=true  egress_proxy=$proxyVal"
+  Info "backend=process_container  etw_audit=true  runtime=supervisor+sandbox"
   Info "workload cwd=$shareDirPolicy  policy grant=$shareDirPolicy"
 
   # 3. Port must be free. Auto-clear a stale OUR-gateway; refuse anything else.
@@ -248,11 +342,10 @@ try {
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
-  $env:OPENSHELL_GATEWAY = ""
-  try { & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 | ForEach-Object { Info $_ } }
-  catch { Info "gateway add: $($_.Exception.Message) (continuing - likely already registered)" }
-  try { & $cli gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ } }
-  catch { Info "gateway select: $($_.Exception.Message) (continuing)" }
+  & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 | ForEach-Object { Info $_ }
+  if ($LASTEXITCODE -ne 0) { throw "gateway add failed (exit $LASTEXITCODE)" }
+  & $cli gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ }
+  if ($LASTEXITCODE -ne 0) { throw "gateway select failed (exit $LASTEXITCODE)" }
   Ok "selected gateway '$GatewayName'"
 
   # 10. Create N sandboxes. Each drives the Sandboxing provider -> a full OCSF
@@ -294,6 +387,7 @@ finally {
   }
 
   # ---- summarise the OCSF audit trail --------------------------------------
+  Exit-IsolatedCliEnvironment
   $logText = @()
   if (Test-Path (Join-Path $resultDir "gateway.log"))     { $logText += Get-Content (Join-Path $resultDir "gateway.log") }
   if (Test-Path (Join-Path $resultDir "gateway.err.log")) { $logText += Get-Content (Join-Path $resultDir "gateway.err.log") }

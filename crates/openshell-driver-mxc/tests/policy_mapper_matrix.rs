@@ -22,13 +22,14 @@
 )]
 
 use openshell_core::proto::{
-    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy,
-    MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint, NetworkMiddlewareConfig,
-    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy, McpOptions,
+    MiddlewareEndpointSelector, NetworkAccessPreset, NetworkBinary, NetworkCredentialBinding,
+    NetworkEndpoint, NetworkEnforcementMode, NetworkMiddlewareConfig, NetworkPolicyRule,
+    NetworkTlsMode, ProcessPolicy, SandboxPolicy, UiClipboardAccess, UiPolicy,
 };
 use openshell_driver_mxc::{
-    EmbeddedPolicyMapper, MapCtx, MapError, MxcMappingOptions, PolicyMapper, map_to_mxc,
-    split_policy,
+    DEFAULT_MXC_VERSION, EmbeddedPolicyMapper, MapCtx, MapError, MxcMappingOptions, PolicyMapper,
+    map_to_mxc, split_policy,
 };
 use openshell_policy::{serialize_sandbox_policy, validate_sandbox_policy};
 use serde_json::Value;
@@ -59,6 +60,17 @@ fn str_list(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn allowed_cidrs(config: &Value) -> Vec<String> {
+    config["network"]["egress"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["to"].as_array())
+        .flatten()
+        .filter_map(|peer| peer["cidr"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn default_opts() -> MxcMappingOptions {
     MxcMappingOptions::default() // bubblewrap containment
 }
@@ -82,6 +94,12 @@ fn pc_split_opts() -> MxcMappingOptions {
     }
 }
 
+fn pc_opts() -> MxcMappingOptions {
+    MxcMappingOptions {
+        containment: "processcontainer".to_owned(),
+        ..Default::default()
+    }
+}
 /// Build a minimal policy with one network rule whose endpoints carry a single
 /// endpoint set up by the caller.
 fn net_policy(key: &str, ep: NetworkEndpoint) -> SandboxPolicy {
@@ -125,6 +143,27 @@ fn assert_single_loss(
 }
 
 // ─── QUADRANT A: mappable fields, assert exact MXC output ───────────────────
+
+/// The standalone mapper and governed-egress path both emit the stable MXC 1.0
+/// directional network schema.
+#[test]
+fn a_schema_versions_use_the_same_stable_network_shape() {
+    let policy = SandboxPolicy::default();
+    let coarse = map_to_mxc(&policy, &default_opts()).config;
+    assert_eq!(DEFAULT_MXC_VERSION, "1.0.0");
+    assert_eq!(coarse["version"], DEFAULT_MXC_VERSION);
+    assert!(coarse["network"].get("egress").is_some());
+    assert!(coarse["network"].get("ingress").is_some());
+    assert!(coarse["network"].get("allowedHosts").is_none());
+    assert!(coarse["network"].get("defaultPolicy").is_none());
+
+    let governed = split_policy(&policy, &pc_split_opts())
+        .expect("governed split must exist when a proxy redirect is configured")
+        .mxc_config;
+    assert_eq!(governed["version"], DEFAULT_MXC_VERSION);
+    assert!(governed["network"].get("allowedHosts").is_none());
+    assert!(governed["network"].get("egress").is_some());
+}
 
 /// filesystem.read_write → readwritePaths verbatim, order preserved.
 #[test]
@@ -233,27 +272,28 @@ fn a_include_workdir_no_cwd_emits_info_loss() {
     assert_eq!(rw, vec!["/work"]);
 }
 
-/// Plain endpoint host → appears in allowedHosts.
+/// Numeric endpoint host → normalized into a directional CIDR rule.
 #[test]
-fn a_plain_host_in_allowed_hosts() {
+fn a_numeric_host_in_directional_allow_rule() {
     let policy = net_policy(
         "api",
         NetworkEndpoint {
-            host: "api.example.com".into(),
+            host: "198.51.100.7".into(),
             ..Default::default()
         },
     );
     let r = map_to_mxc(&policy, &bubblewrap_opts());
-    let hosts = str_list(&r.config["network"]["allowedHosts"]);
-    assert!(
-        hosts.contains(&"api.example.com".to_owned()),
-        "host must appear in allowedHosts; got: {hosts:?}"
+    assert_eq!(allowed_cidrs(&r.config), vec!["198.51.100.7/32"]);
+    assert_eq!(
+        r.config["network"]["egress"]["allow"][0]["ports"][0]["protocol"],
+        "tcp"
     );
 }
 
-/// endpoint.allowed_ips → each IP appended to allowedHosts + a "warning" loss.
+/// endpoint.allowed_ips → valid destinations become CIDRs, while the lost DNS
+/// binding remains a fail-closed mapping error.
 #[test]
-fn a_allowed_ips_appended_with_warning() {
+fn a_allowed_ips_map_to_cidrs_with_dns_binding_error() {
     let policy = net_policy(
         "api",
         NetworkEndpoint {
@@ -263,37 +303,21 @@ fn a_allowed_ips_appended_with_warning() {
         },
     );
     let r = map_to_mxc(&policy, &bubblewrap_opts());
-    let hosts = str_list(&r.config["network"]["allowedHosts"]);
-    assert!(
-        hosts.contains(&"10.0.0.1".to_owned()),
-        "IP 10.0.0.1 must be in allowedHosts"
-    );
-    assert!(
-        hosts.contains(&"10.0.0.2".to_owned()),
-        "IP 10.0.0.2 must be in allowedHosts"
-    );
-    let warnings: Vec<_> = r
-        .loss
-        .iter()
-        .filter(|i| i.severity == "warning" && i.path.contains("allowed_ips"))
-        .collect();
-    assert!(
-        !warnings.is_empty(),
-        "expected warning loss for allowed_ips; got: {:?}",
-        r.loss
-    );
+    assert_eq!(allowed_cidrs(&r.config), vec!["10.0.0.1/32", "10.0.0.2/32"]);
+    assert_single_loss(&r.loss, ".host", "error", "DNS host binding");
+    assert_single_loss(&r.loss, ".allowed_ips", "error", "allowed_ips scope");
 }
 
-/// Duplicate hosts across rules → deduplicated in allowedHosts.
+/// Duplicate directional rules are deduplicated.
 #[test]
-fn a_duplicate_hosts_deduplicated() {
+fn a_duplicate_directional_rules_deduplicated() {
     let mut policy = SandboxPolicy::default();
     let ep_a = NetworkEndpoint {
-        host: "shared.example.com".into(),
+        host: "203.0.113.10".into(),
         ..Default::default()
     };
     let ep_b = NetworkEndpoint {
-        host: "shared.example.com".into(),
+        host: "203.0.113.10".into(),
         ..Default::default()
     };
     policy.network_policies.insert(
@@ -313,14 +337,13 @@ fn a_duplicate_hosts_deduplicated() {
         },
     );
     let r = map_to_mxc(&policy, &bubblewrap_opts());
-    let hosts = str_list(&r.config["network"]["allowedHosts"]);
-    let count = hosts
-        .iter()
-        .filter(|h| h.as_str() == "shared.example.com")
-        .count();
+    assert_eq!(allowed_cidrs(&r.config), vec!["203.0.113.10/32"]);
     assert_eq!(
-        count, 1,
-        "duplicate hosts must be deduplicated; got: {hosts:?}"
+        r.config["network"]["egress"]["allow"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -384,18 +407,18 @@ fn a_split_network_verbatim_and_version_preserved() {
     );
 }
 
-/// split path: mxc_config["network"]["proxy"]["localhost"] == port (new schema).
+/// Split path emits MXC 1.0 loopback-only governed-egress fields.
 #[test]
-fn a_split_proxy_localhost_port() {
+fn a_split_proxy_uses_loopback_only_1_0_fields() {
     let policy = SandboxPolicy::default();
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
+    assert!(result.mxc_config.get("runtimeConfig").is_none());
+    assert_eq!(result.mxc_config["version"], "1.0.0");
+    assert_eq!(result.mxc_config["network"]["egress"]["default"], "deny");
     assert_eq!(
-        result.mxc_config["network"]["proxy"]["localhost"], 18080,
-        "split must emit network.proxy.localhost == port"
+        result.mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "127.0.0.1/32"
     );
-    // Released wxc-exec rejects host-list fields, even when empty.
-    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
-    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
 }
 
 // ─── QUADRANT B: OpenShell features MXC cannot express ──────────────────────
@@ -405,19 +428,48 @@ fn a_split_proxy_localhost_port() {
 // containment, assert exactly one loss item with the documented path fragment
 // and severity.
 
-/// endpoint.ports → "error" (path contains ".port").
+/// endpoint.ports → exact MXC 1.0 TCP destination-port selectors.
 #[test]
-fn b_ports_error() {
+fn a_ports_map_to_directional_rules() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
-            host: "api.example.com".into(),
-            ports: vec![443],
+            host: "198.51.100.7".into(),
+            ports: vec![80, 443],
             ..Default::default()
         },
     );
     let r = map_to_mxc(&policy, &bubblewrap_opts());
-    assert_single_loss(&r.loss, ".port", "error", "endpoint.ports");
+    assert_eq!(
+        r.config["network"]["egress"]["allow"][0]["ports"],
+        serde_json::json!([
+            { "protocol": "tcp", "port": 80 },
+            { "protocol": "tcp", "port": 443 }
+        ])
+    );
+    assert!(r.loss.iter().all(|item| !item.path.contains(".port")));
+}
+
+#[test]
+fn b_invalid_ports_are_rejected_without_broadening() {
+    let policy = net_policy(
+        "r",
+        NetworkEndpoint {
+            host: "198.51.100.7".into(),
+            ports: vec![0, 65_536],
+            ..Default::default()
+        },
+    );
+    let result = map_to_mxc(&policy, &bubblewrap_opts());
+    assert!(allowed_cidrs(&result.config).is_empty());
+    assert_eq!(
+        result
+            .loss
+            .iter()
+            .filter(|item| item.path.contains(".ports[") && item.severity == "error")
+            .count(),
+        2
+    );
 }
 
 /// endpoint.protocol → "error".
@@ -442,7 +494,7 @@ fn b_tls_skip_warning() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+            tls: NetworkTlsMode::Skip as i32,
             ..Default::default()
         },
     );
@@ -452,13 +504,13 @@ fn b_tls_skip_warning() {
 
 /// endpoint.tls = "full" (any non-skip) → "error".
 #[test]
-#[allow(deprecated)]
+#[allow(deprecated)] // Exercise rejection of an authored pre-1.0 TLS mode.
 fn b_tls_non_skip_error() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
+            tls: NetworkTlsMode::Terminate as i32,
             ..Default::default()
         },
     );
@@ -473,7 +525,7 @@ fn b_enforcement_audit_error() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            enforcement: openshell_core::proto::NetworkEnforcementMode::Audit as i32,
+            enforcement: NetworkEnforcementMode::Audit as i32,
             ..Default::default()
         },
     );
@@ -493,7 +545,7 @@ fn b_enforcement_non_audit_warning() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+            enforcement: NetworkEnforcementMode::Enforce as i32,
             ..Default::default()
         },
     );
@@ -513,7 +565,7 @@ fn b_access_error() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+            access: NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         },
     );
@@ -680,9 +732,9 @@ fn b_graphql_max_body_bytes_error() {
     );
 }
 
-/// Wildcard host ("*.example.com") with allow_wildcards=false → "error", host NOT in allowedHosts.
+/// Wildcard hosts are not representable in MXC 1.0 directional CIDR rules.
 #[test]
-fn b_wildcard_host_deny_wildcards_error_host_absent() {
+fn b_wildcard_host_error_and_no_allow_rule() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
@@ -690,13 +742,7 @@ fn b_wildcard_host_deny_wildcards_error_host_absent() {
             ..Default::default()
         },
     );
-    let opts = MxcMappingOptions {
-        allow_wildcards: false,
-        containment: "bubblewrap".to_owned(),
-        ..Default::default()
-    };
-    let r = map_to_mxc(&policy, &opts);
-    // Must have an "error" loss for the wildcard host.
+    let r = map_to_mxc(&policy, &bubblewrap_opts());
     let err_loss: Vec<_> = r
         .loss
         .iter()
@@ -707,47 +753,52 @@ fn b_wildcard_host_deny_wildcards_error_host_absent() {
         "expected error loss for wildcard host; got: {:?}",
         r.loss
     );
-    // Host must NOT be in allowedHosts when allow_wildcards=false.
-    let hosts = str_list(&r.config["network"]["allowedHosts"]);
     assert!(
-        !hosts.contains(&"*.example.com".to_owned()),
-        "wildcard host must be absent from allowedHosts when allow_wildcards=false; got: {hosts:?}"
+        allowed_cidrs(&r.config).is_empty(),
+        "wildcard host must not create an MXC directional allow rule"
     );
 }
 
-/// Wildcard host with allow_wildcards=true → "error" (semantics warning), host IS in allowedHosts.
 #[test]
-fn b_wildcard_host_allow_wildcards_error_host_present() {
+fn b_proxy_only_endpoint_fields_each_emit_error() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
-            host: "*.example.com".into(),
+            host: "198.51.100.7".into(),
+            path: "/v1/**".into(),
+            advisor_proposed: true,
+            credential_signing: "sigv4".into(),
+            signing_service: "bedrock".into(),
+            signing_region: "us-west-2".into(),
+            json_rpc_max_body_bytes: 65_536,
+            mcp: Some(McpOptions {
+                strict_tool_names: Some(true),
+                allow_all_known_mcp_methods: Some(false),
+                versions: vec!["2025-11-25".into()],
+            }),
+            credential_binding: Some(NetworkCredentialBinding {
+                provider: "aws".into(),
+            }),
+            allow_uninspected_credentials: true,
+            provider_credentialed: true,
             ..Default::default()
         },
     );
-    let opts = MxcMappingOptions {
-        allow_wildcards: true,
-        containment: "bubblewrap".to_owned(),
-        ..Default::default()
-    };
-    let r = map_to_mxc(&policy, &opts);
-    // Still an "error" loss (MXC semantics warning), even though we emitted the host.
-    let err_loss: Vec<_> = r
-        .loss
-        .iter()
-        .filter(|i| i.severity == "error" && i.path.contains(".host"))
-        .collect();
-    assert!(
-        !err_loss.is_empty(),
-        "expected error loss for wildcard host even with allow_wildcards=true; got: {:?}",
-        r.loss
-    );
-    // Host IS in allowedHosts when allow_wildcards=true.
-    let hosts = str_list(&r.config["network"]["allowedHosts"]);
-    assert!(
-        hosts.contains(&"*.example.com".to_owned()),
-        "wildcard host must appear in allowedHosts when allow_wildcards=true; got: {hosts:?}"
-    );
+    let result = map_to_mxc(&policy, &bubblewrap_opts());
+    for field in [
+        "path",
+        "advisor_proposed",
+        "credential_signing",
+        "signing_service",
+        "signing_region",
+        "json_rpc_max_body_bytes",
+        "mcp",
+        "credential_binding",
+        "allow_uninspected_credentials",
+        "provider_credentialed",
+    ] {
+        assert_single_loss(&result.loss, field, "error", field);
+    }
 }
 
 /// rule.binaries non-empty → "error" per binary.
@@ -903,12 +954,12 @@ fn b_run_as_group_warning() {
     assert_single_loss(&r.loss, "run_as_group", "warning", "process.run_as_group");
 }
 
-/// Seam-level: EmbeddedPolicyMapper.map over a policy with one error-class field
-/// (a port) via MapCtx{egress: None} returns Err(MapError::Unsupported(_)).
+/// Seam-level: EmbeddedPolicyMapper.map over a policy with unsupported fields
+/// via MapCtx{egress: None} returns Err(MapError::Unsupported(_)).
 #[test]
 fn b_seam_returns_unsupported_on_error_field() {
     let mapper = EmbeddedPolicyMapper;
-    // isolation_session containment + network policy → error loss from add_backend_specific_config.
+    // isolation_session containment cannot enforce filesystem or network policy.
     let mut policy = SandboxPolicy {
         filesystem: Some(FilesystemPolicy {
             read_write: vec!["C:/work".into()],
@@ -931,11 +982,36 @@ fn b_seam_returns_unsupported_on_error_field() {
     let ctx = MapCtx {
         sandbox_id: "sb-test".into(),
         egress: None, // coarse path → isolation_session → network policy errors
+        containment: "isolation_session".into(),
     };
     let err = mapper.map(Some(&policy), &ctx).unwrap_err();
     assert!(
         matches!(err, MapError::Unsupported(_)),
         "seam must return MapError::Unsupported for error-class losses; got: {err:?}"
+    );
+}
+
+#[test]
+fn b_isolation_session_reports_filesystem_grants_as_error() {
+    let policy = SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            read_write: vec!["C:/work".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(
+        &policy,
+        &MxcMappingOptions {
+            containment: "isolation_session".into(),
+            ..Default::default()
+        },
+    );
+    assert_single_loss(
+        &result.loss,
+        "filesystem_policy.grants",
+        "error",
+        "isolation_session filesystem grants",
     );
 }
 
@@ -949,19 +1025,15 @@ fn c_empty_policy_default_deny_posture() {
     let r = map_to_mxc(&policy, &bubblewrap_opts());
     let cfg = &r.config;
 
-    // Network: default deny, no allowed/blocked hosts.
-    assert_eq!(
-        cfg["network"]["defaultPolicy"], "block",
-        "defaultPolicy must be 'block' on empty policy"
-    );
-    assert!(
-        str_list(&cfg["network"]["allowedHosts"]).is_empty(),
-        "allowedHosts must be [] on empty policy"
-    );
-    assert!(
-        str_list(&cfg["network"]["blockedHosts"]).is_empty(),
-        "blockedHosts must be [] on empty policy"
-    );
+    // Network: stable 1.0 directional default deny, with no allow/deny rules.
+    assert_eq!(cfg["network"]["egress"]["default"], "deny");
+    assert!(cfg["network"]["egress"].get("allow").is_none());
+    assert!(cfg["network"]["egress"].get("deny").is_none());
+    assert_eq!(cfg["network"]["ingress"]["default"], "deny");
+    assert_eq!(cfg["network"]["ingress"]["hostLoopback"], "deny");
+    assert!(cfg["network"].get("defaultPolicy").is_none());
+    assert!(cfg["network"].get("allowedHosts").is_none());
+    assert!(cfg["network"].get("blockedHosts").is_none());
 
     // UI: fully locked down.
     assert_eq!(cfg["ui"]["disable"], true, "ui.disable must be true");
@@ -1001,11 +1073,7 @@ fn c_empty_policy_default_deny_posture() {
         "processContainer must be absent when no hosts are mapped"
     );
 
-    // No enforcementMode key when allowedHosts is empty.
-    assert!(
-        cfg["network"].get("enforcementMode").is_none(),
-        "enforcementMode must be absent when allowedHosts is empty"
-    );
+    assert!(cfg["network"].get("enforcementMode").is_none());
 }
 
 /// Split path with network rules present: unsupported host lists stay absent.
@@ -1024,13 +1092,141 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
         },
     );
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
-    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
-    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
-    // But proxy redirect is present.
     assert_eq!(
-        result.mxc_config["network"]["proxy"]["localhost"], 18080,
-        "split must emit network.proxy.localhost"
+        result.mxc_config["network"]["egress"]["default"], "deny",
+        "split path must deny direct egress even with network rules"
     );
+    // The only MXC-level egress allowance is host loopback.
+    assert_eq!(
+        result.mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "127.0.0.1/32"
+    );
+    assert!(result.mxc_config.get("runtimeConfig").is_none());
+}
+
+#[test]
+fn a_processcontainer_maps_ui_capabilities_exactly() {
+    for (clipboard, expected) in [
+        (UiClipboardAccess::Unspecified, "none"),
+        (UiClipboardAccess::None, "none"),
+        (UiClipboardAccess::Read, "read"),
+        (UiClipboardAccess::Write, "write"),
+        (UiClipboardAccess::All, "all"),
+    ] {
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: clipboard as i32,
+                allow_input_injection: true,
+            }),
+            ..Default::default()
+        };
+        let result = map_to_mxc(&policy, &pc_opts());
+        assert_eq!(result.config["ui"]["disable"], false);
+        assert_eq!(result.config["ui"]["clipboard"], expected);
+        assert_eq!(result.config["ui"]["injection"], true);
+        assert_eq!(result.config["ui"].as_object().unwrap().len(), 3);
+        assert!(result.loss.iter().all(|item| item.path != "ui"));
+    }
+}
+
+#[test]
+fn c_processcontainer_absent_or_empty_ui_is_default_deny() {
+    for policy in [
+        SandboxPolicy::default(),
+        SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        },
+    ] {
+        let result = map_to_mxc(&policy, &pc_opts());
+        assert_eq!(result.config["ui"]["disable"], true);
+        assert_eq!(result.config["ui"]["clipboard"], "none");
+        assert_eq!(result.config["ui"]["injection"], false);
+    }
+}
+
+#[test]
+fn b_processcontainer_rejects_clipboard_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            clipboard: UiClipboardAccess::Read as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["clipboard"], "none");
+    assert_single_loss(
+        &result.loss,
+        "ui.clipboard",
+        "error",
+        "clipboard grant suppressed by ui.disable",
+    );
+}
+
+#[test]
+fn b_processcontainer_rejects_input_injection_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            allow_input_injection: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["injection"], false);
+    assert_single_loss(
+        &result.loss,
+        "ui.allow_input_injection",
+        "error",
+        "input-injection grant suppressed by ui.disable",
+    );
+}
+
+#[test]
+fn b_isolation_session_omits_absent_ui_and_rejects_explicit_ui() {
+    let opts = MxcMappingOptions {
+        containment: "isolation_session".into(),
+        ..Default::default()
+    };
+    let absent = map_to_mxc(&SandboxPolicy::default(), &opts);
+    assert!(absent.config.get("ui").is_none());
+
+    let explicit = map_to_mxc(
+        &SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        },
+        &opts,
+    );
+    assert!(explicit.config.get("ui").is_none());
+    assert_single_loss(
+        &explicit.loss,
+        "ui",
+        "error",
+        "isolation_session explicit UI",
+    );
+}
+
+#[test]
+fn a_split_maps_ui_to_mxc_and_omits_it_from_proxy_policy() {
+    let policy = SandboxPolicy {
+        version: 1,
+        ui: Some(UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::Write as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = split_policy(&policy, &pc_split_opts()).expect("split");
+    assert_eq!(result.mxc_config["ui"]["disable"], false);
+    assert_eq!(result.mxc_config["ui"]["clipboard"], "write");
+    assert_eq!(result.mxc_config["ui"]["injection"], false);
+    assert!(result.proxy_policy.ui.is_none());
 }
 
 // ─── DRIFT GUARD ─────────────────────────────────────────────────────────────
@@ -1047,11 +1243,14 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
 /// "landlock"             — loss item emitted in add_static_policy_loss
 /// "process"              — loss items for run_as_user / run_as_group
 /// "network_policies"     — mapped via map_network / delegated in split
+/// "network_middlewares"  — error loss in coarse map / delegated in split
+/// "ui"                    — exact processContainer map / explicit unsupported loss
 const HANDLED_TOPLEVEL: &[&str] = &[
     "version",
     "filesystem_policy",
     "landlock",
     "process",
+    "ui",
     "network_policies",
     "network_middlewares",
 ];
@@ -1061,15 +1260,14 @@ const HANDLED_RULE_KEYS: &[&str] = &["name", "endpoints", "binaries"];
 
 /// Per-endpoint keys that the mapper accounts for (mapping or loss item).
 ///
-/// "host"                          — mapped to allowedHosts (or loss if wildcard/empty)
-/// "port"                          — normalized to ports at parse; covered by ports loss
-/// "ports"                         — error loss
+/// "host"                          — numeric values map to directional CIDRs; DNS/globs are errors
+/// "port" / "ports"               — mapped to directional TCP port selectors
 /// "protocol"                      — error loss
 /// "tls"                           — warning (skip) or error loss
 /// "enforcement"                   — error (audit) or warning (other) loss
 /// "access"                        — error loss
 /// "rules"                         — error loss
-/// "allowed_ips"                   — appended to allowedHosts + warning loss
+/// "allowed_ips"                   — mapped to directional CIDRs plus binding/scope error
 /// "deny_rules"                    — error loss
 /// "allow_encoded_slash"           — error loss
 /// "websocket_credential_rewrite"  — error loss
@@ -1077,11 +1275,7 @@ const HANDLED_RULE_KEYS: &[&str] = &["name", "endpoints", "binaries"];
 /// "persisted_queries"             — error loss
 /// "graphql_persisted_queries"     — error loss
 /// "graphql_max_body_bytes"        — error loss
-/// "path"                          — not currently read by the mapper (no loss emitted);
-///                                   included here so the drift guard does not trip on
-///                                   existing schema fields the mapper silently ignores.
-///                                   If the mapper needs to enforce path-scoped routing,
-///                                   remove this entry and add an explicit loss item.
+/// "path" and credential/L7 config — explicit governed-egress-only errors
 const HANDLED_ENDPOINT_KEYS: &[&str] = &[
     "host",
     "port",
@@ -1100,6 +1294,13 @@ const HANDLED_ENDPOINT_KEYS: &[&str] = &[
     "graphql_persisted_queries",
     "graphql_max_body_bytes",
     "path",
+    "allow_uninspected_credentials",
+    "credential_signing",
+    "signing_service",
+    "signing_region",
+    "credential_binding",
+    "json_rpc",
+    "mcp",
 ];
 
 #[test]
@@ -1122,6 +1323,7 @@ fn handled_fields_inventory() {
             run_as_user: "sandbox".into(),
             run_as_group: "sandbox".into(),
         }),
+        ui: Some(UiPolicy::default()),
         network_policies: {
             let mut m = std::collections::HashMap::new();
             m.insert(
@@ -1194,15 +1396,22 @@ fn handled_fields_inventory() {
         // Two ports → serializes as `ports: [80, 443]` (array form).
         ports: vec![80, 443],
         protocol: "graphql".into(),
-        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
-        enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
-        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+        tls: NetworkTlsMode::Skip as i32,
+        enforcement: NetworkEnforcementMode::Enforce as i32,
+        access: NetworkAccessPreset::Full as i32,
         allowed_ips: vec!["10.0.0.1".into()],
         allow_encoded_slash: true,
         websocket_credential_rewrite: true,
         request_body_credential_rewrite: true,
+        allow_uninspected_credentials: true,
         persisted_queries: "deny".into(),
-        graphql_max_body_bytes: 65536,
+        graphql_max_body_bytes: 65_536,
+        credential_signing: "sigv4".into(),
+        signing_service: "bedrock".into(),
+        signing_region: "us-west-2".into(),
+        credential_binding: Some(NetworkCredentialBinding {
+            provider: "aws".into(),
+        }),
         rules: vec![L7Rule {
             allow: Some(L7Allow {
                 method: "GET".into(),
@@ -1230,6 +1439,23 @@ fn handled_fields_inventory() {
         ports: vec![443],
         ..Default::default()
     };
+    let mcp_ep = NetworkEndpoint {
+        host: "mcp.example.com".into(),
+        protocol: "mcp".into(),
+        json_rpc_max_body_bytes: 131_072,
+        mcp: Some(McpOptions {
+            strict_tool_names: Some(true),
+            allow_all_known_mcp_methods: Some(false),
+            versions: vec!["2025-11-25".into()],
+        }),
+        ..Default::default()
+    };
+    let json_rpc_ep = NetworkEndpoint {
+        host: "rpc.example.com".into(),
+        protocol: "json-rpc".into(),
+        json_rpc_max_body_bytes: 65_536,
+        ..Default::default()
+    };
 
     let full_rule_policy = SandboxPolicy {
         version: 1,
@@ -1239,7 +1465,7 @@ fn handled_fields_inventory() {
                 "rule".to_owned(),
                 NetworkPolicyRule {
                     name: "rule".to_owned(),
-                    endpoints: vec![full_ep, single_port_ep],
+                    endpoints: vec![full_ep, single_port_ep, mcp_ep, json_rpc_ep],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".into(),
                     }],

@@ -25,15 +25,15 @@ pub struct LossItem {
 /// MXC capabilities that have no `OpenShell` *policy* equivalent. Surfaced in the
 /// loss report so reviewers understand the mapping is not symmetric.
 pub const OPEN_SHELL_SUPERSET_GAPS: &[&str] = &[
-    "MXC UI policy has no OpenShell policy equivalent: ui.disable, ui.clipboard, and ui.injection.",
-    "MXC lifecycle fields have no OpenShell policy equivalent: destroyOnExit, preservePolicy, phase, and sandboxId.",
+    "MXC processContainer UI refinements have no portable OpenShell policy equivalent: isolation, desktopSystemControl, systemSettings, and ime.",
+    "MXC lifecycle fields destroyOnExit and preservePolicy have no OpenShell policy equivalent.",
     "MXC backend selection and backend-specific blocks are outside OpenShell policy YAML.",
     "MXC process command, cwd, env, and timeout are runtime config fields, not OpenShell policy fields.",
     "MXC explicit deniedPaths are not expressible in current OpenShell policy YAML, which relies on default-deny filesystem behavior instead.",
     "MXC fallback.allowDaclMutation (host DACL mutation consent) has no OpenShell policy equivalent.",
-    "MXC network.allowLocalNetwork (inbound bind/listen permission) has no OpenShell policy equivalent.",
-    "MXC network.proxy configuration has no OpenShell policy equivalent.",
-    "MXC experimental backend blocks (windows_sandbox, wslc, seatbelt, isolation_session) are outside OpenShell policy YAML.",
+    "MXC directional ingress and host-loopback actions have no direct OpenShell policy equivalent.",
+    "MXC runtimeConfig.networkProxy is runtime configuration rather than an OpenShell policy field.",
+    "MXC backend-specific configuration blocks are outside OpenShell policy YAML.",
 ];
 
 pub fn add_loss(

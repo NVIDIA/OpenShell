@@ -668,7 +668,7 @@ pub async fn run_sandbox(
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
-        &backend_setup::OpenShellBackendSetup,
+        backend_setup::platform_setup(),
         SandboxRunConfig {
             command,
             workdir,

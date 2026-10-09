@@ -1,6 +1,6 @@
 ---
 name: build-openshell-mxc-windows
-description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
+description: Maintain and validate OpenShell's native Windows MSVC and MXC runtime lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, the MXC supervisor/sandbox pairing, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MSI, or service support on Windows.
 metadata:
   internal: true
 ---
@@ -12,11 +12,13 @@ OpenShell repository. The Windows lane is already present in `main`; do not
 treat this skill as a first-time porting recipe unless the user explicitly asks
 for a new fork or a from-scratch bring-up.
 
-The lane is build-only. It validates that OpenShell can compile and test on
-Windows MSVC for the supported deliverables:
+The lane validates that OpenShell can compile and test on Windows MSVC for the
+supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
+- `openshell-supervisor.exe` (host RFC 0012 isolation backend)
+- `openshell-windows-sandbox.exe` (MXC ProcessContainer boundary)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
@@ -32,6 +34,58 @@ mechanics belong to the sandbox or isolation backend. Keep the optional Unix
 SSH access adapter separate from portable session orchestration.
 Shared Sandbox Protocol audit validation defaults to strict Linux evidence;
 concrete platform validators must be selected by the implementing backend.
+
+MXC control connects outward from the boundary to a generation-scoped host
+loopback listener, matching the Windows relay's connection direction. Keep
+the reverse connector in the MXC isolation backend and share it across policy
+discovery and attachment. Shared transport hooks must retain pinned TLS peer
+verification and supervisor JWT authentication; do not change host firewall
+rules to repair host-to-AppContainer control connectivity.
+
+The dedicated Windows sandbox binary links the Windows-only `openshell-mxc-boundary`
+library for process operations, containment confirmation, and loopback
+forwarding. The generic sandbox does not link this library and remains a Linux
+runtime. Do not reintroduce a dedicated supervisor-relay executable or link
+the compute driver into the sandbox. The supervisor remains a separate host
+process. Include boundary-library regression tests in native workspace tests;
+their real process/socket checks are not qualification of MXC enforcement.
+
+Keep MXC audit schemas and their validators in the Windows boundary library.
+Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition.
+Use the private `BackendSetup` / `PreparedBackend` extension for launch decoding,
+policy discovery, and client construction. Shared startup must not decode the
+MXC descriptor or allocate its connector. Retain the same reverse-TCP connector
+in prepared launch state through discovery, attachment, and reconnects.
+It reuses the shared authenticated Sandbox Protocol, whose default Linux
+backend remains separate. Shared protocol code
+must not interpret MXC evidence.
+
+Keep proxy provisioning in MXC-owned host-launch and one-use bootstrap
+envelopes. Private Windows backend setup supplies concrete listener options to
+shared supervisor networking. Do not add proxy hooks to `BoundBoundary`, proxy
+fields to shared Sandbox Protocol descriptors, or placeholders to other drivers.
+Proxy startup remains after authenticated attachment and boundary confirmation.
+
+Do not reintroduce driver-owned proxy startup
+or gateway create-time credential snapshots. Gateway JSONL audit output
+is portable and an explicit operator opt-in, independent of the selected driver.
+Keep platform directory conventions in shared path utilities and ETW capture
+in the MXC driver. Gateway composition supplies generic connection inputs; the
+driver resolves its endpoint defaults and TLS server name. Supervisor gateway
+sessions and main attachment must work without SSH on any host. Gate only the
+Unix socket adapter, not TCP readiness or authenticated session retries.
+
+Adopt the shared protocol's authenticated policy discovery and monotonic
+provider-publication generations. Do not order opaque credential revisions
+numerically. MXC rejects unsupported provider file delivery before launch or
+environment replacement; it must not acknowledge files it did not install.
+
+Preserve main's shared outer-fence evidence contract. At the user's explicit
+request, MXC temporarily asserts the required guarantees for Windows-branch
+parity testing. These MXC-only assertions are stubs, not verified enforcement:
+broad host loopback and unverified live revocation remain known gaps. Keep the
+TODOs and unverified audit mechanism visible; never report passing E2E as proof
+that these gaps are closed. A supported PSEC host alone does not close them.
 
 ## Current Repository Shape
 
@@ -56,8 +110,8 @@ In scope:
 - Refreshing a local checkout to the latest upstream GitHub `main`.
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
-- Building x64 and ARM64 release binaries for `openshell-gateway` and
-  `openshell`.
+- Building x64 and ARM64 release binaries for `openshell-gateway`, `openshell`,
+  `openshell-supervisor`, and `openshell-windows-sandbox`.
 - Running workspace tests on a native x64 or ARM64 host.
 - Running focused unsupported-driver contract tests.
 - Reporting test counts, skipped/gated areas, warnings, artifacts, and logs.
@@ -70,12 +124,9 @@ Out of scope:
 - Kubernetes support on Windows.
 - Podman, Podman machine, or Podman Desktop support on Windows.
 - VM, Hyper-V, WSL, libkrun, or VM-backed sandbox execution on Windows.
-- New MXC compute driver crate.
-- OpenShell to MXC policy translation.
 - Windows named-pipe driver IPC.
 - Windows Credential Manager or DPAPI integration.
 - MSI, WinGet, Windows service registration, or installer work.
-- Windows supervisor runtime port.
 
 ## Hard Rules
 
@@ -168,6 +219,16 @@ mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
 ```
 
+The two `windows:test:mxc-real:*` tasks are host-specific and mutually
+exclusive on a single host (each rejects the other architecture -- see the
+table below): run `windows:test:mxc-real:x64` on an x64 host, or
+`windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
+subsystem -- run the one matching your host architecture, not both, and not
+neither. Both are skip-safe (they print a SKIP reason and exit 0 when
+`wxc-exec` or the matching backend isn't available), so running the
+arch-appropriate task is always safe even without real MXC hardware. Neither
+is part of `windows:ci`'s ordered contract, so invoke it explicitly.
+
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:
 
@@ -176,12 +237,14 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
+        mise run --skip-tools windows:test:mxc-real:x64
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
         mise run --skip-tools windows:build:arm64
         mise run --skip-tools windows:test:arm64
         mise run --skip-tools windows:test:unsupported:arm64
+        mise run --skip-tools windows:test:mxc-real:arm64
         mise run --skip-tools windows:artifacts
     }
     default {
@@ -218,7 +281,7 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and downloads the official prebuilt ARM64 Z3 static library.
+`clang-cl`, and downloads the official prebuilt ARM64 Z3 package.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -253,12 +316,14 @@ crypto dependency builds.
 |---|---|
 | `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
-| `windows:build:x64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for x64. |
-| `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` for x64. |
+| `windows:build:arm64` | Release-builds the same four binaries for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
+| `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
+| `windows:test:mxc-real:arm64` | Runs the same real-`wxc-exec` suite natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
@@ -269,6 +334,30 @@ This includes the Kubernetes Secrets and Vault packages: their libraries remain
 in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 ## Unsupported Driver Contract
+
+MXC requests and mapper artifacts use the stable 1.0.0 schema. Upgrade the
+native host executor to the signed MXC 1.0.0 release before running E2E; preserve
+the old executable for rollback and verify the release checksum, architecture,
+signature, and `--probe` output. Remove `default_configuration_id` from gateway
+configurations: it is retired and rejected. Do not restore alpha-version or
+wildcard compatibility knobs. Standalone network mapping emits numeric CIDRs
+and TCP ports and reports unrepresentable DNS/L7 semantics as losses; full
+network governance remains in the host supervisor. IsolationSession remains
+unsupported by this runtime pair, and its filesystem grants are not enforceable.
+
+MXC does not support external-resource label admission. Its factory explicitly
+acknowledges admission as disabled; do not add `resource_admission` to MXC TOML
+or weaken admission defaults for other drivers. Caller driver JSON still
+requires `allow_driver_config = true`. This does not waive native isolation,
+workload policy, authenticated transport, or outer-fence confirmation.
+
+UI controls remain in `SandboxPolicy`. Advertise `openshell.policy.ui.v1` using
+existing extension metadata, not a new per-driver boolean. The shared gateway
+checks effective policy before driver validation and provisioning; drivers
+without the capability reject explicit UI without implementing UI-specific
+handling. Keep native UI validation and mapping in MXC. Omitted UI settings deny
+graphical UI, clipboard access, and input injection. UI changes require
+recreating the sandbox.
 
 Windows must continue to reject unsupported compute drivers clearly.
 
@@ -303,6 +392,68 @@ validation; GitHub Actions does not re-run it after the full suite.
 
 ## Test Accounting Guidance
 
+For a separate qualified Windows test host, use
+`tasks/scripts/test-mxc-remote.ps1 -HostName <host> -UserName <user>`.
+It builds locally with the existing Windows tasks, detects native remote
+architecture through Windows system configuration (not an emulated SSH shell),
+caches uploads by SHA256, and runs the unchanged real E2E harness. Results and
+host probes return to `target/windows-remote-results`, including nonzero test
+outcomes. The remote host needs SSH, OpenSSL, and MXC, not a compiler toolchain.
+Package the matching `libz3.dll` from the target-specific Cargo cache alongside
+the gateway: Windows prebuilt Z3 uses an import library, not static linkage.
+The `windows:build:*` tasks now stage the pinned DLL, check PE architecture,
+reject conflicting cache hashes, and verify the copied hash. Local MXC E2E
+requires the adjacent DLL and reports a preflight error if it is missing.
+Use `-Z3DllPath` when discovery is ambiguous. The native Visual C++ runtime
+must be present on the remote host. Verify DLL architecture and the gateway
+loader before E2E; do not count missing-DLL crashes as MXC enforcement failures.
+Verify the SSH host key beforehand. Never send the private SSH key or bundle
+the harness signing-key directories. `-SkipBuild` is an explicit stale-artifact
+opt-in, not evidence that artifacts match current sources. See the MXC driver
+README for the command and remote dependency contract.
+
+For MXC validation, also run `windows:e2e:mxc`
+after the native release build. The harness uses .NET port discovery, disposable
+TOML and CLI registration, and owner-only Ed25519 keys generated by OpenSSL on
+PATH. Results live under `target/windows-e2e-results`; signing keys stay outside
+bundles and are deleted unless `-KeepRunning` is explicitly requested.
+
+E2E has no mock mode and rejects `OPENSHELL_MXC_MOCK_WXC=1`. Unit-test mocks
+are not E2E coverage. Every selected scenario must pass for a successful exit;
+any skip reports `INCOMPLETE` and exits non-zero. Do not broaden the temporary
+MXC network-assertion waiver to other audit or authentication checks. Real
+runtime scenarios require native ProcessContainer PSEC egress
+filtering and ingress host-loopback support. `wxc-exec --probe` is authoritative,
+not the Windows build number. All-skipped real runs are not passes. Separate
+test-internal `SKIP` messages from Cargo's passed count in the real integration
+suite, and report a verified unsupported-host rejection independently from
+positive admission coverage.
+
+The real `forwarding` E2E scenario uses a native test-only echo agent inside MXC and
+`openshell forward service` to verify two exact request/reply exchanges through
+the gateway, supervisor, and boundary. Dynamic ports and a per-workload nonce
+avoid mistaking unrelated listeners for success. This is managed-ingress
+coverage, not evidence that direct host ingress is fenced. Use
+`-Scenario forwarding` on the existing local or remote runner for focused checks.
+The E2E mise task and remote runner build the `mxc-forwarding-agent` Cargo example
+using `windows:build:mxc-fixtures` (or its `:x64` / `:arm64` variant). This fixture
+is not one of the four production deliverables; do not package it in releases.
+The `service-forwarding` scenario uses its HTTP mode to test named endpoint
+exposure, two exact GET responses through gateway routing, and HTTP 404 after
+endpoint deletion. This is distinct from `openshell forward service`; neither
+scenario tests file upload or exclusive ingress enforcement.
+
+The real integration HTTPS test runs the same authenticated gateway harness with
+the opt-in `https-ca` scenario, not an unauthenticated standalone driver. Build
+native release binaries first, or select them with `OPENSHELL_MXC_TEST_BINARY_DIR`.
+It requires Internet access to example.com and Windows curl >= 8.3 to explicitly
+expand the injected CA bundle into `--cacert` (Schannel ignores that environment
+variable by default). Require both a nonempty response and the OpenShell proxy
+CA issuer; never replace these assertions with an insecure TLS request. This
+fixture permits unavailable CRL information using best-effort Schannel revocation
+for the ephemeral private CA; this is not revocation qualification. This
+scenario is not part of the default six offline-capable E2E scenarios.
+
 When reporting `windows:ci`, distinguish these categories:
 
 - Passed tests from the full x64 workspace test log.
@@ -328,6 +479,8 @@ Useful log files:
 | `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
+| `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
+| `test-aarch64-pc-windows-msvc-mxc-real.log` | Native ARM64 real-MXC integration output. |
 
 The first check downloads the pinned official Z3 archive for the target
 architecture through `z3-sys`. GitHub Actions authenticates the lookup with its
@@ -356,6 +509,12 @@ error. If a missing runtime feature is required, stop and propose a follow-on
 skill or design doc.
 
 ## Final Report Checklist
+
+When syncing from the `windows` branch, consult the selective integration
+checkpoint in `crates/openshell-driver-mxc/WINDOWS-INTEGRATION.md`. Preserve
+the host-supervisor/Windows-boundary architecture rather than restoring legacy
+relay/proxy demo wrappers. The WebSocket, OpenClaw, and inference policy fixtures
+have parser/mapper tests; do not report them as live runtime scenarios.
 
 Every substantial Windows build run should report:
 

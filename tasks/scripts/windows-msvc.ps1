@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -58,6 +58,7 @@ $PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-p
 $PrebuiltZ3Version = "5.1.0"
 $Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
 $Z3ServerFeatures = $PrebuiltZ3ServerFeatures
+$Z3GatewayFeatures = "--features prebuilt-z3"
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -512,8 +513,41 @@ function Invoke-Lint([string] $RustTarget) {
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor --bin openshell-windows-sandbox $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-release.log"
+    Stage-Z3Runtime $RustTarget
+}
+
+function Stage-Z3Runtime([string] $RustTarget) {
+    $release = Join-Path $TargetDir "$RustTarget/release"
+    if ($env:Z3_LIBRARY_PATH_OVERRIDE) {
+        $candidates = @(Get-Item -LiteralPath (Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE 'libz3.dll') -ErrorAction SilentlyContinue)
+    } else {
+        # Only use the pinned release from this target's build cache. Never pick
+        # the newest arbitrary DLL, or trust a stale adjacent runtime.
+        $candidates = @(Get-ChildItem -Path (Join-Path $release "build/z3-sys-*/out/z3-$PrebuiltZ3Version/bin/libz3.dll") -File -ErrorAction SilentlyContinue)
+    }
+    if ($candidates.Count -eq 0) { throw "Matching libz3.dll not found for $RustTarget." }
+    $hashes = @($candidates | ForEach-Object { Get-Sha256 $_.FullName } | Select-Object -Unique)
+    if ($hashes.Count -ne 1) { throw "Ambiguous Z3 runtimes for $RustTarget; use a clean target cache or Z3_LIBRARY_PATH_OVERRIDE." }
+    $source = $candidates[0].FullName
+    $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($source))
+    try {
+        if ($reader.ReadUInt16() -ne 0x5A4D) { throw "Invalid Z3 DLL: $source" }
+        $reader.BaseStream.Position = 0x3C
+        $offset = $reader.ReadInt32()
+        if ($offset -lt 64 -or $offset -gt $reader.BaseStream.Length - 6) { throw 'Invalid Z3 PE offset.' }
+        $reader.BaseStream.Position = $offset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Invalid Z3 PE signature.' }
+        $expected = if ($RustTarget -eq 'aarch64-pc-windows-msvc') { 0xAA64 } else { 0x8664 }
+        if ($reader.ReadUInt16() -ne $expected) { throw "Z3 DLL architecture does not match $RustTarget." }
+    } finally { $reader.Dispose() }
+    $destination = Join-Path $release 'libz3.dll'
+    if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+    if ((Get-Sha256 $destination) -ne $hashes[0]) { throw 'Staged Z3 DLL hash mismatch.' }
+    Write-Host "==> Staged $destination (SHA256=$($hashes[0]))"
 }
 
 function Invoke-Test([string] $RustTarget) {
@@ -542,7 +576,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3GatewayFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
@@ -551,9 +585,17 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3GatewayFeatures" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
+}
+
+function Invoke-MxcRealTests([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
+        -LogName "test-$RustTarget-mxc-real.log"
 }
 
 function Get-Sha256([string] $Path) {
@@ -573,7 +615,7 @@ function Get-Sha256([string] $Path) {
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
-        foreach ($binary in @("openshell-gateway.exe", "openshell.exe")) {
+        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor.exe", "openshell-windows-sandbox.exe")) {
             $path = Join-Path $TargetDir "$rustTarget\release\$binary"
             if (-not (Test-Path $path)) {
                 continue
@@ -600,16 +642,17 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-precommit", "test-unsupported")) {
+if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "ci")) {
+if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
+    $Z3GatewayFeatures = if ($z3Features.WorkspaceFeatures) { "--features prebuilt-z3" } else { "" }
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
@@ -633,6 +676,13 @@ switch ($Action) {
         }
         Show-Artifacts $targets
     }
+    "build-mxc-fixtures" {
+        foreach ($rustTarget in $targets) {
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo build --release -p openshell-driver-mxc --example mxc-forwarding-agent --target $rustTarget" `
+                -LogName "build-$rustTarget-mxc-fixtures.log"
+        }
+    }
     "test" {
         foreach ($rustTarget in $targets) {
             Invoke-Test $rustTarget
@@ -646,6 +696,11 @@ switch ($Action) {
     "test-unsupported" {
         foreach ($rustTarget in $targets) {
             Invoke-UnsupportedContractTests $rustTarget
+        }
+    }
+    "test-mxc-real" {
+        foreach ($rustTarget in $targets) {
+            Invoke-MxcRealTests $rustTarget
         }
     }
     "artifacts" {

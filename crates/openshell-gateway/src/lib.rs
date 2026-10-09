@@ -153,6 +153,14 @@ struct MxcFactory;
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
+    fn admission_policy(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        Ok(config.admission_policy())
+    }
+
     fn supports_config_preflight(&self) -> bool {
         true
     }
@@ -161,8 +169,8 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let _: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        Ok(())
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        config.validate_configuration()
     }
 
     async fn build(
@@ -170,7 +178,14 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        let backend = openshell_driver_mxc::MxcComputeBackend::new(context.gateway_name(), config);
+        require_guest_tls_for_local_driver(&context, "mxc")?;
+        let backend = openshell_driver_mxc::MxcComputeBackend::for_gateway(
+            context.gateway_name(),
+            config,
+            context.gateway_port(),
+            context.gateway_tls_enabled(),
+            context.guest_tls_ca().map(std::path::Path::to_path_buf),
+        );
         let driver = openshell_driver_mxc::ComputeDriverService::new(backend);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -498,13 +513,16 @@ fn vm_config(
     Ok(config)
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+#[cfg(any(
+    all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-podman",
+            feature = "compute-driver-vm"
+        )
+    ),
+    all(target_os = "windows", feature = "compute-driver-mxc")
 ))]
 fn require_guest_tls_for_local_driver(
     context: &openshell_server::ComputeDriverBuildContext<'_>,
@@ -517,13 +535,16 @@ fn require_guest_tls_for_local_driver(
     )
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+#[cfg(any(
+    all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-podman",
+            feature = "compute-driver-vm"
+        )
+    ),
+    all(target_os = "windows", feature = "compute-driver-mxc")
 ))]
 fn validate_local_driver_guest_tls(
     gateway_tls_enabled: bool,

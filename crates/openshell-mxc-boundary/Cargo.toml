@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-mxc-boundary"
+description = "Windows MXC implementation of the authenticated OpenShell sandbox boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-windows-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+async-trait = "0.1"
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-ocsf = { path = "../openshell-ocsf" }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+windows = { workspace = true, features = ["Win32_Security_Authorization"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

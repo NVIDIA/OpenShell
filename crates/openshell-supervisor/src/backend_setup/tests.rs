@@ -614,6 +614,98 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn mxc_setup_preserves_admitted_identity_and_constructs_only_mxc() {
+    use openshell_sandbox_backend::boundary_protocol::{
+        SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport,
+    };
+
+    let setup = TestSetup::new();
+    let descriptor = SandboxRuntimeDescriptor {
+        boundary_id: setup.sandbox_id.clone(),
+        generation: setup.auth.runtime_generation.to_string(),
+        session_id: setup.auth.session_id,
+        workload_identity: identity(),
+        transport: SandboxTransport::Tcp {
+            authority: "unused-test-runtime".into(),
+            addresses: vec!["127.0.0.1:1".parse().unwrap()],
+        },
+        tls: SandboxTlsClientConfig {
+            server_name: "unused-test-runtime".into(),
+            trust_anchor_pem: String::new(),
+        },
+        host_gateway_ip: None,
+        resource_claims: BTreeMap::from([("mxc.control_transport".into(), "reverse_tcp".into())]),
+        outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
+            "generation-1",
+            [],
+            b"test-evidence",
+        )
+        .unwrap(),
+    };
+    let launch = openshell_mxc_boundary::launch::MxcLaunchDescriptor {
+        runtime: descriptor,
+        proxy: openshell_mxc_boundary::launch::MxcProxyConfig {
+            bind_addr: "127.0.0.1:3128".parse().unwrap(),
+            authorization: "Basic test-generation-token".into(),
+            workload_binary: "C:/Windows/System32/cmd.exe".into(),
+        },
+    };
+    let descriptor = BackendDescriptor {
+        backend_name: openshell_mxc_boundary::BACKEND_NAME.into(),
+        payload: serde_json::to_vec(&launch).unwrap(),
+    };
+    assert_eq!(
+        platform_setup().backend_name(),
+        openshell_mxc_boundary::BACKEND_NAME
+    );
+    assert!(mxc::MxcBackendSetup.decode(b"{}").is_err());
+    let selected = SelectedBackend::select(
+        &mxc::MxcBackendSetup,
+        descriptor.clone(),
+        Some(openshell_mxc_boundary::BACKEND_NAME),
+        Some(&setup.sandbox_id),
+        &setup.auth,
+    )
+    .unwrap();
+    assert!(selected.vm_policy_identity().is_none());
+    assert_eq!(selected.identity.workload_identity, identity());
+    let built = selected.prepared.build(setup.services()).unwrap();
+    assert_eq!(
+        built.backend.backend_name(),
+        openshell_mxc_boundary::BACKEND_NAME
+    );
+    let transport: SandboxRuntimeDescriptor = serde_json::from_slice(&built.payload).unwrap();
+    assert_eq!(transport, launch.runtime);
+    assert!(
+        !String::from_utf8(built.payload)
+            .unwrap()
+            .contains("test-generation-token")
+    );
+    let proxy = built.proxy_listener.unwrap();
+    assert_eq!(proxy.bind_addr, launch.proxy.bind_addr);
+    assert_eq!(proxy.authorization.as_ref(), launch.proxy.authorization);
+    assert_eq!(
+        proxy.binary_identity.executable.path,
+        launch.proxy.workload_binary
+    );
+
+    // Selecting a Windows implementation does not waive main's identity checks.
+    let mut foreign_auth = setup.auth.clone();
+    foreign_auth.session_id = SandboxSessionId::new();
+    assert!(
+        SelectedBackend::select(
+            &mxc::MxcBackendSetup,
+            descriptor,
+            Some(openshell_mxc_boundary::BACKEND_NAME),
+            Some(&setup.sandbox_id),
+            &foreign_auth,
+        )
+        .is_err()
+    );
+}
+
 /// Auth slots and shutdown signals are process-wide. Run the real startup in a
 /// child so parallel tests cannot replace credentials or consume its SIGTERM.
 #[cfg(unix)]

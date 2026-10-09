@@ -5,9 +5,9 @@
 #
 # Runs a table of policy scenarios against the OpenShell MXC driver, emits
 # per-scenario PASS/FAIL/SKIP(reason), prints a summary table, and exits non-zero
-# only on FAIL.
+# unless every selected scenario passes against real MXC.
 #
-# Every run collects its logs into a timestamped results-e2e-<stamp>\ folder and
+# Every run collects its logs beneath target/windows-e2e-results and
 # zips it (mirrors the sibling run-*.ps1 scripts). The bundle contains the console
 # transcript, the per-scenario gateway stdout/stderr, the exact TOML rendered for
 # each scenario, the policy fixture used, and a summary.txt with the verdict table.
@@ -16,9 +16,9 @@
 # isolated. Workload command/cwd are supplied per sandbox through
 # --driver-config-json; they are never patched into gateway configuration.
 #
-# Scoring (why we do NOT gate on `sandbox create` exit code):
-#   The ground truth is the on-disk artifact, so positive scenarios pass on
-#   artifact PRESENT and deny scenarios pass on the denied write being ABSENT.
+# Scoring:
+#   Positive scenarios require successful creation and a workload artifact.
+#   Deny scenarios require absent denied writes plus execution evidence.
 #   A CONTROL write proves the agent ran when the policy grants a writable path;
 #   an empty policy instead requires explicit driver-launch evidence.
 #
@@ -26,7 +26,6 @@
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-mxc-e2e.ps1 -WxcExecPath C:\mxc-kit\bin\wxc-exec.exe
-#   .\run-mxc-e2e.ps1 -Mock                                  # wiring-only, no real backend
 #   .\run-mxc-e2e.ps1 -Scenario fs-rw                        # single scenario
 #
 # Scenarios & expected verdicts:
@@ -34,18 +33,21 @@
 #   fs-readonly      - write to read-only dir is denied; control write succeeds.
 #   fs-default-deny  - ungranted write is denied after the agent launches.
 #                      processcontainer only.
-#   network-reject   - network_policies rule makes sandbox create fail.
+#   network-policy   - supervisor-owned network policy permits admission.
+#   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
+#   service-forwarding - named HTTP service routing and endpoint deletion.
+#   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 
 [CmdletBinding()]
 param(
-    [string] $DemoDir     = "C:\work\openshell-mxc-e2e",
+    [string] $DemoDir,
+    [string] $BinaryDir,
     [string] $WxcExecPath = "C:\mxc-kit\bin\wxc-exec.exe",
     [ValidateSet("isolation_session", "process_container")]
     [string] $Backend     = "process_container",
     [string] $Scenario,
     [int]    $Port        = 17670,
     [string] $GatewayName = "openshell-mxc-e2e",
-    [switch] $Mock,
     [switch] $KeepRunning
 )
 
@@ -63,9 +65,131 @@ $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 # front so the transcript (started inside the guarded region below) captures the
 # whole run, including pre-flight failures.
 $stamp     = Get-Date -Format "yyyyMMdd-HHmmss"
-$resultDir = Join-Path $here "results-e2e-$stamp"
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $here "../../.."))
+$resultsRoot = Join-Path $repoRoot "target/windows-e2e-results"
+$resultDir = Join-Path $resultsRoot "results-e2e-$stamp"
 New-Item -ItemType Directory -Force $resultDir | Out-Null
+if (-not $DemoDir) { $DemoDir = Join-Path $resultDir "work" }
+if (-not $BinaryDir) {
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot "target" }
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $target = if ($arch -eq "Arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+    $BinaryDir = Join-Path $targetRoot "$target/release"
+}
+$savedEnv = @{}
+$processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+foreach ($name in @("OPENSHELL_MXC_MOCK_WXC", "OPENSHELL_WXC_EXEC_PATH", "OPENSHELL_COMPUTE_DRIVER", "OPENSHELL_MXC_SHARE_DIR")) {
+    $exists = $processEnvironment.Contains($name)
+    $savedEnv[$name] = [pscustomobject]@{
+        Exists = $exists
+        Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+    }
+}
+$secretDir = Join-Path $resultsRoot "keys-$stamp-$([guid]::NewGuid().ToString('N'))"
 $transcriptStarted = $false
+
+$cliStateRoot = $null
+$cliEnvironmentSnapshot = @{}
+$cliEnvironmentNames = @(
+    "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+    "OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+    "OPENSHELL_GATEWAY_CONFIG", "OPENSHELL_GATEWAY_NAME"
+)
+
+function Set-ProcessEnvironmentVariableExact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [Parameter(Mandatory = $true)]
+        [bool] $Exists,
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if (-not $Exists) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Value.Length -eq 0) {
+        # Windows PowerShell 5.1 maps an empty value passed through
+        # Environment.SetEnvironmentVariable to deletion. Call Win32 directly
+        # so an inherited empty entry remains distinguishable from absence.
+        if (-not ("OpenShellMxcProcessEnvironmentNative" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class OpenShellMxcProcessEnvironmentNative
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEnvironmentVariable(string name, string value);
+}
+'@
+        }
+        if (-not [OpenShellMxcProcessEnvironmentNative]::SetEnvironmentVariable($Name, [string]::Empty)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "failed to restore empty process environment variable '$Name' (Win32 error $errorCode)"
+        }
+        return
+    }
+
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Enter-IsolatedCliEnvironment {
+    $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+    foreach ($name in $cliEnvironmentNames) {
+        $exists = $processEnvironment.Contains($name)
+        $script:cliEnvironmentSnapshot[$name] = [pscustomobject]@{
+            Exists = $exists
+            Value = if ($exists) { [string] $processEnvironment[$name] } else { $null }
+        }
+    }
+    $script:cliStateRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-mxc-e2e-cli-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $isolatedPaths = @{
+        APPDATA = Join-Path $script:cliStateRoot "appdata"
+        LOCALAPPDATA = Join-Path $script:cliStateRoot "localappdata"
+        XDG_CONFIG_HOME = Join-Path $script:cliStateRoot "xdg-config"
+        XDG_STATE_HOME = Join-Path $script:cliStateRoot "xdg-state"
+        XDG_DATA_HOME = Join-Path $script:cliStateRoot "xdg-data"
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path @($isolatedPaths.Values) | Out-Null
+        foreach ($entry in $isolatedPaths.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        foreach ($name in $cliEnvironmentNames | Where-Object { -not $isolatedPaths.ContainsKey($_) }) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Exit-IsolatedCliEnvironment
+        throw
+    }
+}
+
+function Exit-IsolatedCliEnvironment {
+    foreach ($name in $cliEnvironmentNames) {
+        if (-not $script:cliEnvironmentSnapshot.ContainsKey($name)) { continue }
+        $snapshot = $script:cliEnvironmentSnapshot[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
+    if ($script:cliStateRoot -and (Test-Path -LiteralPath $script:cliStateRoot)) {
+        if ($KeepRunning -and $gw -and -not $gw.HasExited) {
+            Write-Host "Retaining isolated CLI/runtime state for live gateway: $script:cliStateRoot"
+            return
+        }
+        # Resolve the generated target before recursive cleanup; never remove an
+        # arbitrary caller path or the temporary directory itself.
+        $cleanupPath = [IO.Path]::GetFullPath($script:cliStateRoot)
+        $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $cleanupPath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path $cleanupPath -Leaf) -notmatch '^openshell-mxc-(e2e|ocsf)-cli-[0-9]+-[0-9a-f]{32}$') {
+            throw "refusing unsafe CLI state cleanup: $cleanupPath"
+        }
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Step([string]$m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Info([string]$m)  { Write-Host "    $m" }
@@ -105,7 +229,7 @@ function Quote-NativeArgument([string]$value) {
     return $quoted.ToString()
 }
 
-function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList, [int]$timeoutSeconds = 0) {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $filePath
     $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
@@ -129,6 +253,9 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
+    if ($timeoutSeconds -gt 0 -and -not $process.WaitForExit($timeoutSeconds * 1000)) {
+        $process.Kill()
+    }
     $process.WaitForExit()
 
     return @{
@@ -139,13 +266,15 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
 
 # --- Path variables -----------------------------------------------------------
 
-$gateway   = Join-Path $here "openshell-gateway.exe"
-$cli       = Join-Path $here "openshell.exe"
-$toml      = Join-Path $here "mxc-gateway.toml"
+$gateway   = Join-Path $BinaryDir "openshell-gateway.exe"
+$cli       = Join-Path $BinaryDir "openshell.exe"
+$tomlTemplate = Join-Path $here "mxc-gateway.toml"
+$toml      = Join-Path $resultDir "mxc-gateway.toml"
 $policyDir = Join-Path $here "e2e-policies"
 
 $cmdExe     = "C:\Windows\System32\cmd.exe"
 $demoDirFwd = $DemoDir.Replace('\', '/')
+$defaultDemoDir = "C:\work\openshell-mxc-e2e"
 $roSrc      = "$DemoDir-ro-src"      # matches e2e-policies/fs-readonly.yaml read_only path
 $denyProbe  = "$DemoDir-deny-probe"  # ungranted, NOT the share: used to prove default-deny
 
@@ -165,11 +294,24 @@ $gwErrLog = $null
 function Render-Toml {
     $t = $tomlBase
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*backend\s*=.*$', "backend = `"$Backend`"")
-    if (-not $Mock) {
-        $wxcLine = "wxc_exec_path = `"$(Esc $WxcExecPath)`""
-        $t = [regex]::Replace($t, '(?m)^\s*#?\s*wxc_exec_path\s*=.*$', $wxcLine)
-    }
+    $wxcLine = "wxc_exec_path = `"$(Esc $WxcExecPath)`""
+    $t = [regex]::Replace($t, '(?m)^\s*#?\s*wxc_exec_path\s*=.*$', $wxcLine)
+    $t += @"
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = '$(Join-Path $secretDir 'signing.pem')'
+public_key_path = '$(Join-Path $secretDir 'public.pem')'
+kid_path = '$(Join-Path $secretDir 'kid')'
+gateway_id = 'mxc-e2e'
+"@
     Set-Content $toml -Value $t -Encoding UTF8
+}
+
+function Test-PortListening {
+    return @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq $Port }).Count -gt 0
 }
 
 function Start-Gw {
@@ -193,7 +335,7 @@ function Start-Gw {
             Get-Content $gwLog, $gwErrLog -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object { Info $_ }
             throw "gateway exited early (code $($p.ExitCode)). See $gwLog."
         }
-        if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+        if (Test-PortListening) {
             return $p
         }
         Start-Sleep -Milliseconds 400
@@ -214,14 +356,13 @@ function Stop-Gw($p) {
 
 function Register-Cli {
     if ($script:registered) { return }
-    $env:OPENSHELL_GATEWAY = ""
 
     $addResult = Invoke-NativeCaptured $cli @(
         "gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName
     )
     $addText = ($addResult.Output -join "`n")
     if ($addText) { $addResult.Output | ForEach-Object { Info $_ } }
-    if ($addResult.ExitCode -ne 0 -and $addText -notmatch '(?i)already exists') {
+    if ($addResult.ExitCode -ne 0) {
         throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
     }
 
@@ -241,6 +382,130 @@ function Wait-File([string]$path, [int]$seconds) {
         Start-Sleep -Milliseconds 400
     }
     return (Test-Path $path)
+}
+
+# Exercise the public gRPC forward path, never dial the workload port directly.
+# The nonce identifies this workload, not an unrelated host-loopback listener.
+function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
+    if (-not (Wait-File $readyFile 30)) { throw "MXC forwarding listener did not report readiness" }
+    $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
+    if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw "Invalid workload listener port" }
+    $outLog = Join-Path $resultDir "forward.stdout.log"
+    $errLog = Join-Path $resultDir "forward.stderr.log"
+    $arguments = @("forward", "service", $sandboxName, "--target-port", "$targetPort", "--local", "127.0.0.1:0")
+    $forwarder = $null
+    try {
+        $forwarder = Start-Process -FilePath $cli -WindowStyle Hidden -PassThru `
+            -ArgumentList (($arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        $deadline = (Get-Date).AddSeconds(30)
+        $localPort = 0
+        while ((Get-Date) -lt $deadline) {
+            if ($forwarder.HasExited) { throw "CLI forwarder exited early (code $($forwarder.ExitCode)); see $errLog" }
+            $text = (Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue)
+            if ($text -match 'Forwarding 127\.0\.0\.1:(\d+) ->') {
+                $localPort = [int]$Matches[1]
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($localPort -eq 0) { throw "CLI forwarder did not bind within 30 seconds" }
+        for ($exchange = 1; $exchange -le 2; $exchange++) {
+            $socket = New-Object System.Net.Sockets.TcpClient
+            $reader = $null
+            try {
+                $connect = $socket.BeginConnect('127.0.0.1', $localPort, $null, $null)
+                try {
+                    if (-not $connect.AsyncWaitHandle.WaitOne(5000)) { throw "Forward client connection timed out" }
+                    $socket.EndConnect($connect)
+                } finally { $connect.AsyncWaitHandle.Close() }
+                $socket.NoDelay = $true
+                $stream = $socket.GetStream()
+                $stream.ReadTimeout = 10000
+                $stream.WriteTimeout = 10000
+                $request = "request-$exchange-$([guid]::NewGuid().ToString('N'))"
+                $bytes = [Text.Encoding]::ASCII.GetBytes("$request`n")
+                $stream.Write($bytes, 0, $bytes.Length)
+                $socket.Client.Shutdown([Net.Sockets.SocketShutdown]::Send)
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::ASCII)
+                $reply = $reader.ReadLine()
+                if ($reply -ne "$nonce`:$request") { throw "Forwarded exchange $exchange returned an unexpected response: '$reply'" }
+                Info "forwarded exchange ${exchange}: exact workload response verified"
+            } finally {
+                if ($reader) { $reader.Dispose() }
+                $socket.Close()
+            }
+        }
+    } finally {
+        if ($forwarder) {
+            if (-not $forwarder.HasExited) { Stop-Process -Id $forwarder.Id -Force -ErrorAction SilentlyContinue }
+            $forwarder.Dispose()
+        }
+    }
+}
+
+# Connect to the gateway only, setting the exposed service URL's Host header.
+# This avoids DNS requirements and cannot accidentally dial the workload directly.
+function Invoke-ServiceRequest([uri]$serviceUrl, [string]$target) {
+    if ($serviceUrl.Scheme -ne 'http' -or $serviceUrl.Port -ne $Port) {
+        throw "Unexpected E2E service URL: $serviceUrl"
+    }
+    $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port$target")
+    $request.Host = $serviceUrl.Authority
+    $request.Proxy = $null
+    $request.AllowAutoRedirect = $false
+    $request.KeepAlive = $false
+    $request.Timeout = 10000
+    $request.ReadWriteTimeout = 10000
+    $response = $null
+    $reader = $null
+    try {
+        try { $response = $request.GetResponse() }
+        catch [Net.WebException] {
+            if (-not $_.Exception.Response) { throw }
+            $response = $_.Exception.Response
+        }
+        $reader = New-Object IO.StreamReader($response.GetResponseStream())
+        return @{ Status = [int]$response.StatusCode; Body = $reader.ReadToEnd() }
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
+function Test-ServiceForwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
+    if (-not (Wait-File $readyFile 30)) { throw "MXC HTTP listener did not report readiness" }
+    $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
+    if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw "Invalid workload HTTP port" }
+    $exposed = $false
+    try {
+        $result = Invoke-NativeCaptured $cli @('service', 'expose', $sandboxName, "$targetPort", 'web') 15
+        $text = $result.Output -join "`n"
+        $text | Set-Content -LiteralPath (Join-Path $resultDir 'service.expose.log') -Encoding UTF8
+        if ($result.ExitCode -ne 0) { throw "service expose failed: $text" }
+        $exposed = $true
+        if ($text -notmatch 'URL:\s+(http://[^\s\x1b]+)') { throw "service expose returned no HTTP URL: $text" }
+        $serviceUrl = [uri]$Matches[1]
+        for ($exchange = 1; $exchange -le 2; $exchange++) {
+            $target = "/probe-$exchange?request=$([guid]::NewGuid().ToString('N'))"
+            $response = Invoke-ServiceRequest $serviceUrl $target
+            if ($response.Status -ne 200 -or $response.Body -ne "$nonce`:$target") {
+                throw "HTTP exchange $exchange failed: status=$($response.Status); body=$($response.Body)"
+            }
+            Info "service HTTP exchange ${exchange}: exact workload response verified"
+        }
+        $deleted = Invoke-NativeCaptured $cli @('service', 'delete', $sandboxName, 'web') 15
+        $deleted.Output | Set-Content -LiteralPath (Join-Path $resultDir 'service.delete.log') -Encoding UTF8
+        if ($deleted.ExitCode -ne 0) { throw "service delete failed: $($deleted.Output -join "`n")" }
+        $exposed = $false
+        $response = Invoke-ServiceRequest $serviceUrl '/after-delete'
+        if ($response.Status -ne 404) { throw "Deleted service still routes: status=$($response.Status)" }
+        Info 'deleted service returns HTTP 404'
+    } finally {
+        if ($exposed) {
+            try { Invoke-NativeCaptured $cli @('service', 'delete', $sandboxName, 'web') 15 | Out-Null } catch {}
+        }
+    }
 }
 
 # Detect an agent *launch* failure (binary not found / not implemented) vs a
@@ -264,17 +529,22 @@ function Launch-Succeeded([string]$gwText) {
 # --- Backend probe ------------------------------------------------------------
 
 function Probe-Backend([string] $backendName, [string] $wxc) {
-    if ($Mock) { return @{ Live = $true; Reason = "mock mode" } }
     if (-not (Test-Path $wxc)) { return @{ Live = $false; Reason = "wxc-exec not found at $wxc" } }
 
     if ($backendName -eq "process_container") {
+        $probeResult = Invoke-NativeCaptured $wxc @("--probe")
+        if ($probeResult.ExitCode -ne 0) { throw "MXC capability probe failed: $($probeResult.Output -join ' ')" }
+        $capabilities = ($probeResult.Output -join "`n") | ConvertFrom-Json
+        if (-not $capabilities.probes.baseContainerSupportsIngressHostLoopbackAllow) {
+            return @{ Live = $false; Reason = "native ProcessContainer host-loopback support unavailable (processmodel PSEC contract required)" }
+        }
         # Use a REAL directory + absolute cmd.exe: the canonical wxc-exec passes
         # cwd straight to CreateProcessW and does NOT expand %TEMP% (that yields
         # 0x8007010B "directory name is invalid").
         $probeDir = Join-Path $env:TEMP "mxc-e2e-probe"
         New-Item -ItemType Directory -Force $probeDir | Out-Null
         $config = @{
-            version     = "0.6.0-alpha"
+            version     = "1.0.0"
             containerId = "e2e-probe-pc"
             containment = "processcontainer"
             process     = @{ commandLine = "C:\Windows\System32\cmd.exe /c exit 0"; cwd = $probeDir; timeout = 30000 }  # ms (MXC process.timeout is milliseconds)
@@ -295,21 +565,17 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
 
     if ($backendName -eq "isolation_session") {
         $config = @{
-            version     = "0.6.0-alpha"
-            phase       = "provision"
+            version     = "1.0.0"
             containment = "isolation_session"
-            filesystem  = @{ readwritePaths = @(); readonlyPaths = @() }
-            experimental = @{
-                isolation_session = @{
-                    configurationId = "composable"
-                    provision       = @{}
-                }
+            network     = @{
+                egress  = @{ default = "allow" }
+                ingress = @{ default = "allow"; hostLoopback = "allow" }
             }
         }
         $json = $config | ConvertTo-Json -Depth 20 -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $b64 = [Convert]::ToBase64String($bytes)
-        $outObj = & $wxc --config-base64 $b64 --experimental 2>&1
+        $outObj = & $wxc --config-base64 $b64 --operation provision 2>&1
         $exitCode = $LASTEXITCODE
         $output = ($outObj -join "`n").ToLower()
         if ($output -match "backend_unavailable" -or $output -match "0x80040154") {
@@ -326,19 +592,11 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
             $sandboxId = $parsed.result.sandboxId
         } catch {}
         if ($null -ne $sandboxId) {
-            $deprovConfig = @{
-                version      = "0.6.0-alpha"
-                phase        = "deprovision"
-                sandboxId    = $sandboxId
-                experimental = @{
-                    # Unit variant: null, not @{} (malformed_request otherwise).
-                    isolation_session = @{ deprovision = $null }
-                }
-            }
+            $deprovConfig = @{ version = "1.0.0" }
             $deprovJson = $deprovConfig | ConvertTo-Json -Depth 20 -Compress
             $deprovBytes = [System.Text.Encoding]::UTF8.GetBytes($deprovJson)
             $deprovB64 = [Convert]::ToBase64String($deprovBytes)
-            & $wxc --config-base64 $deprovB64 --experimental 2>&1 | Out-Null
+            & $wxc --config-base64 $deprovB64 --operation deprovision --container-id $sandboxId 2>&1 | Out-Null
         }
         return @{ Live = $true; Reason = "isolation_session probe: provisioned and deprovisioned" }
     }
@@ -360,6 +618,7 @@ $backendProbe = @{ Live = $false; Reason = "not probed" }
 $runId = Get-Date -Format 'MMddHHmmss'
 
 try {
+    Enter-IsolatedCliEnvironment
     # Start the transcript inside the guarded region so a Start-Transcript failure
     # is caught and the results bundle is still produced. Pre-flight runs
     # immediately below, so the transcript still captures the whole run.
@@ -368,11 +627,8 @@ try {
 
     # --- Pre-flight -----------------------------------------------------------
 
-    if (-not $Mock) {
-        if ($env:OPENSHELL_MXC_MOCK_WXC -eq "1") {
-            throw "OPENSHELL_MXC_MOCK_WXC=1 is set but -Mock was not passed. " +
-                  "Unset OPENSHELL_MXC_MOCK_WXC or pass -Mock."
-        }
+    if ($env:OPENSHELL_MXC_MOCK_WXC -eq "1") {
+        throw "OPENSHELL_MXC_MOCK_WXC=1 is set. E2E requires real MXC; unset this variable."
     }
 
     # -KeepRunning leaves the gateway up and breaks after the FIRST scenario (so the
@@ -383,7 +639,7 @@ try {
         throw "-KeepRunning requires -Scenario: it stops after the first scenario, so a full-suite run would report PASS on partial results. Re-run with e.g. -Scenario fs-rw-positive-negative -KeepRunning."
     }
 
-    foreach ($f in @($gateway, $cli, $toml)) {
+    foreach ($f in @($gateway, $cli, $tomlTemplate, (Join-Path $BinaryDir 'openshell-supervisor.exe'), (Join-Path $BinaryDir 'openshell-windows-sandbox.exe'))) {
         if (-not (Test-Path $f)) {
             throw "Missing artifact: $f`nBuild first or run from a demo-package folder."
         }
@@ -391,13 +647,29 @@ try {
     if (-not (Test-Path $policyDir)) {
         throw "e2e-policies/ directory not found at $policyDir"
     }
+    if (-not (Test-Path -LiteralPath (Join-Path $BinaryDir 'libz3.dll') -PathType Leaf)) {
+        throw "Missing libz3.dll beside the gateway. Re-run windows:build for this architecture, or package the matching Z3 runtime with these binaries."
+    }
 
     # Capture the pristine TOML once; every scenario renders a fresh copy from this.
-    $tomlBase = Get-Content $toml -Raw
+    $tomlBase = Get-Content $tomlTemplate -Raw
+    $openssl = (Get-Command openssl -ErrorAction Stop).Source
+    New-Item -ItemType Directory $secretDir | Out-Null
+    $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $secretDir /inheritance:r /grant:r "*$($ownerSid):(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "cannot protect disposable signing-key directory" }
+    foreach ($argsForKey in @(
+        @('genpkey', '-algorithm', 'ED25519', '-out', (Join-Path $secretDir 'signing.pem')),
+        @('pkey', '-in', (Join-Path $secretDir 'signing.pem'), '-pubout', '-out', (Join-Path $secretDir 'public.pem'))
+    )) {
+        $keyResult = Invoke-NativeCaptured $openssl $argsForKey
+        if ($keyResult.ExitCode -ne 0) { throw "disposable JWT key generation failed" }
+    }
+    Set-Content (Join-Path $secretDir 'kid') -Value 'mxc-e2e' -Encoding ASCII
 
     # --- Mode setup -----------------------------------------------------------
 
-    Step "Pre-flight (mode=$(if ($Mock) {'MOCK'} else {'REAL'}), backend=$Backend)"
+    Step "Pre-flight (mode=REAL, backend=$Backend)"
     $cliProbe = Invoke-NativeCaptured $cli @("--version")
     $cliProbeText = ($cliProbe.Output -join "`n")
     if ($cliProbe.ExitCode -ne 0) {
@@ -405,29 +677,20 @@ try {
     }
     Ok "CLI executable allowed: $($cliProbe.Output -join ' ')"
 
-    if ($Mock) {
-        $env:OPENSHELL_MXC_MOCK_WXC = "1"
-        Info "OPENSHELL_MXC_MOCK_WXC=1 - mock mode: enforcement simulated"
-    } else {
-        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
-        if (-not (Test-Path $WxcExecPath)) {
-            throw "wxc-exec not found at '$WxcExecPath'. Pass -WxcExecPath or use -Mock."
-        }
-        $env:OPENSHELL_WXC_EXEC_PATH = $WxcExecPath
-        Info "wxc-exec: $WxcExecPath"
-    }
+    Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    $env:OPENSHELL_WXC_EXEC_PATH = $WxcExecPath
+    Info "wxc-exec: $WxcExecPath"
 
     $backendProbe = Probe-Backend -backendName $Backend -wxc $WxcExecPath
     if ($backendProbe.Live) {
         Ok "Backend '$Backend' is live: $($backendProbe.Reason)"
     } else {
         Warn "Backend '$Backend' is not live: $($backendProbe.Reason)"
-        Warn "Enforcement scenarios will SKIP; network-reject scenario will still run."
+        Warn "Runtime scenarios will SKIP; this is not a real-isolation PASS."
     }
 
     Step "Check gateway port $Port"
-    $busy = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
-    if ($busy) { throw "port $Port in use (pid $($busy.OwningProcess)). Stop stale gateway first." }
+    if (Test-PortListening) { throw "port $Port in use. Stop stale gateway first." }
     Ok "port $Port free"
 
     Step "Prepare DemoDir + read-only source + deny-probe dir"
@@ -441,7 +704,7 @@ try {
     $env:OPENSHELL_MXC_SHARE_DIR = $DemoDir
 
     # --- Scenario definitions -------------------------------------------------
-    #   Kind: positive | deny | create-fail
+    #   Kind: positive | deny
     #   For deny: ControlTarget (granted, must be PRESENT) + DenyTarget (must be ABSENT).
 
     $allScenarios = @(
@@ -468,13 +731,41 @@ try {
             Description = "empty policy; ungranted write denied"
         },
         @{
-            Name = "network-reject"; PolicyFile = Join-Path $policyDir "network-reject.yaml"
+            Name = "network-policy"; PolicyFile = Join-Path $policyDir "network-reject.yaml"
             SandboxId = "net"
-            Backends = "both"; Kind = "create-fail"
-            Description = "network_policies rule causes sandbox create to fail (no live backend needed)"
+            Backends = "both"; Kind = "positive"
+            PosTarget = (Join-Path $DemoDir "network-policy-result.txt")
+            Description = "supervisor-owned network policy is accepted and workload runs (not an egress assertion)"
+        },
+        @{
+            Name = "forwarding"; PolicyFile = Join-Path $policyDir "forwarding.yaml"
+            SandboxId = "fwd"
+            Backends = "process_container"; Kind = "forwarding"
+            ReadyFile = (Join-Path $DemoDir "forwarding-port.txt")
+            Description = "real MXC listener receives two TCP exchanges through authenticated OpenShell forwarding"
+        },
+        @{
+            Name = "service-forwarding"; PolicyFile = Join-Path $policyDir "forwarding.yaml"
+            SandboxId = "svc"
+            Backends = "process_container"; Kind = "service-forwarding"
+            ReadyFile = (Join-Path $DemoDir "service-forwarding-port.txt")
+            Description = "named HTTP service routes two requests into MXC and stops routing after deletion"
         }
     )
 
+    # External connectivity is deliberately opt-in; the default six scenarios
+    # remain runnable without Internet access. Use the same authenticated
+    # gateway launch path as every other workload, not a bare driver fixture.
+    if ($Scenario -eq 'https-ca') {
+        $allScenarios += @{
+            Name = 'https-ca'; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
+            SandboxId = 'ca'; Backends = 'process_container'; Kind = 'https'
+            PosTarget = Join-Path $DemoDir 'example.html'
+            CertificateTarget = Join-Path $DemoDir 'peer-certificate.txt'
+            ErrorTarget = Join-Path $DemoDir 'curl-stderr.txt'
+            Description = 'curl trusts the injected CA and observes the OpenShell HTTPS proxy certificate'
+        }
+    }
     if ($Scenario) {
         # Wrap in @() so an exact single match stays an array: without it a lone
         # match is a bare hashtable, its .Count is unreliable on PS 5.1, and
@@ -493,15 +784,12 @@ try {
             Step "Scenario: $($sc.Name)"
             Info $sc.Description
 
-            # Backend gate (deny/positive scenarios need a live backend; create-fail does not).
             $skipReason = $null
-            if ($sc.Kind -ne "create-fail") {
-                $backendMatches = ($sc.Backends -eq "both") -or ($sc.Backends -eq $Backend)
-                if (-not $backendMatches) {
-                    $skipReason = "scenario requires backend=$($sc.Backends); current backend=$Backend"
-                } elseif (-not $backendProbe.Live -and -not $Mock) {
-                    $skipReason = "backend not live: $($backendProbe.Reason)"
-                }
+            $backendMatches = ($sc.Backends -eq "both") -or ($sc.Backends -eq $Backend)
+            if (-not $backendMatches) {
+                $skipReason = "scenario requires backend=$($sc.Backends); current backend=$Backend"
+            } elseif (-not $backendProbe.Live) {
+                $skipReason = "backend not live: $($backendProbe.Reason)"
             }
             if ($null -ne $skipReason) {
                 Skip "$($sc.Name): $skipReason"
@@ -514,6 +802,23 @@ try {
                 $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "policy fixture missing" }
                 continue
             }
+
+            # Render a disposable policy for every scenario. The source YAML
+            # intentionally carries the documented default paths, while
+            # -DemoDir is a supported override. Both the read-write path and
+            # the read-only sibling share the same default prefix, so one
+            # exact prefix substitution keeps their relative naming intact.
+            $policyUsed = Join-Path $resultDir "policy.$($sc.Name).yaml"
+            $policyText = Get-Content $sc.PolicyFile -Raw
+            $policyText = $policyText.Replace(
+                $defaultDemoDir.Replace('\', '/'),
+                $DemoDir.Replace('\', '/')
+            )
+            $curlExe = Join-Path $env:SYSTEMROOT 'System32/curl.exe'
+            # Preserve the exact Windows executable path used in the launch;
+            # network binary identities are compared as strings, not FS paths.
+            $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
+            Set-Content -Path $policyUsed -Value $policyText -Encoding UTF8
 
             # Per-scenario gateway logs land in the bundle under their own names.
             $gwLog    = Join-Path $resultDir "gateway.$($sc.Name).log"
@@ -529,10 +834,40 @@ try {
                 if ($sc.ControlTarget) {
                     Remove-Item $sc.ControlTarget -Force -ErrorAction SilentlyContinue
                     $control = $sc.ControlTarget.Replace('\', '/')
-                    $command = @($cmdExe, "/c", "echo ok 1> $control & echo denied 1> $denied")
+                    $command = @($cmdExe, "/c", "echo denied 1> $denied & echo ok 1> $control")
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq 'https') {
+                if (-not (Test-Path -LiteralPath $curlExe)) { throw "Missing Windows curl: $curlExe" }
+                Remove-Item -LiteralPath $sc.PosTarget, $sc.CertificateTarget, $sc.ErrorTarget -Force -ErrorAction SilentlyContinue
+                # Launch curl directly so the policy identity is the socket
+                # owner. Schannel ignores CURL_CA_BUNDLE by default, so curl
+                # imports and expands it itself (curl >= 8.3). No shell child,
+                # host trust-store installation, or insecure TLS override.
+                # The ephemeral private CA has no CRL distribution point.
+                # Best-effort revocation tolerates that absence, while keeping
+                # certificate/hostname validation and known-revoked rejection.
+                $command = @($curlExe, '--disable', '--fail', '--silent', '--show-error', '--max-time', '45',
+                    '--ssl-revoke-best-effort',
+                    '--variable', '%CURL_CA_BUNDLE', '--expand-cacert', '{{CURL_CA_BUNDLE}}',
+                    '--stderr', $sc.ErrorTarget,
+                    '--output', $sc.PosTarget, '--write-out', "%output{$($sc.CertificateTarget)}%{certs}\nOpenShell curl exit: %{exitcode}\n",
+                    'https://example.com/')
+            } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
+                Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
+                $forwardNonce = [guid]::NewGuid().ToString('N')
+                $fixture = Join-Path $BinaryDir 'mxc-forwarding-agent.exe'
+                if (-not (Test-Path -LiteralPath $fixture)) {
+                    $fixture = Join-Path $BinaryDir 'examples/mxc-forwarding-agent.exe'
+                }
+                if (-not (Test-Path -LiteralPath $fixture)) {
+                    throw "Missing forwarding fixture; run mise run --skip-tools windows:build:mxc-fixtures"
+                }
+                $workload = Join-Path $DemoDir 'mxc-forwarding-agent.exe'
+                Copy-Item -LiteralPath $fixture -Destination $workload -Force
+                $command = @($workload, $sc.ReadyFile, $forwardNonce)
+                if ($sc.Kind -eq "service-forwarding") { $command += 'http' }
             } else {
                 $command = @($cmdExe, "/c", "exit 0")
             }
@@ -547,7 +882,8 @@ try {
             Render-Toml
             # Preserve the exact rendered config + policy fixture used for this scenario.
             Copy-Item $toml (Join-Path $resultDir "mxc-gateway.$($sc.Name).toml") -Force -ErrorAction SilentlyContinue
-            Copy-Item $sc.PolicyFile (Join-Path $resultDir "policy.$($sc.Name).yaml") -Force -ErrorAction SilentlyContinue
+            # policyUsed already lives in the result bundle and is the exact
+            # rendered policy passed to OpenShell.
 
             $gw = Start-Gw
             Info "gateway pid $($gw.Id)"
@@ -557,13 +893,12 @@ try {
             $sandboxName = "mxc-$($sc.SandboxId)-$runId"
             try { Invoke-NativeCaptured $cli @("sandbox", "delete", $sandboxName) | Out-Null } catch {}
 
-            # Run sandbox create. Its exit status is only authoritative for the
-            # create-fail scenario; artifacts score workload scenarios.
+            # Run sandbox create; require artifact evidence for live workload tests.
             $createOut = $null; $createExitCode = 0
             try {
                 $createResult = Invoke-NativeCaptured $cli @(
                     "sandbox", "create", "--name", $sandboxName,
-                    "--policy", [string]$sc.PolicyFile,
+                    "--policy", [string]$policyUsed,
                     "--driver-config-json", $driverConfig,
                     "--no-tty"
                 )
@@ -573,40 +908,36 @@ try {
                 $createOut = $_.Exception.Message; $createExitCode = 1
             }
             $createOutStr = ($createOut -join "`n")
-            Info "create exit: $createExitCode (not used for scoring on non-create-fail scenarios)"
+            Info "create exit: $createExitCode"
 
             $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
 
             # Evaluate.
-            if ($sc.Kind -eq "create-fail") {
-                # A non-zero exit alone is NOT sufficient: gateway-registration,
-                # transport, or malformed-fixture errors also exit non-zero and would
-                # false-pass this scenario. Require a genuine policy-rejection signal
-                # (the driver rejects the network rule with invalid_argument naming
-                # network_policies) AND confirm it is not an infrastructure failure.
-                $rejected = ($createOutStr -match '(?i)network' `
-                    -or $createOutStr -match '(?i)invalid[_ -]?argument' `
-                    -or $createOutStr -match '(?i)policy' `
-                    -or $gwText -match '(?i)network_policies')
-                $infraFail = ($createOutStr -match '(?i)connection refused' `
-                    -or $createOutStr -match '(?i)not registered' `
-                    -or $createOutStr -match '(?i)transport error' `
-                    -or $createOutStr -match '(?i)failed to connect')
-                if ($createExitCode -ne 0 -and $rejected -and -not $infraFail) {
-                    Ok "$($sc.Name): create correctly rejected by policy (exit $createExitCode)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "policy rejection" }
-                } elseif ($createExitCode -ne 0) {
-                    Bad "$($sc.Name): create failed but not with a policy-rejection signal (possible harness/infra error)"
-                    Info "output: $createOutStr"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "non-rejection failure" }
-                } else {
-                    Bad "$($sc.Name): create succeeded but should have failed"
-                    Info "output: $createOutStr"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "create succeeded unexpectedly" }
+            if ($sc.Kind -eq 'https') {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
+                    if (-not (Wait-File $sc.CertificateTarget 60)) { throw 'HTTPS certificate absent' }
+                    $certificate = Get-Content -LiteralPath $sc.CertificateTarget -Raw
+                    Copy-Item -LiteralPath $sc.CertificateTarget -Destination (Join-Path $resultDir 'https-peer-certificate.txt')
+                    if (Test-Path -LiteralPath $sc.ErrorTarget) {
+                        Copy-Item -LiteralPath $sc.ErrorTarget -Destination (Join-Path $resultDir 'https-curl-stderr.txt')
+                    }
+                    if ($certificate -notmatch '(?m)^OpenShell curl exit: 0\r?$') {
+                        $curlError = Get-Content -LiteralPath $sc.ErrorTarget -Raw -ErrorAction SilentlyContinue
+                        throw "curl did not complete successfully: $curlError"
+                    }
+                    if ($certificate -notmatch 'OpenShell Sandbox CA') { throw 'HTTPS peer was not issued by the OpenShell proxy CA' }
+                    if (-not (Wait-File $sc.PosTarget 10)) { throw 'HTTPS response absent' }
+                    if ((Get-Item -LiteralPath $sc.PosTarget).Length -eq 0) { throw 'HTTPS response empty' }
+                    Ok 'https-ca: response and OpenShell proxy certificate verified'
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = 'real HTTPS through injected proxy CA' }
+                } catch {
+                    Bad "https-ca: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
                 }
             } elseif ($sc.Kind -eq "positive") {
                 $present = Wait-File $sc.PosTarget 30
-                if ($present) {
+                if ($present -and $createExitCode -eq 0) {
                     Ok "$($sc.Name): in-policy write produced artifact"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "artifact present" }
                 } else {
@@ -614,6 +945,27 @@ try {
                     Info "createOut: $createOutStr"
                     if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure (not a policy result)" }
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact absent" }
+                }
+            } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
+                    if ($sc.Kind -eq 'forwarding') {
+                        Test-Forwarding $sandboxName $sc.ReadyFile $forwardNonce
+                        $reason = 'two exact TCP replies through OpenShell'
+                    } else {
+                        Test-ServiceForwarding $sandboxName $sc.ReadyFile $forwardNonce
+                        $reason = 'two exact HTTP replies; deleted route returns 404'
+                    }
+                    Ok "$($sc.Name): $reason"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = $reason }
+                } catch {
+                    Bad "$($sc.Name): $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = $_.Exception.Message }
+                    try {
+                        $diagnostic = Invoke-NativeCaptured $cli @('sandbox', 'get', $sandboxName, '-o', 'json') 5
+                        $diagnostic.Output | Set-Content -LiteralPath (Join-Path $resultDir 'forward.sandbox.json') -Encoding UTF8
+                        Info "sandbox state captured in forward.sandbox.json"
+                    } catch { Info "sandbox diagnostics unavailable: $($_.Exception.Message)" }
                 }
             } else {
                 # deny
@@ -692,7 +1044,7 @@ finally {
     $skipCount = @($results | Where-Object { $_.Result -eq "SKIP" }).Count
     Write-Host "PASS=$passCount  FAIL=$failCount  SKIP=$skipCount"
 
-    $verdict = if ($harnessError -or $failCount -gt 0) { "FAIL" } else { "PASS" }
+    $verdict = if ($harnessError -or $failCount -gt 0) { "FAIL" } elseif ($passCount -eq 0 -or $skipCount -gt 0) { "INCOMPLETE" } else { "PASS" }
     $tableText = ($results | Format-Table -AutoSize | Out-String)
     $summary = @"
 OpenShell MXC e2e scenario run
@@ -700,7 +1052,7 @@ OpenShell MXC e2e scenario run
 timestamp    : $stamp
 machine      : $env:COMPUTERNAME
 verdict      : $verdict
-mode         : $(if ($Mock) { 'MOCK' } else { 'REAL' })
+mode         : REAL
 backend      : $Backend
 backend_live : $($backendProbe.Live)   ($($backendProbe.Reason))
 wxc_exec     : $WxcExecPath
@@ -717,9 +1069,13 @@ Files in this bundle ($resultDir):
   mxc-gateway.<scenario>.toml        the exact gateway config rendered per scenario
   policy.<scenario>.yaml             the exact sandbox policy fixture used per scenario
 
-What PASS means: every non-skipped scenario met its expected verdict - positive
+What PASS means: every selected scenario ran against real MXC and met its expected verdict - positive
 writes produced their artifact, deny writes were blocked with either a control
-write or driver-launch evidence, and network-reject was refused by policy.
+write or driver-launch evidence, and forwarding verified two exact TCP replies
+through OpenShell. Service forwarding verifies two HTTP replies and HTTP 404
+after endpoint deletion. Missing coverage exits non-zero; network-policy proves
+admission and execution, not network enforcement. Forwarding proves managed
+ingress works, not that direct host ingress is blocked.
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))
@@ -728,17 +1084,31 @@ write or driver-launch evidence, and network-reject was refused by policy.
 
     # Zip the bundle for easy return (defensive; never throw out of finally).
     try {
-        $zip = Join-Path $here "results-e2e-$stamp.zip"
+        $zip = Join-Path $resultsRoot "results-e2e-$stamp.zip"
         if (Test-Path $zip) { Remove-Item $zip -Force }
         Compress-Archive -Path (Join-Path $resultDir "*") -DestinationPath $zip -Force
         Write-Host "`nResults bundle: $zip" -ForegroundColor Yellow
     } catch { Write-Host "zip failed: $($_.Exception.Message)" -ForegroundColor Red }
+    if (-not ($KeepRunning -and $gw)) {
+        foreach ($keyFile in @('signing.pem', 'public.pem', 'kid')) {
+            Remove-Item -LiteralPath (Join-Path $secretDir $keyFile) -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $secretDir) { Remove-Item -LiteralPath $secretDir -ErrorAction SilentlyContinue }
+    }
+    Exit-IsolatedCliEnvironment
+    foreach ($name in $savedEnv.Keys) {
+        $snapshot = $savedEnv[$name]
+        Set-ProcessEnvironmentVariableExact -Name $name -Exists $snapshot.Exists -Value $snapshot.Value
+    }
 }
 
 if ($harnessError -or $failCount -gt 0) {
     Write-Host "`nSOME SCENARIOS FAILED" -ForegroundColor Red
     exit 1
+} elseif ($passCount -eq 0 -or $skipCount -gt 0) {
+    Write-Host "`nE2E INCOMPLETE: PASS=$passCount SKIP=$skipCount - real runtime coverage required" -ForegroundColor Yellow
+    exit 1
 } else {
-    Write-Host "`nALL SCENARIOS PASSED (or SKIPPED)" -ForegroundColor Green
+    Write-Host "`nALL SELECTED REAL MXC SCENARIOS PASSED: PASS=$passCount" -ForegroundColor Green
     exit 0
 }
