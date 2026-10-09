@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 // Use a qualified policy hostname so runtime-provided resolver search domains
 // (for example Podman's `dns.podman`) cannot rewrite the policy identity.
 const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
+const UNLISTED_ALIAS: &str = "unlisted-exec-recovery.openshell.test";
 const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TCP_DNS_PORT: u16 = 53;
@@ -378,6 +379,7 @@ def denied(host, port):
 assert denied({host:?}, {wrong_port})
 assert denied({real_ip:?}, {port})
 assert denied({real_ip:?}, {transparent_port})
+assert denied({unlisted_host:?}, {port})
 print('transparent-tcp-e2e-ok')
 "#,
         host = policy_host,
@@ -386,6 +388,7 @@ print('transparent-tcp-e2e-ok')
         wrong_port = wrong_port,
         real_ip = real_ip,
         transparent_port = transparent_port,
+        unlisted_host = UNLISTED_ALIAS,
     );
     let output = match sandbox.exec(&["python3", "-c", &script]).await {
         Ok(output) => output,
@@ -407,9 +410,17 @@ print('transparent-tcp-e2e-ok')
     };
     assert!(output.contains("transparent-tcp-e2e-ok"), "{output}");
 
+    let recovery = sandbox
+        .exec(&["sh", "-c", "printf post-denial-exec-ok"])
+        .await
+        .expect("fresh exec should succeed after an unlisted-host denial");
+    assert_eq!(recovery, "post-denial-exec-ok");
+
     let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
         logs.contains(&format!("-> {policy_host}:{fixture_port}"))
             && logs.contains("Denied staged transparent connection")
+            && logs.contains(UNLISTED_ALIAS)
+            && logs.contains("policy_dns_ineligible")
     })
     .await
     .expect("wait for sandbox logs");
@@ -421,6 +432,8 @@ print('transparent-tcp-e2e-ok')
         logs.contains("Denied staged transparent connection"),
         "{logs}"
     );
+    assert!(logs.contains(UNLISTED_ALIAS), "{logs}");
+    assert!(logs.contains("policy_dns_ineligible"), "{logs}");
 
     sandbox.cleanup().await;
 }

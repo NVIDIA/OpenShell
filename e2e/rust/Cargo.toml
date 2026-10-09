@@ -20,9 +20,10 @@ publish = false
 e2e = []
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
-# alias unconditionally; the kube driver only does so when the chart's
-# `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and
-# the helm wrapper opts in explicitly when it has resolved an IP.
+# alias unconditionally; the kube driver only does so when
+# `gatewayConfig.openshell.drivers.kubernetes.host_gateway_ip` is set, so
+# `e2e-kubernetes` does NOT imply this and the Helm wrapper opts in explicitly
+# when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
 e2e-local-container-driver = ["e2e"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
@@ -249,7 +250,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "loggi
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }
+serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }

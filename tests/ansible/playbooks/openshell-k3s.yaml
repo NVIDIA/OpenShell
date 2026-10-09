@@ -137,39 +137,32 @@
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
-    - name: Install gateway port-forward service
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/openshell-k3s-port-forward.service
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=OpenShell K3s gateway port forward
-          After=k3s.service
-          Requires=k3s.service
+    - name: Discover the gateway ClusterIP and gRPC port
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=10s
+          - --namespace
+          - openshell
+          - get
+          - service
+          - openshell
+          - --output=jsonpath={.spec.clusterIP}:{.spec.ports[?(@.name=="grpc")].port}
+      register: k3s_gateway_address
+      changed_when: false
 
-          [Service]
-          ExecStart=/usr/local/bin/k3s kubectl --namespace openshell port-forward --address 127.0.0.1 service/openshell 17670:8080
-          Restart=always
-          RestartSec=1
-
-          [Install]
-          WantedBy=multi-user.target
-
-    - name: Start gateway port-forward service
-      ansible.builtin.systemd_service:
-        name: openshell-k3s-port-forward.service
-        daemon_reload: true
-        enabled: true
-        state: started
-
-    - name: Wait for OpenShell gateway
-      ansible.builtin.wait_for:
-        host: 127.0.0.1
-        port: 17670
-        timeout: 60
+    # Rejects headless Services (ClusterIP "None") and a missing grpc port.
+    - name: Require a gateway Service address
+      ansible.builtin.assert:
+        that:
+          - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
+        fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
 
 - name: Register OpenShell gateway for test client
   hosts: all
   gather_facts: false
+  vars:
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_address.stdout }}"
   roles:
     - openshell_client

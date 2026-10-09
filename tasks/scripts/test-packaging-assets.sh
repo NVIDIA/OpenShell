@@ -119,7 +119,8 @@ snapcraft="${ROOT}/snapcraft.yaml"
 snap_workflow="${ROOT}/.github/workflows/snap-package.yml"
 snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
-snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
+snap_configure_hook="${ROOT}/snap/hooks/configure"
+snap_install_hook="${ROOT}/snap/hooks/install"
 snap_post_refresh_hook="${ROOT}/snap/hooks/post-refresh"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
@@ -127,18 +128,18 @@ assert_file_exists "$snapcraft"
 assert_file_exists "$snap_workflow"
 assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
-assert_file_exists "$snap_repro"
+assert_file_exists "$snap_configure_hook"
+assert_file_exists "$snap_install_hook"
 assert_file_exists "$snap_post_refresh_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
 assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
-assert_contains "$snap_wrapper" "if [ -n \"\${OPENSHELL_GATEWAY_CONFIG:-}\" ]; then"
-assert_contains \
-  "$snap_wrapper" \
-  "elif [ -e \"\$CANONICAL_CONFIG_FILE\" ] || [ -L \"\$CANONICAL_CONFIG_FILE\" ]; then"
-assert_contains "$snap_wrapper" "config preflight -- --config \"\$CANONICAL_CONFIG_FILE\" \"\$@\""
-assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
+assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]'
+assert_contains "$snap_wrapper" '[ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]'
+assert_contains "$snap_wrapper" 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"'
+assert_contains "$snap_wrapper" 'config preflight -- "$@"'
+assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 
 # Store installs autoconnect all required interfaces and require snapd 2.76 for
@@ -149,7 +150,8 @@ for snap_file in \
   "$snapcraft" \
   "$snap_install_docs" \
   "$snap_canary" \
-  "$snap_repro" \
+  "$snap_configure_hook" \
+  "$snap_install_hook" \
   "$snap_post_refresh_hook"; do
   assert_not_contains "$snap_file" "docker:docker-daemon"
   assert_not_contains "$snap_file" "default-provider: docker"
@@ -158,16 +160,39 @@ if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
   echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
   exit 1
 fi
-if [[ -e "${ROOT}/snap/hooks/install" ]]; then
-  echo "FAIL: obsolete Snap install hook must not exist" >&2
+if [[ ! -x "$snap_install_hook" ]]; then
+  echo "FAIL: Snap install hook must be executable" >&2
   exit 1
 fi
+if [[ ! -x "$snap_configure_hook" ]]; then
+  echo "FAIL: Snap configure hook must be executable" >&2
+  exit 1
+fi
+assert_contains "$snapcraft" 'daemon-scope: system'
+assert_contains "$snapcraft" 'daemon-scope: user'
+assert_contains "$snapcraft" 'install-mode: disable'
+assert_not_contains "$snapcraft" 'install-mode: enable'
+if grep -Eq '^  gateway:$' "$snapcraft"; then
+  echo "FAIL: removed Snap gateway app must not remain declared" >&2
+  exit 1
+fi
+assert_contains "$snapcraft" '  system-gateway:'
+assert_contains "$snapcraft" '  user-gateway:'
+assert_contains "$snapcraft" 'OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_COMMON/gateway.toml"'
+assert_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"'
+assert_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_COMMON/tls"'
+assert_not_contains "$snapcraft" 'XDG_RUNTIME_DIR:'
+assert_not_contains "$snapcraft" 'OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_USER_COMMON'
+assert_not_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON'
+assert_not_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON'
 assert_contains "$snapcraft" 'refresh-mode: endure'
 if [[ ! -x "$snap_post_refresh_hook" ]]; then
   echo "FAIL: Snap post-refresh hook must be executable" >&2
   exit 1
 fi
 assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
+bash "$ROOT/tasks/scripts/test-snap-configure-hook.sh" "$snap_configure_hook"
+bash "$ROOT/tasks/scripts/test-snap-install-hook.sh" "$snap_install_hook"
 bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_hook"
 assert_contains "$snap_workflow" 'name: openshell-prover-${{ matrix.rust_arch }}-unknown-linux-musl'
 assert_contains "$snap_workflow" 'chmod +x prebuilt/prover/openshell-prover'
@@ -193,21 +218,29 @@ assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
-assert_contains "$snap_install_docs" "systemctl reset-failed snap.openshell.gateway.service"
-assert_contains "$snap_install_docs" "snap restart openshell.gateway"
+assert_contains "$snap_install_docs" "systemctl --user reset-failed snap.openshell.user-gateway.service"
+assert_contains "$snap_install_docs" "snap start --user openshell.user-gateway"
+assert_contains "$snapcraft" "snap start --user openshell.user-gateway"
+assert_contains "$snap_install_docs" "openshell.user-gateway"
+assert_contains "$snap_install_docs" "openshell.system-gateway"
+assert_contains "$snap_install_docs" "Existing HTTPS registrations continue to work"
+assert_contains "$snapcraft" "Existing HTTPS registrations"
+assert_contains "$snap_install_docs" "/var/snap/openshell/common/tls"
+assert_contains "$snap_install_docs" 'old_registration="NAME_FROM_GATEWAY_LIST"'
+assert_contains "$snap_install_docs" 'openshell gateway remove "$old_registration"'
+assert_contains "$snap_install_docs" "openshell gateway add https://127.0.0.1:17670 --local --name openshell"
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=disable"
+assert_contains "$snap_install_docs" 'tls-backup-$(date +%s%N)'
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=user"
+assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=system"
+assert_contains "$snapcraft" "gateway-mode=disable"
+assert_not_contains "$snap_install_docs" "snap services --user"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 assert_contains "$snap_canary" "openshell.prover check"
-assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
-assert_contains "$snap_repro" "/snap/bin/openshell.prover check"
-assert_contains "$snap_repro" "system-docker"
-assert_contains "$snap_repro" "missing-docker"
-assert_contains "$snap_repro" "docker-snap"
 assert_not_contains "$snap_canary" "--dangerous"
-assert_not_contains "$snap_repro" "--dangerous"
 assert_not_contains "$snap_canary" "snap connect openshell:docker"
-assert_not_contains "$snap_repro" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1

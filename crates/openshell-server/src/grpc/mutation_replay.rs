@@ -150,7 +150,7 @@ pub(super) async fn run<M: Mutation>(
     }
     let request_id = validate_request_id(request.get_ref().request_id())?;
     let principal = super::extract_principal(&request)?;
-    let Principal::User(user) = &principal else {
+    let Some(identity) = principal.user_identity() else {
         return Err(Status::permission_denied(
             "request admission requires a user principal",
         ));
@@ -183,7 +183,7 @@ pub(super) async fn run<M: Mutation>(
     } else {
         (fingerprint(original)?, None)
     };
-    let (provider, issuer) = match user.identity.provider {
+    let (provider, issuer) = match identity.provider {
         IdentityProvider::Oidc => (
             "oidc",
             state
@@ -192,15 +192,18 @@ pub(super) async fn run<M: Mutation>(
                 .as_ref()
                 .map_or("", |config| config.issuer.as_str()),
         ),
-        IdentityProvider::Mtls => ("mtls", ""),
+        IdentityProvider::Mtls => (
+            if matches!(principal, Principal::Operator(_)) {
+                "mtls-operator"
+            } else {
+                "mtls"
+            },
+            "",
+        ),
         IdentityProvider::CloudflareAccess => ("cloudflare_access", ""),
         IdentityProvider::LocalDev => ("local_dev", ""),
     };
-    let caller = hash_json(&serde_json::json!([
-        provider,
-        issuer,
-        user.identity.subject,
-    ]))?;
+    let caller = hash_json(&serde_json::json!([provider, issuer, identity.subject,]))?;
     // Not a valid user workspace name; ordinary workspace cleanup cannot touch
     // these records. The bucket supports an atomic per-caller storage quota.
     let bucket = format!("_mutation/{caller}");

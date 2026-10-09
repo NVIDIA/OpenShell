@@ -42,6 +42,7 @@ pub mod net;
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub use openshell_policy_schema::yaml;
 pub mod policy_identity;
 pub mod progress;
 pub mod proposals;

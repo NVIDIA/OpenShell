@@ -2721,6 +2721,91 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 }
 
 #[test]
+fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in ["example.com/gpu=0", "intel.com/gpu=0", "amd.com/gpu=0"] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit = build_container_create_body(&sandbox, &config).unwrap();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap();
+        for body in [explicit, resolved] {
+            let requests = body.host_config.unwrap().device_requests.unwrap();
+            assert_eq!(requests[0].driver.as_deref(), Some("cdi"));
+            assert_eq!(
+                requests[0].device_ids.as_ref().unwrap(),
+                &[device.to_string()]
+            );
+        }
+    }
+}
+
+#[test]
+fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in [
+        "/dev/sda",
+        "/dev",
+        "/dev/sda:/dev/sda:rwm",
+        "vendor/gpu=0/1",
+    ] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit_error = build_container_create_body(&sandbox, &config).unwrap_err();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved_error = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap_err();
+        for error in [explicit_error, resolved_error] {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("CDI qualified names"));
+        }
+    }
+}
+
+#[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;

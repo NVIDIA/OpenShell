@@ -1,0 +1,118 @@
+# Migrate Helm gateway configuration to `gatewayConfig`
+
+Chart schema v2 replaces application-specific Helm values with one non-secret
+`gatewayConfig` map. Its top-level keys are TOML tables; nested maps are TOML
+inline tables. A top-level YAML list is an ordered TOML array of tables, with
+one map per `[[table]]` entry. Kubernetes resource references (Secrets, certificates, Services,
+and mounts) remain chart values.
+
+## Upgrade compatibility
+
+The chart accepts the 0.1.x application values as deprecated aliases while
+moving to `gatewayConfig`. When both forms set the same runtime field,
+`gatewayConfig` wins. Runtime images and proxy settings may therefore be
+migrated incrementally. Kubernetes pull policy spellings such as `Always` are
+accepted aliases and normalize to `always`, `if_not_present`, or `never`.
+`gatewayConfig` is strictly a non-secret
+configuration contract: do not put passwords, tokens, private keys,
+`database_url`, or other secret material in it; use Secret-backed environment,
+file, or volume configuration instead. Helm serializes unknown fields
+generically and cannot determine whether an arbitrary string such as
+`api_token` is confidential. It rejects `database_url`, inline URL credentials,
+and PEM private keys, but is not a general secret scanner.
+
+Keep `server.disableTls`, TLS Secret names, `server.hostGatewayIP`, `server.externalDbSecret`,
+`server.sandboxNamespace`, `server.oidc.caConfigMapName`, certificate settings and
+Service settings: these own Kubernetes resources. The chart derives their
+runtime counterparts.
+
+## Mapping
+
+| Deprecated alias | Schema-v2 location |
+| --- | --- |
+| `server.name`, `server.logLevel`, `server.enableLoopbackServiceHttp`, `server.policyValidationFailureMode` | `openshell.gateway.{name,log_level,enable_loopback_service_http,policy_validation_failure_mode}` |
+| `server.grpcRateLimit.{requests,windowSeconds}` | `openshell.gateway.{grpc_rate_limit_requests,grpc_rate_limit_window_seconds}` |
+| `server.otlp.{endpoint,serviceName}` | `openshell.gateway.otlp.{endpoint,service_name}` |
+| `server.auth.allowUnauthenticatedUsers` | `openshell.gateway.auth.allow_unauthenticated_users` |
+| `server.oidc.*` | `openshell.gateway.oidc` with snake_case keys |
+| `server.sandboxImage*`, workspace storage/runtime and user namespace settings | `openshell.drivers.kubernetes`. Kubernetes AppArmor configuration is removed by RFC 0012. |
+| `server.drivers.kubernetes.*` | `openshell.drivers.kubernetes` |
+| `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}` | `openshell.gateway.gateway_jwt` or `openshell.drivers.kubernetes.sa_token_ttl_secs` |
+| `supervisor.image.*`, `supervisor.sandboxRuntime.*` | `openshell.drivers.kubernetes.{supervisor_image,supervisor_image_pull_policy,sandbox_runtime}`. `supervisor.topology` and `supervisor.sidecar.*` are removed by RFC 0012 with no replacement. |
+| `upstreamProxy.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}`. |
+| `server.credentialDrivers.{kubernetesSecrets,vault}.*` | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
+| `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | `openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`; omit it to disable SPIFFE provider grants. |
+| `server.hostGatewayIP` | Retained as the chart-owned host-alias input; the chart derives `openshell.drivers.kubernetes.host_gateway_ip`. |
+
+## Examples
+
+The following values configure OIDC, telemetry, sandbox images, managed
+workspaces, rate limiting, and the Kubernetes Secrets credential driver before
+migration:
+
+```yaml
+server:
+  oidc:
+    issuer: https://idp.example/realms/openshell
+    audience: openshell-cli
+    jwksTtl: 3600
+  otlp:
+    endpoint: http://otel-collector:4317
+    serviceName: production-gateway
+  drivers:
+    kubernetes:
+      workspaceMode: managed
+  grpcRateLimit:
+    requests: 120
+    windowSeconds: 60
+  credentialDrivers:
+    kubernetesSecrets:
+      enabled: true
+      namespace: provider-secrets
+sandbox:
+  image:
+    repository: registry.example/sandbox
+    tag: latest
+    pullPolicy: IfNotPresent
+supervisor:
+  image:
+    registry: registry.example
+    repository: openshell-supervisor
+    tag: latest
+  sandboxRuntime:
+    boundaryPort: 5500
+```
+
+After migration, the same settings use `gatewayConfig`:
+
+```yaml
+gatewayConfig:
+  openshell.gateway.oidc:
+    issuer: https://idp.example/realms/openshell
+    audience: openshell-cli
+    jwks_ttl_secs: 3600
+  openshell.gateway.otlp:
+    endpoint: http://otel-collector:4317
+    service_name: production-gateway
+  openshell.drivers.kubernetes:
+    default_image: registry.example/sandbox:latest
+    image_pull_policy: if_not_present
+    supervisor_image: registry.example/openshell-supervisor:latest
+    sandbox_runtime:
+      boundary_port: 5500
+    workspace_mode: managed
+  openshell.gateway:
+    grpc_rate_limit_requests: 120
+    grpc_rate_limit_window_seconds: 60
+    credential_drivers: [kubernetes-secrets]
+  openshell.credential_drivers.kubernetes-secrets:
+    namespace: provider-secrets
+```
+
+For Vault, set `openshell.gateway.credential_drivers: [vault]` and configure
+`openshell.credential_drivers.vault`; use `credentialDrivers.vault.caConfigMapName`
+for a private Vault CA. For a proxy, use the Kubernetes-driver fields in
+`gatewayConfig`. TLS remains Secret-backed; set `server.disableTls: true` only for
+trusted external termination. A null map field omits it; null array elements
+are invalid. Strings are serialized literally; Helm template expressions inside
+them are not evaluated.

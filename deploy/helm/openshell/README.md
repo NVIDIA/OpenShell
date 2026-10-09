@@ -240,9 +240,37 @@ database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
 
-Use `kubernetes-secrets` or `vault` instead when credentials should live in a
-cluster or external secret backend. Enabling one external credential driver
-disables the default credential-storage key-encryption key Secret and env injection.
+Use `gatewayConfig` to select `kubernetes-secrets` or `vault` when credentials
+should live in a cluster or external secret backend. Selecting an external
+credential driver disables the default credential-storage key-encryption-key
+Secret and environment injection. The map is rendered directly as gateway TOML,
+so it uses the gateway's snake_case field names:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    credential_drivers:
+      - vault
+  openshell.credential_drivers.vault:
+    address: https://vault.vault.svc.cluster.local:8200
+    mount: secret
+    kv_version: "2"
+    auth_method: kubernetes
+    role: openshell-gateway
+```
+
+> `gatewayConfig` must contain only non-secret values. Helm serializes unknown
+> fields generically and cannot determine whether an arbitrary string, such as
+> `api_token`, is confidential. Do not put passwords, tokens, private keys,
+> database URLs, or other secret material in this map. Use Secret-backed
+> environment variables, files, volumes, or gateway credential drivers instead.
+> The chart rejects known unsafe forms such as `database_url`, inline URL
+> credentials, and PEM private keys; it is not a general secret scanner.
+
+For the Kubernetes Secret driver, use
+`openshell.credential_drivers.kubernetes-secrets.namespace` in the same map.
+The chart derives any required RBAC from the selected driver; use a dedicated
+namespace to limit access to OpenShell-managed Secrets.
 
 #### OpenShift
 
@@ -318,12 +346,16 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
-sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
-chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
-mounts the SPIFFE CSI socket into the gateway pod, exports
-`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
-the Kubernetes driver so sandbox pods can mount the same socket.
+Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
+sandbox JWTs and passes the configured socket path to the Kubernetes driver.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+```
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.
@@ -353,12 +385,14 @@ discovery endpoint or its TLS CA.
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
+| credentialDrivers.vault.caConfigMapName | string | `""` | ConfigMap containing the private Vault/OpenBao CA certificate under the ca.crt key. Helm mounts it only when the Vault driver is selected. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | gateway.image.digest | string | `""` | Gateway image digest. When set, this takes precedence over tag. |
 | gateway.image.pullPolicy | string | `nil` | Gateway image pull policy. Empty uses global.image.pullPolicy. |
 | gateway.image.registry | string | `""` | Gateway image registry. Empty uses global.image.registry. |
 | gateway.image.repository | string | `"openshell/gateway"` | Gateway image repository. |
 | gateway.image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
+| gatewayConfig | object | `{"openshell":{"version":2}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
 | global.image.pullPolicy | string | `"IfNotPresent"` | Shared OpenShell image pull policy. Individual image pull policies take precedence. |
 | global.image.registry | string | `"ghcr.io/nvidia"` | Shared OpenShell image registry. Individual image registries take precedence. |
 | global.image.tag | string | `""` | Shared OpenShell image tag. Defaults to the chart appVersion when empty. |
@@ -366,14 +400,15 @@ discovery endpoint or its TLS CA.
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
 | grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (`<fullname>.<namespace>.svc.cluster.local`) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
-| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
-| grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
+| grpcRoute.gateway.className | string | `"eg"` | GatewayClass for a chart-created Gateway. Set this to the name exposed by your Gateway API implementation. Envoy Gateway uses "eg" in the OpenShell examples. Ignored when gateway.create is false. |
+| grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. Use sectionName to select a specific listener when needed. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
 | grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
+| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Gateway listener; pair it with server.disableTls=true so the proxy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client certificate). |
 | grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
-| grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
-| grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
+| grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to `<fullname>`. Set a distinct name when the selected controller creates a proxy Service with the Gateway name. When gateway.create is false, set this to the name of the existing Gateway. |
+| grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. A chart-created Gateway always resides in the release namespace. |
+| grpcRoute.gateway.sectionName | string | `""` | Listener name on an existing Gateway. Leave empty to let Gateway API listener matching select compatible listeners. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |

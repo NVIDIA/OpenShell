@@ -2377,7 +2377,7 @@ fn broker_only_provider_credential_keys_for_provider(
         .unwrap_or_default()
 }
 
-fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<String> {
+pub(super) fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<String> {
     profile
         .credentials
         .iter()
@@ -2404,7 +2404,7 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
         .is_none_or(|expiration_ms| expiration_ms > now_ms)
 }
 
-fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
+pub(super) fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
     normalize_profile_id(&provider.r#type).as_deref() == Some("google-vertex-ai")
         && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }

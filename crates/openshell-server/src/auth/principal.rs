@@ -24,6 +24,8 @@ use super::identity::Identity;
 pub enum Principal {
     /// Human caller authenticated via OIDC (Keycloak, Entra ID, Okta, etc.).
     User(UserPrincipal),
+    /// Gateway-wide administrator authenticated only by a verified operator certificate.
+    Operator(OperatorPrincipal),
     /// Sandbox supervisor authenticated by an identity bound to a specific
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
@@ -41,6 +43,26 @@ pub enum Principal {
 pub struct UserPrincipal {
     /// The verified identity from the authentication provider.
     pub identity: Identity,
+}
+
+/// Certificate-authenticated gateway operator. Never constructed from bearer claims.
+#[derive(Debug, Clone)]
+pub struct OperatorPrincipal {
+    /// Verified mTLS certificate subject and roles.
+    pub identity: Identity,
+    /// SHA-256 fingerprint of the verified leaf certificate (not a private key).
+    pub certificate_sha256: String,
+}
+
+impl Principal {
+    /// Identity of a human/API caller, preserving its distinct principal variant.
+    pub fn user_identity(&self) -> Option<&Identity> {
+        match self {
+            Self::User(user) => Some(&user.identity),
+            Self::Operator(operator) => Some(&operator.identity),
+            _ => None,
+        }
+    }
 }
 
 /// Sandbox caller — bound to one specific sandbox UUID.

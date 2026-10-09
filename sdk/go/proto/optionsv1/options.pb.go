@@ -29,7 +29,8 @@ const (
 // descriptor-pool-based auth table to enforce auth mode, role, and scope.
 type AuthorizationRule struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Authentication mode: "bearer", "sandbox", "dual", or "unauthenticated".
+	// Authentication mode: "bearer", "sandbox", "dual", "peer", "operator",
+	// or "unauthenticated". Operator requires a verified mTLS operator certificate.
 	AuthMode string `protobuf:"bytes,1,opt,name=auth_mode,json=authMode,proto3" json:"auth_mode,omitempty"`
 	// Minimum workspace-level role required (checked by handler via
 	// authorize_workspace): "user" or "admin". Mutually exclusive with

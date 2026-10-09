@@ -132,6 +132,13 @@ Treat the ledger as required reviewer input, not optional background:
 - Use `current_patch_id`, `previous_reviewed_patch_id`, base SHA, and merge-base
   SHA to preserve review identity across rebases and merge-main commits. If
   `rebase_equivalent` is true, do not review the same effective patch again.
+- A null `current_patch_id` disables patch-equivalence shortcuts; it does not
+  invalidate the feedback ledger. Preserve exact-SHA history and review the
+  author-only delta conservatively when the head changed.
+- For large PRs, fetch the exact commits and inspect local `git diff` output
+  file-by-file. Do not depend on `gh pr diff` or GitHub's full-diff endpoint:
+  those reject oversized diffs. Review schema/generated changes separately
+  from handwritten behavior, without silently excluding them from scope.
 - For a non-equivalent rebase, compare author patch IDs or use `git range-diff`
   to isolate the author-only delta. Upstream changes are context, not new PR
   findings.

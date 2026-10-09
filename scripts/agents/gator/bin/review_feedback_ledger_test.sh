@@ -341,6 +341,63 @@ if "$LEDGER" --input "$tmp/missing-pr.json" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Exercise live collection against real local Git trees, including a diff
+# larger than GitHub's full-diff limit. No PR code is checked out by the helper.
+mkdir -p "$tmp/mock-bin" "$tmp/source"
+git -C "$tmp/source" init --quiet
+git -C "$tmp/source" -c user.name=Test -c user.email=test@example.test \
+    commit --quiet --allow-empty -m base
+base="$(git -C "$tmp/source" rev-parse HEAD)"
+seq 1 30000 > "$tmp/source/schema.json"
+git -C "$tmp/source" add schema.json
+git -C "$tmp/source" -c user.name=Test -c user.email=test@example.test \
+    commit --quiet -m schema
+head="$(git -C "$tmp/source" rev-parse HEAD)"
+expected_patch="$(git -C "$tmp/source" diff "$base" "$head" | git patch-id --stable | awk '{print $1}')"
+jq --arg head "$head" --arg base "$base" '
+  .data.repository.pullRequest.headRefOid = $head |
+  .data.repository.pullRequest.baseRefOid = $base
+' "$tmp/review-threads.json" > "$tmp/live-threads.json"
+export LEDGER_TEST_TMP="$tmp" LEDGER_TEST_BASE="$base"
+export LEDGER_TEST_REAL_GIT="$(command -v git)"
+cat > "$tmp/mock-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *graphql*) cat "$LEDGER_TEST_TMP/live-threads.json" ;;
+  *compare/*) echo "$LEDGER_TEST_BASE" ;;
+  *reviews\?*) cat "$LEDGER_TEST_TMP/reviews.json" ;;
+  *comments\?*) cat "$LEDGER_TEST_TMP/issue-comments.json" ;;
+  *) echo 'unexpected GitHub request (full diffs unavailable)' >&2; exit 1 ;;
+esac
+SH
+cat > "$tmp/mock-bin/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == https://github.com/* ]]; then
+    [[ "${LEDGER_TEST_FETCH_FAIL:-0}" != 1 ]] || exit 1
+    arg="$LEDGER_TEST_TMP/source"
+  fi
+  args+=("$arg")
+done
+exec "$LEDGER_TEST_REAL_GIT" "${args[@]}"
+SH
+chmod +x "$tmp/mock-bin/gh" "$tmp/mock-bin/git"
+PATH="$tmp/mock-bin:$PATH" "$LEDGER" NVIDIA OpenShell 4288 > "$tmp/live-ledger.json"
+jq -e --arg patch "$expected_patch" --arg head "$head" '
+  .current_patch_id == $patch and .review_scope.current_head_sha == $head
+' "$tmp/live-ledger.json" >/dev/null
+PATH="$tmp/mock-bin:$PATH" LEDGER_TEST_FETCH_FAIL=1 \
+    "$LEDGER" NVIDIA OpenShell 4288 > "$tmp/no-patch-ledger.json"
+jq -e '
+  .current_patch_id == null and
+  .review_scope.rebase_equivalent == false and
+  .review_scope.mode != "already_reviewed" and
+  (.threads | length) > 0
+' "$tmp/no-patch-ledger.json" >/dev/null
+
 rg -q 'COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger' \
   "$GATOR_DIR/Dockerfile"
 rg -q 'COPY bin/resolve-gator-review-threads /usr/local/bin/resolve-gator-review-threads' \
@@ -349,7 +406,7 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
   "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 9
+   abort unless manifest.fetch("payload_version") == 11
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }

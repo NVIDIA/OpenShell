@@ -35,7 +35,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
-    effective_driver_gpu_count, validate_specific_gpu_device_request,
+    effective_driver_gpu_count, validate_cdi_device_names, validate_cdi_gpu_device_request,
 };
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
@@ -1128,7 +1128,7 @@ impl DockerComputeDriver {
         }
 
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -1311,7 +1311,7 @@ impl DockerComputeDriver {
         ) -> Result<Vec<String>, CdiGpuSelectionError>,
     ) -> Result<Option<Vec<String>>, Status> {
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
-            validate_specific_gpu_device_request(
+            validate_cdi_gpu_device_request(
                 gpu_requirements,
                 cdi_devices,
                 "driver_config.cdi_devices",
@@ -5711,12 +5711,8 @@ fn build_container_create_body(
         .as_ref()
         .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
     let cdi_devices = if let Some(cdi_devices) = driver_config.cdi_devices.as_ref() {
-        validate_specific_gpu_device_request(
-            gpu_requirements,
-            cdi_devices,
-            "driver_config.cdi_devices",
-        )
-        .map_err(Status::invalid_argument)?;
+        validate_cdi_gpu_device_request(gpu_requirements, cdi_devices, "driver_config.cdi_devices")
+            .map_err(Status::invalid_argument)?;
         Some(cdi_devices.as_slice())
     } else {
         None
@@ -5767,6 +5763,10 @@ fn build_container_create_body_for_image(
     image: &DockerImageMetadata,
     workload_identity: &ResolvedWorkloadIdentity,
 ) -> Result<ContainerCreateBody, Status> {
+    if let Some(device_ids) = gpu_device_ids {
+        validate_cdi_device_names(device_ids, "driver_config.cdi_devices")
+            .map_err(Status::invalid_argument)?;
+    }
     let spec = sandbox
         .spec
         .as_ref()

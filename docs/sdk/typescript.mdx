@@ -65,6 +65,44 @@ const client = await OpenShellClient.connect({
 The provider retains credentials and tokens in memory and renews the access
 token before expiry.
 
+## Retrieve Provider Credentials
+
+Connect directly with a trusted `OU=operator` client certificate after enabling
+[operator authentication](/how-it-works/gateways/authentication#mtls-operators).
+Do not supply an OIDC or edge token for this connection. No sandbox creation or
+provider attachment is required.
+
+```ts
+import { readFileSync } from 'node:fs'
+import { OpenShellClient } from '@nvidia/openshell-sdk'
+
+const operator = await OpenShellClient.connect({
+  gateway: 'https://gateway.example.com',
+  caCert: readFileSync('ca.crt'),
+  clientCert: readFileSync('operator.crt'),
+  clientKey: readFileSync('operator.key'),
+})
+const credentials = await operator.providers.getCredentials(
+  'my-graph',
+  ['MS_GRAPH_ACCESS_TOKEN'],
+  { workspace: 'production', minimumRemainingLifetimeSecs: 300 },
+)
+const token = credentials.MS_GRAPH_ACCESS_TOKEN!.value
+```
+
+`ProviderClient.connect()` provides the same API as a standalone client. Unlike
+sandbox operations, `getCredentials()` requires an explicit workspace. It returns
+a record of `ProviderCredentialValue` objects with `value` and optional
+`expirationTime`, a `Date`. Sub-millisecond expiration precision is truncated.
+`minimumRemainingLifetimeSecs` accepts fractional seconds; omission or zero uses
+the gateway default. Pass `signal` or `timeoutMs` in the operation options to
+bound delivery. The helper does not retry or cache exports, and canceled delivery
+does not roll back a gateway refresh that has already started.
+
+Keep returned values out of logs and shared output. See
+[Retrieve Runtime Credentials](/how-it-works/providers/overview#retrieve-runtime-credentials)
+for freshness, supported credentials, and the export security boundary.
+
 ## Create and Use a Sandbox
 
 The curated client uses the `default` workspace unless you pass `workspace` in
