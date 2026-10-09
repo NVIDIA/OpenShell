@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::mem::size_of_val;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,7 +50,7 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn run_boundary(config_path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(config_path)
         .map_err(|error| format!("read boundary config {}: {error}", config_path.display()))?;
-    let config: BoundaryConfig = serde_json::from_slice(&bytes)
+    let config: crate::launch::MxcBoundaryConfig = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode boundary config {}: {error}", config_path.display()))?;
     validate_config(&config)?;
     let runtime_directory = config_path
@@ -67,7 +66,7 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
         .build()
         .map_err(|error| format!("create Windows boundary runtime: {error}"))?;
     runtime.block_on(async move {
-        let (address, tls) = match &config.listener {
+        let (address, tls) = match &config.runtime.listener {
             BoundaryListener::TlsTcp { address, tls } => (*address, tls.clone()),
             BoundaryListener::Unix { .. } | BoundaryListener::Vsock { .. } => {
                 return Err("MXC requires a TLS TCP boundary listener".to_string());
@@ -77,14 +76,21 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
         let boundary = Arc::new(BoundaryRuntime::new(config, runtime_directory)?);
         tracing::info!(%address, "MXC Sandbox Protocol reverse control ready");
         loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .map_err(|error| format!("accept MXC boundary connection: {error}"))?;
-            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            // Match the windows branch relay: MXC dials the host, avoiding
+            // host-to-AppContainer inbound authorization requirements. TLS
+            // roles do not change: this boundary still proves its pinned identity.
+            let stream =
+                match openshell_core::net::connect_tcp_nodelay_best_effort(&[address]).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::debug!(%error, "MXC reverse control host not ready");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
             let acceptor = tokio_rustls::TlsAcceptor::from(tls.clone());
             let boundary = boundary.clone();
-            tokio::spawn(async move {
+            {
                 let result = async {
                     let stream =
                         tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream))
@@ -99,12 +105,22 @@ pub fn run_boundary(config_path: &Path) -> Result<(), String> {
                 if let Err(error) = result {
                     tracing::debug!(%error, "MXC boundary connection ended");
                 }
-            });
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
 }
 
-fn validate_config(config: &BoundaryConfig) -> Result<(), String> {
+fn validate_config(launch: &crate::launch::MxcBoundaryConfig) -> Result<(), String> {
+    let config = &launch.runtime;
+    if config
+        .resource_claims
+        .get("mxc.control_transport")
+        .map(String::as_str)
+        != Some("reverse_tcp")
+    {
+        return Err("MXC boundary requires reverse TCP control provisioning".to_string());
+    }
     if config.boundary_id.trim().is_empty()
         || config.generation.trim().is_empty()
         || config.gateway_id.trim().is_empty()
@@ -119,6 +135,7 @@ fn validate_config(config: &BoundaryConfig) -> Result<(), String> {
     match &config.listener {
         BoundaryListener::TlsTcp { address, tls }
             if address.port() != 0
+                && address.ip().is_loopback()
                 && tls.certificate_chain_path.is_absolute()
                 && tls.private_key_path.is_absolute() => {}
         BoundaryListener::TlsTcp { .. } => {
@@ -128,10 +145,8 @@ fn validate_config(config: &BoundaryConfig) -> Result<(), String> {
             return Err("MXC boundary supports only TLS TCP transport".to_string());
         }
     }
-    let Some(proxy_url) = config.direct_proxy_url.as_deref() else {
-        return Err("MXC boundary requires a generation-scoped direct proxy".to_string());
-    };
-    let url = proxy_url
+    let url = launch
+        .proxy_url
         .parse::<url::Url>()
         .map_err(|error| format!("validate MXC direct proxy URL: {error}"))?;
     if url.scheme() != "http"
@@ -625,17 +640,15 @@ impl BoundaryRuntime {
     }
 
     fn confirmation(&self) -> Result<BoundaryConfirmation, String> {
+        let appcontainer_sid = crate::identity::current_appcontainer_sid()?;
         let evidence = MxcSandboxAuditEvidence {
-            process_container: current_process_is_appcontainer()?,
-            appcontainer_profile: self
-                .config
-                .resource_claims
-                .get("mxc.appcontainer_profile")
-                .cloned()
-                .unwrap_or_else(|| self.config.generation.clone()),
+            process_container: !appcontainer_sid.is_empty(),
+            appcontainer_profile: appcontainer_sid,
             default_deny_filesystem: true,
+            // TODO(mxc-network-fence): Windows parity assertions, not measured
+            // exclusive mediation. MXC still allows all host 127.0.0.1 ports.
             default_deny_egress: true,
-            loopback_proxy_only: self.config.direct_proxy_url.is_some(),
+            loopback_proxy_only: !self.proxy_url.is_empty(),
             authenticated_control: true,
             generation_scoped_attribution: true,
         };
@@ -959,41 +972,6 @@ impl BoundaryRuntime {
     }
 }
 
-#[allow(unsafe_code)]
-fn current_process_is_appcontainer() -> Result<bool, String> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut is_appcontainer = 0_u32;
-    let buffer_size = u32::try_from(size_of_val(&is_appcontainer))
-        .map_err(|error| format!("size MXC AppContainer token buffer: {error}"))?;
-    // SAFETY: the token handle is initialized by OpenProcessToken, queried into
-    // a correctly sized u32 buffer, and closed on every path after acquisition.
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token)
-            .map_err(|error| format!("open MXC sandbox process token: {error}"))?;
-        let mut returned = 0_u32;
-        let query = GetTokenInformation(
-            token,
-            TokenIsAppContainer,
-            Some(std::ptr::from_mut(&mut is_appcontainer).cast()),
-            buffer_size,
-            &raw mut returned,
-        );
-        let close = CloseHandle(token);
-        query.map_err(|error| format!("query MXC sandbox AppContainer token: {error}"))?;
-        close.map_err(|error| format!("close MXC sandbox process token: {error}"))?;
-        if returned != buffer_size {
-            return Err(format!(
-                "query MXC sandbox AppContainer token returned {returned} bytes"
-            ));
-        }
-        Ok(is_appcontainer != 0)
-    }
-}
-
 async fn serve_one(
     mut stream: tokio::io::DuplexStream,
     runtime: Arc<BoundaryRuntime>,
@@ -1306,6 +1284,27 @@ impl ManagedProcess {
         let mut child = command
             .spawn()
             .map_err(|error| format!("spawn MXC workload executable {program:?}: {error}"))?;
+        if matches!(kind, ProcessKindWire::Main) {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .action(openshell_ocsf::ActionId::Allowed)
+                    .disposition(openshell_ocsf::DispositionId::Allowed)
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .launch_type(openshell_ocsf::LaunchTypeId::Spawn)
+                    .process(openshell_ocsf::Process::new(
+                        &program,
+                        i64::from(child.id().unwrap_or_default()),
+                    ))
+                    .message("MXC agent launched")
+                    .build()
+            );
+            // Preserve the windows branch's launch acknowledgement for existing
+            // operators and E2E tooling. Process OCSF shorthand omits the message;
+            // emit this acknowledgement only after the native spawn succeeds.
+            tracing::info!(process_id = %id, "MXC agent launched");
+        }
         let stdin = child.stdin.take();
         let stdout = child
             .stdout

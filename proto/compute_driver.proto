@@ -106,10 +106,6 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
-  // Whether this configured driver instance completely enforces the current
-  // portable SandboxPolicy.ui contract. Partial support must report false so
-  // the gateway rejects every explicit UI section before provisioning.
-  bool supports_ui_policy = 14;
 }
 
 message AuthenticateSandboxRequest {

@@ -20,7 +20,7 @@ Policies](/how-it-works/policies/manage-policies).
 
 ## What a Policy Controls
 
-A policy file sets `version: 1` and has up to five other top-level sections.
+A policy file sets `version: 1` and has up to six other top-level sections.
 Each section controls a different part of the sandbox and takes effect at a
 specific time:
 
@@ -29,10 +29,11 @@ specific time:
 | `filesystem_policy` | Paths that sandbox processes can read, or read and write. | Landlock LSM in the kernel. | At sandbox startup. |
 | `landlock` | Whether the sandbox still starts, without your filesystem rules, if OpenShell cannot apply them. | Sandbox runtime. | At sandbox startup. |
 | `process` | User and group that sandbox processes run as. | Docker and Podman, when they create the sandbox. | At sandbox creation. |
+| `ui` | Graphical UI, clipboard, and synthetic input. | A compute driver advertising complete UI-policy support. | At sandbox creation. |
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
 | `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
-Filesystem, Landlock, and process settings are fixed once the sandbox starts.
+Filesystem, Landlock, process, and UI settings are fixed once the sandbox starts.
 Network rules and middleware can change while it runs, as described in [How
 Changes Take
 Effect](/how-it-works/policies/manage-policies#how-changes-take-effect).

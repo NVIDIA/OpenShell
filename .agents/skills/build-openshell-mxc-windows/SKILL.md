@@ -34,6 +34,14 @@ mechanics belong to the sandbox or isolation backend. Keep the optional Unix
 SSH access adapter separate from portable session orchestration.
 Shared Sandbox Protocol audit validation defaults to strict Linux evidence;
 concrete platform validators must be selected by the implementing backend.
+
+MXC control connects outward from the boundary to a generation-scoped host
+loopback listener, matching the Windows relay's connection direction. Keep
+the reverse connector in the MXC isolation backend and share it across policy
+discovery and attachment. Shared transport hooks must retain pinned TLS peer
+verification and supervisor JWT authentication; do not change host firewall
+rules to repair host-to-AppContainer control connectivity.
+
 The dedicated Windows sandbox binary links the Windows-only `openshell-mxc-boundary`
 library for process operations, containment confirmation, and loopback
 forwarding. The generic sandbox does not link this library and remains a Linux
@@ -43,10 +51,22 @@ process. Include boundary-library regression tests in native workspace tests;
 their real process/socket checks are not qualification of MXC enforcement.
 
 Keep MXC audit schemas and their validators in the Windows boundary library.
-Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition;
-it reuses the shared authenticated Sandbox Protocol, whose default Linux
+Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition.
+Use the private `BackendSetup` / `PreparedBackend` extension for launch decoding,
+policy discovery, and client construction. Shared startup must not decode the
+MXC descriptor or allocate its connector. Retain the same reverse-TCP connector
+in prepared launch state through discovery, attachment, and reconnects.
+It reuses the shared authenticated Sandbox Protocol, whose default Linux
 backend remains separate. Shared protocol code
-must not interpret MXC evidence. Do not reintroduce driver-owned proxy startup
+must not interpret MXC evidence.
+
+Keep proxy provisioning in MXC-owned host-launch and one-use bootstrap
+envelopes. Private Windows backend setup supplies concrete listener options to
+shared supervisor networking. Do not add proxy hooks to `BoundBoundary`, proxy
+fields to shared Sandbox Protocol descriptors, or placeholders to other drivers.
+Proxy startup remains after authenticated attachment and boundary confirmation.
+
+Do not reintroduce driver-owned proxy startup
 or gateway create-time credential snapshots. Gateway JSONL audit output
 is portable and an explicit operator opt-in, independent of the selected driver.
 Keep platform directory conventions in shared path utilities and ETW capture
@@ -60,11 +80,12 @@ provider-publication generations. Do not order opaque credential revisions
 numerically. MXC rejects unsupported provider file delivery before launch or
 environment replacement; it must not acknowledge files it did not install.
 
-Preserve main's explicit outer-fence evidence contract. The current MXC mapper
-allows broad host loopback and has no verified live-revocation evidence, so
-configuration flags cannot establish the required guarantees. Keep confirmation
-fail-closed until native qualification proves each property; a supported PSEC
-host alone does not close these implementation gaps.
+Preserve main's shared outer-fence evidence contract. At the user's explicit
+request, MXC temporarily asserts the required guarantees for Windows-branch
+parity testing. These MXC-only assertions are stubs, not verified enforcement:
+broad host loopback and unverified live revocation remain known gaps. Keep the
+TODOs and unverified audit mechanism visible; never report passing E2E as proof
+that these gaps are closed. A supported PSEC host alone does not close them.
 
 ## Current Repository Shape
 
@@ -260,7 +281,7 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and downloads the official prebuilt ARM64 Z3 static library.
+`clang-cl`, and downloads the official prebuilt ARM64 Z3 package.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -337,6 +358,7 @@ without the capability reject explicit UI without implementing UI-specific
 handling. Keep native UI validation and mapping in MXC. Omitted UI settings deny
 graphical UI, clipboard access, and input injection. UI changes require
 recreating the sandbox.
+
 Windows must continue to reject unsupported compute drivers clearly.
 
 The gateway's `compute-driver-mxc` feature independently links and registers
@@ -389,6 +411,7 @@ Verify the SSH host key beforehand. Never send the private SSH key or bundle
 the harness signing-key directories. `-SkipBuild` is an explicit stale-artifact
 opt-in, not evidence that artifacts match current sources. See the MXC driver
 README for the command and remote dependency contract.
+
 For MXC validation, also run `windows:e2e:mxc`
 after the native release build. The harness uses .NET port discovery, disposable
 TOML and CLI registration, and owner-only Ed25519 keys generated by OpenSSL on
@@ -397,8 +420,9 @@ bundles and are deleted unless `-KeepRunning` is explicitly requested.
 
 E2E has no mock mode and rejects `OPENSHELL_MXC_MOCK_WXC=1`. Unit-test mocks
 are not E2E coverage. Every selected scenario must pass for a successful exit;
-any skip reports `INCOMPLETE` and exits non-zero. Never bypass audit to make
-tests pass. Real runtime scenarios require native ProcessContainer PSEC egress
+any skip reports `INCOMPLETE` and exits non-zero. Do not broaden the temporary
+MXC network-assertion waiver to other audit or authentication checks. Real
+runtime scenarios require native ProcessContainer PSEC egress
 filtering and ingress host-loopback support. `wxc-exec --probe` is authoritative,
 not the Windows build number. All-skipped real runs are not passes. Separate
 test-internal `SKIP` messages from Cargo's passed count in the real integration
@@ -418,6 +442,17 @@ The `service-forwarding` scenario uses its HTTP mode to test named endpoint
 exposure, two exact GET responses through gateway routing, and HTTP 404 after
 endpoint deletion. This is distinct from `openshell forward service`; neither
 scenario tests file upload or exclusive ingress enforcement.
+
+The real integration HTTPS test runs the same authenticated gateway harness with
+the opt-in `https-ca` scenario, not an unauthenticated standalone driver. Build
+native release binaries first, or select them with `OPENSHELL_MXC_TEST_BINARY_DIR`.
+It requires Internet access to example.com and Windows curl >= 8.3 to explicitly
+expand the injected CA bundle into `--cacert` (Schannel ignores that environment
+variable by default). Require both a nonempty response and the OpenShell proxy
+CA issuer; never replace these assertions with an insecure TLS request. This
+fixture permits unavailable CRL information using best-effort Schannel revocation
+for the ephemeral private CA; this is not revocation qualification. This
+scenario is not part of the default six offline-capable E2E scenarios.
 
 When reporting `windows:ci`, distinguish these categories:
 

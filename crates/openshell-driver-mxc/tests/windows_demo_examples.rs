@@ -43,6 +43,30 @@ fn websocket_fixture_grants_read_only_workload_without_egress() {
 }
 
 #[test]
+fn https_fixture_authorizes_direct_curl_with_read_only_https() {
+    let yaml = std::fs::read_to_string(examples().join("e2e-policies/https-ca.yaml"))
+        .unwrap()
+        .replace("__CURL_EXE__", r"C:\Windows\System32\curl.exe");
+    let (policy, mapped) = map_fixture(&yaml);
+    let rule = &policy.network_policies["https_example"];
+    assert_eq!(rule.binaries[0].path, r"C:\Windows\System32\curl.exe");
+    assert_eq!(rule.endpoints[0].host, "example.com");
+    assert_eq!(rule.endpoints[0].ports, [443]);
+    assert_eq!(
+        rule.endpoints[0].access,
+        NetworkAccessPreset::ReadOnly as i32
+    );
+    assert_eq!(
+        rule.endpoints[0].enforcement,
+        NetworkEnforcementMode::Enforce as i32
+    );
+    assert_eq!(
+        mapped.trimmed_policy.unwrap().network_policies,
+        policy.network_policies
+    );
+}
+
+#[test]
 fn openclaw_fixture_preserves_explicit_ui_and_node_network_grants() {
     let yaml =
         std::fs::read_to_string(examples().join("e2e-policies/openclaw-gateway.yaml")).unwrap();
@@ -178,11 +202,16 @@ $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     $env:OPENSHELL_BUILD_SCRIPT, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "build script parse errors: $($errors.Message -join '; ')" }
-$function = $ast.Find({ param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stage-Z3Runtime'
-}, $true)
-if ($null -eq $function) { throw 'missing staging function' }
-Invoke-Expression $function.Extent.Text
+foreach ($name in @('Get-Sha256', 'Stage-Z3Runtime')) {
+    $function = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "missing function: $name" }
+    Invoke-Expression $function.Extent.Text
+}
+# Mise's Windows PowerShell may not expose this module cmdlet. Packaging must
+# retain its checksum checks without depending on it.
+function Get-FileHash { throw 'Get-FileHash must not be used' }
 $TargetDir = $env:OPENSHELL_TEST_ROOT
 $PrebuiltZ3Version = '5.1.0'
 $env:Z3_LIBRARY_PATH_OVERRIDE = $null
@@ -197,11 +226,11 @@ $bytes[68] = 0x64; $bytes[69] = 0xAA
 [IO.File]::WriteAllBytes($source, $bytes)
 Stage-Z3Runtime 'aarch64-pc-windows-msvc'
 $destination = Join-Path $release 'libz3.dll'
-if ((Get-FileHash $destination).Hash -ne (Get-FileHash $source).Hash) { throw 'copy mismatch' }
+if ((Get-Sha256 $destination) -ne (Get-Sha256 $source)) { throw 'copy mismatch' }
 # A stale adjacent DLL must be overwritten from the pinned cache.
 [IO.File]::WriteAllBytes($destination, (New-Object byte[] 128))
 Stage-Z3Runtime 'aarch64-pc-windows-msvc'
-if ((Get-FileHash $destination).Hash -ne (Get-FileHash $source).Hash) { throw 'stale DLL retained' }
+if ((Get-Sha256 $destination) -ne (Get-Sha256 $source)) { throw 'stale DLL retained' }
 $bytes[68] = 0x64; $bytes[69] = 0x86
 [IO.File]::WriteAllBytes($source, $bytes)
 $rejected = $false

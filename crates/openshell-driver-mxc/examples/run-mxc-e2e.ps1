@@ -36,6 +36,7 @@
 #   network-policy   - supervisor-owned network policy permits admission.
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 #   service-forwarding - named HTTP service routing and endpoint deletion.
+#   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 
 [CmdletBinding()]
 param(
@@ -752,6 +753,19 @@ try {
         }
     )
 
+    # External connectivity is deliberately opt-in; the default six scenarios
+    # remain runnable without Internet access. Use the same authenticated
+    # gateway launch path as every other workload, not a bare driver fixture.
+    if ($Scenario -eq 'https-ca') {
+        $allScenarios += @{
+            Name = 'https-ca'; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
+            SandboxId = 'ca'; Backends = 'process_container'; Kind = 'https'
+            PosTarget = Join-Path $DemoDir 'example.html'
+            CertificateTarget = Join-Path $DemoDir 'peer-certificate.txt'
+            ErrorTarget = Join-Path $DemoDir 'curl-stderr.txt'
+            Description = 'curl trusts the injected CA and observes the OpenShell HTTPS proxy certificate'
+        }
+    }
     if ($Scenario) {
         # Wrap in @() so an exact single match stays an array: without it a lone
         # match is a bare hashtable, its .Count is unreliable on PS 5.1, and
@@ -800,6 +814,10 @@ try {
                 $defaultDemoDir.Replace('\', '/'),
                 $DemoDir.Replace('\', '/')
             )
+            $curlExe = Join-Path $env:SYSTEMROOT 'System32/curl.exe'
+            # Preserve the exact Windows executable path used in the launch;
+            # network binary identities are compared as strings, not FS paths.
+            $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
             Set-Content -Path $policyUsed -Value $policyText -Encoding UTF8
 
             # Per-scenario gateway logs land in the bundle under their own names.
@@ -820,6 +838,22 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq 'https') {
+                if (-not (Test-Path -LiteralPath $curlExe)) { throw "Missing Windows curl: $curlExe" }
+                Remove-Item -LiteralPath $sc.PosTarget, $sc.CertificateTarget, $sc.ErrorTarget -Force -ErrorAction SilentlyContinue
+                # Launch curl directly so the policy identity is the socket
+                # owner. Schannel ignores CURL_CA_BUNDLE by default, so curl
+                # imports and expands it itself (curl >= 8.3). No shell child,
+                # host trust-store installation, or insecure TLS override.
+                # The ephemeral private CA has no CRL distribution point.
+                # Best-effort revocation tolerates that absence, while keeping
+                # certificate/hostname validation and known-revoked rejection.
+                $command = @($curlExe, '--disable', '--fail', '--silent', '--show-error', '--max-time', '45',
+                    '--ssl-revoke-best-effort',
+                    '--variable', '%CURL_CA_BUNDLE', '--expand-cacert', '{{CURL_CA_BUNDLE}}',
+                    '--stderr', $sc.ErrorTarget,
+                    '--output', $sc.PosTarget, '--write-out', "%output{$($sc.CertificateTarget)}%{certs}\nOpenShell curl exit: %{exitcode}\n",
+                    'https://example.com/')
             } elseif ($sc.Kind -in @("forwarding", "service-forwarding")) {
                 Remove-Item -LiteralPath $sc.ReadyFile -Force -ErrorAction SilentlyContinue
                 $forwardNonce = [guid]::NewGuid().ToString('N')
@@ -879,7 +913,29 @@ try {
             $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
 
             # Evaluate.
-            if ($sc.Kind -eq "positive") {
+            if ($sc.Kind -eq 'https') {
+                try {
+                    if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
+                    if (-not (Wait-File $sc.CertificateTarget 60)) { throw 'HTTPS certificate absent' }
+                    $certificate = Get-Content -LiteralPath $sc.CertificateTarget -Raw
+                    Copy-Item -LiteralPath $sc.CertificateTarget -Destination (Join-Path $resultDir 'https-peer-certificate.txt')
+                    if (Test-Path -LiteralPath $sc.ErrorTarget) {
+                        Copy-Item -LiteralPath $sc.ErrorTarget -Destination (Join-Path $resultDir 'https-curl-stderr.txt')
+                    }
+                    if ($certificate -notmatch '(?m)^OpenShell curl exit: 0\r?$') {
+                        $curlError = Get-Content -LiteralPath $sc.ErrorTarget -Raw -ErrorAction SilentlyContinue
+                        throw "curl did not complete successfully: $curlError"
+                    }
+                    if ($certificate -notmatch 'OpenShell Sandbox CA') { throw 'HTTPS peer was not issued by the OpenShell proxy CA' }
+                    if (-not (Wait-File $sc.PosTarget 10)) { throw 'HTTPS response absent' }
+                    if ((Get-Item -LiteralPath $sc.PosTarget).Length -eq 0) { throw 'HTTPS response empty' }
+                    Ok 'https-ca: response and OpenShell proxy certificate verified'
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = 'real HTTPS through injected proxy CA' }
+                } catch {
+                    Bad "https-ca: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq "positive") {
                 $present = Wait-File $sc.PosTarget 30
                 if ($present -and $createExitCode -eq 0) {
                     Ok "$($sc.Name): in-policy write produced artifact"

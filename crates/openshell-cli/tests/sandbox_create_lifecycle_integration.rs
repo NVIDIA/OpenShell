@@ -64,7 +64,6 @@ struct SandboxState {
     /// so a catalog lookup failure can be told apart from an empty catalog.
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
-    delete_requests: Arc<Mutex<Vec<DeleteSandboxRequest>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
@@ -390,11 +389,6 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.state
-            .delete_requests
-            .lock()
-            .await
-            .push(request.clone());
         self.state
             .deleted_names
             .lock()
@@ -1593,10 +1587,6 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
     server.openshell.state.deleted_names.lock().await.clone()
 }
 
-async fn delete_requests(server: &TestServer) -> Vec<DeleteSandboxRequest> {
-    server.openshell.state.delete_requests.lock().await.clone()
-}
-
 async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
@@ -1706,8 +1696,6 @@ async fn sandbox_delete_continues_after_entry_failure() {
         &server.endpoint,
         &["failing-sandbox".to_string(), "later-sandbox".to_string()],
         false,
-        None,
-        None,
         "default",
         &tls,
         "openshell",

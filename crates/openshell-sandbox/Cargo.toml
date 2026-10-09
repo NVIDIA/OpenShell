@@ -61,7 +61,6 @@ tokio-rustls = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-url = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

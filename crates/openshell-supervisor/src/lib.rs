@@ -19,7 +19,6 @@ mod activity_aggregator;
 mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
-mod isolation_backends;
 mod mechanistic_mapper;
 mod provider_readiness;
 
@@ -309,6 +308,7 @@ fn prepare_control_readiness_path(_path: &std::path::Path) -> Result<()> {
         "Unix readiness sockets are unsupported on this host"
     ))
 }
+
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
@@ -668,7 +668,7 @@ pub async fn run_sandbox(
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
-        &backend_setup::OpenShellBackendSetup,
+        backend_setup::platform_setup(),
         SandboxRunConfig {
             command,
             workdir,

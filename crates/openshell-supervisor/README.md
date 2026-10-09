@@ -4,7 +4,9 @@ The supervisor loads and reconciles policy, maintains provider credentials, appl
 
 ## Backend startup
 
-The public `run_sandbox` entry point selects the OpenShell Sandbox Protocol backend and collects its startup inputs into a private `SandboxRunConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns that backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
+The public `run_sandbox` entry point selects the platform backend and collects its startup inputs into a private `SandboxRunConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns the selected backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
+
+Windows composition selects MXC; other platforms retain the standard OpenShell Sandbox Protocol backend. The MXC setup retains one reverse-TCP connector through discovery, attachment, and reconnects, and builds the host-side isolation backend with its Windows audit validator. Provisioning remains in the compute driver; supervision remains in a separate host process.
 
 Shared startup checks the admitted backend name before passing the opaque payload to its decoder. It then compares the decoded sandbox, session, and runtime generation with the trusted launch inputs before installing credentials or discovering workload policy. A mismatch stops startup.
 
@@ -14,7 +16,14 @@ The supervisor admits policy and prepares credentials before constructing and at
 
 The client receives the supervisor's live provider state, bearer-token slot, and CA-path slot. Provider refresh, token rotation, and later CA publication must remain visible through those shared handles. Startup does not create independent copies of their current values.
 
-The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
+The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature remains unchanged.
+
+MXC proxy settings are decoded by Windows backend setup from an MXC-owned
+launch envelope. The private startup result carries the transport payload and
+concrete CONNECT listener options separately. Shared networking consumes those
+options after attachment and confirmation; the host supervisor still owns policy
+evaluation, live credentials, and listener lifetime. Neither `BoundBoundary` nor
+the shared Sandbox Protocol descriptor exposes a proxy-configuration hook.
 
 The private startup result separates the backend transport payload from optional
 authenticated CONNECT listener settings. Shared networking starts the listener
@@ -27,6 +36,7 @@ a proxy hook to the isolation interface or the shared Sandbox Protocol descripto
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.
 
 Console JSON is installed independently of optional file appenders and uses an INFO filter independent of the diagnostic filter. Its runtime enabled flag and target schema version are shared with the existing JSONL file layer. The supervisor retains the writer guards until shutdown. The gateway log push layer continues to emit shorthand only.
+
 ## Portable supervisor access
 
 The supervisor consumes the shared isolation backend contract. Its gateway

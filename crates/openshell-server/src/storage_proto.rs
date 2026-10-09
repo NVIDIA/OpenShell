@@ -143,9 +143,9 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3fead4a66e57e6828072109564fa25b5b65ef541b35098d9ed7f0785387fe0aa";
+        "6ebadd136a19ea99297614489d25e4153d3b48ba18badb6a5ffd76531458ef5d";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "92facb7b5277267f239c3ef960aa0136d1f18c0dd87a864ad60e4e69237aaf1b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "5f5165548d2ec333689fc88ab652af1977760bb976007a634e3ed30f28782424";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -612,7 +612,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (307, 28),
+                (308, 28),
                 (94, 22),
                 (82, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

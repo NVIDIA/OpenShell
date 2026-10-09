@@ -260,11 +260,6 @@ openshell sandbox create --from registry.example.com/agents/my-agent:1.0
 
 Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
 
-Reusable image and resource settings belong in sandbox templates; see
-[Templates](/how-it-works/sandboxes/templates) for the current SDK workflow.
-The pre-0.1.0 `base` image alias and CLI template commands do not apply to
-this release; pass an explicit image reference with `--from`.
-
 ## Connect to a Sandbox
 
 Attach to the canonical main process in a running sandbox:
@@ -971,20 +966,6 @@ openshell sandbox delete sandbox-a sandbox-b
 When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
 failure and continues with the remaining names. The command exits with an error
 after it attempts every requested deletion if any entry failed.
-
-Automation that already observed a sandbox's immutable identity can prevent a
-same-name replacement from being deleted:
-
-```shell
-openshell sandbox delete my-sandbox \
-  --expected-id <sandbox-id> \
-  --expected-resource-version <resource-version>
-```
-
-Identity preconditions require exactly one sandbox name, and a resource version
-may be supplied only with the immutable ID. The gateway returns an `ABORTED`
-error without changing the sandbox or calling its compute driver when either
-value no longer matches.
 
 ## Sandbox Lifecycle
 

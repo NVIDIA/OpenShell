@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{
-    BackendError, BinaryIdentity, DirectProxyConfiguration, ExecutableIdentity,
-    OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
+use openshell_mxc_boundary::launch::{MxcBoundaryConfig, MxcLaunchDescriptor, MxcProxyConfig};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -20,6 +20,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[allow(clippy::struct_excessive_bools)] // separately serialized enforcement properties, not state flags
 struct MxcOuterFenceEvidence<'a> {
+    compatibility_assertion: &'a str,
     generation: &'a str,
     containment: &'a str,
     default_deny_filesystem: bool,
@@ -47,8 +48,8 @@ pub struct MxcBoundarySpec {
 }
 
 pub struct MxcBoundaryProvisioning {
-    pub boundary_config: BoundaryConfig,
-    pub runtime_descriptor: SandboxRuntimeDescriptor,
+    pub boundary_config: MxcBoundaryConfig,
+    pub runtime_descriptor: MxcLaunchDescriptor,
 }
 
 impl MxcBoundarySpec {
@@ -74,6 +75,10 @@ impl MxcBoundarySpec {
             resource_digest,
         )?;
         let resource_claims = BTreeMap::from([
+            (
+                "mxc.control_transport".to_string(),
+                "reverse_tcp".to_string(),
+            ),
             ("mxc.generation".to_string(), self.generation.clone()),
             (
                 "mxc.appcontainer_profile".to_string(),
@@ -81,6 +86,7 @@ impl MxcBoundarySpec {
             ),
         ]);
         let evidence = serde_json::to_vec(&MxcOuterFenceEvidence {
+            compatibility_assertion: "windows-parity-unverified-egress-and-revocation",
             generation: &self.generation,
             containment: "process_container",
             default_deny_filesystem: true,
@@ -91,60 +97,87 @@ impl MxcBoundarySpec {
         .map_err(|error| {
             BackendError::Descriptor(format!("encode MXC outer-fence evidence: {error}"))
         })?;
-        // Configuration intent is not enforcement evidence. In particular,
-        // allowing all host loopback ports does not prove NoUnmanagedEgressPath,
-        // and this launch path has no verified live-revocation mechanism.
-        // Keep main's confirmation gate closed until native evidence can
-        // establish every required guarantee.
-        let outer_fence =
-            OuterFenceGuarantees::from_enforcement_evidence(&self.generation, [], &evidence)?;
-        let direct_proxy = DirectProxyConfiguration {
+        let outer_fence = windows_parity_outer_fence(&self.generation, &evidence)?;
+        let proxy = MxcProxyConfig {
             bind_addr: self.proxy_addr,
             authorization: self.proxy_authorization,
-            binary_identity: BinaryIdentity {
-                executable: ExecutableIdentity {
-                    path: self.workload_binary,
-                    digest: None,
-                },
-                ancestors: Vec::new(),
-                cmdline_paths: Vec::new(),
-            },
+            workload_binary: self.workload_binary,
         };
+        proxy.validate()?;
         Ok(MxcBoundaryProvisioning {
-            boundary_config: BoundaryConfig {
-                boundary_id: self.boundary_id.clone(),
-                generation: self.generation.clone(),
-                session_id: self.session_id,
-                session_rotation: self.session_rotation,
-                auth_epoch: self.auth_epoch,
-                gateway_id: self.gateway_id,
-                verification_keys: self.verification_keys,
-                listener: BoundaryListener::TlsTcp {
-                    address: self.control_addr,
-                    tls: self.sandbox_tls,
+            boundary_config: MxcBoundaryConfig {
+                proxy_url: self.proxy_url,
+                runtime: BoundaryConfig {
+                    boundary_id: self.boundary_id.clone(),
+                    generation: self.generation.clone(),
+                    session_id: self.session_id,
+                    session_rotation: self.session_rotation,
+                    auth_epoch: self.auth_epoch,
+                    gateway_id: self.gateway_id,
+                    verification_keys: self.verification_keys,
+                    listener: BoundaryListener::TlsTcp {
+                        address: self.control_addr,
+                        tls: self.sandbox_tls,
+                    },
+                    resource_claims: resource_claims.clone(),
+                    resource_claim_files: BTreeMap::new(),
+                    workload_identity: workload_identity.clone(),
+                    outer_fence: outer_fence.clone(),
+                    child_env: self.child_env,
                 },
-                resource_claims: resource_claims.clone(),
-                resource_claim_files: BTreeMap::new(),
-                workload_identity: workload_identity.clone(),
-                outer_fence: outer_fence.clone(),
-                direct_proxy_url: Some(self.proxy_url),
-                child_env: self.child_env,
             },
-            runtime_descriptor: SandboxRuntimeDescriptor {
-                boundary_id: self.boundary_id,
-                generation: self.generation,
-                session_id: self.session_id,
-                workload_identity,
-                transport: SandboxTransport::Tcp {
-                    authority: self.control_addr.to_string(),
-                    addresses: vec![self.control_addr],
+            runtime_descriptor: MxcLaunchDescriptor {
+                proxy,
+                runtime: SandboxRuntimeDescriptor {
+                    boundary_id: self.boundary_id,
+                    generation: self.generation,
+                    session_id: self.session_id,
+                    workload_identity,
+                    transport: SandboxTransport::Tcp {
+                        authority: self.control_addr.to_string(),
+                        addresses: vec![self.control_addr],
+                    },
+                    tls: self.supervisor_tls,
+                    host_gateway_ip: Some(self.proxy_addr.ip()),
+                    resource_claims,
+                    outer_fence,
                 },
-                tls: self.supervisor_tls,
-                host_gateway_ip: Some(self.proxy_addr.ip()),
-                direct_proxy: Some(direct_proxy),
-                resource_claims,
-                outer_fence,
             },
         })
+    }
+}
+
+fn windows_parity_outer_fence(
+    generation: &str,
+    evidence: &[u8],
+) -> Result<OuterFenceGuarantees, BackendError> {
+    // TODO(mxc-network-fence): Remove this temporary Windows-branch parity stub
+    // once supervisor-only egress and live revocation are implemented. Broad
+    // 127.0.0.1 access permits bypassing the proxy through other host services;
+    // these assertions are NOT verified enforcement evidence. Keep this waiver
+    // confined to MXC rather than weakening the shared confirmation contract.
+    OuterFenceGuarantees::from_enforcement_evidence(
+        generation,
+        [
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ],
+        evidence,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_parity_stub_preserves_generation_binding() {
+        let fence = windows_parity_outer_fence("generation-a", b"compatibility-stub").unwrap();
+        assert!(fence.validate("generation-a").is_ok());
+        assert!(fence.validate("generation-b").is_err());
+        assert!(windows_parity_outer_fence("", b"compatibility-stub").is_err());
+        assert!(windows_parity_outer_fence("generation-a", b"").is_err());
     }
 }

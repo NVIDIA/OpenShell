@@ -50,7 +50,7 @@ if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsB
 }
 $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
 
-$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-vfio"
+$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
@@ -528,7 +528,7 @@ function Stage-Z3Runtime([string] $RustTarget) {
         $candidates = @(Get-ChildItem -Path (Join-Path $release "build/z3-sys-*/out/z3-$PrebuiltZ3Version/bin/libz3.dll") -File -ErrorAction SilentlyContinue)
     }
     if ($candidates.Count -eq 0) { throw "Matching libz3.dll not found for $RustTarget." }
-    $hashes = @($candidates | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } | Select-Object -Unique)
+    $hashes = @($candidates | ForEach-Object { Get-Sha256 $_.FullName } | Select-Object -Unique)
     if ($hashes.Count -ne 1) { throw "Ambiguous Z3 runtimes for $RustTarget; use a clean target cache or Z3_LIBRARY_PATH_OVERRIDE." }
     $source = $candidates[0].FullName
     $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($source))
@@ -546,7 +546,7 @@ function Stage-Z3Runtime([string] $RustTarget) {
     if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
-    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne $hashes[0]) { throw 'Staged Z3 DLL hash mismatch.' }
+    if ((Get-Sha256 $destination) -ne $hashes[0]) { throw 'Staged Z3 DLL hash mismatch.' }
     Write-Host "==> Staged $destination (SHA256=$($hashes[0]))"
 }
 

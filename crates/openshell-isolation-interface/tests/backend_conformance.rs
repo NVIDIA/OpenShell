@@ -383,6 +383,7 @@ fn complete_outer_fence(generation: &str, evidence: &[u8]) -> OuterFenceGuarante
     )
     .unwrap()
 }
+
 fn confirmation() -> BoundaryConfirmation {
     BoundaryConfirmation {
         generation: "generation-1".to_string(),

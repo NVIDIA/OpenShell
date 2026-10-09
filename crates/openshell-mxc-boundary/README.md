@@ -42,6 +42,7 @@ payload; the authenticated workload proxy URL stays in the MXC bootstrap.
 Windows supervisor composition turns these into ordinary shared CONNECT
 listener options. Shared isolation traits and Sandbox Protocol descriptors
 contain no MXC proxy fields, and other compute drivers need no placeholders.
+
 MXC adopts main's authenticated image-policy discovery and ordered provider
 environment publication. Command-based MXC has no rootfs image policy to
 discover. Publication generations prevent stale refreshes from replacing newer
@@ -68,9 +69,17 @@ still requires native ProcessContainer networking and permits all ports on
 `127.0.0.1`; it is not isolation from unrelated host-loopback services.
 
 Main requires explicit proof of no unmanaged egress path and verified
-revocation. The current driver publishes no established outer-fence guarantees
-because its configuration alone does not prove those properties. Confirmation
-therefore remains fail-closed, including on an otherwise qualified PSEC host.
+revocation. For Windows-branch parity testing, the MXC driver temporarily
+asserts those guarantees without establishing them. Network audit assertions
+are likewise compatibility stubs, labeled as unverified in mechanism metadata.
+This does not restrict access to unrelated host-loopback services or establish
+live revocation. TODOs in provisioning and confirmation track removing the
+stubs; shared backend validation and native AppContainer checks remain intact.
+
+The boundary measures its AppContainer SID from the current Windows process
+token for audit identity. It rejects uncontained processes; a configured
+container/profile name is not a substitute for that native token measurement.
+This measurement alone does not establish network-fence guarantees.
 
 Unit tests exercise real Windows process launch, output retention, and a real
 ephemeral TCP forwarding target. These tests do not qualify MXC enforcement;

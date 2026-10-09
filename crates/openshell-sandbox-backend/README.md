@@ -24,6 +24,7 @@ the execution outcome unknown.
 
 Exec envelopes without an expiration time are rejected. Update the supervisor
 and sandbox runtime together when deploying this protocol change.
+
 ## Boundary audit validation
 
 `OpenShellRuntimeBackend` implements the authenticated host side of the shared

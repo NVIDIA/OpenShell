@@ -11,8 +11,11 @@ version = 2
 # and environment variables through the standard sandbox --env option.
 
 [openshell.drivers.mxc]
-# Path to wxc-exec.exe. Required for live runs. Leave the default for mock-mode
-# smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
+# Explicit administrator opt-in for this disposable development gateway.
+# MXC workload command and cwd are supplied through per-sandbox driver config.
+allow_driver_config = true
+
+# Path to wxc-exec.exe. Required for real runtime tests; mocks are not E2E.
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
 # The RFC 0012 MXC runtime requires ProcessContainer.

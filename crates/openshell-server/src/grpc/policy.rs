@@ -8601,18 +8601,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_runtime_inputs_preserve_base_policy_without_credential_sink() {
-        let state = test_server_state().await;
-        let policy = openshell_policy::restrictive_default_policy();
-        let sandbox = test_sandbox("create-policy", "create-policy", policy.clone(), Vec::new());
-        let inputs = resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox)
-            .await
-            .expect("driver-independent effective policy");
-        assert_eq!(inputs.effective_policy, Some(policy));
-        assert!(inputs.launch_authentication.is_none());
-    }
-
-    #[tokio::test]
     async fn create_runtime_inputs_apply_global_policy_and_preserve_startup_ui() {
         let state = test_server_state().await;
         let mut global_policy = install_test_global_policy(&state).await;

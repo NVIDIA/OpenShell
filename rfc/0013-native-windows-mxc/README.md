@@ -80,7 +80,13 @@ probe, as runtime readiness.
 ### Outer fence and confirmation
 
 MXC receives the mapped filesystem, UI, and network constraints before
-`openshell-sandbox` starts. The boundary consumes and deletes its one-use
+workload startup. UI remains part of `SandboxPolicy`; the gateway requires the
+selected driver's existing extension metadata to advertise
+`openshell.policy.ui.v1` for any explicit UI section. Unsupported drivers need
+no UI-specific handling. MXC validates and maps the native UI settings before
+provisioning; omitted capabilities deny and changes require recreation.
+
+The boundary consumes and deletes its one-use
 configuration and TLS private key before releasing workload code. It confirms
 the ProcessContainer generation, resource claims, filesystem fence, egress
 fence, authenticated control transport, and controller-loss behavior through
@@ -95,7 +101,10 @@ descriptors are stored beneath an owner-only Windows DACL.
 MXC denies direct Internet egress and permits the loopback route used by the
 Sandbox Protocol and explicit proxy. The host supervisor owns a distinct proxy
 listener and random authorization value for every sandbox generation.
-`openshell-sandbox` injects the proxy URL and public CA paths only into workload
+These launch settings stay in MXC-owned envelopes. Private Windows supervisor
+composition supplies listener options to shared networking without extending
+`BoundBoundary` or the shared Sandbox Protocol descriptor. The dedicated
+`openshell-windows-sandbox` injects the proxy URL and public CA paths only into workload
 children. The supervisor retains private CA keys and provider secrets, applies
 network policy, and refreshes provider state through the ordinary session.
 

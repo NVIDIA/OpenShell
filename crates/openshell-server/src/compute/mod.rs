@@ -349,9 +349,6 @@ pub struct ComputeDriverInfoSnapshot {
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
     pub rootfs_tar_max_bytes: u64,
-    /// Whether this configured driver instance completely enforces the portable
-    /// UI policy contract.
-    pub supports_ui_policy: bool,
 }
 
 // Startup recovery owns persisted desired state before normal observations
@@ -782,7 +779,6 @@ impl ComputeRuntime {
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
-            supports_ui_policy: capabilities.supports_ui_policy,
         };
         let default_image = capabilities.default_image;
         let rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
@@ -1142,8 +1138,14 @@ impl ComputeRuntime {
             .or_else(|| sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()))
             .and_then(|policy| policy.ui.as_ref())
             .is_some();
-        if has_explicit_ui && !self.driver_info.supports_ui_policy {
-            return Err(Status::invalid_argument(format!(
+        let supports_ui = self
+            .driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| capability == openshell_core::extension_protocol::POLICY_UI_V1);
+        if has_explicit_ui && !supports_ui {
+            return Err(Status::failed_precondition(format!(
                 "compute driver '{}' does not support the complete UI policy contract; remove the explicit ui section or select a supporting driver/backend",
                 self.driver_info.name
             )));
@@ -7368,7 +7370,6 @@ impl ComputeDriver for NoopTestDriver {
                     "test",
                     [],
                 )),
-                supports_ui_policy: false,
             },
         ))
     }
@@ -7546,7 +7547,6 @@ pub fn new_test_runtime_with_driver(
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            supports_ui_policy: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -7571,7 +7571,6 @@ pub fn new_test_runtime_with_driver(
 mod tests {
     use super::*;
     use futures::stream;
-    use openshell_core::proto::SandboxPolicy as PublicSandboxPolicy;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
@@ -7988,7 +7987,6 @@ mod tests {
                     }
                     metadata
                 }),
-                supports_ui_policy: false,
             }))
         }
 
@@ -8392,7 +8390,6 @@ mod tests {
                     "test",
                     [],
                 )),
-                supports_ui_policy: false,
             }))
         }
 
@@ -8654,7 +8651,6 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
-                supports_ui_policy: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -8697,7 +8693,7 @@ mod tests {
             .await
             .expect_err("an unsupported driver must reject explicit UI policy");
 
-        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("complete UI policy contract"));
         assert_eq!(
             driver.validate_create_calls.load(Ordering::Relaxed),
@@ -8716,7 +8712,7 @@ mod tests {
             .await
             .expect_err("an internal caller must not bypass UI capability validation");
 
-        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.code(), Code::FailedPrecondition);
         assert_eq!(
             driver.create_calls.load(Ordering::Relaxed),
             0,
@@ -8743,7 +8739,7 @@ mod tests {
             .await
             .expect_err("an unsupported driver must reject the effective UI policy");
 
-        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.code(), Code::FailedPrecondition);
         assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 0);
     }
 
@@ -8751,7 +8747,11 @@ mod tests {
     async fn explicit_ui_policy_reaches_driver_when_capability_is_complete() {
         let driver = Arc::new(TestDriver::default());
         let mut runtime = test_runtime(driver.clone()).await;
-        runtime.driver_info.supports_ui_policy = true;
+        runtime
+            .driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::POLICY_UI_V1.to_string());
 
         runtime
             .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-supported"))
@@ -8759,6 +8759,27 @@ mod tests {
             .expect("a driver advertising complete UI support accepts validation");
 
         assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn effective_ui_policy_rejects_before_unsupported_driver_create() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-effective-ui-create",
+            "ui-policy",
+            SandboxPhase::Provisioning,
+        );
+        let runtime_inputs = SandboxCreateRuntimeInputs::new(PublicSandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        });
+        let error = runtime
+            .create_sandbox_with_runtime_inputs(sandbox, None, false, runtime_inputs)
+            .await
+            .expect_err("effective UI must be checked on internal creation");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.create_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -8774,6 +8795,7 @@ mod tests {
 
         assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
     }
+
     #[tokio::test]
     async fn create_runtime_inputs_reach_driver_without_persisting_effective_policy_or_secrets() {
         let driver = Arc::new(TestDriver::default());

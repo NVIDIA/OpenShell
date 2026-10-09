@@ -59,6 +59,7 @@ pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAM
     + BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES;
 // HTTP/2 caps any flow-control window at 2^31 - 1.
 const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
+
 /// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
 /// co-located runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,12 +440,6 @@ pub struct SandboxRuntimeDescriptor {
     /// network supervisor cannot use the boundary's resolver view.
     #[serde(default)]
     pub host_gateway_ip: Option<std::net::IpAddr>,
-    /// Optional generation-scoped explicit proxy owned by the host
-    /// supervisor. Backends set this only when their outer fence routes the
-    /// workload to this listener and the boundary cannot provide staged
-    /// socket mediation.
-    #[serde(default)]
-    pub direct_proxy: Option<openshell_isolation_interface::contract::DirectProxyConfiguration>,
     /// Driver-specific immutable resource coordinates bound at attach (for
     /// example pod UID, VM generation, or container ID).
     #[serde(default)]
@@ -463,7 +458,6 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("transport", &self.transport)
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
-            .field("direct_proxy", &self.direct_proxy)
             .field("resource_claims", &self.resource_claims)
             .field("outer_fence", &self.outer_fence)
             .finish()
@@ -518,13 +512,8 @@ pub struct BoundaryConfig {
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Backend-neutral projection of the validated outer fence.
+    /// Backend-neutral projection of the validated outer network fence.
     pub outer_fence: OuterFenceGuarantees,
-    /// Authenticated proxy URL injected into workload children. It is staged
-    /// only in this protected one-use configuration and is never inherited by
-    /// the trusted sandbox process itself.
-    #[serde(default)]
-    pub direct_proxy_url: Option<String>,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
@@ -553,10 +542,6 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
             .field("outer_fence", &self.outer_fence)
-            .field(
-                "direct_proxy_url",
-                &self.direct_proxy_url.as_ref().map(|_| "<redacted>"),
-            )
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -1537,6 +1522,7 @@ mod tests {
         assert!(audit.validate().is_err());
         assert!(!audit.properties().egress_interception.enforced);
     }
+
     #[test]
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
         for encoded in [

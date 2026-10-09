@@ -110,6 +110,7 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-podman
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
+--exclude openshell-sandbox
 --exclude openshell-vfio
 ```
 

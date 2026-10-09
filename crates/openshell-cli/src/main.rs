@@ -1674,16 +1674,8 @@ enum SandboxCommands {
         names: Vec<String>,
 
         /// Delete all sandboxes.
-        #[arg(long, conflicts_with_all = ["names", "expected_id", "expected_resource_version"])]
+        #[arg(long, conflicts_with = "names")]
         all: bool,
-
-        /// Delete only if the current sandbox has this exact immutable ID.
-        #[arg(long = "expected-id", value_name = "ID")]
-        expected_id: Option<String>,
-
-        /// Delete only if the current sandbox has this resource version.
-        #[arg(long = "expected-resource-version", value_name = "VERSION")]
-        expected_resource_version: Option<u64>,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3584,18 +3576,11 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete {
-                            names,
-                            all,
-                            expected_id,
-                            expected_resource_version,
-                        } => {
+                        SandboxCommands::Delete { names, all } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
                                 all,
-                                expected_id.as_deref(),
-                                expected_resource_version,
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,
@@ -5538,48 +5523,6 @@ mod tests {
                 command: Some(SandboxCommands::Start { name: None }),
             })
         ));
-    }
-
-    #[test]
-    fn sandbox_delete_accepts_identity_preconditions() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "sandbox",
-            "delete",
-            "demo",
-            "--expected-id",
-            "sb-123",
-            "--expected-resource-version",
-            "17",
-        ])
-        .expect("identity-guarded sandbox delete should parse");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Delete {
-                    ref names,
-                    all: false,
-                    expected_id: Some(ref expected_id),
-                    expected_resource_version: Some(17),
-                })
-            }) if names == &["demo"] && expected_id == "sb-123"
-        ));
-    }
-
-    #[test]
-    fn sandbox_delete_all_rejects_identity_preconditions() {
-        assert!(
-            Cli::try_parse_from([
-                "openshell",
-                "sandbox",
-                "delete",
-                "--all",
-                "--expected-id",
-                "sb-123",
-            ])
-            .is_err()
-        );
     }
 
     #[test]

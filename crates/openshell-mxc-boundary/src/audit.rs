@@ -7,10 +7,11 @@ use openshell_isolation_interface::contract::{BackendError, BoundaryProperties, 
 use openshell_sandbox_backend::audit::BoundaryAuditValidator;
 use serde::{Deserialize, Serialize};
 
-/// Windows `ProcessContainer` evidence measured by the MXC boundary.
+/// Windows `ProcessContainer` audit reported by the MXC boundary.
 ///
 /// MXC supplies the outer filesystem and network fence; the in-container
-/// sandbox supplies authenticated lifecycle and process I/O.
+/// sandbox supplies authenticated lifecycle and process I/O. Network assertions
+/// currently include a temporary Windows-parity stub, not measured exclusivity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(
@@ -59,7 +60,7 @@ impl MxcSandboxAuditEvidence {
             ),
             egress_interception: EnforcedProperty::new(
                 self.default_deny_egress && self.loopback_proxy_only,
-                "mxc-wfp-loopback-proxy-fence",
+                "mxc-windows-parity-unverified-egress-stub",
             ),
             request_attribution: EnforcedProperty::new(
                 self.generation_scoped_attribution,

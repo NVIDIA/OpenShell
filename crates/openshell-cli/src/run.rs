@@ -412,9 +412,7 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) =
-        sandbox_delete(server, &names, false, None, None, workspace, tls, gateway).await
-    {
+    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3881,35 +3879,14 @@ fn labels_display(labels: &HashMap<String, String>) -> String {
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
-#[allow(clippy::too_many_arguments)] // user-facing CLI command with explicit identity guards
 pub async fn sandbox_delete(
     server: &str,
     names: &[String],
     all: bool,
-    expected_id: Option<&str>,
-    expected_resource_version: Option<u64>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
 ) -> Result<()> {
-    if (expected_id.is_some() || expected_resource_version.is_some()) && (all || names.len() != 1) {
-        return Err(miette!(
-            "--expected-id and --expected-resource-version require exactly one sandbox name"
-        ));
-    }
-    if expected_id.is_some_and(str::is_empty) {
-        return Err(miette!("--expected-id must not be empty"));
-    }
-    if expected_resource_version.is_some() && expected_id.is_none() {
-        return Err(miette!(
-            "--expected-resource-version requires --expected-id"
-        ));
-    }
-    if expected_resource_version == Some(0) {
-        return Err(miette!(
-            "--expected-resource-version must be greater than zero"
-        ));
-    }
     let mut client = grpc_client(server, tls).await?;
 
     let names_to_delete: Vec<String> = if all {

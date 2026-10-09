@@ -16,6 +16,21 @@ use openshell_isolation_interface::contract::{
     ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
 };
 
+#[cfg(target_os = "windows")]
+mod mxc;
+
+/// Trusted binary composition chooses the platform implementation, never the payload.
+pub fn platform_setup() -> &'static dyn BackendSetup {
+    #[cfg(target_os = "windows")]
+    {
+        &mxc::MxcBackendSetup
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &OpenShellBackendSetup
+    }
+}
+
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
 /// these against admission before credentials or discovery reach that backend.
 pub struct LaunchIdentity {
@@ -201,8 +216,10 @@ impl SelectedBackend {
 
 /// The standard binary selects the `OpenShell` Sandbox Protocol. Its wire schema
 /// and concrete client stay here rather than in the shared startup sequence.
+#[cfg(any(test, not(target_os = "windows")))]
 pub struct OpenShellBackendSetup;
 
+#[cfg(any(test, not(target_os = "windows")))]
 impl BackendSetup for OpenShellBackendSetup {
     fn backend_name(&self) -> &str {
         openshell_sandbox_backend::BACKEND_NAME
@@ -233,8 +250,10 @@ impl BackendSetup for OpenShellBackendSetup {
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 struct OpenShellLaunch(openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor);
 
+#[cfg(any(test, not(target_os = "windows")))]
 #[tonic::async_trait]
 impl PreparedBackend for OpenShellLaunch {
     async fn discover_policy(

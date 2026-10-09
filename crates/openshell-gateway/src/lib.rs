@@ -153,6 +153,14 @@ struct MxcFactory;
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
+    fn admission_policy(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        Ok(config.admission_policy())
+    }
+
     fn supports_config_preflight(&self) -> bool {
         true
     }

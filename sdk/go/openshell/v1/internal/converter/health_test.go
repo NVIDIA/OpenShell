@@ -20,9 +20,8 @@ func TestGatewayInfoFromProto(t *testing.T) {
 			{
 				Name: "k8s",
 				Capabilities: &pb.ComputeDriverCapabilities{
-					DriverName:       "kubernetes",
-					DriverVersion:    "2.1.0",
-					SupportsUiPolicy: true,
+					DriverName:    "kubernetes",
+					DriverVersion: "2.1.0",
 				},
 			},
 			{
@@ -55,14 +54,12 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
 	assert.Equal(t, "kubernetes", info.ComputeDrivers[0].DriverName)
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
-	assert.True(t, info.ComputeDrivers[0].SupportsUIPolicy)
 	assert.Equal(t, "docker", info.ComputeDrivers[1].Name)
 	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].DriverName)
 	require.Len(t, info.Extensions, 1)
 	assert.Equal(t, v1.ExtensionKindComputeDriver, info.Extensions[0].Kind)
 	assert.Equal(t, "openshell/kubernetes", info.Extensions[0].ImplementationName)
 	assert.Equal(t, uint32(1), info.Extensions[0].ProtocolMajor)
-	assert.False(t, info.ComputeDrivers[1].SupportsUIPolicy)
 }
 
 func TestGatewayInfoFromProto_NoDrivers(t *testing.T) {
@@ -133,7 +130,6 @@ func TestComputeDriverInfoFromProto_NilCapabilities(t *testing.T) {
 	assert.Equal(t, "bare-metal", info.Name)
 	assert.Empty(t, info.DriverName)
 	assert.Empty(t, info.DriverVersion)
-	assert.False(t, info.SupportsUIPolicy)
 }
 
 func TestCurrentUserFromProto(t *testing.T) {

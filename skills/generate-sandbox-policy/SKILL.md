@@ -288,11 +288,10 @@ ui:
 ```
 
 Treat clipboard direction from the sandbox's perspective. Warn that UI is a
-static sandbox-creation control. It is currently enforceable only by the MXC
-driver's OpenShell `process_container` backend, which emits MXC's
-`processcontainer` containment value and advertises complete support. MXC
-`isolation_session` and non-Windows drivers advertise no support, so the gateway
-rejects any explicit UI section, including `{}`, before provisioning. Omit the
+static sandbox-creation control. It requires the selected compute driver to
+advertise `openshell.policy.ui.v1` through existing extension metadata. A driver
+without that capability rejects any explicit UI section, including `{}`, before
+provisioning. Omit the
 section rather than emitting deny-only UI for those drivers; omission preserves
 their existing behavior.
 

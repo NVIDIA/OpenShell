@@ -12,6 +12,10 @@
 pub mod audit;
 #[cfg(target_os = "windows")]
 pub mod backend;
+#[cfg(target_os = "windows")]
+mod identity;
+#[cfg(target_os = "windows")]
+pub mod launch;
 
 /// Exact admission name for the MXC isolation backend; never a Linux fallback.
 pub const BACKEND_NAME: &str = "openshell-mxc";
