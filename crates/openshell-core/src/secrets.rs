@@ -431,14 +431,17 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+        // Normalize aliases before identity checks so a wrapped revision or stable
+        // handle retains the original endpoint, epoch, and expiration constraints.
+        let canonical_alias = alias_env_key(value).map(placeholder_for_env_key);
+        let value = canonical_alias.as_deref().unwrap_or(value);
         if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
             && revisioned_placeholder_parts(value).is_none()
             && stable_placeholder_parts(value).is_none()
         {
-            // Canonical placeholders and provider-shaped aliases carry no
-            // credential identity. Endpoint-bound request input must use the
-            // revision-scoped placeholder issued to the workload so a stale
-            // process cannot resolve a replacement provider's credential.
+            // Unversioned placeholders carry no credential identity. Endpoint-bound
+            // request input must retain the issued revision or stable handle so a
+            // stale process cannot resolve a replacement provider's credential.
             return None;
         }
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
@@ -449,7 +452,7 @@ impl SecretResolver {
             // credential refresh. For endpoint-bound credentials, permit that
             // fallback only when the exact opaque revision belongs to the
             // current provider-identity epoch.
-            let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
+            let key = revisioned_placeholder_env_key(value)?;
             if let Some((revision, key)) = revisioned_placeholder_parts(value)
                 && self.identity_bound_env_keys.contains(key)
                 && self
@@ -782,7 +785,13 @@ fn placeholder_env_key(token: &str) -> Option<&str> {
         .map(|(_, key)| key)
         .or_else(|| revisioned_placeholder_env_key(token))
         .or_else(|| token.strip_prefix(PLACEHOLDER_PREFIX))
-        .or_else(|| alias_env_key(token))
+        .or_else(|| {
+            alias_env_key(token).map(|suffix| {
+                split_stable_env_key(suffix)
+                    .or_else(|| split_revisioned_env_key(suffix))
+                    .map_or(suffix, |(_, key)| key)
+            })
+        })
 }
 
 pub fn uses_reserved_revision_namespace(key: &str) -> bool {
