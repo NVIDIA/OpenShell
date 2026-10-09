@@ -192,8 +192,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(
+                        openshell_cli::oidc_auth::oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             insecure,
                         ),
