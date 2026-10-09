@@ -175,6 +175,75 @@ let
     '';
   };
 
+  # Reports how many of the e2e-podman-eligible targets the archive actually
+  # selects and executes, so a narrow CI run cannot be mistaken for full
+  # coverage (#3712). Computes the eligible set the same way podmanE2eCiTests
+  # does (a real `cargo nextest list`, not a hand-maintained number) and
+  # compares it against podmanE2eFollowUpBinaries, the single declarative
+  # exclusion list that also drives the archive filter above — so this can't
+  # drift from what actually runs. Uses the full (not binaries-only) listing
+  # so per-test `#[ignore]` status is visible: a selected binary whose only
+  # test is a manual-only benchmark (see the two perf targets elsewhere in
+  # this file) is archive-scoped but never actually executes, and reporting
+  # it as "selected" without that distinction would itself be misleading.
+  podmanE2eCoverageSummary = pkgs.writeShellApplication {
+    name = "podman-e2e-coverage-summary";
+    runtimeInputs = [
+      pkgs.cargo-nextest
+      pkgs.git
+      pkgs.jq
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      counts=$(cargo nextest list \
+        --manifest-path e2e/rust/Cargo.toml \
+        --target ${muslToolchain.target} \
+        -p openshell-e2e \
+        --features e2e-podman \
+        --message-format json \
+        | jq --argjson excluded ${pkgs.lib.escapeShellArg (builtins.toJSON podmanE2eFollowUpBinaries)} '
+          [
+            .["rust-suites"][]
+            | select(.kind == "test")
+            | {
+                name: .["binary-name"],
+                selected: (.["binary-name"] as $name | $excluded | index($name) | not),
+                all_ignored: ((.testcases | length) > 0 and (.testcases | to_entries | all(.value.ignored == true)))
+              }
+          ] as $targets
+          | ($targets | map(select(.selected))) as $selected
+          | {
+              eligible: ($targets | length),
+              excluded_count: ($excluded | length),
+              selected: ($selected | length),
+              manual_only: [$selected[] | select(.all_ignored) | .name]
+            }
+        ')
+
+      eligible=$(jq -r '.eligible' <<<"$counts")
+      excluded_count=$(jq -r '.excluded_count' <<<"$counts")
+      selected=$(jq -r '.selected' <<<"$counts")
+      manual_only_count=$(jq -r '.manual_only | length' <<<"$counts")
+      manual_only_names=$(jq -r '.manual_only | join(", ")' <<<"$counts")
+      executing=$((selected - manual_only_count))
+
+      echo "### Podman \`e2e-podman\` archive coverage"
+      echo
+      echo "- **$eligible** targets eligible under the \`e2e-podman\` feature"
+      echo "- **$excluded_count** excluded — see \`podmanE2eFollowUpBinaries\` in \`tests/artifacts.nix\` for the documented reason behind each one"
+      if [ "$manual_only_count" -gt 0 ]; then
+        echo "- **$selected** selected into the archive, of which **$manual_only_count** are manual-only benchmarks (\`#[ignore]\`) that don't run automatically: $manual_only_names"
+      else
+        echo "- **$selected** selected into the archive"
+      fi
+      echo "- **$executing** actually execute in this run"
+    '';
+  };
+
   podmanDriverArchive = mkTestArchive {
     name = "podman-driver";
     workspacePath = "tests/suites/drivers";
@@ -183,6 +252,32 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
   };
+  # Runs rootless-only in branch CI today (see .github/workflows/branch-e2e.yml's
+  # driver-specific-integration matrix), unlike podmanDriverArchive above, which
+  # runs both rootful and rootless. This is a deliberate scoping decision, not an
+  # oversight (#3712): most of this archive's selected targets (sandbox/workspace
+  # lifecycle, labels, templates, port forwarding, uploads, settings) exercise
+  # driver-agnostic gateway/policy logic with no privilege-model sensitivity, so a
+  # rootful leg would duplicate coverage without catching anything new.
+  #
+  # podman_host_gateway was checked specifically (host.openshell.internal
+  # resolution plausibly depends on the rootless pasta/slirp4netns vs. rootful
+  # netavark/CNI network backend) and confirmed NOT privilege-sensitive: the
+  # outer container's /etc/hosts entry uses Podman's own native "host-gateway"
+  # alias value (container.rs), which Podman resolves identically in both
+  # modes, and the supervisor-side resolution defaults to a hardcoded
+  # 127.0.0.1 on Linux regardless of rootful/rootless
+  # (PodmanComputeConfig::resolved_host_gateway_ip in config.rs). No rootful
+  # coverage gap here.
+  #
+  # The one confirmed exception is podman_resource_limits, which reads real
+  # cgroup v2 state from inside the sandbox: rootless cgroup delegation
+  # depends on systemd-user `Delegate=` and can silently no-op if
+  # misconfigured, making rootless the harder, higher-risk case -- already
+  # covered here. Rootful is the lower-risk, currently-unverified path for
+  # that one target. Tracked in #4163; since nextest archive filters select
+  # whole binaries, closing that gap means running this entire archive
+  # rootful too, not just the one target that needs it.
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
@@ -201,6 +296,7 @@ rec {
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
+    podmanE2eCoverageSummary
     ;
 
   binaries = pkgs.writeShellApplication {
