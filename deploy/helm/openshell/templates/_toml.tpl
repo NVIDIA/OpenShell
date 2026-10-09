@@ -111,6 +111,20 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
+{{- $dbMaxConnections := int (get $legacyServer "dbMaxConnections") -}}
+{{- if lt $dbMaxConnections 0 -}}
+{{- fail "server.dbMaxConnections must not be negative; set 0 to use the gateway default" -}}
+{{- end -}}
+{{- if and (gt $dbMaxConnections 0) (not (hasKey $gateway "database_max_connections")) -}}
+{{- $_ := set $gateway "database_max_connections" $dbMaxConnections -}}
+{{- end -}}
+{{- $dbLockMaxConnections := int (get $legacyServer "dbLockMaxConnections") -}}
+{{- if lt $dbLockMaxConnections 0 -}}
+{{- fail "server.dbLockMaxConnections must not be negative; set 0 to use the gateway default" -}}
+{{- end -}}
+{{- if and (gt $dbLockMaxConnections 0) (not (hasKey $gateway "database_lock_max_connections")) -}}
+{{- $_ := set $gateway "database_lock_max_connections" $dbLockMaxConnections -}}
+{{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
 {{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}
 {{- if and $serverDnsNames (not (hasKey $gateway "server_sans")) -}}

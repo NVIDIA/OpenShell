@@ -27,6 +27,7 @@ pub use endpoint_status::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, require_platform_admin};
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
@@ -1237,7 +1238,7 @@ fn background_pending_refreshes() -> &'static std::sync::Mutex<HashMap<String, b
 }
 
 /// Refresh pending proposals off the request path. Used where the policy
-/// change runs under the gateway-wide sandbox sync guard (`UpdateConfig`) or
+/// change runs under the sandbox's mutation guard (`UpdateConfig`) or
 /// is driven by the sandbox itself (auto-approval), so the refresh neither
 /// extends the guard nor adds agent-controlled work to the response. At most
 /// one refresh runs per sandbox; changes that arrive meanwhile coalesce into
@@ -3805,10 +3806,13 @@ async fn handle_update_config_inner(
                 "annotations are only supported for sandbox-scoped updates",
             ));
         }
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::Global)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3942,7 +3946,8 @@ async fn handle_update_config_inner(
         }
 
         // Deleting global policy changes the report's effective configuration.
-        // Keep settings -> sandbox lock order for all global policy mutations.
+        // The global guard taken at the top of this branch excludes every
+        // sandbox-scoped settings, policy, and report mutation.
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -3996,10 +4001,13 @@ async fn handle_update_config_inner(
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -4020,6 +4028,7 @@ async fn handle_update_config_inner(
             let mut sandbox_settings =
                 load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
                     .await?;
+            ensure_sandbox_keeps_name(state, &sandbox).await?;
             let removed = sandbox_settings.settings.remove(key).is_some();
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
@@ -4064,6 +4073,7 @@ async fn handle_update_config_inner(
 
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+        ensure_sandbox_keeps_name(state, &sandbox).await?;
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
@@ -4094,9 +4104,13 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire policy mutation lock")
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4633,9 +4647,16 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire configuration admission lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&sandbox_id)
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire configuration admission lock")
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     let mut sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
@@ -4835,9 +4856,16 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let Some(_mutation_guard) = state
+            .compute
+            .sandbox_mutation_guard_by_id(&req.sandbox_id)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?
+        else {
+            return Err(Status::not_found("sandbox not found"));
+        };
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -7500,6 +7528,30 @@ pub(super) async fn save_global_settings(
     .await
 }
 
+/// Sandbox settings are keyed by name, and a sandbox's mutation guard does not
+/// exclude a new sandbox that takes the name once this one is deleted. Called
+/// after loading the settings: sandbox IDs are never reused, so if the sandbox
+/// still exists under its name, the loaded settings are its own.
+async fn ensure_sandbox_keeps_name(state: &ServerState, sandbox: &Sandbox) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+    match current {
+        Some(current)
+            if current.object_name() == sandbox.object_name()
+                && current.object_workspace() == sandbox.object_workspace() =>
+        {
+            Ok(())
+        }
+        _ => Err(Status::not_found(format!(
+            "sandbox '{}' was deleted",
+            sandbox.object_name()
+        ))),
+    }
+}
+
 pub(super) async fn load_sandbox_settings(
     store: &Store,
     workspace: &str,
@@ -7538,6 +7590,7 @@ async fn load_settings_record(
         let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
             .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
         settings.resource_version = record.resource_version;
+        settings.record_id = Some(record.id.clone());
         for key in settings.settings.keys() {
             settings
                 .change_clocks
@@ -7588,6 +7641,17 @@ async fn save_settings_record(
             .await
             .map_err(|e| Status::internal(format!("fetch settings for CAS failed: {e}")))?
             .ok_or_else(|| Status::not_found("settings disappeared since load"))?;
+        // Settings are keyed by name. A row recreated under the same name, for
+        // a sandbox that reused it, restarts at the loaded resource version.
+        if settings
+            .record_id
+            .as_deref()
+            .is_some_and(|loaded| loaded != existing.id)
+        {
+            return Err(Status::aborted(
+                "settings were replaced concurrently; please retry",
+            ));
+        }
 
         (
             existing.id,
@@ -8001,8 +8065,14 @@ mod tests {
         // A duplicate report racing the initial registration must share one
         // persisted transition; either may acquire the lifecycle fence first.
         let (first, duplicate) = tokio::join!(
-            handle_report_sandbox_configuration(&state, request()),
-            handle_report_sandbox_configuration(&state, request()),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
         );
         first.unwrap();
         duplicate.unwrap();
@@ -20969,6 +21039,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_setting_update_does_not_wait_for_unrelated_sandbox_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-setting-target",
+                "setting-target",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let unrelated_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", "sb-setting-unrelated")),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    sandbox: "setting-target".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    setting_key: "ocsf_json_enabled".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .expect("a sandbox setting update should not wait for an unrelated sandbox")
+        .expect("sandbox setting update succeeds");
+        let settings = load_sandbox_settings(state.store.as_ref(), "default", "setting-target")
+            .await
+            .unwrap();
+        assert!(settings.settings.contains_key("ocsf_json_enabled"));
+        drop(unrelated_guard);
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -21716,6 +21834,87 @@ mod tests {
             loaded.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY),
             Some(&StoredSettingValue::String("auto".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_save_aborts_when_row_was_recreated() {
+        let store = test_store().await;
+        let sandbox_name = "reused-name";
+        let mut original = StoredSettings::default();
+        original
+            .settings
+            .insert("a_key".to_string(), StoredSettingValue::Bool(true));
+        save_sandbox_settings(&store, "default", sandbox_name, &original)
+            .await
+            .unwrap();
+        let mut loaded = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+
+        // A new sandbox reuses the name: its settings row restarts at the
+        // version the stale load saw.
+        store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, "default", sandbox_name)
+            .await
+            .unwrap();
+        let mut replacement = StoredSettings::default();
+        replacement
+            .settings
+            .insert("c_key".to_string(), StoredSettingValue::Bool(true));
+        save_sandbox_settings(&store, "default", sandbox_name, &replacement)
+            .await
+            .unwrap();
+        let recreated = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+        assert_eq!(recreated.resource_version, loaded.resource_version);
+
+        loaded
+            .settings
+            .insert("r_key".to_string(), StoredSettingValue::Bool(true));
+        let error = save_sandbox_settings(&store, "default", sandbox_name, &loaded)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        let current = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+        assert!(current.settings.contains_key("c_key"));
+        assert!(!current.settings.contains_key("r_key"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_owner_check_rejects_a_reused_name() {
+        let state = test_server_state().await;
+        let original = test_sandbox(
+            "sb-original",
+            "reused-name",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&original).await.unwrap();
+        ensure_sandbox_keeps_name(&state, &original).await.unwrap();
+
+        state
+            .store
+            .delete(Sandbox::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let replacement = test_sandbox(
+            "sb-replacement",
+            "reused-name",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&replacement).await.unwrap();
+
+        let error = ensure_sandbox_keeps_name(&state, &original)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+        ensure_sandbox_keeps_name(&state, &replacement)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -48,6 +48,27 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### PostgreSQL-backed tests
+
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
+
+```shell
+mise run test:rust:postgres
+```
+
+The task starts a disposable PostgreSQL container with Docker or Podman
+(set `CONTAINER_ENGINE` to choose), runs the tests one at a time, and removes
+the container. Each test works in its own temporary schema. To use your own
+disposable database, set `OPENSHELL_TEST_POSTGRES_URL`. The task overrides
+`OPENSHELL_REPLAY_TEST_DATABASE_URL` so legacy tests use that same database.
+Never point it at a database that a running gateway uses: the tests take
+fleet-wide advisory locks.
+Branch Checks runs them on x86_64 Linux.
+Load-sensitive capacity checks are named `bench_postgres_*` instead, so that
+task skips them. Run them on an idle machine with
+`mise run test:rust:postgres:bench`.
+
 ### Native Windows validation
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.

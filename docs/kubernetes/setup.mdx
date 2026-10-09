@@ -278,6 +278,7 @@ The most commonly changed values are:
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
+| `server.dbMaxConnections` / `server.dbLockMaxConnections` | Connection ceilings for the gateway's database pool and its PostgreSQL mutation lock pool. `0` keeps the gateway defaults (10 for PostgreSQL, 5 for on-disk SQLite, and 4 lock connections). Each replica opens both pools, so keep `(dbMaxConnections + dbLockMaxConnections) × replicaCount`, plus rollout pods, below the database server's `max_connections`. Refer to [Gateway Configuration](/how-it-works/gateways/configuration#database-pool). |
 | `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Default sandbox image used when a sandbox does not specify one. |
 | `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |

@@ -231,9 +231,12 @@ autoscaling:
   enabled: false
   # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
   minReplicas: 2
-  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
-  # connection pool; size the database for rollouts at this count, as the High
-  # Availability guide describes.
+  # -- Maximum gateway replicas. Each replica opens up to
+  # server.dbMaxConnections + server.dbLockMaxConnections PostgreSQL
+  # connections (14 with the defaults); size the database for rollouts at this
+  # count, as the High Availability guide describes. With a Deployment and the
+  # default pool sizes, the default of 4 needs `max_connections` of at least
+  # 126, more than the PostgreSQL default of 100.
   maxReplicas: 4
   # -- Target average CPU utilization, as a percentage of
   # resources.requests.cpu. Set to null to disable. Requires
@@ -361,6 +364,20 @@ server:
   # from this Secret instead of using dbUrl. The Secret must contain a
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
+  # -- Connection ceiling for the gateway's database pool, shared by every
+  # database-backed request. 0 (default) uses the gateway's backend default:
+  # 10 for PostgreSQL, 5 for on-disk SQLite. PostgreSQL needs at least 2,
+  # because the SSH identity lock keeps one connection while it queries the
+  # pool, so the gateway rejects 1 there. On PostgreSQL each replica opens
+  # this pool plus its dbLockMaxConnections lock pool, so size the server's
+  # max_connections for both, counting rollout pods, as the High Availability
+  # guide describes.
+  dbMaxConnections: 0
+  # -- Connection ceiling for the gateway's PostgreSQL mutation lock pool. Each
+  # mutation guard holds one lock connection, so this bounds how many guarded
+  # mutations a replica runs or waits on at once. 0 (default) uses the gateway
+  # default of 4. SQLite has no lock pool and ignores it.
+  dbLockMaxConnections: 0
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []

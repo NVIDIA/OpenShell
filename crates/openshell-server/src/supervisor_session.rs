@@ -2229,13 +2229,38 @@ async fn establish_supervisor_session(
     )
     .await
     {
-        abandon_session_setup(
-            &state,
-            &owner_index,
-            &owner_guard,
-            "endpoint status initialization",
-        )
-        .await;
+        let was_current = state
+            .supervisor_sessions
+            .remove_if_current(&sandbox_id, &session_id)
+            .is_some();
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after endpoint status initialization failure");
+        }
+        // While this session was current, the superseded session's disconnect
+        // reset deferred to this one, so its evidence may still be stored.
+        // Invalidate it the way a session end does.
+        if was_current {
+            let state = Arc::clone(&state);
+            let sandbox_id = sandbox_id.clone();
+            tokio::spawn(async move {
+                // Lifecycle demotion takes an unbounded local lock. Keep it
+                // off this failure path so a timed-out reset returns promptly.
+                if let Err(err) = state
+                    .compute
+                    .supervisor_session_disconnected(&sandbox_id, false)
+                    .await
+                {
+                    warn!(sandbox_id, error = %err, "supervisor session: failed to mark sandbox disconnected after endpoint status initialization failure");
+                }
+                // Shutdown waits for the demotion, like other session cleanup,
+                // but not for the retry, which runs until the reset is durable.
+                drop(session_lifetime);
+                crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
+                    state, sandbox_id,
+                )
+                .await;
+            });
+        }
         return Err(error);
     }
     if !state

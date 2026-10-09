@@ -163,6 +163,13 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
+# Connection ceiling for the gateway's database pool. Omit to use the backend
+# default: 10 for Postgres, 5 for on-disk SQLite.
+database_max_connections = 10
+
+# Connection ceiling for the Postgres mutation lock pool. Omit to use 4.
+database_lock_max_connections = 4
+
 # When omitted, the gateway auto-detects Kubernetes, then Podman, then Docker.
 # VM is never auto-detected and requires an explicit entry here.
 compute_driver        = "kubernetes"
@@ -327,6 +334,28 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Database Pool
+
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+
+Omit the key to use the backend default, which is unchanged from earlier releases:
+
+| Backend | Default ceiling |
+|---|---|
+| Postgres | 10 |
+| SQLite (on disk) | 5 |
+| SQLite (in memory) | 1, always. The database lives inside its single connection, so a configured value is ignored and the gateway logs that it was. |
+
+The equivalent flag and environment variable are `--db-max-connections` and `OPENSHELL_DB_MAX_CONNECTIONS`, and the Helm chart renders this key from `server.dbMaxConnections`. Values below `1` are rejected at startup: a zero-sized pool would block every acquisition rather than degrade. Postgres needs at least `2`, because the SSH identity lock keeps one data connection while it queries the pool, so the gateway rejects `1` there too.
+
+On Postgres, the gateway holds its mutation advisory locks on a separate lock pool, one connection per guarded mutation while it runs or waits. `[openshell.gateway] database_lock_max_connections` sets that pool's ceiling, `4` by default, so it bounds how many guarded mutations a replica runs or waits on in Postgres at once. When every lock connection is in use, further guarded mutations queue for one, and fail with `MUTATION_LOCK_TIMEOUT` only if none frees up before their 10-second lock wait runs out. The equivalent flag and environment variable are `--db-lock-max-connections` and `OPENSHELL_DB_LOCK_MAX_CONNECTIONS`, and the Helm chart renders this key from `server.dbLockMaxConnections`. Values below `1` are rejected at startup. SQLite has no lock pool, so the gateway ignores the key there and logs that it did.
+
+For Helm deployments, set both keys in the `openshell.gateway` table under `gatewayConfig`. These values override the compatibility settings `server.dbMaxConnections` and `server.dbLockMaxConnections`.
+
+On Postgres, each replica opens both pools, so plan for `(database_max_connections + database_lock_max_connections) × replicaCount` connections, 14 per replica with the defaults, and keep that total below the server's own `max_connections` (and below any connection-pooler limit in front of it). Rollouts run extra pods; refer to [Size PostgreSQL Connections](/kubernetes/high-availability#size-postgresql-connections). Raising either ceiling past what the server admits moves the failure from a slow acquire to a refused connection.
+
+On SQLite, writers are serialized regardless of pool size, so a larger ceiling buys read concurrency only. A gateway that needs more write throughput wants an external Postgres database (`server.externalDbSecret`), not a larger SQLite pool.
 
 ## OCSF JSONL Output
 

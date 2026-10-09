@@ -102,6 +102,28 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub log_level: Option<String>,
 
+    // ── Database ─────────────────────────────────────────────────────────
+    /// Connection ceiling for the persistence pool. One shared pool serves
+    /// every database-backed RPC, so this is also the gateway's ceiling on
+    /// concurrent database work. On Postgres, each replica also opens up to
+    /// `database_lock_max_connections` lock connections, so total server
+    /// connections are `(database_max_connections +
+    /// database_lock_max_connections) × replica_count`, plus rollout pods,
+    /// which must stay under the server's own `max_connections`. Omit to keep
+    /// the backend default (10 for Postgres, 5 for on-disk `SQLite`); an
+    /// in-memory `SQLite` database is always a single connection. Postgres
+    /// needs at least 2, because the SSH identity lock keeps one connection
+    /// while it queries the pool.
+    #[serde(default)]
+    pub database_max_connections: Option<u32>,
+
+    /// Connection ceiling for the Postgres mutation lock pool. Each mutation
+    /// guard holds one lock connection, so this bounds how many guarded
+    /// mutations a replica runs or waits on in Postgres at once. Omit to keep
+    /// the default of 4; `SQLite` has no lock pool and ignores it.
+    #[serde(default)]
+    pub database_lock_max_connections: Option<u32>,
+
     // ── Drivers ──────────────────────────────────────────────────────────
     /// Explicit compute driver selection. `None` enables auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +610,21 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             field: "database_url",
             env: "OPENSHELL_DB_URL",
             cli: "--db-url",
+        });
+    }
+    // A zero-sized pool would deadlock every `acquire` rather than degrade,
+    // so reject it at load instead of starting a gateway that cannot serve.
+    if file.openshell.gateway.database_max_connections == Some(0) {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.database_max_connections",
+            message: "must be greater than zero; omit the key to use the built-in default",
+        });
+    }
+    // A zero-sized lock pool would time out every guarded mutation.
+    if file.openshell.gateway.database_lock_max_connections == Some(0) {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.database_lock_max_connections",
+            message: "must be greater than zero; omit the key to use the built-in default",
         });
     }
     if file
@@ -1283,6 +1320,65 @@ database_url = "sqlite::memory:"
             err,
             ConfigFileError::SecretInFile {
                 field: "database_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_database_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_max_connections = 64
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("a positive pool ceiling parses");
+        assert_eq!(file.openshell.gateway.database_max_connections, Some(64));
+    }
+
+    #[test]
+    fn rejects_zero_database_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_max_connections = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("a zero pool ceiling must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.database_max_connections",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_database_lock_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_lock_max_connections = 8
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("a positive lock pool ceiling parses");
+        assert_eq!(
+            file.openshell.gateway.database_lock_max_connections,
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_database_lock_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_lock_max_connections = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("a zero lock pool ceiling must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.database_lock_max_connections",
                 ..
             }
         ));

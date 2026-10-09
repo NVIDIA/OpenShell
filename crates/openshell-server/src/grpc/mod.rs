@@ -79,8 +79,10 @@ use crate::ServerState;
 /// Map a `PersistenceError` to an appropriate gRPC `Status`.
 ///
 /// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
-/// to signal that the client should retry with fresh data. Other persistence
-/// errors are mapped to `INTERNAL`.
+/// to signal that the client should retry with fresh data. Mutation lock
+/// timeouts are mapped to `UNAVAILABLE` with a retry delay: the mutation lock
+/// was not acquired, so this request's guarded writes did not run. Other
+/// persistence errors are mapped to `INTERNAL`.
 pub fn persistence_error_to_status(
     err: crate::persistence::PersistenceError,
     operation: &str,
@@ -97,6 +99,11 @@ pub fn persistence_error_to_status(
                 current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
             ),
             current_resource_version,
+        ),
+        PersistenceError::LockTimeout(_) => openshell_core::rpc_error::unavailable(
+            "MUTATION_LOCK_TIMEOUT",
+            format!("{operation} timed out waiting for a concurrent mutation; retry the request"),
+            std::time::Duration::from_secs(1),
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
@@ -184,6 +191,10 @@ struct StoredSettings {
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
     resource_version: u64,
+    /// Database id of the loaded row. Not persisted; a save aborts when the
+    /// row was deleted and recreated under the same name since the load.
+    #[serde(skip)]
+    record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1165,6 +1176,32 @@ mod tests {
         let gpu = capabilities.gpu.expect("GPU capabilities");
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    #[test]
+    fn persistence_error_to_status_maps_mutation_lock_timeout_to_unavailable() {
+        let status = persistence_error_to_status(
+            crate::persistence::PersistenceError::LockTimeout(
+                "waiting for a PostgreSQL advisory lock".into(),
+            ),
+            "acquire provider mutation lock",
+        );
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "acquire provider mutation lock timed out waiting for a concurrent mutation; \
+             retry the request"
+        );
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "MUTATION_LOCK_TIMEOUT"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(std::time::Duration::from_secs(1))
+        );
     }
 
     #[test]

@@ -237,6 +237,36 @@ jobs:
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
+  rust-postgres-test:
+    name: Rust PostgreSQL tests
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    # Bare runner: the test script starts a disposable PostgreSQL container
+    # with the host's Docker.
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Test
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          CONTAINER_ENGINE: docker
+          OPENSHELL_TELEMETRY_ENABLED: "false"
+        run: tasks/scripts/run-postgres-tests.sh --locked --profile ci
+
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
     needs: pr_metadata

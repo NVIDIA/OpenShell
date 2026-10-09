@@ -212,6 +212,9 @@ configuration, and access control.
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
 | Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Spikes of `grpc_code="unavailable"` during rollouts are expected. Do not use as an HPA target. |
+| Lock contention | `openshell_server_mutation_lock_wait_seconds`, `openshell_server_mutation_lock_hold_seconds`, `openshell_server_mutation_lock_timeouts_total` | Alert on any timeout. Long holds on a scope make its waiters wait, and holds longer than 10 seconds make them time out. |
+| Lock errors | `openshell_server_mutation_lock_errors_total` | Alert on any increase, separately from timeouts. PostgreSQL ran out of connection slots, restarted, or became unreachable. Readiness can stay healthy, because it uses established data connections. |
+| Lock pool | `openshell_server_mutation_lock_connections_in_use`, `openshell_server_mutation_lock_connections_capacity` | PostgreSQL only. Graph in use over capacity per replica. Values that stay near 1 mean that guarded operations on this replica hold their lock connections, or wait in PostgreSQL for a lock held elsewhere, often by another replica, and lock waits and timeouts follow. |
 
 These queries assume that Prometheus labels each series with `namespace` and
 `pod`:
@@ -241,6 +244,24 @@ sum by (operation) (rate(openshell_server_routed_request_attempts_total{route="p
 
 # 99th percentile peer request latency across the fleet.
 histogram_quantile(0.99, sum by (le, operation) (rate(openshell_server_peer_request_duration_seconds_bucket{outcome="success"}[5m])))
+
+# 99th percentile mutation lock wait by scope. Watch scope="sandbox" during rollouts.
+histogram_quantile(0.99, sum by (le, scope) (rate(openshell_server_mutation_lock_wait_seconds_bucket[5m])))
+
+# Mutation lock timeouts by scope. Alert on any increase.
+sum by (scope) (increase(openshell_server_mutation_lock_timeouts_total[10m]))
+
+# 99th percentile time a mutation lock is held, by replica and scope.
+# Conflicting acquisitions time out after 10 seconds.
+histogram_quantile(0.99, sum by (namespace, pod, le, scope) (rate(openshell_server_mutation_lock_hold_seconds_bucket[5m])))
+
+# Mutation lock acquisitions that failed without timing out. Timeouts do not
+# include them, so alert on any increase here as well.
+sum by (namespace, pod, scope) (increase(openshell_server_mutation_lock_errors_total[10m]))
+
+# Lock-pool connections in use on each replica, PostgreSQL only. Values that
+# stay near 1 mean the pool is close to full.
+max by (namespace, pod) (max_over_time(openshell_server_mutation_lock_connections_in_use[5m]) / openshell_server_mutation_lock_connections_capacity)
 ```
 
 Relay capacity is used on the replica that owns the sandbox's supervisor
@@ -249,6 +270,20 @@ adding replicas does not relieve a busy owner. A relay whose client gave up
 stays counted for up to about 40 seconds, the 10-second claim timeout plus the
 30-second cleanup interval. Routed request counts include retries during
 rollouts.
+
+Each supervisor that reconnects takes one or two short sandbox-scoped locks on
+the replica that receives it. When a gateway pod stops during a rollout, its
+supervisors reconnect to the other replicas, so watch
+`openshell_server_mutation_lock_wait_seconds` and
+`openshell_server_mutation_lock_timeouts_total` with `scope="sandbox"` on the
+receiving replicas. Rising waits or any timeout mean that those replicas
+receive reconnects faster than they can absorb them, or that slow compute
+driver, credential backend, middleware, or provider profile source calls during
+sandbox and provider changes hold their locks longer. Guarded work has no time
+limit of its own, so such a call holds its lock until it returns:
+`openshell_server_mutation_lock_hold_seconds` shows how long, and the replica
+logs `mutation lock held longer than the lock wait timeout` when it releases a
+lock held longer than 10 seconds.
 
 ## Scale the Gateway
 
@@ -380,9 +415,13 @@ kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/openshell/pods
 
 ### Size PostgreSQL Connections
 
-Each gateway pod opens up to 10 PostgreSQL connections on demand. The chart
-uses the Kubernetes default rolling update strategy for each workload kind, so
-the number of pods that run during a rollout depends on the kind.
+With the default settings, each gateway pod opens up to 14 PostgreSQL
+connections on demand: 10 for data access (`server.dbMaxConnections`) and 4
+for mutation locks (`server.dbLockMaxConnections`). A request cancelled during
+a lock wait can leave its lock session open for up to 10 seconds, so keep
+headroom. The chart uses the Kubernetes default rolling update strategy for
+each workload kind, so the number of pods that run during a rollout depends on
+the kind.
 
 A Deployment rollout adds up to 25 percent of the replica count, rounded up,
 as surge pods. Kubernetes does not count terminating pods against that surge,
@@ -390,18 +429,20 @@ and each replaced pod can keep its connections throughout its termination
 grace period. A rollout can therefore run up to twice the replica count at
 once, and an eviction or an autoscaler scale-down during the rollout adds more
 terminating pods. Set PostgreSQL `max_connections` to at least
-`(2 × replicas + surge) × 10`, which leaves one surge of margin for those
-pods, plus headroom for your other clients and administration. Use
-`autoscaling.maxReplicas` as the replica count when autoscaling is enabled.
+`(2 × replicas + surge) × (data + lock connections)`, which leaves one surge
+of margin for those pods, plus headroom for your other clients and
+administration. Use `autoscaling.maxReplicas` as the replica count when
+autoscaling is enabled. With the defaults, that is
+`(2 × replicas + surge) × 14`:
 
 | Replicas | Surge | Minimum `max_connections` |
 |---|---|---|
-| 2 | 1 | `(4 + 1) × 10 = 50` |
-| 3 | 1 | `(6 + 1) × 10 = 70` |
-| 4 | 1 | `(8 + 1) × 10 = 90` |
-| 6 | 2 | `(12 + 2) × 10 = 140` |
+| 2 | 1 | `(4 + 1) × 14 = 70` |
+| 3 | 1 | `(6 + 1) × 14 = 98` |
+| 4 | 1 | `(8 + 1) × 14 = 126` |
+| 6 | 2 | `(12 + 2) × 14 = 196` |
 
-With a Deployment, five or more replicas exceed what the PostgreSQL default of
+With a Deployment, three or more replicas exceed what the PostgreSQL default of
 100 leaves for the gateway, because PostgreSQL reserves 3 connections for
 superusers. Raise `max_connections` or use a larger managed instance. Let one
 rollout finish before you start another, because each overlapping rollout adds
@@ -410,13 +451,57 @@ its own terminating pods.
 If you run several replicas as a StatefulSet with
 `workload.allowMultiReplicaStatefulSet`, a rollout adds no surge pods. It
 replaces one pod at a time and creates each replacement only after the old pod
-exits. Set `max_connections` to at least `replicas × 10`, using
-`autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for your
-other clients and administration.
+exits. Set `max_connections` to at least
+`replicas × (data + lock connections)`, 14 per replica with the defaults,
+using `autoscaling.maxReplicas` when autoscaling is enabled, plus headroom for
+your other clients and administration.
+
+Raise `server.dbLockMaxConnections` only when mutation lock timeouts on a
+replica come from a full lock pool: the gateway logs them with the detail
+`waiting for a mutation lock connection`, and
+`openshell_server_mutation_lock_connections_in_use` stays at
+`openshell_server_mutation_lock_connections_capacity`. Also check that the
+replica's own acquisitions are not mostly waiting behind another holder: few
+of its timeouts carry the detail `waiting for a PostgreSQL advisory lock` or
+`canceling statement due to lock timeout`, and `pg_locks` shows the pod's lock
+sessions granted rather than waiting. Otherwise, find the slow holder first,
+because a larger pool only queues more waiters behind it. Each extra lock
+connection adds `2 × replicas + surge` to the minimum `max_connections` for a
+Deployment.
 
 If a connection pooler sits between the gateway and PostgreSQL, use session
 pooling. The gateway holds session-level advisory locks, which transaction
 pooling breaks.
+
+Mutations lock only what they change. Sandbox operations lock their own
+sandbox, provider and workspace-profile changes lock their workspace, and
+gateway-global policy, settings, and platform-profile changes lock the whole
+fleet. Sandbox start, stop, and delete lock only on the replica that runs them,
+and only a gateway-global change on that replica blocks them directly.
+Provider, workspace-profile, and other replicas' gateway-global changes delay
+them only while another operation on the same sandbox waits behind the change.
+Sandbox create, start, restart, and delete also take one fleet-wide lock while
+they provision or remove the sandbox's SSH host identity, so that step runs for
+one sandbox at a time across all replicas. For other
+mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
+reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
+that carried a `request_id` leaves its admission unresolved, like any other
+error, so a retry with the same ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe
+resource state and reconcile effects, then send a new request with a new
+`request_id`. Refer to
+[Durable Request Admission](/sdk/api-errors#durable-request-admission).
+
+### Upgrade from an Earlier Release
+
+With the default settings, each gateway pod now opens up to 14 PostgreSQL
+connections instead of 10. The upgrade rollout already runs new pods at that
+count, so raise `max_connections` to the minimum in
+[Size PostgreSQL Connections](#size-postgresql-connections) before you upgrade.
+
+While gateways from the earlier release and the new release run together
+during the upgrade, the older replicas serialize every mutation across the
+fleet. Mutations can be slower and can briefly fail under load until the
+rollout finishes.
 
 ## Next Steps
 
