@@ -30,8 +30,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pins for runtime tool versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
-UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 PLATFORM=""
 BUILD_DIR=""
