@@ -95,6 +95,20 @@ let
         };
       }
       {
+        name = "k3s-ha-tls";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s-ha-tls.yaml" ];
+        inputs = {
+          openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
+          agent_sandbox_version = "0.5.0";
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        };
+      }
+      {
         name = "none";
         use_galaxy = false;
         playbooks = [ ];
