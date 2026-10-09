@@ -78,7 +78,7 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
+The `snapd` configuration is available for Ubuntu and prepares snapd for snap
 Store installation experiments. Combine it with `docker` to reproduce the
 system-Docker canary, or use it alone to verify that `install.sh` fails safely
 when Docker is absent.

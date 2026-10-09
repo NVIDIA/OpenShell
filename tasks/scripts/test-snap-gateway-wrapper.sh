@@ -64,7 +64,7 @@ assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$c
 generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
 --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
 
-# An operator-provided environment path takes precedence over the Snap
+# An operator-provided environment path takes precedence over the snap
 # compatibility path, while CLI arguments are replayed unchanged.
 override="$work/override.toml"
 printf 'operator override\n' >"$override"
