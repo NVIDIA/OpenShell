@@ -2218,24 +2218,38 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(providers) => {
+                    for (workspace, provider_name) in providers {
+                        crate::config_delivery::publish_provider_components(
+                            &state,
+                            &workspace,
+                            &provider_name,
+                            crate::config_delivery::ConfigComponents::ALL,
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
 }
 
+/// Returns the `(workspace, provider)` pairs whose provider records changed.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<std::collections::HashSet<(String, String)>, Status> {
+    let changed_providers = std::collections::HashSet::new();
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -2255,7 +2269,7 @@ async fn run_refresh_worker_tick(
         .iter()
         .any(|state| refresh_state_has_work(state, now_ms))
     {
-        return Ok(());
+        return Ok(changed_providers);
     }
     let span = tracing::info_span!(
         "refresh",
@@ -2263,8 +2277,10 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span)).await;
-    Ok(())
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
 }
 
 fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
@@ -2284,7 +2300,8 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
-) {
+) -> std::collections::HashSet<(String, String)> {
+    let mut changed_providers = std::collections::HashSet::new();
     for state in states {
         if state
             .metadata
@@ -2314,6 +2331,8 @@ async fn refresh_states(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                changed_providers.insert(changed_provider(&state));
             }
             continue;
         }
@@ -2392,8 +2411,18 @@ async fn refresh_states(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            changed_providers.insert(changed_provider(&state));
         }
     }
+    changed_providers
+}
+
+fn changed_provider(state: &StoredProviderCredentialRefreshState) -> (String, String) {
+    (
+        state.object_workspace().to_string(),
+        state.provider_name.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -4050,10 +4079,18 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
+        let changed = Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
+        assert_eq!(
+            changed,
+            std::collections::HashSet::from([(
+                "default".to_string(),
+                "tombstoned-refresh".to_string()
+            )]),
+            "only the refreshed provider's attached sandboxes need an update"
+        );
         assert!(
             get_refresh_state(
                 &store,

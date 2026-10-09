@@ -275,6 +275,7 @@ mock_gateway! {
         peer_report_provider_readiness(proto::ReportProviderReadinessRequest) -> proto::ReportProviderReadinessResponse;
         peer_report_endpoint_status(proto::ReportEndpointStatusRequest) -> proto::ReportEndpointStatusResponse;
         peer_get_sandbox_provider_status(proto::GetSandboxProviderStatusRequest) -> proto::GetSandboxProviderStatusResponse;
+        peer_notify_config_update(proto::PeerNotifyConfigUpdateRequest) -> proto::PeerNotifyConfigUpdateResponse;
         submit_policy_analysis(proto::SubmitPolicyAnalysisRequest) -> proto::SubmitPolicyAnalysisResponse;
         get_draft_policy(proto::GetDraftPolicyRequest) -> proto::GetDraftPolicyResponse;
         approve_draft_chunk(proto::ApproveDraftChunkRequest) -> proto::ApproveDraftChunkResponse;

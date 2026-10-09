@@ -17,6 +17,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
 mod credentials;
@@ -306,6 +307,8 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
+    /// Per-session delivery tasks for supervisor configuration.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Stable identity for this gateway process.
     pub replica_id: String,
@@ -433,6 +436,8 @@ impl ServerState {
             .oidc
             .as_ref()
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -447,6 +452,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            config_delivery,
             replica_id,
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
@@ -688,6 +694,7 @@ pub(crate) async fn run_server(
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
+        provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL,
     )
     .map_err(|err| {
         Error::config(format!(
@@ -698,6 +705,8 @@ pub(crate) async fn run_server(
         sources = ?provider_profile_sources.source_ids(),
         "provider profile sources configured"
     );
+    // Builds read cached interceptor snapshots, so fetch them before serving.
+    provider_profile_sources.refresh_cached(&store).await;
     let mut state = ServerState::new_with_credentials(
         config.clone(),
         store.clone(),
@@ -816,6 +825,10 @@ pub(crate) async fn run_server(
     }
 
     let state = Arc::new(state);
+
+    grpc::policy::backfill_legacy_policy_history(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
 
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped
@@ -974,6 +987,7 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;

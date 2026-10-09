@@ -6,7 +6,7 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use openshell_core::config::{ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
@@ -242,6 +242,10 @@ struct RunArgs {
     /// gRPC rate-limit window length in seconds. Set to 0 to disable.
     #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
     grpc_rate_limit_window_seconds: Option<u64>,
+
+    /// Supervisor configuration delivery: poll (default) or push over the supervisor session.
+    #[arg(long, env = "OPENSHELL_CONFIG_DELIVERY_MODE")]
+    config_delivery_mode: Option<ConfigDeliveryMode>,
 
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
@@ -573,6 +577,13 @@ fn prepare_server_config_with_drivers(
     {
         config.policy_validation_failure_mode = mode;
     }
+    config.config_delivery_mode = args
+        .config_delivery_mode
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|f| f.openshell.gateway.config_delivery_mode)
+        })
+        .unwrap_or_default();
 
     if let Some(seconds) = file
         .as_ref()

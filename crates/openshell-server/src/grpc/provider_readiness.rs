@@ -258,9 +258,14 @@ async fn load_current_snapshot(
     provider_name: &str,
 ) -> Result<(ProviderDesiredIdentity, ProviderReadinessReason), Status> {
     let mut desired = current_target_identity(state, sandbox, provider_name).await?;
-    let config = super::policy::load_sandbox_config(state, sandbox).await?;
-    let environment =
-        super::policy::load_sandbox_provider_environment(state, sandbox, true).await?;
+    let (config, environment) = Box::pin(async {
+        let inputs = super::policy::load_sandbox_config_inputs(state, sandbox.clone()).await?;
+        tokio::try_join!(
+            super::policy::build_sandbox_config_snapshot_from_inputs(state, &inputs),
+            super::policy::build_provider_environment_snapshot_from_inputs(state, &inputs, true),
+        )
+    })
+    .await?;
     let current = state
         .store
         .get_message::<Sandbox>(sandbox.object_id())

@@ -7,6 +7,7 @@ package openshell.v1;
 
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "options.proto";
@@ -431,6 +432,8 @@ service OpenShell {
   }
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+  // Polling projection of the sandbox configuration delivered over
+  // ConnectSupervisor; removed with the polling RPCs.
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
       returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
     option (openshell.options.v1.authorization) = {
@@ -516,7 +519,9 @@ service OpenShell {
     option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
   }
 
-  // Get provider environment for a sandbox (called by sandbox supervisor at startup).
+  // Get provider environment for a sandbox (called by the sandbox supervisor at
+  // startup and by its poll loop). Polling projection of the provider
+  // environment delivered over ConnectSupervisor; removed with the polling RPCs.
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse) {
     option (openshell.options.v1.authorization) = {
@@ -553,9 +558,11 @@ service OpenShell {
   //
   // The supervisor opens this stream at startup and keeps it alive for the
   // sandbox lifetime. The gateway uses it to coordinate relay channels for
-  // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-  // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-  // connection), not over this stream.
+  // SSH connect, ExecSandbox, targetable sandbox services, and configuration
+  // delivery. Supervisors advertise optional stream features in
+  // SupervisorHello, and the gateway sends only payloads the supervisor
+  // advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
+  // streams on the same connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
@@ -624,6 +631,15 @@ service OpenShell {
 
   rpc PeerGetSandboxProviderStatus(GetSandboxProviderStatusRequest)
       returns (GetSandboxProviderStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
+  // Best-effort notification to the replica that owns a supervisor session.
+  // The receiver rebuilds snapshots from authoritative state.
+  rpc PeerNotifyConfigUpdate(PeerNotifyConfigUpdateRequest)
+      returns (PeerNotifyConfigUpdateResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "peer"
     };
@@ -1607,6 +1623,9 @@ enum ConfigApplyOutcome {
   CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD = 6;
   CONFIG_APPLY_OUTCOME_FAILED_CLOSED = 7;
   CONFIG_APPLY_OUTCOME_UNSUPPORTED = 8;
+  // The supervisor holds the snapshot until the matching snapshot of the other
+  // component arrives. Not terminal.
+  CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT = 9;
 }
 
 // Durable lifecycle of one desired-state update operation.
@@ -2665,7 +2684,9 @@ message StaticCredentialBinding {
   string workload_credential_handle = 3;
 }
 
-// Get sandbox provider environment response.
+// Polling projection of ProviderEnvironmentSnapshot. The parallel maps below
+// are keyed by the same environment variable names. Removed with the polling
+// RPCs; new provider environment fields belong on the snapshot first.
 message GetSandboxProviderEnvironmentResponse {
   reserved 3;
   reserved "credential_expires_at_ms";
@@ -2695,6 +2716,42 @@ message GetSandboxProviderEnvironmentResponse {
   ProviderReadinessReason readiness_reason = 9;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 10;
+}
+
+// Receivers treat UNSPECIFIED and unknown values as secret.
+enum ProviderEnvironmentValueClassification {
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_UNSPECIFIED = 0;
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_NON_SECRET = 1;
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_STATIC_CREDENTIAL = 2;
+}
+
+// One environment value and all metadata that shares its key. Names are unique
+// within a snapshot. static_credential_binding is present exactly when
+// classification is STATIC_CREDENTIAL. Snapshots that violate either rule are
+// invalid.
+message ProviderEnvironmentValue {
+  string name = 1;
+  string value = 2 [(openshell.options.v1.secret) = true];
+  ProviderEnvironmentValueClassification classification = 4;
+  StaticCredentialBinding static_credential_binding = 5;
+  // Absolute expiration time. Absence means no expiry.
+  google.protobuf.Timestamp expiration_time = 3;
+}
+
+// Complete provider environment state delivered to a supervisor. This is the
+// canonical provider environment shape; GetSandboxProviderEnvironmentResponse
+// is its polling projection and is removed with the polling RPCs. Dynamic
+// credentials are endpoint selectors rather than environment values and stay
+// in their own collection.
+message ProviderEnvironmentSnapshot {
+  uint64 provider_env_revision = 1;
+  repeated ProviderEnvironmentValue values = 2;
+  map<string, ProviderProfileCredential> dynamic_credentials = 3;
+  string provider_attachment_epoch = 4;
+  string policy_hash = 5;
+  ProviderReadinessReason readiness_reason = 6;
+  // Complete desired set of non-secret managed files, keyed by absolute path.
+  map<string, string> files = 7;
 }
 
 message ExchangeProviderSubjectTokenRequest {
@@ -3012,6 +3069,9 @@ message GetSandboxLogsResponse {
 // Supervisor session messages
 // ---------------------------------------------------------------------------
 
+// These messages form an internal, version-locked deployment protocol between
+// the gateway and the supervisor. They are not a public sandbox client API.
+
 // Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
 message SupervisorMessage {
   oneof payload {
@@ -3019,8 +3079,16 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ConfigUpdateResult config_update_result = 5;
+    ConfigBootstrapResult config_bootstrap_result = 6;
+    StartupConfigPrepared startup_config_prepared = 7;
+    // Sent after accepted admission once the workload relay is usable.
+    SupervisorRuntimeReady runtime_ready = 8;
   }
 }
+
+// Confirms that the admitted workload and its gateway relay are usable.
+message SupervisorRuntimeReady {}
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
 message GatewayMessage {
@@ -3031,6 +3099,11 @@ message GatewayMessage {
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
     SessionRedirect session_redirect = 6;
+    ConfigUpdate config_update = 7;
+    StartupConfigCandidate startup_config_candidate = 8;
+    // Durable gateway acknowledgement of streamed configuration admission.
+    // The supervisor must not launch the workload until this is ACCEPTED.
+    SandboxConfigurationAdmission configuration_admission = 9;
   }
 }
 
@@ -3053,6 +3126,52 @@ message SupervisorHello {
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
   bool supports_session_redirect = 6;
+  // Set while the supervisor's workload has not started yet. The gateway then
+  // waits for SupervisorRuntimeReady before treating the sandbox as ready;
+  // otherwise a polling session is ready as soon as it is accepted.
+  bool workload_pending = 7;
+  // Explicit result of inspecting the workload image policy, sent only on the
+  // first connection of a supervisor process. The gateway considers it when
+  // preparing the first authoritative bootstrap for this process.
+  ImagePolicyDiscovery image_policy_discovery = 8;
+  // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
+  // stream, applies them, reports apply results and admission, and prepares
+  // its startup policy on this stream. Gateways send configuration payloads
+  // only when this is set.
+  bool supports_config_apply = 9;
+}
+
+message ImagePolicyDiscovery {
+  oneof result {
+    google.protobuf.Empty missing = 1;
+    google.protobuf.Empty invalid = 2;
+    openshell.sandbox.v1.SandboxPolicy policy = 3;
+  }
+}
+
+// Gateway-selected policy that the supervisor must prepare against the local
+// image before the session can be accepted. The candidate is not authoritative
+// runtime state; SessionAccepted carries the final gateway-owned bootstrap.
+message StartupConfigCandidate {
+  // Opaque identifier scoped to this ConnectSupervisor attempt.
+  string candidate_id = 1;
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
+  string policy_hash = 3;
+  openshell.sandbox.v1.PolicySource policy_source = 4;
+  uint32 policy_version = 5;
+}
+
+// Supervisor preparation result for one StartupConfigCandidate.
+message StartupConfigPrepared {
+  string candidate_id = 1;
+  oneof result {
+    // The candidate needs no image-specific changes.
+    google.protobuf.Empty unchanged = 2;
+    // Complete prepared policy. The gateway validates its difference from the
+    // candidate and remains authoritative for persistence and composition.
+    openshell.sandbox.v1.SandboxPolicy prepared_policy = 3;
+    ConfigApplyFailure failure = 4;
+  }
 }
 
 // Gateway accepts the supervisor session.
@@ -3061,8 +3180,73 @@ message SessionAccepted {
   reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
+  // Complete gateway-owned configuration. Present exactly when
+  // config_apply_enabled is set.
+  ConfigBootstrap bootstrap = 3;
+  // The gateway delivers configuration authoritatively on this stream: the
+  // bootstrap is required, ConfigUpdate payloads are applied and
+  // acknowledged, and the supervisor may stop polling. Set only for
+  // supervisors that set SupervisorHello.supports_config_apply.
+  bool config_apply_enabled = 4;
   // Recommended heartbeat interval.
   google.protobuf.Duration heartbeat_interval = 102;
+}
+
+// Complete gateway-owned configuration for a supervisor session.
+message ConfigBootstrap {
+  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 1;
+  ProviderEnvironmentSnapshot provider_environment = 2;
+}
+
+// A complete replacement snapshot for exactly one configuration component.
+message ConfigUpdate {
+  // Opaque non-empty identifier scoped to the active supervisor session.
+  string update_id = 1;
+  // Monotonic within one session and component. Snapshot revisions are
+  // content identities and must only be compared for equality.
+  uint64 component_sequence = 2;
+  oneof component {
+    openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 3;
+    ProviderEnvironmentSnapshot provider_environment = 4;
+  }
+}
+
+// Sanitized application failure. Messages must not contain configuration
+// payloads, credentials, or provider values.
+message ConfigApplyFailure {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ConfigComponentApplyResult {
+  ConfigComponent component = 1;
+  // Revision extracted from the received snapshot.
+  ConfigSnapshotRevision requested_revision = 2;
+  // Revision active after this attempt. Omitted when the received snapshot
+  // was not installed or a local override has no gateway revision.
+  ConfigSnapshotRevision applied_revision = 3;
+  ConfigApplyOutcome outcome = 4;
+  ConfigApplyFailure failure = 5;
+}
+
+// Application result for one ConfigUpdate.
+message ConfigUpdateResult {
+  // Echoes ConfigUpdate.update_id for session-local correlation.
+  string update_id = 1;
+  // Echoes ConfigUpdate.component_sequence.
+  uint64 component_sequence = 2;
+  ConfigComponentApplyResult result = 3;
+  // Admission state for a sandbox-configuration update. Omitted for provider
+  // environment updates and compatibility supervisors.
+  SandboxConfigurationAdmission admission = 4;
+}
+
+// Aggregate application result for the SessionAccepted bootstrap.
+message ConfigBootstrapResult {
+  repeated ConfigComponentApplyResult results = 1;
+  // Admission state of the complete gateway-authored bootstrap generation.
+  SandboxConfigurationAdmission admission = 2;
 }
 
 // Gateway rejects the supervisor session.
@@ -3175,6 +3359,34 @@ message PeerRelayFrame {
     PeerRelayInit init = 1;
     bytes data = 2;
   }
+}
+
+message PeerConfigSandboxTarget {
+  string sandbox_id = 1;
+  // Fences a targeted notification to the session observed by the sending replica.
+  string session_id = 2;
+}
+
+// Sandboxes in a workspace that attach the named provider.
+message PeerConfigProviderTarget {
+  string workspace = 1;
+  string name = 2;
+}
+
+message PeerNotifyConfigUpdateRequest {
+  oneof scope {
+    PeerConfigSandboxTarget sandbox = 1;
+    string workspace = 2;
+    bool all_connected = 3;
+    PeerConfigProviderTarget provider = 6;
+  }
+  bool sandbox_config = 4;
+  bool provider_environment = 5;
+}
+
+message PeerNotifyConfigUpdateResponse {
+  // The targeted session moved before the receiving replica accepted the notification.
+  bool stale_owner = 1;
 }
 
 // Supervisor reports the result of a relay open request.

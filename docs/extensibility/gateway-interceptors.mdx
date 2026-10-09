@@ -153,6 +153,8 @@ Include a `{ type = "user" }` entry to compose interceptor profiles with importe
 
 The gateway validates snapshot structure and provider profile semantics. It treats the configured interceptor as a trusted source and does not verify interceptor-defined signature, hash, or key annotations.
 
+The gateway calls `SnapshotProviderProfiles` at startup and then every 10 seconds, not on every profile read. A changed `revision` reaches sandboxes on the next refresh. If the interceptor stays unreachable for 30 seconds, reads that need the catalog fail closed until it recovers.
+
 ## Operate and Observe Interceptors
 
 Plan interceptor deployment around these boundaries:
