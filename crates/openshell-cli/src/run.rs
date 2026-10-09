@@ -211,47 +211,7 @@ fn current_user_to_json(view: &CurrentUserView) -> serde_json::Value {
     })
 }
 
-/// Validate system prerequisites for running a gateway.
-///
-/// Checks Docker connectivity and reports the result. Returns exit code 0
-/// if all checks pass, 1 otherwise.
-pub fn doctor_check() -> Result<()> {
-    use std::io::Write;
-    let mut stdout = std::io::stdout().lock();
-
-    writeln!(stdout, "Checking system prerequisites...\n").into_diagnostic()?;
-
-    // --- Docker connectivity ---
-    write!(stdout, "  Docker ............. ").into_diagnostic()?;
-    stdout.flush().into_diagnostic()?;
-
-    let output = Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .into_diagnostic()
-        .wrap_err("failed to execute docker info")?;
-
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout);
-        let version_str = version.trim();
-        writeln!(stdout, "ok (version {version_str})").into_diagnostic()?;
-
-        // --- DOCKER_HOST ---
-        write!(stdout, "  DOCKER_HOST ........ ").into_diagnostic()?;
-        match std::env::var("DOCKER_HOST") {
-            Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
-            Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
-        }
-
-        writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
-        return Ok(());
-    }
-
-    writeln!(stdout, "FAILED").into_diagnostic()?;
-    writeln!(stdout).into_diagnostic()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(miette::miette!("docker info failed: {}", stderr.trim()))
-}
+pub use crate::commands::doctor::doctor_check;
 
 fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
     keep || forward.is_some() || expose.is_some()

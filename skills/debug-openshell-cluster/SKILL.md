@@ -309,7 +309,10 @@ Common findings:
 - SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
 - Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
-  can mean host networking is disabled. Enable host networking in Docker
+  can mean host networking is disabled. Run `openshell doctor check` on the
+  gateway host to test container-to-host loopback connectivity. This starts a
+  temporary probe container and may pull the default sandbox image; an image-pull or
+  container-start error leaves connectivity unverified. Enable host networking in Docker
   Desktop, ensure Enhanced Container Isolation is disabled, and verify the
   gateway's primary endpoint is reachable from a host-networked container.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
