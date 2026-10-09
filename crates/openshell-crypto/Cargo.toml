@@ -14,15 +14,13 @@ repository.workspace = true
 # Only this feature selects the default backend. With defaults disabled an
 # embedder must install its backend before any crypto operation.
 default = ["aws-lc"]
-aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rcgen/aws_lc_rs", "jsonwebtoken/aws_lc_rs", "tonic?/tls-aws-lc", "hyper-rustls?/aws-lc-rs", "kube?/aws-lc-rs", "sqlx?/tls-rustls-aws-lc-rs"]
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rcgen/aws_lc_rs", "jsonwebtoken/aws_lc_rs", "tonic?/tls-aws-lc", "kube?/aws-lc-rs", "sqlx?/tls-rustls-aws-lc-rs"]
 tls-tonic = ["dep:tonic"]
-tls-hyper = ["dep:hyper-rustls"]
 tls-kube = ["dep:kube", "dep:k8s-openapi"]
 tls-sqlx = ["dep:sqlx"]
 
 [dependencies]
 tonic = { workspace = true, optional = true }
-hyper-rustls = { version = "0.27", default-features = false, optional = true }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

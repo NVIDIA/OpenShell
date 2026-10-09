@@ -1718,7 +1718,6 @@ name = "openshell-crypto"
 version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
- "hyper-rustls",
  "jsonwebtoken",
  "kube",
  "pem 3.0.6",
