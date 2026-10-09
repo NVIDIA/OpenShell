@@ -229,6 +229,17 @@ jobs:
           cache-key: rust-checks-v2
           save-cache: "true"
 
+      - name: Verify crypto backend independence
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --prefix none > /tmp/openshell-crypto-dependencies.txt
+          if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys) v' /tmp/openshell-crypto-dependencies.txt; then
+            echo "ERROR: backend-free crypto build includes Ring or AWS-LC" >&2
+            cat /tmp/openshell-crypto-dependencies.txt >&2
+            exit 1
+          fi
+          cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
+
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
         env:

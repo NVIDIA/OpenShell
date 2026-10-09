@@ -43,7 +43,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// In VM mode, the overlayfs snapshotter re-extracts image layers from the
 /// content store on every boot, so 600s accommodates cold image preparation,
 /// workspace initialization, and sandbox startup.
-const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
+const SANDBOX_READY_TIMEOUT: Duration = Duration::from_mins(10);
 
 static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
 
