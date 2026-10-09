@@ -21,6 +21,14 @@ Opting out applies only to telemetry emitted by OpenShell. Third-party services,
 
 Set `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this setting into sandbox supervisor environments, so sandbox-side telemetry collection is disabled as well.
 
+To disable telemetry at install time, pass the variable to the install script:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_TELEMETRY_ENABLED=false sh
+```
+
+On Linux (deb/rpm) and macOS (Homebrew), the installer saves the setting in the user gateway environment file before starting the service. It preserves other environment settings. The opt-out persists across service restarts and package upgrades; omitting the variable on a later install does not re-enable telemetry. Snap installs do not support this option; configure telemetry after installation by setting `OPENSHELL_TELEMETRY_ENABLED=false` in the gateway environment directly.
+
 ## Compile Telemetry Out
 
 Telemetry support is a default-on `telemetry` Cargo feature. Each crate that carries it also defines a `defaults-without-telemetry` alias covering every other default feature. Build telemetry-free artifacts with `--no-default-features --features defaults-without-telemetry`:
