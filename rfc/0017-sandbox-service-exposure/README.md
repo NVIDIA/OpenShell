@@ -132,6 +132,8 @@ A passthrough proxy cannot inspect HTTP credentials. An edge that terminates TLS
 
 `openshell-sandbox-proxy` is a separate binary with its own listener, discovery credentials, cache, limits, and metrics. Replicas can sit behind a load balancer and discover routes independently.
 
+It also serves as a reference implementation for users integrating their own ingress with gateway service discovery, showing how to consume route updates and connect to the correct supervisor.
+
 The proxy is optional, consistent with the [PR discussion](https://github.com/NVIDIA/OpenShell/pull/4267#issuecomment-6053456908). Kubernetes operators can use existing ingress plus a discovery adapter to route to supervisor Services. Several sandbox services can share one supervisor Service. A Service spanning supervisors with different sandbox owners still needs routing that selects the correct owner. Ingress must preserve service SNI or use an explicitly supported TLS termination mode.
 
 Enable the new path explicitly and retain existing gateway-mode behavior. CLI/SDK URLs must use the application ingress domain and public port independently of the gateway endpoint. Status should distinguish configured, advertised, and unavailable routes. Domain migrations require coordinated DNS, TLS, and client changes.
