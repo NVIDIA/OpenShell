@@ -15,7 +15,7 @@ use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest, ListWork
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::oidc_auth::oidc_refresh_token;
+use crate::oidc_auth::oidc_renew_token;
 use crate::tls::{TlsOptions, build_channel};
 
 /// Complete gateway names from local metadata files (no network call).
@@ -142,8 +142,9 @@ async fn completion_grpc_client(
             Some("oidc") => {
                 if let Some(bundle) = load_oidc_token(gateway_name) {
                     if is_token_expired(&bundle) {
-                        match oidc_refresh_token(
+                        match oidc_renew_token(
                             &bundle,
+                            meta.oidc_audience.as_deref(),
                             meta.oidc_scopes.as_deref(),
                             tls_opts.gateway_insecure,
                         )

@@ -32,6 +32,11 @@ pub struct OidcTokenBundle {
 
     /// OIDC client ID used to obtain the token.
     pub client_id: String,
+
+    /// Whether the token came from the `client_credentials` grant, so it can
+    /// be renewed by repeating that grant. Absent in older bundles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_credentials: bool,
 }
 
 /// Path to the stored OIDC token bundle for a gateway.
@@ -171,11 +176,37 @@ mod tests {
                 expires_at: None,
                 issuer: "https://issuer.example.com".to_string(),
                 client_id: "openshell-cli".to_string(),
+                client_credentials: false,
             };
             assert!(store_oidc_token("../escape", &bundle).is_err());
             assert!(load_oidc_token("../escape").is_none());
             assert!(remove_oidc_token("../escape").is_err());
         });
+    }
+
+    #[test]
+    fn client_credentials_marker_is_optional_on_disk() {
+        let old: OidcTokenBundle = serde_json::from_str(
+            r#"{"access_token":"t","issuer":"https://issuer","client_id":"c"}"#,
+        )
+        .unwrap();
+        assert!(!old.client_credentials);
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("client_credentials")
+        );
+
+        let marked = OidcTokenBundle {
+            client_credentials: true,
+            ..old
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(
+            serde_json::from_str::<OidcTokenBundle>(&json)
+                .unwrap()
+                .client_credentials
+        );
     }
 
     #[test]
@@ -190,6 +221,7 @@ mod tests {
             expires_at: Some(now + 10),
             issuer: "https://issuer.example.com".to_string(),
             client_id: "openshell-cli".to_string(),
+            client_credentials: false,
         };
 
         assert!(is_token_expired(&bundle));
@@ -220,6 +252,7 @@ mod tests {
                 expires_at: None,
                 issuer: "https://issuer.example.com".to_string(),
                 client_id: "openshell-cli".to_string(),
+                client_credentials: false,
             };
             store_oidc_token("alpha", &bundle).unwrap();
 
