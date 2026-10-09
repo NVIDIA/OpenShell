@@ -5943,6 +5943,8 @@ func (x *ReportProviderReadinessResponse) GetObservationTtl() *durationpb.Durati
 type DeleteSandboxResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Outcome DeletionOutcome        `protobuf:"varint,2,opt,name=outcome,proto3,enum=openshell.v1.DeletionOutcome" json:"outcome,omitempty"`
+	// ACCEPTED means deletion may still be in progress. COMPLETED and
+	// ALREADY_ABSENT establish logical completion.
 	// Immutable identity of the targeted sandbox, empty for ALREADY_ABSENT.
 	// A same-name replacement is not part of this deletion.
 	SandboxId     string `protobuf:"bytes,3,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`

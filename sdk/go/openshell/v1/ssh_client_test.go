@@ -194,6 +194,9 @@ func (m *mockSandboxResolver) Start(_ context.Context, _, _ string) (*Sandbox, e
 func (m *mockSandboxResolver) WaitStopped(_ context.Context, _, _ string, _ ...WaitOptions) (*Sandbox, error) {
 	return nil, nil
 }
+func (m *mockSandboxResolver) WaitDeleted(_ context.Context, _, _ string, _ ...WaitOptions) error {
+	return nil
+}
 
 // --- Test setup ---
 

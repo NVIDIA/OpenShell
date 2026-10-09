@@ -182,6 +182,38 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string, opts
 	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome()), SandboxID: resp.GetSandboxId()}, nil
 }
 
+// WaitDeleted polls until the original sandbox is absent. Pass the ID returned
+// by Delete to avoid waiting on a same-name replacement.
+func (s *sandboxClient) WaitDeleted(ctx context.Context, workspace, name string, opts ...WaitOptions) error {
+	interval := defaultPollInterval
+	var expectedID string
+	if len(opts) > 0 {
+		if opts[0].PollInterval > 0 {
+			interval = opts[0].PollInterval
+		}
+		expectedID = opts[0].ExpectedSandboxID
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return contextError(err)
+		}
+		sandbox, err := s.Get(ctx, workspace, name)
+		if IsNotFound(err) || (err == nil && expectedID != "" && sandbox.ID != expectedID) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return contextError(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
 		Name:           name,

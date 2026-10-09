@@ -937,15 +937,22 @@ longer need its retained state.
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
 
-The command can return while cleanup is pending. `deletion accepted` means the
-gateway started deletion; inspect the sandbox until it disappears if your next
-step requires completion. An already-absent sandbox is a successful no-op, but
+The gateway can acknowledge a delete while cleanup is pending. `deletion
+accepted` means the gateway started deletion; SDK callers should wait for the
+original sandbox to disappear if their next step requires completion. An
+already-absent sandbox is a successful no-op, but
 missing workspaces and authorization failures remain errors. SDK callers can
 inspect [typed deletion outcomes](/sdk/api-errors#deletion-outcomes).
 
 ```shell
 openshell sandbox delete my-sandbox
 ```
+
+The command waits for the targeted sandbox to be absent before returning, so
+you can delete its workspace immediately afterward. Use `--wait=false` to
+return after the gateway accepts deletion. Set `--timeout <seconds>` to bound
+each wait; the default is 300 seconds and can also be set with
+`OPENSHELL_LIFECYCLE_TIMEOUT`. A timeout does not cancel the gateway's deletion.
 
 Delete multiple sandboxes by listing their names in one command:
 
