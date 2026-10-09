@@ -39,9 +39,5 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
-[build-dependencies]
-protoc-bin-vendored = { workspace = true }
-tonic-prost-build = { workspace = true }
-
 [lints]
 workspace = true

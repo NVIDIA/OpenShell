@@ -4,7 +4,7 @@
 //! Backend-owned launch decoding and client construction for supervisor startup.
 
 mod registration;
-pub use registration::{BackendRegistration, BackendRegistrations};
+pub use registration::{BackendRegistration, BackendRegistrations, RegisteredBackendSetup};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
