@@ -1040,6 +1040,20 @@ listeners. MXC does not give the gateway or peer an identity-scoped reverse path
 to the workload, so `openshell forward service` fails before opening a listener
 when this mode is enabled.
 
+Proxy-peer mode also requires the gateway account to have permission to manage
+Windows Firewall rules. Before startup succeeds, the gateway adds an inbound
+TCP allow rule scoped to the helper executable, AppContainer SID, loopback
+addresses and ephemeral listener port. Startup fails with a diagnostic when
+permission is missing or an active firewall profile ignores inbound rules. The
+gateway removes the peer, pipes, profile and rule after confirmed workload exit,
+stop or launch failure. A timed-out stop or delete retains them until termination
+is confirmed. An abrupt gateway termination can leave the profile and rule for
+operator cleanup.
+
+Restage the gateway and `openshell-supervisor-relay.exe` together: relay protocol
+version 5 enables inheritance of MXC proxy variables only for peer launches.
+Other curated launch environments exclude ambient proxy settings.
+
 This mode narrows outbound and loopback reachability, but it is not complete
 inbound isolation. MXC 1.0 requires `ingress.default = "allow"` for the target
 ProcessContainer, which enables private-network server traffic. Accept that

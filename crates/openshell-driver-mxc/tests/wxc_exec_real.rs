@@ -999,6 +999,22 @@ fn pc_oneshot_token_is_appcontainer_without_admin_access() {
 #[tokio::test]
 #[ignore = "requires real wxc-exec and outbound HTTPS"]
 async fn pc_https_egress_reads_injected_ca_bundle() {
+    https_egress_reads_injected_ca_bundle(None).await;
+}
+
+/// The same real HTTPS/L7 policy proof through the `AppContainer` peer. This
+/// requires a staged AC-readable helper and firewall-management permission.
+#[tokio::test]
+#[ignore = "requires real wxc-exec, outbound HTTPS and peer firewall permission"]
+async fn pc_peer_https_egress_reads_injected_ca_bundle() {
+    let Ok(peer) = std::env::var("OPENSHELL_MXC_PEER_EXE") else {
+        eprintln!("SKIP: set OPENSHELL_MXC_PEER_EXE to a staged AC-readable helper");
+        return;
+    };
+    https_egress_reads_injected_ca_bundle(Some(peer)).await;
+}
+
+async fn https_egress_reads_injected_ca_bundle(peer: Option<String>) {
     let Some(wxc) = wxc_path() else {
         eprintln!("SKIP: wxc-exec not found");
         return;
@@ -1008,7 +1024,9 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         eprintln!("SKIP: processcontainer not live: {reason}");
         return;
     }
-    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+    if peer.is_none()
+        && let Err(reason) = probe_processcontainer_host_loopback(&wxc)
+    {
         eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
         return;
     }
@@ -1114,6 +1132,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let config = MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
         egress_proxy: true,
+        pc_proxy_peer_path: peer.unwrap_or_default(),
         egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };

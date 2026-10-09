@@ -361,6 +361,23 @@ The default-feature tests are also included in the full workspace test run.
 The focused task is available for local diagnosis and selective-build
 validation; GitHub Actions does not re-run it after the full suite.
 
+### Proxy-peer firewall validation
+
+Proxy-peer startup requires permission to manage Windows Firewall rules. The
+peer rule is restricted to its executable, AppContainer SID, loopback endpoints
+and ephemeral TCP port; the gateway removes it after confirmed workload exit,
+stop or launch failure. On an unelevated host, validate the actionable startup
+failure and report successful rule installation and real peer egress as unavailable.
+Do not count the permission-denied path as successful peer connectivity.
+For the real peer HTTPS/L7 test, stage an AC-readable `openshell-mxc-peer.exe`,
+set `OPENSHELL_MXC_PEER_EXE` to its absolute path, and run the architecture's
+`windows:test:mxc-real:*` task with firewall-management permission. The peer test
+must execute rather than print SKIP before claiming connectivity coverage.
+
+Relay protocol version 5 requires matching gateway and relay binaries. The
+compiled relay contract tests cover curated non-peer environments and explicit
+peer proxy inheritance, including override precedence and NO_PROXY exclusion.
+
 ## Test Accounting Guidance
 
 When reporting `windows:ci`, distinguish these categories:

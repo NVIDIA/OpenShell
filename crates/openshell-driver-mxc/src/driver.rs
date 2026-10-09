@@ -1404,6 +1404,7 @@ impl MxcComputeBackend {
             }
         }
 
+        release_proxy_peer(&self.registry, &sandbox_id).await;
         let mut registry = self.registry.lock().await;
         if let Some(entry) = registry.get_mut(&sandbox_id) {
             entry.isolation_stopped = isolation_stopped;
@@ -1454,7 +1455,6 @@ impl MxcComputeBackend {
             signal_file,
             control_channel,
             host_proxy,
-            peer,
         ) = {
             let mut registry = self.registry.lock().await;
             let Some(entry) = registry.get_mut(sandbox_id) else {
@@ -1471,7 +1471,6 @@ impl MxcComputeBackend {
                 entry.signal_file.take(),
                 entry.control_channel.take(),
                 entry.host_proxy.take(),
-                entry.peer.take(),
             )
         };
         drop(host_proxy);
@@ -1564,9 +1563,7 @@ impl MxcComputeBackend {
         // The sandbox is gone; stop its proxy peer and delete the peer's
         // AppContainer profile. Forward bridges may still hold the handle, so
         // terminate explicitly instead of waiting for the last reference.
-        if let Some(peer) = peer {
-            let _ = tokio::task::spawn_blocking(move || peer.terminate()).await;
-        }
+        release_proxy_peer(&self.registry, sandbox_id).await;
 
         let mut registry = self.registry.lock().await;
         if registry.remove(sandbox_id).is_some() {
@@ -2118,9 +2115,9 @@ async fn run_lifecycle(
             // "launch" request that can never arrive -- a silent hang,
             // not a failure. Fail the sandbox now instead.
             let err = "wxc-exec stdin is not piped; control-channel launch cannot proceed";
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, err).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
+            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, err).await;
             return;
         }
     } else {
@@ -2382,6 +2379,7 @@ async fn run_lifecycle(
                     let launch_data = serde_json::json!({
                         "command": sandbox_config.command,
                         "env": env,
+                        "inherit_proxy_env": proxy_peer.is_some(),
                     });
                     match channel
                         .request("launch", launch_data, std::time::Duration::from_mins(2))
@@ -2515,8 +2513,9 @@ async fn run_lifecycle(
                 // wait out the full timeout for a signal that never comes,
                 // while `child` -- which does not kill-on-drop -- leaks.
                 // Kill and reap it directly instead.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                if child.kill().await.is_ok() && child.wait().await.is_ok() {
+                    release_proxy_peer(&registry, &sandbox_id).await;
+                }
             } else if let Some(mut rx) = terminated_rx {
                 // leftover_child was None, so monitor_exec already claimed
                 // exec_child and is the one racing shutdown_tx against
@@ -2641,6 +2640,7 @@ async fn monitor_exec(
                 {
                     idx.retire_launch(&sandbox_id, pid);
                 }
+                release_proxy_peer(&registry, &sandbox_id).await;
                 info!(sandbox = %sandbox.name, "MXC ProcessContainer terminated for sandbox stop/delete");
                 let _ = done_tx.send(true);
                 return;
@@ -2650,6 +2650,7 @@ async fn monitor_exec(
         (child.wait().await, None)
     };
     if wait_result.is_ok() {
+        release_proxy_peer(&registry, &sandbox_id).await;
         if let Some(pid) = wxc_pid
             && let Ok(mut idx) = attribution.lock()
         {
@@ -2717,6 +2718,21 @@ async fn monitor_exec(
     }
 }
 
+/// Release the peer after confirmed workload termination or before a workload
+/// was spawned. A retained terminal sandbox has no peer resources.
+async fn release_proxy_peer(
+    registry: &Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    sandbox_id: &str,
+) {
+    let peer = {
+        let mut reg = registry.lock().await;
+        reg.get_mut(sandbox_id).and_then(|entry| entry.peer.take())
+    };
+    if let Some(peer) = peer {
+        let _ = tokio::task::spawn_blocking(move || peer.terminate()).await;
+    }
+}
+
 /// Control-channel diagnostics can contain the relay's captured workload
 /// stderr. Scrub the decoded text at the diagnostic boundary, leaving protocol
 /// envelopes and successful control-channel payloads untouched.
@@ -2771,7 +2787,11 @@ async fn set_failed(
     }
     entry.sandbox = failed.clone();
     entry.phase_state = PhaseState::Failed(message.to_string());
+    let before_workload = entry.terminated_rx.is_none() && entry.exec_child.is_none();
     drop(reg);
+    if before_workload {
+        release_proxy_peer(registry, sandbox_id).await;
+    }
     let _ = watch_tx.send(sandbox_event(failed));
 }
 
@@ -4440,6 +4460,280 @@ mod lifecycle_tests {
         assert!(failed.is_some(), "sandbox should report ExecFailed");
     }
 
+    async fn attach_test_peer(
+        backend: &MxcComputeBackend,
+        sandbox_id: &str,
+    ) -> (Arc<PeerHandle>, std::process::Child) {
+        let (peer, child) = PeerHandle::test_fixture();
+        let peer = Arc::new(peer);
+        backend
+            .registry
+            .lock()
+            .await
+            .get_mut(sandbox_id)
+            .unwrap()
+            .peer = Some(peer.clone());
+        (peer, child)
+    }
+
+    #[tokio::test]
+    async fn terminal_workload_releases_peer_before_sandbox_deletion() {
+        for (id, code, reason) in [
+            ("peer-success", 0, "AgentCompleted"),
+            ("peer-failure", 17, "ExecFailed"),
+        ] {
+            let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+            // Insert the resource owner before running the actual monitor on a
+            // real short-lived workload; do not race a synthetic sleep.
+            let sandbox = driver_sandbox(id);
+            let mut child = tokio::process::Command::new(inbox_cmd())
+                .args(["/d", "/c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            drop(child.stdin.take());
+            let (done_tx, done_rx) = watch::channel(false);
+            let (_tx, rx) = oneshot::channel();
+            backend.registry.lock().await.insert(
+                id.into(),
+                SandboxEntry {
+                    sandbox: sandbox.clone(),
+                    iso_sandbox_id: None,
+                    isolation_stopped: false,
+                    phase_state: PhaseState::Starting,
+                    lifecycle_gate: Arc::new(Mutex::new(())),
+                    exec_child: Some(child),
+                    shutdown_tx: None,
+                    terminated_rx: Some(done_rx.clone()),
+                    signal_file: None,
+                    trimmed_policy: None,
+                    proxy_addr: None,
+                    host_proxy: None,
+                    control_channel: None,
+                    peer: None,
+                },
+            );
+            let (peer, mut peer_child) = attach_test_peer(&backend, id).await;
+            monitor_exec(
+                backend.registry.clone(),
+                backend.watch_tx.clone(),
+                backend.attribution.clone(),
+                sandbox,
+                id.into(),
+                Some((rx, done_tx)),
+            )
+            .await;
+            assert!(*done_rx.borrow());
+            let retained = backend.get_sandbox(id).await.unwrap();
+            assert_eq!(ready_condition(&retained).unwrap().reason, reason);
+            assert!(
+                backend
+                    .registry
+                    .lock()
+                    .await
+                    .get(id)
+                    .unwrap()
+                    .peer
+                    .is_none()
+            );
+            peer.assert_released(&mut peer_child);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_failure_retains_peer_until_monitor_confirms_termination() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-launch-failure");
+        let child = tokio::process::Command::new(inbox_powershell())
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+            .spawn()
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done_rx) = watch::channel(false);
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Starting,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: Some(child),
+                shutdown_tx: Some(shutdown_tx),
+                terminated_rx: Some(done_rx.clone()),
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut peer_child) = attach_test_peer(&backend, &sandbox.id).await;
+        set_launch_failed(
+            &backend.registry,
+            &backend.watch_tx,
+            &sandbox,
+            &sandbox.id,
+            "target readiness failed",
+            &[],
+        )
+        .await;
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_some()
+        );
+        assert!(peer_child.try_wait().unwrap().is_none());
+        backend
+            .registry
+            .lock()
+            .await
+            .get_mut(&sandbox.id)
+            .unwrap()
+            .shutdown_tx
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        monitor_exec(
+            backend.registry.clone(),
+            backend.watch_tx.clone(),
+            backend.attribution.clone(),
+            sandbox.clone(),
+            sandbox.id.clone(),
+            Some((shutdown_rx, done_tx)),
+        )
+        .await;
+        assert!(*done_rx.borrow());
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut peer_child);
+        assert_eq!(
+            ready_condition(&backend.get_sandbox(&sandbox.id).await.unwrap())
+                .unwrap()
+                .reason,
+            "ProvisionFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_delete_preserves_peer_until_confirmed_retry() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-delete-retry");
+        let (done_tx, done_rx) = watch::channel(false);
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Running,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: Some(done_rx),
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut child) = attach_test_peer(&backend, &sandbox.id).await;
+        let error = backend
+            .delete_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_some()
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "unconfirmed workload must retain its peer"
+        );
+        done_tx.send(true).unwrap();
+        assert!(
+            backend
+                .delete_sandbox(&sandbox.id, &sandbox.name)
+                .await
+                .unwrap()
+        );
+        peer.assert_released(&mut child);
+    }
+
+    #[tokio::test]
+    async fn failure_before_workload_launch_releases_peer() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-startup-failure");
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Starting,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: None,
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut child) = attach_test_peer(&backend, &sandbox.id).await;
+        set_failed(
+            &backend.registry,
+            &backend.watch_tx,
+            &sandbox,
+            &sandbox.id,
+            "test spawn failure",
+        )
+        .await;
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut child);
+        assert_eq!(
+            ready_condition(&backend.get_sandbox(&sandbox.id).await.unwrap())
+                .unwrap()
+                .reason,
+            "ProvisionFailed"
+        );
+    }
+
     #[tokio::test]
     async fn stop_terminates_and_reaps_a_running_process_container() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4463,6 +4757,7 @@ mod lifecycle_tests {
         .await
         .expect("long-running child should start");
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let (peer, mut peer_child) = attach_test_peer(&backend, "sb-stop").await;
         let running = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&running).unwrap().reason, "AgentRunning");
 
@@ -4472,6 +4767,17 @@ mod lifecycle_tests {
             .expect("stop should terminate and reap the child");
         let stopped = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&stopped).unwrap().reason, "Stopped");
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get("sb-stop")
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut peer_child);
     }
 
     /// `delete_sandbox` must await *confirmed* `ProcessContainer` termination

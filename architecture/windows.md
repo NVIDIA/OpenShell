@@ -168,6 +168,21 @@ is enabled. The peer replaces broad sandbox-to-host-loopback access with an
 identified egress connection, but operators must still accept the remaining
 private-network ingress surface.
 
+Peer readiness includes a Windows Firewall inbound allow rule scoped to the
+peer executable, AppContainer SID, loopback addresses and ephemeral TCP port.
+Proxy-peer mode requires permission to manage local firewall rules; startup
+fails with an actionable diagnostic if permission is missing or active policy
+ignores inbound rules. The gateway removes the rule, process, pipes and profile
+after confirmed workload termination, including natural exit and launch failure.
+A timed-out stop or delete retains ownership until termination is confirmed.
+Retaining the sandbox record does not retain a live peer. Abrupt gateway death
+can leave a rule and profile for operator cleanup.
+
+The relay launch protocol explicitly enables inheritance of MXC-injected proxy
+variables for peer launches. Other curated launch environments exclude ambient
+proxy settings. Protocol version 5 rejects a stale relay that cannot enforce
+this distinction; restage the gateway and relay together.
+
 Two gateway-wide ProcessContainer compatibility settings can deliberately
 broaden this boundary. `pc_network_allow` permits unrestricted outbound TCP, and
 `pc_allow_local_network` enables MXC local-network access. These are operator

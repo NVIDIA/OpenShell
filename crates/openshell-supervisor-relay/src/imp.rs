@@ -73,9 +73,12 @@
 //! hanging or misbehaving later), then blocks waiting for a `"launch"`
 //! request carrying `data: {"command": [...], "env": [...]}` (one arg per
 //! `command` element, first is the executable; `env` is `"KEY=VALUE"`
-//! strings, replacing the inherited environment entirely when non-empty --
-//! lets runtimes that choke on an unrecognized host env, e.g. node.js
-//! `STATUS_DLL_INIT_FAILED`, get a curated one instead). The driver sends
+//! strings, replacing the inherited environment entirely when non-empty.
+//! `inherit_proxy_env: true` is sent only for MXC proxy-peer launches to retain
+//! the HTTP(S) proxy endpoint MXC injects; it defaults to false. This flag never
+//! copies `NO_PROXY`. Curated environment entries take precedence.
+//! This lets runtimes that choke on an unrecognized host env, e.g. node.js
+//! `STATUS_DLL_INIT_FAILED`, get a curated one instead. The driver sends
 //! this once its stdout-reader observes the ready event (see driver.rs).
 //! Command/env travel over this channel rather than as `agent-cmd.txt`/
 //! `agent-env.txt` files in `share_dir` -- keeps them (which can carry
@@ -110,7 +113,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// out-of-sync peer can't safely ignore, so an independently staged, stale
 /// binary on either side fails fast with a clear version-mismatch error
 /// instead of hanging or misbehaving against a field/event it predates.
-const PROTOCOL_VERSION: u64 = 4;
+const PROTOCOL_VERSION: u64 = 5;
 
 const TARGET_STDERR_TAIL_LINES: usize = 20;
 const TARGET_STDERR_LINE_CHARS: usize = 1024;
@@ -146,7 +149,7 @@ pub async fn run() -> anyhow::Result<()> {
     // control channel, not as files read from share_dir. Shutdown notice
     // arrives the same way (a later "shutdown" request) -- no share_dir
     // files are used by this process at all.
-    let (launch_tx, launch_rx) = oneshot::channel::<(Vec<String>, Vec<String>)>();
+    let (launch_tx, launch_rx) = oneshot::channel::<(Vec<String>, Vec<String>, bool)>();
     let launch_slot = Arc::new(tokio::sync::Mutex::new(Some(launch_tx)));
     let (target_ready_tx, target_ready_rx) = oneshot::channel::<()>();
     let target_ready_slot = Arc::new(tokio::sync::Mutex::new(Some(target_ready_tx)));
@@ -169,11 +172,11 @@ pub async fn run() -> anyhow::Result<()> {
     ));
 
     eprintln!("[openshell-supervisor-relay] waiting for launch request from driver...");
-    let (command, env) = launch_rx
+    let (command, env, inherit_proxy_env) = launch_rx
         .await
         .map_err(|_| anyhow::anyhow!("control channel closed before a launch request arrived"))?;
 
-    let mut target = match spawn_target(command, env) {
+    let mut target = match spawn_target(command, env, inherit_proxy_env) {
         Ok(target) => target,
         Err(error) => {
             let message = format!("target process failed to start: {error:#}");
@@ -323,7 +326,11 @@ fn inherited_proxy_env(
         .collect()
 }
 
-fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<SpawnedTarget> {
+fn spawn_target(
+    command: Vec<String>,
+    env: Vec<String>,
+    inherit_proxy_env: bool,
+) -> anyhow::Result<SpawnedTarget> {
     if command.is_empty() {
         anyhow::bail!("launch command must not be empty");
     }
@@ -347,7 +354,14 @@ fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<Spawne
             "[openshell-supervisor-relay] using {} child env vars from launch request",
             child_env.len()
         );
-        let inherited = inherited_proxy_env(|key| std::env::var(key).ok(), &child_env);
+        // Only MXC networkProxy mode injects an endpoint that must survive
+        // the curated launch environment. Other backends may inherit host
+        // proxy settings and must not pass them to the workload.
+        let inherited = if inherit_proxy_env {
+            inherited_proxy_env(|key| std::env::var(key).ok(), &child_env)
+        } else {
+            Vec::new()
+        };
         if !inherited.is_empty() {
             eprintln!(
                 "[openshell-supervisor-relay] inheriting {} proxy env var(s) set for this container",
@@ -465,9 +479,9 @@ async fn target_failure_message(
 // independent of target/relay state.
 
 /// Holds the one-shot sender the `"launch"` op fires, carrying `(command,
-/// env)` to `main()`. `None` after the first successful launch (or if
+/// env, inherit_proxy_env)` to `main()`. `None` after the first successful launch (or if
 /// `main()` already gave up on it) -- a second `"launch"` is rejected.
-type LaunchSlot = tokio::sync::Mutex<Option<oneshot::Sender<(Vec<String>, Vec<String>)>>>;
+type LaunchSlot = tokio::sync::Mutex<Option<oneshot::Sender<(Vec<String>, Vec<String>, bool)>>>;
 /// Holds the one-shot sender the driver's host-side listener observation
 /// fires. Startup does not become ready until this confirmation arrives.
 type TargetReadySlot = tokio::sync::Mutex<Option<oneshot::Sender<()>>>;
@@ -701,7 +715,11 @@ async fn handle_control_request(
             slot.map_or_else(
                 || serde_json::json!({"id": id, "ok": false, "error": "launch already requested"}),
                 |tx| {
-                    let _ = tx.send((command, env));
+                    let inherit_proxy_env = data
+                        .get("inherit_proxy_env")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = tx.send((command, env, inherit_proxy_env));
                     serde_json::json!({"id": id, "ok": true})
                 },
             )

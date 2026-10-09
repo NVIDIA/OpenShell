@@ -43,6 +43,7 @@
 
 #![allow(unsafe_code)]
 
+use crate::peer_firewall::PeerFirewallRule;
 use std::ffi::c_void;
 use std::io;
 use std::net::SocketAddr;
@@ -331,7 +332,14 @@ fn ensure_profile(name: &str, capabilities: &[SID_AND_ATTRIBUTES]) -> io::Result
     let name_w = wide(name);
     let name_p = PCWSTR(name_w.as_ptr());
     // SAFETY: all string arguments are NUL-terminated and outlive the call.
-    let created = unsafe { CreateAppContainerProfile(name_p, name_p, name_p, Some(capabilities)) };
+    let created = unsafe {
+        CreateAppContainerProfile(
+            name_p,
+            name_p,
+            name_p,
+            (!capabilities.is_empty()).then_some(capabilities),
+        )
+    };
     match created {
         Ok(sid) => Ok(OwnedSid(sid)),
         Err(error) if error.code().0 == HRESULT_ALREADY_EXISTS => {
@@ -445,7 +453,9 @@ pub struct PeerHandle {
     process: isize,
     prefix: String,
     descriptor: Arc<SecurityDescriptor>,
-    control: Mutex<NamedPipeServer>,
+    control: Mutex<Option<NamedPipeServer>>,
+    firewall: StdMutex<Option<PeerFirewallRule>>,
+    profile_sid: String,
     proxy_addr: SocketAddr,
     terminated: AtomicBool,
     /// First instance of the egress pipe, created before the peer starts so the
@@ -493,7 +503,11 @@ impl PeerHandle {
         let mut handle = Self::start_process(peer_exe, sandbox_id, egress.is_some())?;
 
         let ready = async {
-            let control = handle.control.get_mut();
+            let control = handle
+                .control
+                .get_mut()
+                .as_mut()
+                .expect("control pipe exists during startup");
             tokio::time::timeout(PEER_READY_TIMEOUT, control.connect())
                 .await
                 .map_err(|_| {
@@ -512,6 +526,16 @@ impl PeerHandle {
             })
         }
         .await?;
+        // READY proves only that bind succeeded. Firewall authorization is
+        // required before the driver may publish this endpoint to a workload.
+        let name = format!("OpenShell MXC peer {}", handle.prefix);
+        let exe = peer_exe.to_string();
+        let sid = handle.profile_sid.clone();
+        let rule =
+            tokio::task::spawn_blocking(move || PeerFirewallRule::install(name, &exe, &sid, ready))
+                .await
+                .map_err(io::Error::other)??;
+        *handle.firewall.get_mut().expect("new firewall mutex") = Some(rule);
         handle.proxy_addr = SocketAddr::from(([127, 0, 0, 1], ready));
         let egress_enabled = egress.is_some();
         if let (Some(first), Some(tunnel)) = (handle.egress_first.take(), egress) {
@@ -535,6 +559,96 @@ impl PeerHandle {
         Ok(handle)
     }
 
+    /// Native resource fixture: a real child, `AppContainer` profile and secured
+    /// pipe. It avoids requiring an installed, AC-readable peer executable.
+    #[cfg(test)]
+    pub(super) fn test_fixture() -> (Self, std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        let profile = profile_name_for(&uuid::Uuid::new_v4().to_string());
+        let sid = ensure_profile(&profile, &[]).unwrap();
+        let profile_sid = sid_to_string(sid.as_psid()).unwrap();
+        let descriptor =
+            SecurityDescriptor::from_sddl(&pipe_sddl(&current_user_sid().unwrap(), &profile_sid))
+                .unwrap();
+        let prefix = format!("openshell-mxc-test-{}", uuid::Uuid::new_v4());
+        let control = descriptor
+            .create_pipe(&ctl_pipe_name(&prefix), true)
+            .unwrap();
+        let root = std::env::var("SYSTEMROOT").unwrap();
+        let child = std::process::Command::new(format!(
+            r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ))
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+        let mut process = HANDLE::default();
+        // SAFETY: duplicate the live child's process handle for PeerHandle to own.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                HANDLE(child.as_raw_handle()),
+                GetCurrentProcess(),
+                &raw mut process,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .unwrap();
+        }
+        (
+            Self {
+                profile,
+                process: process.0 as isize,
+                prefix,
+                descriptor: Arc::new(descriptor),
+                control: Mutex::new(Some(control)),
+                firewall: StdMutex::new(None),
+                profile_sid,
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                terminated: AtomicBool::new(false),
+                egress_first: None,
+                egress_task: StdMutex::new(None),
+            },
+            child,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_released(&self, child: &mut std::process::Child) {
+        assert!(self.terminated.load(Ordering::Acquire));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "peer child must be reaped before reporting termination"
+        );
+        assert!(
+            self.control.try_lock().unwrap().is_none(),
+            "retained Arc must not retain the control pipe"
+        );
+        // first_pipe_instance proves the old pipe was closed, even though this
+        // fixture deliberately retains an Arc to the terminated PeerHandle.
+        let _rebound = self
+            .descriptor
+            .create_pipe(&ctl_pipe_name(&self.prefix), true)
+            .unwrap();
+        let name = wide(&self.profile);
+        // SAFETY: terminated strings, no capabilities; the returned SID is freed.
+        unsafe {
+            let recreated = CreateAppContainerProfile(
+                PCWSTR(name.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                None,
+            )
+            .expect("retained peer Arc must not retain its AppContainer profile");
+            let _sid = OwnedSid(recreated);
+            DeleteAppContainerProfile(PCWSTR(name.as_ptr())).unwrap();
+        }
+    }
+
     /// Create the profile and control pipe and start the peer process. Does not
     /// wait for the peer; see [`PeerHandle::spawn`].
     fn start_process(peer_exe: &str, sandbox_id: &str, egress: bool) -> io::Result<Self> {
@@ -550,30 +664,30 @@ impl PeerHandle {
             })
             .collect();
         let sid = ensure_profile(&profile, &capabilities)?;
-        let sddl = pipe_sddl(&current_user_sid()?, &sid_to_string(sid.as_psid())?);
-        let descriptor = SecurityDescriptor::from_sddl(&sddl)?;
+        let result = (|| {
+            let profile_sid = sid_to_string(sid.as_psid())?;
+            let sddl = pipe_sddl(&current_user_sid()?, &profile_sid);
+            let descriptor = SecurityDescriptor::from_sddl(&sddl)?;
 
-        // The control pipe exists before the peer starts, so the peer's first
-        // connect attempt succeeds and no other process can squat the name
-        // (first_pipe_instance + a DACL that only admits the peer).
-        let control = descriptor.create_pipe(&ctl_pipe_name(&prefix), true)?;
-        let egress_first = if egress {
-            Some(descriptor.create_pipe(&egress_pipe_name(&prefix), true)?)
-        } else {
-            None
-        };
+            // The control pipe exists before the peer starts, so the peer's first
+            // connect attempt succeeds and no other process can squat the name
+            // (first_pipe_instance + a DACL that only admits the peer).
+            let control = descriptor.create_pipe(&ctl_pipe_name(&prefix), true)?;
+            let egress_first = if egress {
+                Some(descriptor.create_pipe(&egress_pipe_name(&prefix), true)?)
+            } else {
+                None
+            };
 
-        let command_line = peer_command_line(peer_exe, &token, egress);
-        let process =
-            match spawn_in_app_container(peer_exe, &command_line, sid.as_psid(), &mut capabilities)
-            {
+            let command_line = peer_command_line(peer_exe, &token, egress);
+            let process = match spawn_in_app_container(
+                peer_exe,
+                &command_line,
+                sid.as_psid(),
+                &mut capabilities,
+            ) {
                 Ok(handle) => handle,
                 Err(error) => {
-                    // SAFETY: best-effort profile cleanup on the failure path.
-                    unsafe {
-                        let name = wide(&profile);
-                        let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
-                    }
                     return Err(io::Error::new(
                         error.kind(),
                         format!("failed to start proxy peer '{peer_exe}': {error}"),
@@ -581,18 +695,30 @@ impl PeerHandle {
                 }
             };
 
-        // From here on the handle's Drop cleans up the process and profile.
-        Ok(Self {
-            profile,
-            process: process.0 as isize,
-            prefix,
-            descriptor: Arc::new(descriptor),
-            control: Mutex::new(control),
-            proxy_addr: "127.0.0.1:0".parse().expect("static address"),
-            terminated: AtomicBool::new(false),
-            egress_first,
-            egress_task: StdMutex::new(None),
-        })
+            // From here on the handle's Drop cleans up the process and profile.
+            Ok(Self {
+                profile: profile.clone(),
+                process: process.0 as isize,
+                prefix,
+                descriptor: Arc::new(descriptor),
+                control: Mutex::new(Some(control)),
+                firewall: StdMutex::new(None),
+                profile_sid,
+                proxy_addr: "127.0.0.1:0".parse().expect("static address"),
+                terminated: AtomicBool::new(false),
+                egress_first,
+                egress_task: StdMutex::new(None),
+            })
+        })();
+        if result.is_err() {
+            // SAFETY: profile creation succeeded; all preparation failures must
+            // release it, including SID conversion, DACL and pipe creation.
+            unsafe {
+                let name = wide(&profile);
+                let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+            }
+        }
+        result
     }
 }
 
@@ -685,6 +811,10 @@ impl PeerHandle {
         {
             task.abort();
         }
+        // Close the control pipe even while other Arc holders survive.
+        if let Ok(mut control) = self.control.try_lock() {
+            control.take();
+        }
         let process = HANDLE(self.process as *mut c_void);
         // SAFETY: `process` is the handle returned by CreateProcessW and owned by
         // this struct; the `terminated` flag guarantees it is closed exactly once.
@@ -696,6 +826,9 @@ impl PeerHandle {
             if let Err(error) = DeleteAppContainerProfile(PCWSTR(name.as_ptr())) {
                 warn!(profile = %self.profile, "failed to delete proxy peer profile: {error}");
             }
+        }
+        if let Ok(mut firewall) = self.firewall.lock() {
+            firewall.take();
         }
         info!(profile = %self.profile, "MXC proxy peer terminated");
     }
@@ -710,6 +843,52 @@ impl Drop for PeerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a staged AC-readable helper in OPENSHELL_MXC_PEER_EXE"]
+    async fn peer_startup_confirms_firewall_or_fails_before_ready() {
+        let exe = std::env::var("OPENSHELL_MXC_PEER_EXE").expect("stage the real helper first");
+        let id = uuid::Uuid::new_v4().to_string();
+        match PeerHandle::spawn(&exe, &id, None).await {
+            Ok(peer) => {
+                assert_ne!(peer.proxy_addr().port(), 0);
+                tokio::task::spawn_blocking(move || peer.terminate())
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "EVIDENCE: actual AppContainer peer reached firewall-authorized readiness"
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("firewall authorization failed"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("permission to manage Windows Firewall rules"),
+                    "{message}"
+                );
+                eprintln!(
+                    "EVIDENCE: actual AppContainer peer failed before readiness with an actionable firewall diagnostic"
+                );
+            }
+        }
+        // Profile creation must succeed anew, proving cleanup on either path.
+        let name = wide(&profile_name_for(&id));
+        // SAFETY: terminated strings and no capabilities; SID is freed on drop.
+        unsafe {
+            let sid = CreateAppContainerProfile(
+                PCWSTR(name.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                None,
+            )
+            .expect("startup failure or termination must release the peer profile");
+            let _sid = OwnedSid(sid);
+            DeleteAppContainerProfile(PCWSTR(name.as_ptr())).unwrap();
+        }
+    }
 
     #[test]
     fn profile_name_is_stable_and_within_limits() {

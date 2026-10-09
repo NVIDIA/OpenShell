@@ -850,3 +850,22 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
+
+### MXC proxy-peer startup failures
+
+When `pc_proxy_peer_path` is configured, the gateway must be able to manage local
+Windows Firewall rules. Peer startup adds an inbound TCP allow rule scoped to
+the peer executable, AppContainer SID, loopback addresses and ephemeral listener
+port. An authorization error or active policy that ignores inbound rules fails
+startup before readiness; verify the gateway account's permission and effective
+firewall policy. Do not disable the firewall or add a broad port exception.
+
+Peers, pipes, profiles and firewall rules are released after confirmed workload
+termination, including natural completion and launch failure. A timed-out stop
+or delete retains ownership for retry. After abrupt gateway death, inspect
+orphan `OpenShell MXC peer openshell-mxc-*` rules and profiles and confirm no
+owning gateway or peer is alive before removing them.
+
+Protocol version 5 requires the gateway and `openshell-supervisor-relay.exe` to
+be restaged together. Proxy inheritance is explicit for peer launches; a curated
+non-peer launch must not copy the gateway user's ambient proxy settings.

@@ -153,9 +153,20 @@ forward:  unsupported in proxy-peer mode
   PACKAGES" (for example `icacls <dir> /grant *S-1-15-2-1:(OI)(CI)(RX)`).
 - Requires the `process_container` backend and cannot be combined with
   `pc_network_allow` or `pc_allow_local_network`.
-- The peer and its profile are removed when the sandbox is deleted. If the gateway
-  is killed, the peer exits when its control pipe closes, but its profile stays
-  registered until it is removed by hand (`DeleteAppContainerProfile`).
+- Proxy-peer mode requires permission to manage Windows Firewall rules. Before
+  publishing readiness, the gateway installs an inbound TCP allow rule scoped to
+  the helper executable, profile SID, `127.0.0.1` endpoints and listener port.
+  Startup fails if permission is missing or active firewall policy ignores
+  inbound rules. The gateway does not change profile defaults or loopback exemptions.
+- The peer, pipes, firewall rule and profile are released after confirmed workload
+  exit, stop or launch failure, even when the sandbox record is retained. A stop
+  or delete timeout retains ownership for retry. If the gateway is killed, the
+  peer exits when its control pipe closes, but its profile and firewall rule can
+  remain. Remove orphan `OpenShell MXC peer openshell-mxc-*` rules and profiles
+  only after confirming the owning gateway and peer are gone.
+- Restage the gateway and `openshell-supervisor-relay.exe` together. Protocol
+  version 5 gates inheritance of MXC proxy variables on the peer launch flag;
+  other curated launch environments exclude ambient proxies.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
