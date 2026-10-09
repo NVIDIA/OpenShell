@@ -65,3 +65,5 @@ export type { ErrorInfo, FieldViolation, SdkErrorCode } from './errors.js';
 export { fromConnect, SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';
 export { clientCredentials } from './oidc.js';
+export type { ProviderCredentialsOptions, ProviderCredentialValue } from './providers.js';
+export { ProviderClient } from './providers.js';
