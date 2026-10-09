@@ -453,6 +453,15 @@ class ClientCredentialsAuth:
 
 
 @dataclass(frozen=True)
+class SandboxConditionRef:
+    type: str
+    status: str
+    reason: str = ""
+    message: str = ""
+    transition_time_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
@@ -460,6 +469,7 @@ class SandboxStatusRef:
     restart_count: int = 0
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
+    conditions: tuple[SandboxConditionRef, ...] = ()
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -537,6 +547,10 @@ class SandboxRef:
     @property
     def current_policy_version(self) -> int:
         return self.status.current_policy_version
+
+    @property
+    def conditions(self) -> tuple[SandboxConditionRef, ...]:
+        return self.status.conditions
 
 
 @dataclass(frozen=True)
@@ -1772,6 +1786,25 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
+def _sandbox_conditions(
+    status: openshell_pb2.SandboxStatus | None,
+) -> tuple[SandboxConditionRef, ...]:
+    if status is None:
+        return ()
+    return tuple(
+        SandboxConditionRef(
+            type=condition.type,
+            status=condition.status,
+            reason=condition.reason,
+            message=condition.message,
+            transition_time_ms=condition.transition_time.ToMilliseconds()
+            if condition.HasField("transition_time")
+            else None,
+        )
+        for condition in status.conditions
+    )
+
+
 def _sandbox_ref(
     sandbox: openshell_pb2.Sandbox,
     service_urls: Mapping[str, str] | None = None,
@@ -1802,6 +1835,7 @@ def _sandbox_ref(
             main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
             if status is not None and status.HasField("main_process_started_time")
             else None,
+            conditions=_sandbox_conditions(status),
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
