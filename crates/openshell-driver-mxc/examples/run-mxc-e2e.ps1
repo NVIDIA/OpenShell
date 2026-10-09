@@ -646,6 +646,9 @@ try {
     if (-not (Test-Path $policyDir)) {
         throw "e2e-policies/ directory not found at $policyDir"
     }
+    if (-not (Test-Path -LiteralPath (Join-Path $BinaryDir 'libz3.dll') -PathType Leaf)) {
+        throw "Missing libz3.dll beside the gateway. Re-run windows:build for this architecture, or package the matching Z3 runtime with these binaries."
+    }
 
     # Capture the pristine TOML once; every scenario renders a fresh copy from this.
     $tomlBase = Get-Content $tomlTemplate -Raw

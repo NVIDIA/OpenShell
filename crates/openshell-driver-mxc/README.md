@@ -135,6 +135,54 @@ not required; driver-owned guest TLS fields are rejected.
 
 ## Validation
 
+Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
+the gateway and verify its architecture and copied SHA256. Conflicting cached
+DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
+this adjacent DLL; rebuild for the native architecture if preflight reports it
+missing.
+
+### Remote Windows host
+
+Build on a Windows MSVC development machine and run the unchanged real E2E
+harness on a separate MXC host:
+
+```powershell
+.\tasks\scripts\test-mxc-remote.ps1 -HostName 172.16.178.137 -UserName test `
+  -WxcExecPath 'C:\Tools\MXC\wxc-exec.exe'
+```
+
+Install the public SSH key on the target and verify its host key before running.
+The script defaults to `~/.ssh/openshell-mxc-test`; override `-IdentityFile` as
+needed. Both SSH and SCP must be on PATH locally. The target needs Windows
+OpenSSH Server, OpenSSL on its SSH-session PATH, and a qualified MXC runtime,
+but does not need Rust, MSVC, mise, or a source checkout.
+
+The script detects native Windows architecture independently of the SSH shell,
+uses the existing `windows:build:*` task, and validates the executable PE
+architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
+`-SkipBuild` reuses existing artifacts without claiming they match current
+sources. `-Scenario` selects an existing harness scenario.
+
+The package includes `libz3.dll` from the target-specific Cargo build cache.
+Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
+different cached versions exist or when using a custom Z3 build. The remote
+host needs the native Visual C++ runtime; the runner validates DLL architecture
+and gateway startup before invoking E2E.
+
+The example gateway explicitly enables caller driver config so tests can submit
+their workload command and directory. MXC does not implement external-resource
+label admission. The temporary outer-fence assertions permit compatibility
+testing but do not qualify exclusive network mediation or live revocation.
+
+Uploads are cached by SHA256 and verified before execution. Each run has an
+isolated remote directory under `%USERPROFILE%\openshell-mxc-tests`; old runs
+are retained. Full logs, host capabilities, source status, artifact hashes, and
+the results ZIP return to `target/windows-remote-results` in this checkout.
+Signing-key directories are not downloaded. Test failures and incomplete
+coverage remain nonzero exits. Missing host-loopback evidence is not a pass,
+and a qualified host does not close the outer-fence implementation gaps above.
+
+### Local Windows host
 Run the Windows build lane on a native Windows MSVC host:
 
 ```powershell

@@ -165,3 +165,75 @@ if (Test-Path -LiteralPath $cliStateRoot) { throw "temporary state not removed" 
         );
     }
 }
+
+#[test]
+fn windows_build_stages_only_unambiguous_target_matching_z3() {
+    // Synthetic PE headers exercise packaging checks, not MXC containment.
+    let root = tempfile::tempdir().unwrap();
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:OPENSHELL_BUILD_SCRIPT, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw "build script parse errors: $($errors.Message -join '; ')" }
+$function = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stage-Z3Runtime'
+}, $true)
+if ($null -eq $function) { throw 'missing staging function' }
+Invoke-Expression $function.Extent.Text
+$TargetDir = $env:OPENSHELL_TEST_ROOT
+$PrebuiltZ3Version = '5.1.0'
+$env:Z3_LIBRARY_PATH_OVERRIDE = $null
+$release = Join-Path $TargetDir 'aarch64-pc-windows-msvc/release'
+$sourceDir = Join-Path $release 'build/z3-sys-first/out/z3-5.1.0/bin'
+New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+$source = Join-Path $sourceDir 'libz3.dll'
+$bytes = New-Object byte[] 128
+$bytes[0] = 0x4D; $bytes[1] = 0x5A; $bytes[60] = 64
+$bytes[64] = 0x50; $bytes[65] = 0x45
+$bytes[68] = 0x64; $bytes[69] = 0xAA
+[IO.File]::WriteAllBytes($source, $bytes)
+Stage-Z3Runtime 'aarch64-pc-windows-msvc'
+$destination = Join-Path $release 'libz3.dll'
+if ((Get-FileHash $destination).Hash -ne (Get-FileHash $source).Hash) { throw 'copy mismatch' }
+# A stale adjacent DLL must be overwritten from the pinned cache.
+[IO.File]::WriteAllBytes($destination, (New-Object byte[] 128))
+Stage-Z3Runtime 'aarch64-pc-windows-msvc'
+if ((Get-FileHash $destination).Hash -ne (Get-FileHash $source).Hash) { throw 'stale DLL retained' }
+$bytes[68] = 0x64; $bytes[69] = 0x86
+[IO.File]::WriteAllBytes($source, $bytes)
+$rejected = $false
+try { Stage-Z3Runtime 'aarch64-pc-windows-msvc' } catch {
+    if ($_.Exception.Message -notmatch 'architecture') { throw }
+    $rejected = $true
+}
+if (-not $rejected) { throw 'wrong architecture accepted' }
+$secondDir = Join-Path $release 'build/z3-sys-second/out/z3-5.1.0/bin'
+New-Item -ItemType Directory -Path $secondDir -Force | Out-Null
+$bytes[69] = 0xAA
+[IO.File]::WriteAllBytes((Join-Path $secondDir 'libz3.dll'), $bytes)
+$rejected = $false
+try { Stage-Z3Runtime 'aarch64-pc-windows-msvc' } catch {
+    if ($_.Exception.Message -notmatch 'Ambiguous') { throw }
+    $rejected = $true
+}
+if (-not $rejected) { throw 'conflicting runtimes accepted' }
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", script])
+        .env(
+            "OPENSHELL_BUILD_SCRIPT",
+            examples().join("../../../tasks/scripts/windows-msvc.ps1"),
+        )
+        .env("OPENSHELL_TEST_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Z3 staging regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

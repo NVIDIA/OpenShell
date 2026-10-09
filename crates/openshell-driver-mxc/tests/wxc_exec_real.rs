@@ -916,6 +916,8 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
+        // This fixture intentionally submits a caller-selected curl command.
+        allow_driver_config: true,
         ..Default::default()
     };
     let backend = MxcComputeBackend::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
