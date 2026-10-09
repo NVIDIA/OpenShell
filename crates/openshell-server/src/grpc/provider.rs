@@ -2692,6 +2692,7 @@ pub(super) async fn handle_list_providers(
 ) -> Result<Response<ListProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    super::validation::validate_label_selector(&request.label_selector)?;
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -2716,12 +2717,18 @@ pub(super) async fn handle_list_providers(
         request.page_size,
         &request.page_token,
         "ListProviders",
-        &[scope_fingerprint],
+        &[scope_fingerprint, &request.label_selector],
     )?;
     let after = pagination.object_cursor()?;
-    let query = workspace
-        .as_deref()
-        .map_or(ObjectListQuery::AllWorkspaces, ObjectListQuery::Workspace);
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), label_selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector,
+        },
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, label_selector) => ObjectListQuery::AllWorkspacesSelector(label_selector),
+    };
     let page = state
         .store
         .list_message_page::<Provider>(query, after.as_ref(), pagination.page_size())
@@ -14839,6 +14846,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14855,6 +14863,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14891,6 +14900,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14948,6 +14958,7 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 100,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
@@ -14957,6 +14968,140 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(listed.providers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_providers_filters_labels_before_pagination_and_redacts_secrets() {
+        let state = test_server_state().await;
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "beta".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        for (workspace, name, env, team) in [
+            ("default", "prod", "prod", "ml"),
+            ("default", "dev-one", "dev", "ml"),
+            ("default", "other-team", "dev", "platform"),
+            ("default", "dev-two", "dev", "ml"),
+            ("beta", "beta-dev", "dev", "ml"),
+        ] {
+            let labels = HashMap::from([("env".into(), env.into()), ("team".into(), team.into())]);
+            let created = handle_create_provider(
+                &state,
+                authed_request(CreateProviderRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                    provider: Some(Provider {
+                        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                            name: name.into(),
+                            labels: labels.clone(),
+                            ..Default::default()
+                        }),
+                        r#type: "github".into(),
+                        credentials: HashMap::from([(
+                            "GITHUB_TOKEN".into(),
+                            "secret-token".into(),
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner()
+            .provider
+            .unwrap();
+            assert_eq!(created.metadata.unwrap().labels, labels);
+        }
+
+        for (all_workspaces, expected) in [(false, 2), (true, 3)] {
+            let scope = if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
+            } else {
+                openshell_core::proto::workspace_selector("default")
+            };
+            let mut request = ListProvidersRequest {
+                workspace_scope: Some(scope),
+                page_size: 1,
+                label_selector: "env=dev,team=ml".into(),
+                ..Default::default()
+            };
+            let mut names = HashSet::new();
+            loop {
+                let response = handle_list_providers(&state, authed_request(request.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(
+                    response.providers.len(),
+                    1,
+                    "filtering must precede pagination"
+                );
+                let provider = &response.providers[0];
+                assert_eq!(provider.metadata.as_ref().unwrap().labels["env"], "dev");
+                assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
+                assert_eq!(provider.credentials["GITHUB_TOKEN"], "REDACTED");
+                assert!(provider.credential_handles.is_empty());
+                if !all_workspaces {
+                    assert_eq!(provider.object_workspace(), "default");
+                }
+                assert!(
+                    names.insert(provider.object_name().to_string()),
+                    "pages must not repeat objects"
+                );
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                let changed_selector = ListProvidersRequest {
+                    label_selector: "env=prod".into(),
+                    page_token: response.next_page_token.clone(),
+                    ..request.clone()
+                };
+                let err = handle_list_providers(&state, authed_request(changed_selector))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), Code::InvalidArgument);
+                request.page_token = response.next_page_token;
+            }
+            assert_eq!(names.len(), expected);
+        }
+
+        let empty = handle_list_providers(
+            &state,
+            authed_request(ListProvidersRequest {
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                label_selector: "env=missing".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(empty.providers.is_empty());
+        assert!(empty.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_providers_rejects_invalid_label_selectors() {
+        let state = test_server_state().await;
+        for selector in ["=no-key", "no-equals-sign", "env=bad value"] {
+            let err = handle_list_providers(
+                &state,
+                authed_request(ListProvidersRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    label_selector: selector.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "selector: {selector}");
+        }
     }
 
     #[tokio::test]
@@ -15938,6 +16083,7 @@ mod tests {
             &state,
             non_member_request(ListProvidersRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
+                label_selector: "env=dev".into(),
                 ..Default::default()
             }),
         )
@@ -15948,6 +16094,18 @@ mod tests {
             Code::PermissionDenied,
             "handle_list_providers should reject non-members"
         );
+
+        let err = handle_list_providers(
+            &state,
+            non_member_request(ListProvidersRequest {
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                label_selector: "env=dev".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
 
         let err = handle_update_provider(
             &state,

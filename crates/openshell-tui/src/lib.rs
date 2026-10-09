@@ -2242,6 +2242,7 @@ async fn fetch_providers(
     let mut page_token = String::new();
     loop {
         let req = openshell_core::proto::ListProvidersRequest {
+            label_selector: String::new(),
             page_size: 100,
             page_token,
             workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),

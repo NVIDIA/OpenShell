@@ -201,6 +201,35 @@ openshell provider update my-graph \
 
 Use `0` as the timestamp to clear expiry for a credential key.
 
+## Label a Provider
+
+Attach labels when you create a provider to track environment or team ownership.
+Repeat `--label` for each key-value pair. This example uses the imported `pypi`
+profile, which requires no static credentials.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+```
+
+List providers that match every key-value pair in a comma-separated selector.
+Filtering applies before pagination and only returns providers in the selected
+workspace. Platform Admins can filter across workspaces with `--all-workspaces`.
+
+```shell
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+`get` displays attached labels. JSON and YAML list output also include labels.
+When continuing a paginated list with `--page-token`, keep the selector and
+workspace scope unchanged.
+
+API clients set `CreateProviderRequest.provider.metadata.labels` and filter with
+`ListProvidersRequest.label_selector`. The gateway returns labels in
+`provider.metadata.labels`. Provider updates preserve existing labels and do
+not change them, so set labels during creation.
+
 ## Credential Refresh
 
 Provider refresh stores non-injectable refresh material separately from the
