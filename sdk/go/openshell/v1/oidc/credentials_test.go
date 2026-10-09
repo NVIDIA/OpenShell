@@ -308,6 +308,84 @@ func TestClientCredentialsAuthLateFlightReusesCachedToken(t *testing.T) {
 	assert.Equal(t, "cached-token", accessToken)
 }
 
+// A non-positive timeout means "no deadline". The exchange context must not be
+// born expired, so the token exchange should still succeed.
+func TestClientCredentialsAuthNonPositiveTimeoutHasNoDeadline(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -1 * time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			resetDiscoveryCache()
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/.well-known/openid-configuration" {
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"issuer":                 server.URL,
+						"authorization_endpoint": server.URL + "/authorize",
+						"token_endpoint":         server.URL + "/token",
+					})
+					return
+				}
+				_, _ = w.Write([]byte(tokenResponseJSON("token", "", 3600)))
+			}))
+			t.Cleanup(server.Close)
+
+			auth, err := NewClientCredentialsAuth(
+				WithIssuer(server.URL),
+				WithClientID("client"),
+				WithClientSecret("secret"),
+				WithTimeout(timeout), // explicitly no timeout
+			)
+			require.NoError(t, err)
+
+			// The explicit timeout must be preserved (not replaced by the default).
+			require.Equal(t, timeout, auth.(*clientCredentialsAuth).cfg.timeout)
+
+			metadata, err := auth.GetRequestMetadata(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, "Bearer token", metadata["authorization"])
+		})
+	}
+}
+
+// The client credentials grant has no user and no ID token, so "openid" must
+// never be forced onto it the way the interactive flows force it.
+func TestClientCredentialsScopesAreNotNormalized(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []LoginOption
+		want []string
+	}{
+		{
+			name: "unset sends no scopes",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "explicit empty sends no scopes",
+			opts: []LoginOption{WithScopes()},
+			want: []string{},
+		},
+		{
+			name: "application scopes are sent verbatim",
+			opts: []LoginOption{WithScopes("sandbox:read", "sandbox:write")},
+			want: []string{"sandbox:read", "sandbox:write"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := append([]LoginOption{
+				WithIssuer("https://issuer.example.com"),
+				WithClientID("client"),
+				WithClientSecret("secret"),
+			}, tt.opts...)
+
+			cfg, err := resolveClientCredentialsConfig(opts...)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.scopes)
+		})
+	}
+}
+
 func TestClientCredentialsAuthCancellationDoesNotPoisonSharedExchange(t *testing.T) {
 	resetDiscoveryCache()
 	var server *httptest.Server

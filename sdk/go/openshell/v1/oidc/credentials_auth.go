@@ -71,7 +71,13 @@ func (a *clientCredentialsAuth) accessTokenForExchange() (string, error) {
 		return accessToken, nil
 	}
 
-	exchangeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.timeout)
+	// A zero timeout means "no deadline"; only bound the exchange when a
+	// positive timeout was configured (mirrors Login and DeviceFlow).
+	exchangeCtx := context.Background()
+	cancel := context.CancelFunc(func() {})
+	if a.cfg.timeout > 0 {
+		exchangeCtx, cancel = context.WithTimeout(exchangeCtx, a.cfg.timeout)
+	}
 	defer cancel()
 	token, err := exchangeClientCredentials(exchangeCtx, a.cfg, true)
 	if err != nil {
