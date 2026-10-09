@@ -119,7 +119,6 @@ snapcraft="${ROOT}/snapcraft.yaml"
 snap_workflow="${ROOT}/.github/workflows/snap-package.yml"
 snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
-snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
 snap_configure_hook="${ROOT}/snap/hooks/configure"
 snap_install_hook="${ROOT}/snap/hooks/install"
 snap_post_refresh_hook="${ROOT}/snap/hooks/post-refresh"
@@ -129,7 +128,6 @@ assert_file_exists "$snapcraft"
 assert_file_exists "$snap_workflow"
 assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
-assert_file_exists "$snap_repro"
 assert_file_exists "$snap_configure_hook"
 assert_file_exists "$snap_install_hook"
 assert_file_exists "$snap_post_refresh_hook"
@@ -152,7 +150,6 @@ for snap_file in \
   "$snapcraft" \
   "$snap_install_docs" \
   "$snap_canary" \
-  "$snap_repro" \
   "$snap_configure_hook" \
   "$snap_install_hook" \
   "$snap_post_refresh_hook"; do
@@ -242,15 +239,8 @@ assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 assert_contains "$snap_canary" "openshell.prover check"
-assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
-assert_contains "$snap_repro" "/snap/bin/openshell.prover check"
-assert_contains "$snap_repro" "system-docker"
-assert_contains "$snap_repro" "missing-docker"
-assert_contains "$snap_repro" "docker-snap"
 assert_not_contains "$snap_canary" "--dangerous"
-assert_not_contains "$snap_repro" "--dangerous"
 assert_not_contains "$snap_canary" "snap connect openshell:docker"
-assert_not_contains "$snap_repro" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1

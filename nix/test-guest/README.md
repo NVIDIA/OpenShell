@@ -296,44 +296,6 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-## Reproduce Snap installation
-
-Copy the repository installer and reproduction script into a prepared Ubuntu
-guest. The script follows both Release Canary Snap flows: it runs `install.sh`
-with `OPENSHELL_VERSION=dev`, checks the `latest/edge` channel and Docker
-interface, and exercises a sandbox. Repeated attempts also cover the installer's
-idempotent Snap refresh path. On each failure the script prints snapd, Docker,
-and gateway diagnostics.
-
-Reuse system Docker and verify that the Docker snap is not installed:
-
-```shell
-nix run .#test-guest -- \
-  --distro ubuntu-24-04 \
-  --with docker \
-  --with snapd \
-  --keep \
-  --copy ./install.sh:/tmp/install.sh \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh system-docker 10
-```
-
-Start without Docker and verify that `install.sh` rejects the Snap installation:
-
-```shell
-nix run .#test-guest -- \
-  --distro ubuntu-24-04 \
-  --with snapd \
-  --keep \
-  --copy ./install.sh:/tmp/install.sh \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh missing-docker 10
-```
-
-`--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown.
-
-
 The destination must be an absolute guest path. Use bare octal permission bits
 from `000` through `777` for explicit modes.
 
