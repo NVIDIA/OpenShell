@@ -115,6 +115,32 @@ if _, err := client.Sandboxes().Delete(ctx, "default", sandbox.Name); err != nil
 }
 ```
 
+## Stop a Specific Execution
+
+Use `StopSandboxExecution` for an automated response tied to one runtime
+execution. Capture `sandbox.Status.ExecutionID` when you observe the event;
+do not replace it with a newly fetched identity when handling a delayed event.
+
+```go
+receipt, err := client.StopSandboxExecution(
+    ctx, "default", sandbox.Name, sandbox.Status.ExecutionID,
+    v1.StopExecutionOptions{RequestID: requestID},
+)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("execution %s: %s\n", receipt.ExecutionID, receipt.Phase)
+```
+
+`requestID` is an optional nonzero UUID persisted with the operation and reused
+only for retries of that same request. The receipt describes the original
+execution, including on replay. A stale identity fails with `FailedPrecondition`;
+an older gateway returns `Unimplemented`. The SDK never falls back to `Stop`.
+The in-memory fake returns `Unimplemented` because it does not model durable
+execution identity. Conditional stop currently supports a single gateway using
+SQLite; PostgreSQL and multi-replica deployments reject it with
+`FailedPrecondition`. See [Stop a Specific Execution](/how-it-works/sandboxes/overview#stop-a-specific-execution).
+
 The root client also exposes subclients for providers, services, files, SSH,
 TCP forwarding, policy, configuration, templates, and workspaces. List methods
 return lazy pagers so callers choose when to fetch the next page.

@@ -63,6 +63,21 @@ pub struct DeletionResult {
     pub sandbox_id: Option<String>,
 }
 
+/// Durable deduplication for an execution-conditional stop.
+#[derive(Clone, Debug, Default)]
+pub struct StopExecutionOptions {
+    /// Optional nonzero UUID, reused only for retries of the same request.
+    pub request_id: Option<String>,
+}
+
+/// Historical receipt for the requested execution, including on request replay.
+/// This does not establish the current state of a same-name sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StopExecutionResult {
+    pub execution_id: String,
+    pub phase: SandboxPhase,
+}
+
 /// Gateway health snapshot.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -381,6 +396,8 @@ pub struct SandboxRef {
     pub name: String,
     pub workspace: String,
     pub phase: SandboxPhase,
+    /// Current runtime execution identity, when supplied by the gateway.
+    pub execution_id: Option<String>,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
@@ -406,6 +423,9 @@ pub struct SandboxWorkloadTemplateProvenance {
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
+        let execution_id = sandbox.status.as_ref().and_then(|status| {
+            (!status.execution_id.is_empty()).then(|| status.execution_id.clone())
+        });
         let created_from_workload_template =
             sandbox
                 .created_from_workload_template
@@ -436,6 +456,7 @@ impl SandboxRef {
             name: meta.name,
             workspace: meta.workspace,
             phase,
+            execution_id,
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,

@@ -23,6 +23,7 @@ type sandboxClient struct {
 
 var _ SandboxInterface = (*sandboxClient)(nil)
 var _ SandboxTemplateCreateInterface = (*sandboxClient)(nil)
+var _ SandboxExecutionInterface = (*sandboxClient)(nil)
 
 func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
@@ -191,6 +192,28 @@ func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sand
 		return nil, converter.FromGRPCError(err)
 	}
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func (s *sandboxClient) StopExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error) {
+	if executionID == "" {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "execution ID must not be empty"}
+	}
+	req := &pb.StopSandboxExecutionRequest{
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		ExecutionId:    executionID,
+	}
+	if len(opts) > 0 {
+		req.RequestId = opts[0].RequestID
+	}
+	resp, err := s.client.StopSandboxExecution(ctx, req)
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return &StopExecutionResult{
+		ExecutionID: resp.GetExecutionId(),
+		Phase:       converter.SandboxPhaseFromProto(resp.GetPhase()),
+	}, nil
 }
 
 func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {

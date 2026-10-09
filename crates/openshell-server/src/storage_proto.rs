@@ -142,10 +142,12 @@ mod tests {
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
+    // Conditional stop adds two public messages and a status execution ID;
+    // stored statuses without that additive field decode with an empty ID.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3fead4a66e57e6828072109564fa25b5b65ef541b35098d9ed7f0785387fe0aa";
+        "1bb7c5992eeb230cacb6b32b280ff3085a75e2c1682c7da5d31446c4e086b3f9";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "1b759328887a85d9a2baf4098ad4a90f799a9e0956b7b981d3fc937df94c0c29";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -555,12 +557,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -568,7 +570,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -612,7 +614,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (307, 27),
+                (309, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

@@ -116,6 +116,7 @@ When the gateway has JWT signing configured, OpenShell sends a short-lived beare
 | `aud` | The registration's `audience`. Defaults to `urn:openshell:extension:interceptor:<name>` or `urn:openshell:extension:middleware:<name>`. |
 | `caller_kind` | `gateway`, or `supervisor` for middleware calls from a sandbox. |
 | `sandbox_id` | The calling sandbox, when `caller_kind` is `supervisor`. |
+| `execution_id` | The gateway-authenticated runtime launch epoch, when `caller_kind` is `supervisor` and the gateway supports execution identities. |
 
 ### Validate Each Token
 
@@ -129,6 +130,20 @@ For each request, check that:
 - `caller_kind` and `sandbox_id` match what your service accepts.
 
 OpenShell reuses a token until it rotates, so don't reject a repeated `jti`.
+
+For a response that stops the execution associated with an event, retain the
+`execution_id` from the verified supervisor JWT together with the event. This
+identity stays stable during credential refresh and changes on explicit,
+automatic, and gateway recovery starts that replace compute. Reconnection and
+replica handoff preserve it when the runtime remains the same. Gateway-origin tokens do not identify
+a sandbox execution. A missing claim cannot safely be replaced with a sandbox
+name, sandbox ID, token `jti`, or a later status lookup. Do not trust an identity
+copied into request payloads instead of the verified token.
+
+Use the `StopSandboxExecution` RPC with this identity. An unsupported gateway
+returns `Unimplemented`; a stale identity or unsupported PostgreSQL/multi-replica
+deployment returns `FailedPrecondition`. Never downgrade these failures to
+unconditional stop. See [Stop a Specific Execution](/how-it-works/sandboxes/overview#stop-a-specific-execution).
 
 Services must use `https://` endpoints. OpenShell verifies the certificate and hostname against platform roots, or against `tls_ca_cert_path` for a private CA.
 

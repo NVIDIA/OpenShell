@@ -118,6 +118,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Stop a Specific Execution
+
+Capture `sandbox.execution_id` when observing an event and retain it for any
+delayed response. `stop_sandbox_execution` checks it atomically before stopping:
+
+```rust
+let execution_id = sandbox.execution_id.as_deref()
+    .ok_or("gateway did not supply an execution identity")?;
+let receipt = client.workspace("default")
+    .stop_sandbox_execution(
+        &sandbox.name,
+        execution_id,
+        openshell_sdk::StopExecutionOptions::default(),
+    )
+    .await?;
+```
+
+Set `StopExecutionOptions.request_id` to a nonzero UUID to deduplicate retries
+of the same operation. Replays retain the original receipt; they do not describe
+the current sandbox. A stale identity returns `FailedPrecondition`; older
+gateways return `Unimplemented`. The SDK never falls back to stopping by name.
+Conditional stop currently supports a single gateway using SQLite. PostgreSQL
+and multi-replica deployments reject it with `FailedPrecondition` because
+lifecycle coordination is process-local.
+
 Use `raw_grpc_fresh()` for RPCs that the curated API does not yet wrap. The raw
 client returns generated protobuf types and requires callers to assemble full
 requests.

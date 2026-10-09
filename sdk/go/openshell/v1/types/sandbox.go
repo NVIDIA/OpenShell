@@ -115,6 +115,9 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
+	// ExecutionID identifies the current runtime execution, not the persistent
+	// sandbox. Empty means no qualified execution identity is available.
+	ExecutionID          string
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string

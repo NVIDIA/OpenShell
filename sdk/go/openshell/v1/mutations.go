@@ -22,6 +22,12 @@ type DeletionResult = types.DeletionResult
 // DeleteOptions configures the missing-target contract.
 type DeleteOptions = types.DeleteOptions
 
+// StopExecutionOptions configures durable deduplication of an execution stop.
+type StopExecutionOptions = types.StopExecutionOptions
+
+// StopExecutionResult is a historical receipt for the requested execution.
+type StopExecutionResult = types.StopExecutionResult
+
 func allowMissing(opts []DeleteOptions) bool {
 	return len(opts) > 0 && opts[0].AllowMissing
 }

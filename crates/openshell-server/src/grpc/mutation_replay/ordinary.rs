@@ -23,7 +23,8 @@ use openshell_core::proto::{
     ImportProviderProfilesResponse, Provider, ProviderMutationReceipt, ProviderProfile,
     ProviderProfileDiagnostic, ProviderResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest, UndoDraftChunkRequest,
+    ServiceEndpointResponse, StartSandboxRequest, StopSandboxExecutionRequest,
+    StopSandboxExecutionResponse, StopSandboxRequest, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WorkspaceSelector,
@@ -90,9 +91,24 @@ struct WriteFacts {
     references: Vec<Reference>,
     refresh: Option<Refresh>,
     global: bool,
+    execution_mismatch: bool,
 }
 
 impl Facts {
+    pub(crate) fn execution_mismatch(&self) -> Result<(), Status> {
+        self.0.lock().map_err(|_| uncertain())?.execution_mismatch = true;
+        Ok(())
+    }
+
+    pub(super) fn rejection(&self) -> Result<Option<super::Rejection>, Status> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| uncertain())?
+            .execution_mismatch
+            .then_some(super::Rejection::StaleExecution))
+    }
+
     pub(crate) fn global(&self) -> Result<(), Status> {
         self.0.lock().map_err(|_| uncertain())?.global = true;
         Ok(())
@@ -156,6 +172,10 @@ pub(in crate::grpc) enum Outcome {
         changed: bool,
         #[serde(default)]
         service_urls: HashMap<String, String>,
+    },
+    SandboxExecutionStopped {
+        execution_id: String,
+        phase: i32,
     },
     SandboxDeletion {
         id: String,
@@ -481,6 +501,33 @@ sandbox_mutation!(
     StopSandboxRequest,
     "StopSandbox",
     sandbox::handle_stop_sandbox
+);
+
+sandbox_scoped_mutation!(
+    StopSandboxExecutionRequest,
+    StopSandboxExecutionResponse,
+    "StopSandboxExecution",
+    sandbox::handle_stop_sandbox_execution,
+    User,
+    |response: &Response<StopSandboxExecutionResponse>| {
+        Ok(Outcome::SandboxExecutionStopped {
+            execution_id: response.get_ref().execution_id.clone(),
+            phase: response.get_ref().phase,
+        })
+    },
+    async |_store: &Store, outcome: Outcome| {
+        let Outcome::SandboxExecutionStopped {
+            execution_id,
+            phase,
+        } = outcome
+        else {
+            return Err(replay_unavailable());
+        };
+        Ok(StopSandboxExecutionResponse {
+            execution_id,
+            phase,
+        })
+    }
 );
 
 macro_rules! attachment_mutation {

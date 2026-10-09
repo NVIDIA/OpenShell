@@ -647,6 +647,7 @@ struct Control {
     proceed: tokio::sync::Notify,
     calls: AtomicUsize,
     fail_after_effect: bool,
+    fail_with_stale_status: bool,
 }
 
 #[tonic::async_trait]
@@ -683,6 +684,9 @@ impl Mutation for ControlledCreate {
             }),
         )
         .await?;
+        if control.fail_with_stale_status {
+            return Err(crate::compute::stale_execution_status());
+        }
         if control.fail_after_effect {
             return Err(Status::internal("simulated interruption after effect"));
         }
@@ -696,6 +700,31 @@ impl Mutation for ControlledCreate {
             workspace: Some(restore_resource(store, success).await?),
         })
     }
+}
+
+#[tokio::test]
+async fn a_stale_status_after_effect_is_not_a_confirmed_rejection() {
+    let state = test_server_state().await;
+    let control = Arc::new(Control {
+        fail_with_stale_status: true,
+        ..Default::default()
+    });
+    control.proceed.notify_one();
+    let req = create("untrusted-stale");
+    let mut request = authed_request(ControlledCreate {
+        name: req.name.clone(),
+        request_id: req.request_id.clone(),
+    });
+    request.extensions_mut().insert(control.clone());
+    assert_eq!(
+        reason(&run(&state, request).await.unwrap_err()),
+        "STALE_EXECUTION"
+    );
+    assert_eq!(
+        reason(&run(&state, authed_request(req)).await.unwrap_err()),
+        "REQUEST_OUTCOME_UNCERTAIN"
+    );
+    assert_eq!(control.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -750,6 +779,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         workspace_id: None,
         target_id: None,
         success: None,
+        rejection: None,
         completed_at_ms: None,
     };
     let payload = serde_json::to_vec(&pending).unwrap();

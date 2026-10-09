@@ -95,3 +95,9 @@ type SandboxInterface interface {
 type SandboxTemplateCreateInterface interface {
 	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 }
+
+// SandboxExecutionInterface adds execution-conditional stop without widening
+// the legacy SandboxInterface. Unsupported gateways never fall back to Stop.
+type SandboxExecutionInterface interface {
+	StopExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error)
+}

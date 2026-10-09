@@ -933,6 +933,59 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+### Stop a Specific Execution
+
+Controllers responding to a delayed event must retain the execution identity
+observed with that event. `sandbox get --output json` exposes `execution_id`.
+Pass that identity when stopping the sandbox:
+
+```shell
+openshell sandbox stop my-sandbox --execution-id "$EXECUTION_ID"
+```
+
+The gateway checks the identity atomically with stop admission. If the sandbox
+has restarted or a replacement has reused its name, the request fails with
+`FailedPrecondition` and leaves the replacement running. An empty or malformed
+identity returns `InvalidArgument`. Older gateways return `Unimplemented`;
+the CLI never falls back to an unconditional stop.
+
+The execution identity represents a gateway-authenticated runtime launch epoch.
+It changes on explicit start, automatic restart, and gateway recovery starts,
+including another driver launch attempt while a sandbox is already `Starting`.
+Each launch attempt rotates the runtime generation and authorization epoch;
+credential refresh preserves them and the execution identity. Supervisor
+reconnection and Gateway replica handoff also preserve it when compute is not
+replaced. The persistent SSH host key survives runtime replacement and cannot
+serve as an execution precondition. The execution
+identity is distinct from the sandbox ID, a Kubernetes Pod UID, and a token's
+`jti`.
+
+Conditional stop returns a receipt identifying the targeted execution and the
+phase recorded by that operation. The CLI does not poll or stop local forwards
+by sandbox name for this operation. A later read may already describe another
+execution. API clients can supply a `request_id` to replay the same successful
+receipt for 24 hours without stopping a newer execution. A Gateway-confirmed
+execution mismatch returns `FailedPrecondition` with reason `STALE_EXECUTION`;
+retries with the same request ID replay that rejection for 24 hours. Reusing
+that ID with a different execution identity returns `REQUEST_ID_PAYLOAD_MISMATCH`.
+Driver failures and interrupted operations remain `REQUEST_OUTCOME_UNCERTAIN`
+on retry because the Gateway cannot prove their effects.
+
+Conditional execution stop currently requires the SQLite store with a single
+gateway process. PostgreSQL and multi-replica deployments return
+`FailedPrecondition` because lifecycle coordination is process-local. They do
+not downgrade to an unconditional stop.
+
+When upgrading an existing deployment, retained runtime records may lack the
+bootstrap execution binding. The Gateway rejects bootstrap from those runtimes;
+it does not infer a binding from their name or compute identity. Existing
+credentials do not establish that an older observation carries execution identity.
+Before enabling automatic responses, have an authorized operator stop and start
+the affected sandboxes through the Gateway, using matching Gateway, supervisor,
+and sandbox runtime releases. Verify fresh authenticated observations with
+execution identity. Retain observation-only operation until verification succeeds;
+never substitute the replacement's current identity into an older event.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

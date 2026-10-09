@@ -121,6 +121,12 @@ func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name
 	return fc.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
 }
 
+// StopSandboxExecution returns Unimplemented. The fake does not model durable
+// execution identity or deduplication and must not fall back to stopping by name.
+func (fc *Client) StopSandboxExecution(_ context.Context, _, _, _ string, _ ...types.StopExecutionOptions) (*types.StopExecutionResult, error) {
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "fake client does not model execution-conditional stop"}
+}
+
 // Providers returns the provider sub-client.
 func (fc *Client) Providers() v1.ProviderInterface { return fc.providers }
 

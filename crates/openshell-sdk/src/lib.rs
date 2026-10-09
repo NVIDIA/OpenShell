@@ -55,5 +55,6 @@ pub use types::{
     SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
     SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
     SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    ServiceExposure, ServiceStatus, WatchEvent, WatchOptions, WorkspaceRef,
+    ServiceExposure, ServiceStatus, StopExecutionOptions, StopExecutionResult, WatchEvent,
+    WatchOptions, WorkspaceRef,
 };

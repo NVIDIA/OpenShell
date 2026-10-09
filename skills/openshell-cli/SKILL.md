@@ -499,6 +499,22 @@ sandbox, even under the same name, creates a different identity. See the
 [sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for verification behavior and release compatibility.
 
+For a response to an event from a specific execution, retain the event's
+execution identity and use `openshell sandbox stop NAME --execution-id ID`.
+The gateway rejects stale identities without stopping a replacement; the CLI
+never falls back to a name-only stop. `sandbox get NAME --output json` exposes
+`execution_id` for status observations. Middleware events must use the verified
+supervisor JWT claim. Do not substitute a fresh status identity for a delayed
+event. Conditional stop returns an execution receipt and does not manage local
+forwards or poll by name. It currently requires a single SQLite gateway;
+PostgreSQL/multi-replica deployments reject it with `FailedPrecondition`.
+A confirmed stale-target rejection replays for 24 hours with the same request
+ID; uncertain driver failures remain unresolved. Session reconnection preserves
+execution identity; compute replacement changes it. After upgrading legacy
+runtime records, an authorized operator must stop/start affected sandboxes with
+matching runtime releases and verify fresh execution-attested observations
+before enabling automatic responses.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop

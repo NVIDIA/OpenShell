@@ -44,6 +44,17 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
     let mut second = state_for(Store::connect(url).await.unwrap()).await;
     configure_key(&mut first, &directory);
     configure_key(&mut second, &directory);
+    if !first.store.is_single_replica() {
+        // Exact-execution stops fail closed until lifecycle ownership spans
+        // replicas for the complete compute-driver operation.
+        let error = first
+            .compute
+            .stop_sandbox_execution("default", "absent", &format!("exec-v1:{}", "0".repeat(64)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("single-replica"));
+    }
     let req = DeleteSandboxRequest {
         name: "keyed-restart".into(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -263,6 +274,180 @@ async fn replay<M: Mutation + Clone>(state: &Arc<ServerState>, req: M) -> M::Out
         "true"
     );
     response.into_inner()
+}
+
+#[tokio::test]
+async fn stale_execution_rejection_replays_and_cannot_be_retargeted() {
+    let (_directory, state) = protected_state().await;
+    let mut sandbox = Sandbox {
+        metadata: Some(meta("stale-receipt")),
+        ..Default::default()
+    };
+    sandbox.set_phase(SandboxPhase::Ready as i32);
+    crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+        .unwrap()
+        .write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+    let current_execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+    state.store.put_message(&sandbox).await.unwrap();
+    let req = StopSandboxExecutionRequest {
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        name: "stale-receipt".into(),
+        execution_id: format!("exec-v1:{}", "0".repeat(64)),
+        request_id: id(),
+    };
+    let first = run(&state, authed_request(req.clone())).await.unwrap_err();
+    assert_eq!(reason(&first), "STALE_EXECUTION");
+    for _ in 0..3 {
+        let replay = run(&state, authed_request(req.clone())).await.unwrap_err();
+        assert_eq!(replay.code(), first.code());
+        assert_eq!(replay.message(), first.message());
+        assert_eq!(replay.details(), first.details());
+        assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    }
+    let mut retarget = req.clone();
+    retarget.execution_id = current_execution;
+    assert_eq!(
+        reason(&run(&state, authed_request(retarget)).await.unwrap_err()),
+        "REQUEST_ID_PAYLOAD_MISMATCH"
+    );
+    state
+        .store
+        .delete(Sandbox::object_type(), sandbox.object_id())
+        .await
+        .unwrap();
+    let mut replacement = Sandbox {
+        metadata: Some(meta("stale-receipt")),
+        ..sandbox
+    };
+    crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+        .unwrap()
+        .write(&mut replacement.metadata.as_mut().unwrap().annotations);
+    state.store.put_message(&replacement).await.unwrap();
+    assert_eq!(
+        reason(&run(&state, authed_request(req.clone())).await.unwrap_err()),
+        "STALE_EXECUTION"
+    );
+    assert_eq!(
+        state
+            .store
+            .get_message::<Sandbox>(replacement.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .phase(),
+        SandboxPhase::Ready as i32
+    );
+    let rows = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    let mut admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+    admission.completed_at_ms =
+        Some(super::super::current_time_ms() - super::super::SUCCESS_TTL_MS);
+    state
+        .store
+        .put_if(
+            OBJECT_TYPE,
+            &row.id,
+            &row.name,
+            &row.workspace,
+            &serde_json::to_vec(&admission).unwrap(),
+            None,
+            crate::persistence::WriteCondition::MatchResourceVersion(row.resource_version),
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::super::prune_expired(&state.store, &row.workspace)
+            .await
+            .unwrap()
+    );
+    let fresh = run(&state, authed_request(req)).await.unwrap_err();
+    assert_eq!(reason(&fresh), "STALE_EXECUTION");
+    assert!(fresh.metadata().get("openshell-replayed").is_none());
+}
+
+#[tokio::test]
+async fn execution_stop_receipt_survives_restart_and_same_name_replacement() {
+    let (_directory, state) = protected_state().await;
+    let mut sandbox = Sandbox {
+        metadata: Some(meta("execution-receipt")),
+        ..Default::default()
+    };
+    sandbox.set_phase(SandboxPhase::Stopped as i32);
+    crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+        .unwrap()
+        .write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+    let execution_id = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+    state.store.put_message(&sandbox).await.unwrap();
+    let req = StopSandboxExecutionRequest {
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        name: "execution-receipt".into(),
+        execution_id: execution_id.clone(),
+        request_id: id(),
+    };
+    let receipt = run(&state, authed_request(req.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(receipt.execution_id, execution_id);
+    assert_eq!(receipt.phase, SandboxPhase::Stopped as i32);
+
+    let mut restarted = sandbox.clone();
+    let mut identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+        &restarted.metadata.as_ref().unwrap().annotations,
+    )
+    .unwrap();
+    identity.auth_epoch = openshell_core::jwt::CredentialEpoch::new(2).unwrap();
+    identity.write(&mut restarted.metadata.as_mut().unwrap().annotations);
+    restarted.set_phase(SandboxPhase::Ready as i32);
+    state.store.put_message(&restarted).await.unwrap();
+    assert_eq!(replay(&state, req.clone()).await, receipt);
+    let mut fresh = req.clone();
+    fresh.request_id = id();
+    assert_eq!(
+        run(&state, authed_request(fresh)).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .phase(),
+        SandboxPhase::Ready as i32
+    );
+
+    state
+        .store
+        .delete(Sandbox::object_type(), sandbox.object_id())
+        .await
+        .unwrap();
+    let replacement = Sandbox {
+        metadata: Some(meta("execution-receipt")),
+        ..restarted
+    };
+    state.store.put_message(&replacement).await.unwrap();
+    assert_eq!(
+        replay(&state, req).await,
+        receipt,
+        "a receipt acknowledges the original execution, never the live replacement"
+    );
+    assert_eq!(
+        state
+            .store
+            .get_message::<Sandbox>(replacement.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .phase(),
+        SandboxPhase::Ready as i32
+    );
 }
 
 #[tokio::test]

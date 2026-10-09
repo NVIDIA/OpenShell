@@ -26,3 +26,17 @@ type DeletionResult struct {
 type DeleteOptions struct {
 	AllowMissing bool
 }
+
+// StopExecutionOptions configures durable deduplication of an execution stop.
+type StopExecutionOptions struct {
+	// RequestID is an optional nonzero UUID. Reuse it only for retries of the
+	// same request; successful receipts can be replayed for 24 hours.
+	RequestID string
+}
+
+// StopExecutionResult is a historical receipt for the requested execution.
+// A replay does not establish the current sandbox phase.
+type StopExecutionResult struct {
+	ExecutionID string
+	Phase       SandboxPhase
+}
