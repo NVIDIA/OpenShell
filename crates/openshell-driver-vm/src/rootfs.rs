@@ -1328,6 +1328,103 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Runs the shipped guest init's `configure_hosts` against `root`.
+    ///
+    /// The function is cut out of the real script so the test exercises the
+    /// shell that boots the guest rather than a Rust reimplementation of it.
+    fn run_guest_configure_hosts(root: &Path) -> std::process::Output {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("configure_hosts() {\n")
+            .expect("guest init defines configure_hosts");
+        let tail = &script[start..];
+        let end = tail
+            .find("\n}\n")
+            .expect("configure_hosts closes at column zero")
+            + "\n}\n".len();
+        let program = format!(
+            "set -euo pipefail\n\
+             ts() {{ :; }}\n\
+             root_path() {{ printf '%s%s\\n' \"${{ROOT_PREFIX:-}}\" \"$1\"; }}\n\
+             {}\n\
+             configure_hosts\n",
+            &tail[..end]
+        );
+        Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .env("ROOT_PREFIX", root)
+            .output()
+            .expect("run configure_hosts")
+    }
+
+    #[test]
+    fn guest_init_populates_missing_or_empty_hosts_and_keeps_image_hosts() {
+        let dir = unique_temp_dir();
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).expect("create etc");
+        let hosts = etc.join("hosts");
+        let loopback = "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n";
+
+        // An image that ships no hosts file at all.
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), loopback);
+
+        // The usual OCI placeholder: present but empty.
+        fs::write(&hosts, "").expect("write empty hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), loopback);
+
+        // A hosts file authored by the image is not rewritten.
+        let authored = "10.1.2.3 build-host\n";
+        fs::write(&hosts, authored).expect("write authored hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&hosts).expect("read hosts"), authored);
+
+        // An image-authored symlink is left alone, and an absolute target
+        // outside the workload root is never written through.
+        let outside = dir.join("outside-hosts");
+        fs::write(&outside, "").expect("write outside hosts");
+        fs::remove_file(&hosts).expect("remove hosts");
+        std::os::unix::fs::symlink(&outside, &hosts).expect("link hosts");
+        let output = run_guest_configure_hosts(&dir);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(&outside).expect("read outside"), "");
+        assert!(
+            fs::symlink_metadata(&hosts)
+                .expect("stat hosts")
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_init_boot_path_configures_hosts_after_the_account_and_before_networking() {
+        // The step only helps if the boot function itself calls it, so look at
+        // the lines of `run_post_overlay_setup` rather than anywhere in the file.
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("run_post_overlay_setup() {\n")
+            .expect("guest init defines run_post_overlay_setup");
+        let boot = &script[start..];
+        let network = boot
+            .find("openshell-vm-init prepare-network")
+            .expect("boot function brings up the loopback interface");
+        let lines: Vec<&str> = boot[..network].lines().map(str::trim).collect();
+        let position = |call: &str| lines.iter().position(|line| *line == call);
+        let account = position("reconcile_sandbox_account").expect("account reconciled");
+        let hosts = position("configure_hosts").expect("boot function calls configure_hosts");
+        assert!(
+            account < hosts,
+            "hosts are written after the root is set up"
+        );
+    }
+
     #[test]
     fn prepare_sandbox_rootfs_preserves_image_workdir_contents_in_rootfs() {
         let dir = unique_temp_dir();
