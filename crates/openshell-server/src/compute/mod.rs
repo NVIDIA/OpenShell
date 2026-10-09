@@ -8,6 +8,7 @@ pub mod lease;
 pub mod provisioning_deadline;
 mod provisioning_operation;
 pub mod rootfs_tar;
+pub mod warm_pool;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -23,6 +24,8 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectWorkspace;
+use openshell_core::SetResourceVersion;
 use openshell_core::extension_protocol::{
     ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
 };
@@ -45,7 +48,6 @@ use openshell_core::proto::{
     SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -532,6 +534,23 @@ impl RemoteComputeDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for RemoteComputeDriver {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status>
+    {
+        let _ = &request;
+        self.client.clone().select_warm_pair(request).await
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status>
+    {
+        self.client.clone().sync_warm_pools(request).await
+    }
+
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -671,6 +690,8 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
+    /// Wake local registration waiters; durable driver state remains authoritative.
+    assignment_notifications: watch::Sender<()>,
     replica_id: String,
     /// Gateway-issued staging slots for rootfs tar archives. Shared across
     /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
@@ -696,6 +717,10 @@ impl fmt::Debug for ComputeRuntime {
 }
 
 impl ComputeRuntime {
+    pub(crate) fn subscribe_assignments(&self) -> watch::Receiver<()> {
+        self.assignment_notifications.subscribe()
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "driver.initialize",
@@ -774,6 +799,7 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            assignment_notifications: watch::channel(()).0,
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
@@ -984,6 +1010,7 @@ impl ComputeRuntime {
         }
         let request = AuthenticateSandboxRequest {
             credential: credential.to_string(),
+            supervisor_registration: false,
         };
         self.driver
             .call(
@@ -993,6 +1020,36 @@ impl ComputeRuntime {
             )
             .await
             .map(tonic::Response::into_inner)
+    }
+
+    pub(crate) async fn authenticate_supervisor(
+        &self,
+        credential: &str,
+    ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
+        if !self.supports_sandbox_authentication() {
+            return Err(Status::unimplemented(
+                "driver does not support registration",
+            ));
+        }
+        let request = AuthenticateSandboxRequest {
+            credential: credential.to_string(),
+            supervisor_registration: true,
+        };
+        let response = self
+            .driver
+            .call(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                None,
+                |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
+            )
+            .await?
+            .into_inner();
+        if response.registration.is_none() {
+            return Err(Status::unimplemented(
+                "driver does not support registration",
+            ));
+        }
+        Ok(response)
     }
 
     #[must_use]
@@ -1133,13 +1190,15 @@ impl ComputeRuntime {
             .map_err(|error| {
                 crate::grpc::persistence_error_to_status(error, "acquire sandbox mutation lock")
             })?;
+        let mut lifecycle_guard = Some(lifecycle_guard);
+        let mut global_guard = Some(global_guard);
         Box::pin(self.create_sandbox_authenticated_with_guards(
             sandbox,
             sandbox_token,
             launch_authentication,
             await_main_process_attachment,
-            lifecycle_guard,
-            global_guard,
+            &mut lifecycle_guard,
+            &mut global_guard,
         ))
         .await
     }
@@ -1151,8 +1210,8 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
-        lifecycle_guard: SandboxLifecycleGuard,
-        global_guard: SandboxSyncGuard,
+        lifecycle_guard: &mut Option<SandboxLifecycleGuard>,
+        global_guard: &mut Option<SandboxSyncGuard>,
     ) -> Result<Sandbox, Status> {
         // Defend the internal create path too, before consuming a staged archive
         // or persisting the sandbox. The gRPC handler checks before driver validation.
@@ -1186,29 +1245,22 @@ impl ComputeRuntime {
         }
 
         // Create with MustCreate condition to prevent duplicate creation race
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        let labels_map = sandbox.object_labels();
-        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&labels_map)
-                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
-            )
-        };
+        let allocation_claim = warm_pool::allocation_claim(self, &sandbox)?;
         let result = self
             .store
-            .put_if(
-                Sandbox::object_type(),
-                &sandbox_id,
-                sandbox.object_name(),
-                sandbox.object_workspace(),
-                &sandbox.encode_to_vec(),
-                labels_json.as_deref(),
+            .put_sandbox_allocation(
+                &sandbox,
+                allocation_claim.as_ref(),
                 WriteCondition::MustCreate,
             )
             .await
             .map_err(|e| {
+                if matches!(
+                    e,
+                    crate::persistence::PersistenceError::AllocationTargetReserved
+                ) {
+                    return Status::aborted("allocation target is reserved");
+                }
                 if matches!(
                     e,
                     crate::persistence::PersistenceError::UniqueViolation { .. }
@@ -1246,16 +1298,21 @@ impl ComputeRuntime {
             }
         }
         .await;
-        drop(global_guard);
+        drop(global_guard.take());
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
             Err(status) => {
                 return Err(self
-                    .compensate_failed_create(&sandbox, lifecycle_guard, None, status)
+                    .compensate_failed_create(
+                        &sandbox,
+                        lifecycle_guard.take().expect("lifecycle guard retained"),
+                        None,
+                        status,
+                    )
                     .await);
             }
         };
-
+        self.sandbox_index.update_from_sandbox(&sandbox);
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -1265,6 +1322,8 @@ impl ComputeRuntime {
             spec.await_main_process_attachment = await_main_process_attachment;
             spec.launch_authentication = launch_authentication.unwrap_or_default();
         }
+        let warm_pair = warm_pool::candidate(&sandbox)?;
+        let warm_pending = warm_pool::pending(&sandbox);
         let result = Box::pin(self.await_provisioning_operation(
             &sandbox,
             self.driver.call_owned(
@@ -1280,6 +1339,7 @@ impl ComputeRuntime {
                     let response = driver
                         .create_sandbox(Request::new(CreateSandboxRequest {
                             sandbox: Some(driver_sandbox),
+                            warm_pair,
                         }))
                         .await;
                     if let Some(staged) = staged.as_mut() {
@@ -1297,6 +1357,12 @@ impl ComputeRuntime {
                 | ProvisioningOperationError::Unsettled(status),
             ) => return Err(status),
             Err(ProvisioningOperationError::Driver { status, settled }) => {
+                if warm_pending {
+                    warn!(%status, %sandbox_id, "warm assignment remains pending reconciliation");
+                    self.sandbox_index.update_from_sandbox(&settled);
+                    self.sandbox_watch_bus.notify(settled.object_id());
+                    return Ok(*settled);
+                }
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
                     Code::FailedPrecondition => {
@@ -1305,11 +1371,18 @@ impl ComputeRuntime {
                     _ => Status::internal(format!("create sandbox failed: {}", status.message())),
                 };
                 return Err(self
-                    .compensate_failed_create(&settled, lifecycle_guard, None, status)
+                    .compensate_failed_create(
+                        &settled,
+                        lifecycle_guard.take().expect("lifecycle guard retained"),
+                        None,
+                        status,
+                    )
                     .await);
             }
         };
-        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let global_guard = self
+            .lock_global_for_lifecycle(lifecycle_guard.as_ref().expect("lifecycle guard retained"))
+            .await;
         // The scanner can expire preparation while create owns the lifecycle
         // gate. Every driver outcome must observe that durable decision before
         // deleting records, publishing status, or compensating a failed create.
@@ -1330,10 +1403,31 @@ impl ComputeRuntime {
         if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
             let status = Status::internal("compute driver did not return a runtime identity");
             return Err(self
-                .compensate_failed_create(&sandbox, lifecycle_guard, Some(global_guard), status)
+                .compensate_failed_create(
+                    &sandbox,
+                    lifecycle_guard.take().expect("lifecycle guard retained"),
+                    Some(global_guard),
+                    status,
+                )
                 .await);
         }
-        if self.supports_sandbox_authentication() {
+        if warm_pending {
+            drop(global_guard);
+            if let Err(error) =
+                warm_pool::completed_with_runtime_identity(self, &sandbox, Some(&runtime_identity))
+                    .await
+            {
+                warn!(%error, %sandbox_id, "warm assignment completion remains pending reconciliation");
+            }
+            if let Some(current) = self
+                .store
+                .get_message::<Sandbox>(&sandbox_id)
+                .await
+                .map_err(|error| Status::internal(format!("reload warm sandbox failed: {error}")))?
+            {
+                sandbox = current;
+            }
+        } else if self.supports_sandbox_authentication() {
             let persisted = self
                 .persist_runtime_binding(
                     &sandbox_id,
@@ -1358,7 +1452,7 @@ impl ComputeRuntime {
                     return Err(self
                         .compensate_failed_create(
                             &sandbox,
-                            lifecycle_guard,
+                            lifecycle_guard.take().expect("lifecycle guard retained"),
                             Some(global_guard),
                             status,
                         )
@@ -1533,6 +1627,7 @@ impl ComputeRuntime {
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                ..Default::default()
                             }))
                             .await
                     }
@@ -1733,6 +1828,7 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|status| status.provisioning.as_ref())
                 .is_some_and(|record| record.cleanup_completed_time.is_none())
+            || provisioning_deadline::cleanup_pending(&candidate)
         {
             return Err(Status::failed_precondition(
                 "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
@@ -1815,7 +1911,8 @@ impl ComputeRuntime {
 
             let previous = current.clone();
             let next_identity = if authority.is_some()
-                && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                && (matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                    || is_failed_main_process_result(&current))
             {
                 Some(next_runtime_identity(&current)?)
             } else {
@@ -1979,6 +2076,7 @@ impl ComputeRuntime {
                                 let response = driver
                                     .create_sandbox(Request::new(CreateSandboxRequest {
                                         sandbox: Some(driver_sandbox),
+                                        warm_pair: None,
                                     }))
                                     .await?;
                                 Ok(tonic::Response::new(StartSandboxResponse {
@@ -2524,11 +2622,14 @@ impl ComputeRuntime {
                 |driver| {
                     let sandbox_id = transition.deleting.object_id().to_string();
                     let sandbox_name = transition.deleting.object_name().to_string();
+                    let warm_pair = warm_pool::candidate(&transition.deleting);
                     async move {
                         driver
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                warm_pair: warm_pair?,
+                                ..Default::default()
                             }))
                             .await
                     }
@@ -2566,7 +2667,9 @@ impl ComputeRuntime {
                 })
             }
             Err(err) => {
-                self.recover_failed_delete(&delete_guard, &transition).await;
+                if warm_pool::candidate(&transition.deleting)?.is_none() {
+                    self.recover_failed_delete(&delete_guard, &transition).await;
+                }
                 Err(Status::internal(format!(
                     "delete sandbox failed: {}",
                     err.message()
@@ -4295,6 +4398,7 @@ impl ComputeRuntime {
                                     .delete_sandbox(Request::new(DeleteSandboxRequest {
                                         sandbox_id,
                                         name: sandbox_name,
+                                        ..Default::default()
                                     }))
                                     .await
                             }
@@ -5316,6 +5420,7 @@ impl ComputeRuntime {
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                ..Default::default()
                             }))
                             .await
                     }
@@ -5537,7 +5642,13 @@ impl ComputeRuntime {
             }
 
             let sandbox = decode_sandbox_record(&current_record)?;
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if provisioning_deadline::driver_operation_pending(&sandbox)
+                || warm_pool::pending(&sandbox)
+                || (warm_pool::candidate(&sandbox)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                    && sandbox.phase() == SandboxPhase::Deleting as i32)
+            {
                 return Ok(());
             }
             let age_ms = openshell_core::time::now_ms()
@@ -5771,7 +5882,7 @@ fn has_specific_infrastructure_error(sandbox: &Sandbox) -> bool {
         })
 }
 
-fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
+pub fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
     sandbox.phase() == SandboxPhase::Error as i32
         && sandbox.status.as_ref().is_some_and(|status| {
             status.exit_code.is_some()
@@ -6969,6 +7080,11 @@ fn apply_lifecycle_phase(
     image_preparation_timeout_seconds: u32,
 ) {
     sandbox.set_phase(phase as i32);
+    if phase == SandboxPhase::Starting {
+        // Restart can beat allocation recovery after a lost claim
+        // acknowledgement. Never carry that intent into a new attempt.
+        warm_pool::clear_pending(sandbox);
+    }
     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
         let status = sandbox.status.get_or_insert_with(Default::default);
         // Retain the previous instance id as a tombstone until the restarted
@@ -7107,6 +7223,25 @@ impl Default for NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 #[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status>
+    {
+        let _ = &request;
+        Err(Status::unimplemented(
+            "warm pair allocation is not supported",
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status>
+    {
+        Err(Status::unimplemented("warm pools are not supported"))
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<AuthenticateSandboxRequest>,
@@ -7119,6 +7254,7 @@ impl ComputeDriver for NoopTestDriver {
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
                     runtime_identity: runtime_identity.clone(),
+                    registration: None,
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -7344,6 +7480,7 @@ pub fn new_test_runtime_with_driver(
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+        assignment_notifications: watch::channel(()).0,
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
@@ -7713,6 +7850,8 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestDriver {
+        warm_create_store: Option<Arc<Store>>,
+        warm_create_error: Option<Code>,
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
@@ -7723,6 +7862,29 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for TestDriver {
+        async fn select_warm_pair(
+            &self,
+            request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>,
+            Status,
+        > {
+            let _ = &request;
+            Err(Status::unimplemented(
+                "warm pair allocation is not supported",
+            ))
+        }
+
+        async fn sync_warm_pools(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("warm pools are not supported"))
+        }
+
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -7806,6 +7968,7 @@ mod tests {
 
             Ok(tonic::Response::new(GetSandboxResponse {
                 sandbox: Some(sandbox),
+                runtime_identity: String::new(),
             }))
         }
 
@@ -7825,9 +7988,23 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
             self.create_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(store) = &self.warm_create_store {
+                let request = request.into_inner();
+                let id = &request.sandbox.as_ref().unwrap().id;
+                let stored = store
+                    .get_message::<Sandbox>(id)
+                    .await
+                    .unwrap()
+                    .expect("candidate must be durable before claim");
+                assert_eq!(warm_pool::candidate(&stored).unwrap(), request.warm_pair);
+                assert!(warm_pool::pending(&stored));
+            }
+            if let Some(code) = self.warm_create_error {
+                return Err(Status::new(code, "injected claim failure"));
+            }
             Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
@@ -7898,6 +8075,7 @@ mod tests {
     enum ControlledDeleteOutcome {
         Ok(bool),
         Error(&'static str),
+        AlreadyClaimed,
     }
 
     #[derive(Clone)]
@@ -7915,6 +8093,20 @@ mod tests {
     }
 
     struct ControlledDriver {
+        candidates: TestMutex<Vec<openshell_core::proto::compute::v1::WarmPairCandidate>>,
+        rejected_candidates: TestMutex<Vec<String>>,
+        selections: TestMutex<Vec<Vec<String>>>,
+        create_requests: TestMutex<Vec<CreateSandboxRequest>>,
+        create_calls: AtomicUsize,
+        create_started: Notify,
+        create_finished: Notify,
+        create_release: Semaphore,
+        create_blocked: AtomicBool,
+        create_error: TestMutex<Option<Status>>,
+        cold_create_error: TestMutex<Option<Code>>,
+        track_compute: AtomicBool,
+        compute_exists: AtomicBool,
+        warm_delete_requests: TestMutex<Vec<DeleteSandboxRequest>>,
         watch_tx: mpsc::UnboundedSender<Result<WatchSandboxesEvent, Status>>,
         watch_rx: TestMutex<Option<mpsc::UnboundedReceiver<Result<WatchSandboxesEvent, Status>>>>,
         watch_started: Notify,
@@ -7924,14 +8116,6 @@ mod tests {
         delete_calls: AtomicUsize,
         delete_requests: TestMutex<Vec<(String, String)>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
-        create_started: Notify,
-        create_finished: Notify,
-        create_release: Semaphore,
-        create_blocked: AtomicBool,
-        create_calls: AtomicUsize,
-        create_error: TestMutex<Option<Status>>,
-        track_compute: AtomicBool,
-        compute_exists: AtomicBool,
         stop_started: Notify,
         stop_finished: Notify,
         stop_release: Semaphore,
@@ -7959,6 +8143,20 @@ mod tests {
         fn new() -> Arc<Self> {
             let (watch_tx, watch_rx) = mpsc::unbounded_channel();
             Arc::new(Self {
+                candidates: TestMutex::new(Vec::new()),
+                rejected_candidates: TestMutex::new(Vec::new()),
+                selections: TestMutex::new(Vec::new()),
+                create_requests: TestMutex::new(Vec::new()),
+                create_calls: AtomicUsize::new(0),
+                create_started: Notify::new(),
+                create_finished: Notify::new(),
+                create_release: Semaphore::new(0),
+                create_blocked: AtomicBool::new(false),
+                create_error: TestMutex::new(None),
+                cold_create_error: TestMutex::new(None),
+                track_compute: AtomicBool::new(false),
+                compute_exists: AtomicBool::new(false),
+                warm_delete_requests: TestMutex::new(Vec::new()),
                 watch_tx,
                 watch_rx: TestMutex::new(Some(watch_rx)),
                 watch_started: Notify::new(),
@@ -7968,14 +8166,6 @@ mod tests {
                 delete_calls: AtomicUsize::new(0),
                 delete_requests: TestMutex::new(Vec::new()),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
-                create_started: Notify::new(),
-                create_finished: Notify::new(),
-                create_release: Semaphore::new(0),
-                create_blocked: AtomicBool::new(false),
-                create_calls: AtomicUsize::new(0),
-                create_error: TestMutex::new(None),
-                track_compute: AtomicBool::new(false),
-                compute_exists: AtomicBool::new(false),
                 stop_started: Notify::new(),
                 stop_finished: Notify::new(),
                 stop_release: Semaphore::new(0),
@@ -8128,6 +8318,40 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for ControlledDriver {
+        async fn select_warm_pair(
+            &self,
+            request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>,
+            Status,
+        > {
+            let request = request.into_inner();
+            self.selections
+                .lock()
+                .unwrap()
+                .push(request.excluded_candidate_uids.clone());
+            let candidate = self
+                .candidates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|pair| !request.excluded_candidate_uids.contains(&pair.uid))
+                .cloned();
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::SelectWarmPairResponse { candidate },
+            ))
+        }
+
+        async fn sync_warm_pools(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("warm pools are not supported"))
+        }
+
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -8196,6 +8420,11 @@ mod tests {
                 ControlledGetOutcome::Sandbox(sandbox) => {
                     Ok(tonic::Response::new(GetSandboxResponse {
                         sandbox: Some(*sandbox),
+                        runtime_identity: self
+                            .runtime_identity
+                            .lock()
+                            .expect("runtime identity lock poisoned")
+                            .clone(),
                     }))
                 }
                 ControlledGetOutcome::Missing => Err(Status::not_found("sandbox not found")),
@@ -8219,16 +8448,26 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            let request = request.into_inner();
+            let warm = request.warm_pair.is_some();
+            let rejected = request
+                .warm_pair
+                .as_ref()
+                .is_some_and(|pair| self.rejected_candidates.lock().unwrap().contains(&pair.uid));
+            self.create_requests.lock().unwrap().push(request);
             self.create_calls.fetch_add(1, Ordering::SeqCst);
             self.create_started.notify_one();
             if self.create_blocked.load(Ordering::SeqCst) {
-                self.create_release
-                    .acquire()
-                    .await
-                    .expect("create release semaphore closed")
-                    .forget();
+                self.create_release.acquire().await.unwrap().forget();
+            }
+            let cold_create_error = *self.cold_create_error.lock().unwrap();
+            if rejected {
+                return Err(Status::aborted("candidate lost its claim"));
+            }
+            if !warm && let Some(code) = cold_create_error {
+                return Err(Status::new(code, "injected cold create failure"));
             }
             self.create_finished.notify_one();
             let create_error = self
@@ -8342,6 +8581,12 @@ mod tests {
             request: Request<DeleteSandboxRequest>,
         ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
             let request = request.into_inner();
+            if request.warm_pair.is_some() {
+                self.warm_delete_requests
+                    .lock()
+                    .unwrap()
+                    .push(request.clone());
+            }
             self.delete_requests
                 .lock()
                 .expect("delete requests lock poisoned")
@@ -8365,6 +8610,9 @@ mod tests {
                     Ok(tonic::Response::new(DeleteSandboxResponse { deleted }))
                 }
                 ControlledDeleteOutcome::Error(message) => Err(Status::internal(message)),
+                ControlledDeleteOutcome::AlreadyClaimed => Err(Status::failed_precondition(
+                    "candidate already claimed; recover the assignment",
+                )),
             }
         }
 
@@ -8438,6 +8686,7 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
+            assignment_notifications: watch::channel(()).0,
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
@@ -11198,6 +11447,29 @@ mod tests {
 
         #[tonic::async_trait]
         impl ComputeDriver for FailingDriver {
+            async fn select_warm_pair(
+                &self,
+                request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>,
+                Status,
+            > {
+                let _ = &request;
+                Err(Status::unimplemented(
+                    "warm pair allocation is not supported",
+                ))
+            }
+
+            async fn sync_warm_pools(
+                &self,
+                _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>,
+                Status,
+            > {
+                Err(Status::unimplemented("warm pools are not supported"))
+            }
+
             async fn authenticate_sandbox(
                 &self,
                 _request: Request<AuthenticateSandboxRequest>,
@@ -11851,6 +12123,50 @@ mod tests {
             sandbox_resource_version(&stored) + 2,
             "Starting retry claims and settles another operation without rotating identity"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_failed_main_process_restart_rotates_identity() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox =
+            sandbox_record("sb-auth-failed", "sandbox-auth-failed", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "instance-old", 7);
+        let original = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let authority = test_session_authority();
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&authority),
+            )
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let rotated = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &stored.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(rotated.runtime_generation, original.runtime_generation);
+        assert_eq!(rotated.auth_epoch.get(), original.auth_epoch.get() + 1);
+        assert_ne!(rotated.gateway_token_id, original.gateway_token_id);
+        assert!(rotated.refresh_replay.is_none());
+        let authentications = driver.start_authentications();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        assert_eq!(authentication.supervisor.auth_epoch, rotated.auth_epoch);
     }
 
     #[tokio::test]
@@ -14583,6 +14899,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_applies_driver_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            warm_create_store: None,
+            warm_create_error: None,
             workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -14763,6 +15081,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_does_not_recreate_missing_record_from_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            warm_create_store: None,
+            warm_create_error: None,
             workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -15727,6 +16047,7 @@ mod tests {
             remote
                 .create_sandbox(Request::new(CreateSandboxRequest {
                     sandbox: Some(sandbox.clone()),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap();
@@ -15756,6 +16077,7 @@ mod tests {
                 .delete_sandbox(Request::new(DeleteSandboxRequest {
                     sandbox_id: sandbox.id,
                     name: String::new(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap();
@@ -15986,7 +16308,8 @@ mod tests {
         assert!(
             remote
                 .create_sandbox(Request::new(CreateSandboxRequest {
-                    sandbox: Some(sandbox)
+                    sandbox: Some(sandbox),
+                    ..Default::default()
                 }))
                 .await
                 .is_err()
@@ -16089,6 +16412,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_candidate_is_durable_before_claim_and_survives_uncertain_results() {
+        use openshell_core::proto::compute::v1::WarmPairCandidate;
+        for error in [None, Some(Code::Unavailable), Some(Code::Aborted)] {
+            let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            runtime.driver = TracedDriver::new(
+                Arc::new(TestDriver {
+                    warm_create_store: Some(runtime.store.clone()),
+                    warm_create_error: error,
+                    ..Default::default()
+                }),
+                "test-driver".into(),
+            );
+            let mut sandbox = sandbox_record("warm-logical", "warm", SandboxPhase::Provisioning);
+            sandbox.status.as_mut().unwrap().provisioning = Some(
+                provisioning_deadline::new_record(openshell_core::time::now_ms()),
+            );
+            let pair = WarmPairCandidate {
+                uid: "parent-uid".into(),
+                name: "physical".into(),
+                namespace: "openshell".into(),
+                runtime_generation: "prepared-generation".into(),
+                ..Default::default()
+            };
+            let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
+            annotations.insert(
+                "internal.openshell.ai/warm-pair-candidate".into(),
+                hex::encode(pair.encode_to_vec()),
+            );
+            annotations.insert(
+                "internal.openshell.ai/warm-pair-pending".into(),
+                "true".into(),
+            );
+            let mut assignments = runtime.subscribe_assignments();
+            runtime.create_sandbox(sandbox, None, false).await.unwrap();
+            assert_eq!(assignments.has_changed().unwrap(), error.is_none());
+            if error.is_none() {
+                // A claim between observation and waiting must not lose its wakeup.
+                tokio::time::timeout(Duration::from_millis(100), assignments.changed())
+                    .await
+                    .expect("successful claim should wake registration immediately")
+                    .unwrap();
+            }
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>("warm-logical")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(warm_pool::candidate(&stored).unwrap(), Some(pair));
+            assert_eq!(warm_pool::pending(&stored), error.is_some());
+            if error.is_some() {
+                let record = runtime
+                    .store
+                    .get(Sandbox::object_type(), "warm-logical")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                runtime
+                    .prune_missing_sandbox(record, i64::MAX, 0)
+                    .await
+                    .unwrap();
+                assert!(
+                    runtime
+                        .store
+                        .get_message::<Sandbox>("warm-logical")
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -16446,6 +16843,269 @@ mod tests {
         }
     }
 
+    fn warm_recovery_state(mut runtime: ComputeRuntime) -> crate::ServerState {
+        // Fresh process-local fences with the same durable store and driver.
+        runtime.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+        runtime.sync_lock = Arc::new(Mutex::new(()));
+        let mut state = crate::ServerState::new(
+            crate::Config::new(None).with_credential_drivers(["test-static"]),
+            runtime.store.clone(),
+            runtime.clone(),
+            runtime.sandbox_index.clone(),
+            runtime.sandbox_watch_bus.clone(),
+            runtime.tracing_log_bus.clone(),
+            runtime.supervisor_sessions,
+            None,
+        );
+        let key = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+        state.sandbox_session_jwt_authority = Some(Arc::new(
+            crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                key.signing_key_pem.as_bytes(),
+                key.public_key_pem.as_bytes(),
+                key.kid,
+                "gateway",
+                Some(Duration::from_hours(1)),
+            )
+            .unwrap(),
+        ));
+        state
+    }
+
+    async fn seed_warm_attempt(runtime: &ComputeRuntime, warm: bool, now_ms: i64) -> Sandbox {
+        use crate::auth::sandbox_session::PersistedSandboxIdentity;
+        use openshell_core::proto::compute::v1::WarmPairCandidate;
+        let mut sandbox = seed_provisioning_attempt(runtime).await;
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_record(now_ms));
+        let mut identity = PersistedSandboxIdentity::new().unwrap();
+        warm_pool::bind_candidate(
+            &mut sandbox,
+            &mut identity,
+            warm.then(|| WarmPairCandidate {
+                namespace: "openshell".into(),
+                name: "physical".into(),
+                uid: "pair-uid".into(),
+                runtime_generation: "prepared-generation".into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn allocation_pair(index: usize) -> openshell_core::proto::compute::v1::WarmPairCandidate {
+        openshell_core::proto::compute::v1::WarmPairCandidate {
+            namespace: "openshell".into(),
+            name: format!("physical-{index}"),
+            uid: format!("uid-{index}"),
+            runtime_generation: format!("generation-{index}"),
+            template_id: "pool-template".into(),
+            ..Default::default()
+        }
+    }
+
+    async fn unpersisted_warm_intent(runtime: &ComputeRuntime, id: &str) -> Sandbox {
+        use openshell_core::proto::{ObjectMeta, SandboxWorkloadTemplateProvenance};
+        if runtime
+            .store
+            .get_message::<SandboxWorkloadTemplate>("pool-template")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            runtime
+                .store
+                .put_message(&SandboxWorkloadTemplate {
+                    metadata: Some(ObjectMeta {
+                        id: "pool-template".into(),
+                        name: "pool-template".into(),
+                        workspace: "default".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let template = runtime
+            .store
+            .get_message::<SandboxWorkloadTemplate>("pool-template")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sandbox = sandbox_record(id, id, SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec::default());
+        sandbox.created_from_workload_template = Some(SandboxWorkloadTemplateProvenance {
+            name: "pool-template".into(),
+            resource_version: template.metadata.unwrap().resource_version.to_string(),
+        });
+        sandbox.status.as_mut().unwrap().provisioning = Some(provisioning_deadline::new_record(
+            openshell_core::time::now_ms(),
+        ));
+        warm_pool::bind_candidate(
+            &mut sandbox,
+            &mut crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap(),
+            Some(allocation_pair(0)),
+        )
+        .unwrap();
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn warm_create_with_providers_releases_global_guard_after_persistence() {
+        use crate::grpc::test_support::{authed_request, seed_example_provider_profiles};
+        use openshell_core::proto::open_shell_server::OpenShell;
+        use openshell_core::proto::{
+            ObjectMeta, Provider, SandboxWorkloadConfig, SandboxWorkloadTemplateSpec,
+        };
+
+        for (collision, uncertain) in [(false, false), (true, false), (false, true)] {
+            let driver = ControlledDriver::new();
+            *driver.candidates.lock().unwrap() = vec![allocation_pair(0), allocation_pair(1)];
+            driver.create_blocked.store(true, Ordering::SeqCst);
+            if uncertain {
+                *driver.create_error.lock().unwrap() =
+                    Some(Status::unavailable("injected create failure"));
+            }
+            let runtime = test_runtime(driver.clone()).await;
+            crate::ensure_default_workspace(&runtime.store)
+                .await
+                .unwrap();
+            seed_example_provider_profiles(&runtime.store).await;
+            runtime
+                .store
+                .put_message(&Provider {
+                    metadata: Some(ObjectMeta {
+                        id: "provider-github".into(),
+                        name: "work-github".into(),
+                        workspace: "default".into(),
+                        ..Default::default()
+                    }),
+                    r#type: "github".into(),
+                    credentials: HashMap::from([("TOKEN".into(), "test-secret".into())]),
+                    profile_workspace: "default".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let winner = unpersisted_warm_intent(&runtime, "winner").await;
+            if collision {
+                runtime
+                    .store
+                    .put_sandbox_allocation(
+                        &winner,
+                        warm_pool::allocation_claim(&runtime, &winner)
+                            .unwrap()
+                            .as_ref(),
+                        WriteCondition::MustCreate,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut template = runtime
+                .store
+                .get_message::<SandboxWorkloadTemplate>("pool-template")
+                .await
+                .unwrap()
+                .unwrap();
+            template.spec = Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    image: "test-image".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            runtime.store.put_message(&template).await.unwrap();
+            let state = Arc::new(warm_recovery_state(runtime));
+            let guard = state.compute.sandbox_sync_guard().await;
+            let task_state = state.clone();
+            let mut task = tokio::spawn(async move {
+                Box::pin(
+                    crate::grpc::OpenShellService::new(task_state).create_sandbox(authed_request(
+                        openshell_core::proto::CreateSandboxRequest {
+                            name: "provider-warm".into(),
+                            spec: Some(SandboxSpec {
+                                providers: vec!["work-github".into()],
+                                ..Default::default()
+                            }),
+                            workload_template: "pool-template".into(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                )
+                .await
+            });
+            let waiting = tokio::time::timeout(Duration::from_millis(20), &mut task).await;
+            assert!(
+                waiting.is_err(),
+                "provider validation must wait for the global guard: {waiting:?}"
+            );
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(5), driver.create_started.notified())
+                .await
+                .expect("create should reach the driver");
+
+            // The driver is blocked: other operations can already take the
+            // global lock and observe the committed provider attachment.
+            let guard =
+                tokio::time::timeout(Duration::from_secs(1), state.compute.sandbox_sync_guard())
+                    .await
+                    .expect("driver I/O must not hold the global guard");
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", "provider-warm")
+                .await
+                .unwrap()
+                .expect("intent must be persisted before releasing the guard");
+            assert_eq!(stored.spec.as_ref().unwrap().providers, vec!["work-github"]);
+            assert_eq!(
+                warm_pool::candidate(&stored).unwrap(),
+                Some(allocation_pair(usize::from(collision)))
+            );
+            let mut competing_claim = warm_pool::allocation_claim(&state.compute, &stored)
+                .unwrap()
+                .unwrap();
+            competing_claim.sandbox_id = "contender".into();
+            assert!(
+                state
+                    .store
+                    .allocation_conflicts(&competing_claim)
+                    .await
+                    .unwrap()
+            );
+            drop(guard);
+
+            driver.create_blocked.store(false, Ordering::SeqCst);
+            driver.create_release.add_permits(1);
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+            if result.is_err() {
+                task.abort();
+            }
+            let sandbox = result
+                .expect("completion and recovery must not deadlock")
+                .unwrap()
+                .unwrap()
+                .into_inner()
+                .sandbox
+                .unwrap();
+            assert_eq!(warm_pool::pending(&sandbox), uncertain);
+            assert_eq!(sandbox.spec.unwrap().providers, vec!["work-github"]);
+            assert_eq!(
+                driver.create_calls.load(Ordering::SeqCst),
+                if uncertain { 2 } else { 1 }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn late_create_error_preserves_newer_recovery_operation() {
         assert_late_create_preserves_recovery(true, "").await;
@@ -16747,6 +17407,561 @@ mod tests {
             assert!(provisioning_deadline::timed_out(&retained));
             assert_eq!(retained.phase(), i32::from(SandboxPhase::Error));
             assert!(provisioning_operation::same_operation(&pending, &retained));
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_concurrent_creates_reserve_distinct_targets_without_waiting_for_recovery() {
+        let driver = ControlledDriver::new();
+        *driver.candidates.lock().unwrap() = vec![allocation_pair(0), allocation_pair(1)];
+        driver.create_blocked.store(true, Ordering::SeqCst);
+        let runtime = test_runtime(driver.clone()).await;
+        let first = unpersisted_warm_intent(&runtime, "first").await;
+        let second = unpersisted_warm_intent(&runtime, "second").await;
+        let left = warm_recovery_state(runtime.clone());
+        let right = warm_recovery_state(runtime.clone());
+        let a = tokio::spawn(
+            async move { Box::pin(warm_pool::create(&left, first, None, None)).await },
+        );
+        tokio::time::timeout(Duration::from_secs(5), driver.create_started.notified())
+            .await
+            .unwrap();
+        let b =
+            tokio::spawn(
+                async move { Box::pin(warm_pool::create(&right, second, None, None)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), driver.create_started.notified())
+            .await
+            .unwrap();
+        let requests = driver.create_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].warm_pair, Some(allocation_pair(0)));
+        assert_eq!(requests[1].warm_pair, Some(allocation_pair(1)));
+        assert_eq!(
+            driver.delete_calls(),
+            0,
+            "the losing reservation must never retire the winner's target"
+        );
+        assert_eq!(
+            *driver.selections.lock().unwrap(),
+            vec![vec!["uid-0".to_string()]]
+        );
+        driver.create_blocked.store(false, Ordering::SeqCst);
+        driver.create_release.add_permits(2);
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            (a.await.unwrap().unwrap(), b.await.unwrap().unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(!warm_pool::pending(&first));
+        assert!(!warm_pool::pending(&second));
+        assert_ne!(
+            warm_pool::candidate(&first).unwrap(),
+            warm_pool::candidate(&second).unwrap()
+        );
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_recovery_claims_replacement_immediately_and_bounds_cold_fallback() {
+        for exhaust in [false, true] {
+            let driver = ControlledDriver::new();
+            *driver.candidates.lock().unwrap() = (0..8).map(allocation_pair).collect();
+            *driver.rejected_candidates.lock().unwrap() = if exhaust {
+                (0..8).map(|index| allocation_pair(index).uid).collect()
+            } else {
+                vec!["uid-0".into()]
+            };
+            let runtime = test_runtime(driver.clone()).await;
+            let sandbox = unpersisted_warm_intent(&runtime, "recover").await;
+            let attempt = sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .clone();
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let state = warm_recovery_state(runtime.clone());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                warm_pool::recover_one(&state, "recover"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>("recover")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!warm_pool::pending(&current));
+            assert_eq!(
+                current
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap()
+                    .attempt_id,
+                attempt.attempt_id
+            );
+            assert_eq!(
+                current
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap()
+                    .deadline,
+                attempt.deadline
+            );
+            let requests = driver.create_requests.lock().unwrap().clone();
+            if exhaust {
+                assert_eq!(
+                    requests.len(),
+                    5,
+                    "four warm attempts then immediate cold fallback"
+                );
+                assert!(requests.last().unwrap().warm_pair.is_none());
+                assert!(warm_pool::candidate(&current).unwrap().is_none());
+            } else {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[1].warm_pair, Some(allocation_pair(1)));
+                assert_eq!(
+                    sandbox_runtime_generation(&current).unwrap().as_str(),
+                    "generation-1"
+                );
+            }
+            assert_eq!(driver.delete_calls(), if exhaust { 4 } else { 1 });
+            let mut previous = warm_pool::allocation_claim(&runtime, &sandbox)
+                .unwrap()
+                .unwrap();
+            previous.sandbox_id = "probe".into();
+            assert!(
+                !runtime.store.allocation_conflicts(&previous).await.unwrap(),
+                "retired target reservation must be released"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_fallback_recovers_runtime_identity_after_lost_create_response() {
+        let driver = ControlledDriver::new();
+        *driver.candidates.lock().unwrap() = vec![allocation_pair(0)];
+        *driver.rejected_candidates.lock().unwrap() = vec![allocation_pair(0).uid];
+        *driver.cold_create_error.lock().unwrap() = Some(Code::Unavailable);
+        driver.set_runtime_identity("kubernetes://openshell/runtime-uid/supervisor-uid");
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(DriverSandbox {
+            id: "recover".into(),
+            name: "recover".into(),
+            ..Default::default()
+        })));
+
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = unpersisted_warm_intent(&runtime, "recover").await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let state = warm_recovery_state(runtime.clone());
+
+        assert_eq!(
+            warm_pool::recover_one(&state, "recover")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        let pending = runtime
+            .store
+            .get_message::<Sandbox>("recover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(warm_pool::pending(&pending));
+        assert!(warm_pool::candidate(&pending).unwrap().is_none());
+
+        *driver.cold_create_error.lock().unwrap() = Some(Code::AlreadyExists);
+        warm_pool::recover_one(&state, "recover").await.unwrap();
+
+        let recovered = runtime
+            .store
+            .get_message::<Sandbox>("recover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!warm_pool::pending(&recovered));
+        let annotations = &recovered.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "kubernetes://openshell/runtime-uid/supervisor-uid"
+        );
+        assert_eq!(annotations[COMPUTE_DRIVER_ANNOTATION], "test-driver");
+    }
+
+    #[tokio::test]
+    async fn warm_uncertain_claim_keeps_reservation_across_gateway_restart() {
+        let driver = ControlledDriver::new();
+        *driver.create_error.lock().unwrap() = Some(Status::unavailable("injected create failure"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = unpersisted_warm_intent(&runtime, "uncertain").await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        assert_eq!(
+            warm_pool::recover_one(&warm_recovery_state(runtime.clone()), "uncertain")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        let mut contender = warm_pool::allocation_claim(&runtime, &sandbox)
+            .unwrap()
+            .unwrap();
+        contender.sandbox_id = "other".into();
+        assert!(
+            runtime
+                .store
+                .allocation_conflicts(&contender)
+                .await
+                .unwrap()
+        );
+        assert_eq!(driver.delete_calls(), 0);
+        assert!(driver.selections.lock().unwrap().is_empty());
+        *driver.create_error.lock().unwrap() = None;
+        warm_pool::recover_one(&warm_recovery_state(runtime.clone()), "uncertain")
+            .await
+            .unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>("uncertain")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!warm_pool::pending(&current));
+        assert_eq!(
+            warm_pool::candidate(&current).unwrap(),
+            warm_pool::candidate(&sandbox).unwrap()
+        );
+        assert_eq!(driver.create_requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_restart_after_lost_claim_acknowledgement_preserves_assignment() {
+        use crate::auth::sandbox_session::PersistedSandboxIdentity;
+
+        for exit_code in [0, 1] {
+            for recover_before_restart in [false, true] {
+                let driver = ControlledDriver::new();
+                *driver.create_error.lock().unwrap() =
+                    Some(Status::unavailable("injected create failure"));
+                let runtime = test_runtime(driver.clone()).await;
+                let sandbox = unpersisted_warm_intent(&runtime, "uncertain").await;
+                runtime.store.put_message(&sandbox).await.unwrap();
+                let state = warm_recovery_state(runtime.clone());
+
+                // Reserve the pair, but lose the acknowledgement of its claim.
+                assert_eq!(
+                    warm_pool::recover_one(&state, "uncertain")
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::Unavailable
+                );
+                *driver.create_error.lock().unwrap() = None;
+                let mut finished = runtime
+                    .store
+                    .get_message::<Sandbox>("uncertain")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let claim = warm_pool::allocation_claim(&runtime, &finished)
+                    .unwrap()
+                    .unwrap();
+                assert!(warm_pool::pending(&finished));
+
+                // The workload can finish before recovery ever observes Ready.
+                apply_main_process_exit(&mut finished, "first-process", exit_code);
+                runtime.store.put_message(&finished).await.unwrap();
+                if recover_before_restart {
+                    warm_pool::recover_one(&state, "uncertain").await.unwrap();
+                    let recovered = runtime
+                        .store
+                        .get_message::<Sandbox>("uncertain")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(!warm_pool::pending(&recovered));
+                    assert_eq!(recovered.phase(), finished.phase());
+                    assert_eq!(
+                        recovered.status.as_ref().unwrap().exit_code,
+                        Some(exit_code)
+                    );
+                }
+
+                // Also cover restart winning the race with background recovery.
+                // The driver returns before readiness, leaving recovery a Starting row.
+                let starting = runtime.start_sandbox("default", "uncertain").await.unwrap();
+                assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+                assert_ne!(
+                    starting
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .provisioning
+                        .as_ref()
+                        .unwrap()
+                        .attempt_id,
+                    claim.attempt_id
+                );
+                assert!(!warm_pool::pending(&starting));
+                let identity = PersistedSandboxIdentity::read(
+                    &starting.metadata.as_ref().unwrap().annotations,
+                )
+                .unwrap();
+
+                // A different gateway replica must not allocate a replacement or
+                // change the credentials supplied to the restarting supervisor.
+                warm_pool::recover_one(&warm_recovery_state(runtime.clone()), "uncertain")
+                    .await
+                    .unwrap();
+                let current = runtime
+                    .store
+                    .get_message::<Sandbox>("uncertain")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    PersistedSandboxIdentity::read(&current.metadata.as_ref().unwrap().annotations)
+                        .unwrap(),
+                    identity
+                );
+                assert_eq!(
+                    warm_pool::candidate(&current).unwrap(),
+                    Some(allocation_pair(0))
+                );
+                assert_eq!(driver.start_calls(), 1);
+                assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+                assert!(driver.selections.lock().unwrap().is_empty());
+                assert_eq!(driver.delete_calls(), 0);
+                assert!(!runtime.store.allocation_conflicts(&claim).await.unwrap());
+                let mut contender = claim;
+                contender.sandbox_id = "other".into();
+                assert!(
+                    runtime
+                        .store
+                        .allocation_conflicts(&contender)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_recovery_reclaims_expired_attempts_without_allocating() {
+        for warm in [false, true] {
+            for previously_completed in [false, true] {
+                let driver = ControlledDriver::new();
+                let runtime = test_runtime(driver.clone()).await;
+                let mut sandbox = seed_warm_attempt(&runtime, warm, 0).await;
+                let attempt = sandbox
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap()
+                    .attempt_id
+                    .clone();
+                if previously_completed {
+                    sandbox = runtime
+                        .claim_provisioning_timeout(&sandbox, 300_000)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    sandbox
+                        .status
+                        .as_mut()
+                        .unwrap()
+                        .provisioning
+                        .as_mut()
+                        .unwrap()
+                        .cleanup_completed_time =
+                        openshell_core::time::timestamp_from_millis(300_001).ok();
+                    if warm {
+                        // An older late completion could also clear pending,
+                        // leaving only the candidate as evidence of unfinished cleanup.
+                        sandbox
+                            .metadata
+                            .as_mut()
+                            .unwrap()
+                            .annotations
+                            .remove("internal.openshell.ai/warm-pair-pending");
+                    }
+                    runtime.store.put_message(&sandbox).await.unwrap();
+                    assert_eq!(
+                        runtime
+                            .start_sandbox("default", "sandbox-ttl")
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        Code::FailedPrecondition
+                    );
+                }
+                let state = warm_recovery_state(runtime.clone());
+                warm_pool::recover_one(&state, "sb-ttl").await.unwrap();
+                let cleaned = runtime
+                    .store
+                    .get_message::<Sandbox>("sb-ttl")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(cleaned.phase(), SandboxPhase::Error as i32);
+                assert!(provisioning_deadline::timed_out(&cleaned));
+                assert!(!provisioning_deadline::cleanup_pending(&cleaned));
+                assert!(!warm_pool::has_allocation(&cleaned));
+                assert_eq!(driver.create_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(driver.stop_calls(), 1);
+                let requests = driver.warm_delete_requests.lock().unwrap().clone();
+                assert_eq!(requests.len(), usize::from(warm));
+                if warm {
+                    assert!(requests[0].only_unassigned_pair);
+                    assert_eq!(
+                        requests[0].warm_pair,
+                        warm_pool::candidate(&sandbox).unwrap()
+                    );
+                }
+                // Repeated recovery cannot resurrect compute or redo successful cleanup.
+                warm_pool::recover_one(&state, "sb-ttl").await.unwrap();
+                assert_eq!(driver.stop_calls(), 1);
+                assert_eq!(driver.create_calls.load(Ordering::SeqCst), 0);
+                let restarted = runtime
+                    .start_sandbox("default", "sandbox-ttl")
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    restarted
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .provisioning
+                        .as_ref()
+                        .unwrap()
+                        .attempt_id,
+                    attempt
+                );
+                assert!(!provisioning_deadline::timed_out(&restarted));
+                assert_eq!(driver.start_calls(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_timeout_retirement_failure_survives_restart_and_claim_race() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("retirement unavailable"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = seed_warm_attempt(&runtime, true, 0).await;
+        warm_pool::recover_one(&warm_recovery_state(runtime.clone()), "sb-ttl")
+            .await
+            .unwrap();
+        let mut failed = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(provisioning_deadline::cleanup_pending(&failed));
+        assert!(warm_pool::pending(&failed));
+        assert_eq!(
+            warm_pool::candidate(&failed).unwrap(),
+            warm_pool::candidate(&sandbox).unwrap()
+        );
+        let record = failed
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap();
+        assert!(record.cleanup_completed_time.is_none());
+        assert!(!record.cleanup_error.is_empty());
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "sandbox-ttl")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        // Simulate the backoff elapsing and a claim winning before retirement retries.
+        record.cleanup_retry_time = None;
+        runtime.store.put_message(&failed).await.unwrap();
+        driver.set_delete_outcome(ControlledDeleteOutcome::AlreadyClaimed);
+        warm_pool::recover_one(&warm_recovery_state(runtime.clone()), "sb-ttl")
+            .await
+            .unwrap();
+        let cleaned = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provisioning_deadline::cleanup_pending(&cleaned));
+        assert!(!warm_pool::has_allocation(&cleaned));
+        assert_eq!(driver.stop_calls(), 1);
+        assert!(
+            driver
+                .warm_delete_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.only_unassigned_pair)
+        );
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn warm_completion_cannot_clear_expired_or_replaced_attempts() {
+        for change_attempt in [false, true] {
+            let runtime = test_runtime(ControlledDriver::new()).await;
+            // None candidates must still distinguish cold fallback generations.
+            let expected = seed_warm_attempt(&runtime, false, openshell_core::time::now_ms()).await;
+            let mut replacement = expected.clone();
+            if change_attempt {
+                replacement.status.as_mut().unwrap().provisioning = Some(
+                    provisioning_deadline::new_record(openshell_core::time::now_ms()),
+                );
+            } else {
+                crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+                    .unwrap()
+                    .write(&mut replacement.metadata.as_mut().unwrap().annotations);
+            }
+            runtime.store.put_message(&replacement).await.unwrap();
+            warm_pool::completed(&runtime, &expected).await.unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>("sb-ttl")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(warm_pool::pending(&current));
+            let expired = runtime
+                .claim_provisioning_timeout(&current, openshell_core::time::now_ms() + 300_001)
+                .await
+                .unwrap()
+                .unwrap();
+            warm_pool::completed(&runtime, &current).await.unwrap();
+            let after = runtime
+                .store
+                .get_message::<Sandbox>("sb-ttl")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after, expired);
         }
     }
 
@@ -17924,6 +19139,172 @@ mod tests {
                 .cleanup_completed_time
                 .is_some()
         );
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cold_allocation_recovery_retains_create_until_cleanup_can_stop_it() {
+        let driver = ControlledDriver::new();
+        driver.block_create();
+        driver.track_compute.store(true, Ordering::SeqCst);
+        let runtime = test_runtime(driver.clone()).await;
+        // A pending allocation with no candidate is the cold fallback path.
+        seed_warm_attempt(&runtime, false, openshell_core::time::now_ms()).await;
+        let state = warm_recovery_state(runtime.clone());
+        let worker = tokio::spawn(async move { warm_pool::recover_one(&state, "sb-ttl").await });
+        tokio::time::timeout(Duration::from_secs(3), driver.create_started.notified())
+            .await
+            .unwrap();
+        let pending = wait_driver_pending(&runtime, "sb-ttl", true).await;
+        // Model the recovery caller's timeout while its driver request is blocked.
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let expired = runtime
+            .claim_provisioning_timeout(&pending, openshell_core::time::now_ms() + 300_001)
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
+        runtime
+            .reclaim_provisioning_timeout(&expired, &gate)
+            .await
+            .unwrap();
+        let pending = wait_driver_pending(&runtime, "sb-ttl", true).await;
+        assert!(provisioning_deadline::cleanup_pending(&pending));
+        assert!(warm_pool::pending(&pending));
+        assert_eq!(
+            driver.stop_calls(),
+            1,
+            "first stop observes missing compute"
+        );
+
+        driver.release_create();
+        let settled = wait_driver_pending(&runtime, "sb-ttl", false).await;
+        assert!(driver.compute_exists.load(Ordering::SeqCst));
+        assert!(provisioning_deadline::cleanup_pending(&settled));
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                "sb-ttl",
+                sandbox_resource_version(&settled),
+                |sandbox| {
+                    sandbox
+                        .status
+                        .as_mut()
+                        .unwrap()
+                        .provisioning
+                        .as_mut()
+                        .unwrap()
+                        .cleanup_retry_time = None;
+                },
+            )
+            .await
+            .unwrap();
+        let settled = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .reclaim_provisioning_timeout(&settled, &gate)
+            .await
+            .unwrap();
+        let cleaned = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provisioning_deadline::cleanup_pending(&cleaned));
+        assert!(!warm_pool::has_allocation(&cleaned));
+        assert!(!driver.compute_exists.load(Ordering::SeqCst));
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.stop_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_recovery_fences_driver_results_after_expiry() {
+        for outcome in [None, Some(Code::Aborted)] {
+            let driver = ControlledDriver::new();
+            driver.create_blocked.store(true, Ordering::SeqCst);
+            *driver.create_error.lock().unwrap() =
+                outcome.map(|code| Status::new(code, "injected create failure"));
+            let runtime = test_runtime(driver.clone()).await;
+            seed_warm_attempt(&runtime, true, openshell_core::time::now_ms()).await;
+            let state = warm_recovery_state(runtime.clone());
+            let worker =
+                tokio::spawn(async move { warm_pool::recover_one(&state, "sb-ttl").await });
+            tokio::time::timeout(Duration::from_secs(5), driver.create_started.notified())
+                .await
+                .unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>("sb-ttl")
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .claim_provisioning_timeout(&current, openshell_core::time::now_ms() + 300_001)
+                .await
+                .unwrap()
+                .unwrap();
+            driver.create_release.add_permits(1);
+            worker.await.unwrap().unwrap();
+            let cleaned = runtime
+                .store
+                .get_message::<Sandbox>("sb-ttl")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(provisioning_deadline::timed_out(&cleaned));
+            assert!(!provisioning_deadline::cleanup_pending(&cleaned));
+            assert!(!warm_pool::has_allocation(&cleaned));
+            assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(driver.delete_calls(), 1);
+            assert_eq!(driver.stop_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_recovery_cannot_rebind_after_expiry_during_candidate_retirement() {
+        let driver = ControlledDriver::new();
+        *driver.create_error.lock().unwrap() = Some(Status::aborted("injected create failure"));
+        driver.block_delete();
+        let runtime = test_runtime(driver.clone()).await;
+        seed_warm_attempt(&runtime, true, openshell_core::time::now_ms()).await;
+        let state = warm_recovery_state(runtime.clone());
+        let worker = tokio::spawn(async move { warm_pool::recover_one(&state, "sb-ttl").await });
+        tokio::time::timeout(Duration::from_secs(5), driver.delete_started.notified())
+            .await
+            .unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .claim_provisioning_timeout(&current, openshell_core::time::now_ms() + 300_001)
+            .await
+            .unwrap()
+            .unwrap();
+        driver.delete_blocked.store(false, Ordering::SeqCst);
+        driver.release_delete();
+        worker.await.unwrap().unwrap();
+        let cleaned = runtime
+            .store
+            .get_message::<Sandbox>("sb-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(provisioning_deadline::timed_out(&cleaned));
+        assert!(!warm_pool::has_allocation(&cleaned));
+        assert_eq!(
+            sandbox_runtime_generation(&cleaned).unwrap(),
+            sandbox_runtime_generation(&current).unwrap()
+        );
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
         assert_eq!(driver.stop_calls(), 1);
     }
 

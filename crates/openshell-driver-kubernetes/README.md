@@ -107,6 +107,19 @@ and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. The shared network fence remains for
 the lifetime of the namespace.
 
+In managed workspace mode, immutable bootstrap journals live in the driver's
+configured namespace. Registration reads those journals and verifies the
+recorded Sandbox and Pod identities; it does not read workspace Secrets.
+Namespace-scoped RBAC grants journal access, while workspace Secret publication
+uses create-only requests. An interrupted publication before workload release
+fails closed on an existing Secret and requires retiring that preparation.
+Generation cleanup removes its journal, and periodic cleanup removes journals
+whose recorded Sandbox owner no longer exists, using UID-fenced deletion.
+
+Warm-pool claims revalidate external resource approvals and recorded UIDs before
+assignment. Idle inventory with revoked approval is retired; temporary API
+failures retain inventory without making it eligible for assignment.
+
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or

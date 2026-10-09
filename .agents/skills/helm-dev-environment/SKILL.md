@@ -86,6 +86,12 @@ workload Pod. The
 generates gateway and CLI TLS secrets on first install. Supervisor Pods project
 only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
 client certificates and private keys remain outside supervisor and workload Pods.
+Managed workspace deployments keep bootstrap journals in the driver's configured
+namespace under a namespace-scoped pair-journal Role. The gateway creates and
+deletes workspace bootstrap Secrets without Secret reads in workspace namespaces.
+Operator deployments need the workspace chart's bootstrap Secret `get` permission.
+Registration retries older gateway replicas during rollouts; preparation deadlines
+still bound startup.
 The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.

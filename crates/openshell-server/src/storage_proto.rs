@@ -143,8 +143,10 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // Warm-pool registration and allocation messages are public-only. Durable
+    // allocation intent is encoded in existing sandbox metadata annotations.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "2770c37a5c25b3312026a2b2f6a84da225389f1efbfc1eb0c241b2064123f72e";
     const DURABLE_SCHEMA_SHA256: &str =
         "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -556,12 +558,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            106 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -569,7 +571,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -613,7 +615,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
+                (313, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

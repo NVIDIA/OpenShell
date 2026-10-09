@@ -43,6 +43,13 @@ render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
 
+# Upgrades using --reuse-values can lack settings introduced by this chart.
+# Missing warm-pool settings must use the Rust driver's typed defaults.
+render "${work_dir}/warm-pool-absent.yaml" \
+  --set server.drivers.kubernetes.warmPool=null
+extract_toml "${work_dir}/warm-pool-absent.yaml" "${work_dir}/warm-pool-absent.toml"
+preflight "${work_dir}/warm-pool-absent.toml"
+
 # Exercise all serializer shapes through a raw driver table and prove that
 # literal strings, TOML escaping, and null omission survive parsing.
 render "${work_dir}/shapes.yaml" --values "${fixture}"

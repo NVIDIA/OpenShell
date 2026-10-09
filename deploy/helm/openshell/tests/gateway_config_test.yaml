@@ -1432,3 +1432,33 @@ tests:
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 3
+
+  - it: enables warm pooling by default with bounded preparation settings
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.warmPool.maxPairs: 3
+      server.drivers.kubernetes.warmPool.preparationTimeoutSeconds: 120
+      server.drivers.kubernetes.warmPool.maxIdleSeconds: 900
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pool\]\s*enabled = true\s*max_idle_seconds = 900\s*max_pairs = 3\s*preparation_timeout_seconds = 120'
+
+  - it: leaves warm pool defaults to the gateway when reused values lack the map
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.warmPool: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pool\]\s*\['
+
+  - it: preserves disabled warm pooling and a zero pair limit
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.warmPool.enabled: false
+      server.drivers.kubernetes.warmPool.maxPairs: 0
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pool\]\s*enabled = false\s*max_idle_seconds = 3600\s*max_pairs = 0\s*preparation_timeout_seconds = 300'
