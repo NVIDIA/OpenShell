@@ -361,6 +361,19 @@ The default-feature tests are also included in the full workspace test run.
 The focused task is available for local diagnosis and selective-build
 validation; GitHub Actions does not re-run it after the full suite.
 
+### BaseContainer no-UAC qualification
+
+Run the `pc_basecontainer_` tests in `tests/wxc_exec_real.rs` from an unelevated
+terminal with `OPENSHELL_MXC_QUALIFY_NO_UAC=1` and the real
+`OPENSHELL_WXC_EXEC_PATH`. Use the native target and serial execution. One test
+proves the actual OpenShell host-proxy HTTPS/CA/L7 path with
+`pc_proxy_peer_path` empty; the other independently proves MXC's native
+`runtimeConfig.networkProxy` with an ordinary host listener. Both assert
+`TokenElevation=0` and the BaseContainer probe tier. Once enabled, qualification
+fails on missing prerequisites or a skipped workload. Without the opt-in flag,
+the generic real-MXC task skips them; do not count those skips as proof.
+Neither test creates a Windows Firewall rule or launches an AppContainer peer.
+
 ### Proxy-peer firewall validation
 
 Proxy-peer startup requires permission to manage Windows Firewall rules. The
@@ -373,6 +386,10 @@ For the real peer HTTPS/L7 test, stage an AC-readable `openshell-mxc-peer.exe`,
 set `OPENSHELL_MXC_PEER_EXE` to its absolute path, and run the architecture's
 `windows:test:mxc-real:*` task with firewall-management permission. The peer test
 must execute rather than print SKIP before claiming connectivity coverage.
+The current writer's `INetFwRules::Add` plus `LocalAppPackageId` combination is
+[unsupported by Windows](https://learn.microsoft.com/en-us/windows/win32/api/netfw/nf-netfw-inetfwrules-add).
+Elevation alone is not a verified remedy. A passing permission-denial test
+proves failure handling, not successful firewall installation or peer HTTPS.
 
 Relay protocol version 5 requires matching gateway and relay binaries. The
 compiled relay contract tests cover curated non-peer environments and explicit

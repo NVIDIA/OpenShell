@@ -155,7 +155,8 @@ async fn wait_for_target_listener(port: u16) -> std::io::Result<()> {
 /// - `IsolationSession`: persistent, attachable session
 ///   (provision → start → exec → stop → deprovision). Does not support
 ///   `OpenShell` filesystem-policy grants; backend defaults determine visibility.
-/// - `ProcessContainer` (default): one-shot `AppContainer`. Genuinely default-deny: a
+/// - `ProcessContainer` (default): one-shot MXC process. MXC selects `BaseContainer`
+///   when supported and an `AppContainer` fallback otherwise. Genuinely default-deny: a
 ///   write to any ungranted path is denied by the OS. No persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

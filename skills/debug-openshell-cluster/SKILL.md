@@ -857,8 +857,12 @@ When `pc_proxy_peer_path` is configured, the gateway must be able to manage loca
 Windows Firewall rules. Peer startup adds an inbound TCP allow rule scoped to
 the peer executable, AppContainer SID, loopback addresses and ephemeral listener
 port. An authorization error or active policy that ignores inbound rules fails
-startup before readiness; verify the gateway account's permission and effective
-firewall policy. Do not disable the firewall or add a broad port exception.
+startup before readiness. The current rule writer uses `INetFwRules::Add` with
+`LocalAppPackageId`, which Windows does not support, so do not prescribe UAC
+approval as a verified fix. Default BaseContainer host-proxy mode with
+`pc_proxy_peer_path` empty creates no firewall rule and supports an unelevated
+harness on a host with MXC host-loopback support. Keep the loopback-access
+tradeoff explicit. Do not disable the firewall or add a broad port exception.
 
 Peers, pipes, profiles and firewall rules are released after confirmed workload
 termination, including natural completion and launch failure. A timed-out stop

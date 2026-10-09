@@ -81,7 +81,7 @@ onto the agent user's default environment.
 
 | Property | `process_container` | `isolation_session` |
 |---|---|---|
-| Runtime model | One-shot AppContainer process; default backend | Persistent MXC session used to run one configured process |
+| Runtime model | One-shot MXC process; prefers BaseContainer, with a compatible AppContainer fallback; default backend | Persistent MXC session used to run one configured process |
 | Driver lifecycle | Launch and monitor `wxc-exec` | `provision` -> `start` -> `exec`; stop/delete issue `stop` and `deprovision` |
 | Filesystem | Read-only/read-write grants with default-deny behavior | OpenShell filesystem-policy grants are unsupported; MXC rejects non-empty read-only/read-write grants |
 | Portable UI policy | Supported completely | Every explicit `ui` section is rejected before provisioning |
@@ -153,6 +153,12 @@ prevent another sandbox from using the OpenShell proxy, but they do not isolate
 unrelated host-loopback services or authenticate individual processes within
 one sandbox.
 
+On a host where MXC selects BaseContainer and supports host loopback, the
+default host-proxy mode runs from an unelevated harness without a UAC prompt.
+Leave `pc_proxy_peer_path` empty; this path creates no Windows Firewall rule.
+The OpenShell backend name remains `process_container`; BaseContainer is MXC's
+selected enforcement tier.
+
 Proxy-peer mode narrows that exception. The driver starts
 `openshell-mxc-peer.exe` under a per-sandbox AppContainer identity, names that
 identity as MXC's `allowedProxyPeer`, sets MXC's `networkProxy`, and keeps
@@ -172,7 +178,10 @@ Peer readiness includes a Windows Firewall inbound allow rule scoped to the
 peer executable, AppContainer SID, loopback addresses and ephemeral TCP port.
 Proxy-peer mode requires permission to manage local firewall rules; startup
 fails with an actionable diagnostic if permission is missing or active policy
-ignores inbound rules. The gateway removes the rule, process, pipes and profile
+ignores inbound rules. The current rule writer uses `INetFwRules::Add` with
+`LocalAppPackageId`, a combination Windows does not support. This optional mode
+is not qualified for unattended use; elevation alone does not resolve that
+implementation limitation. The gateway removes the rule, process, pipes and profile
 after confirmed workload termination, including natural exit and launch failure.
 A timed-out stop or delete retains ownership until termination is confirmed.
 Retaining the sandbox record does not retain a live peer. Abrupt gateway death

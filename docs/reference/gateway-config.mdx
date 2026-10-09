@@ -1026,6 +1026,13 @@ non-mutating administrator-gated Service Control Manager open.
 
 Set `egress_proxy = true` with `egress_proxy_addr = "127.0.0.1:18080"` to enable the Windows Pattern C split. The address must be a `127.0.0.1:PORT` socket. The driver allocates a unique ephemeral port per sandbox, injects that listener through proxy environment variables, and stages the public proxy CA beneath the sandbox's configured `<cwd>/.openshell-proxy/<sandbox-id>/`. A non-empty per-sandbox `cwd` is therefore required when governed egress is enabled; sandbox-specific subdirectories prevent concurrent sandboxes from overwriting each other's trust files. In the default mode, MXC denies direct Internet egress but allows `127.0.0.1/32`; this permits dynamic forwarding but also means the sandbox can reach unrelated host services bound to loopback.
 
+For an agent harness running without elevation, use `backend = "process_container"`,
+enable `egress_proxy`, and leave `pc_proxy_peer_path = ""`. On a host where MXC
+selects BaseContainer and reports `baseContainerSupportsIngressHostLoopbackAllow`,
+this host-proxy path creates no Windows Firewall rules and requires no UAC
+prompt. BaseContainer is an MXC enforcement tier; it is not a gateway backend
+name. The host-loopback access described above still applies.
+
 Set `pc_proxy_peer_path` to the absolute path of
 `openshell-mxc-peer.exe` to replace that broad host-loopback exception with
 MXC's identity-scoped proxy-peer model. This mode requires
@@ -1044,8 +1051,11 @@ Proxy-peer mode also requires the gateway account to have permission to manage
 Windows Firewall rules. Before startup succeeds, the gateway adds an inbound
 TCP allow rule scoped to the helper executable, AppContainer SID, loopback
 addresses and ephemeral listener port. Startup fails with a diagnostic when
-permission is missing or an active firewall profile ignores inbound rules. The
-gateway removes the peer, pipes, profile and rule after confirmed workload exit,
+permission is missing or an active firewall profile ignores inbound rules.
+The current rule writer combines `INetFwRules::Add` with `LocalAppPackageId`,
+which [Windows does not support](https://learn.microsoft.com/en-us/windows/win32/api/netfw/nf-netfw-inetfwrules-add).
+This optional mode is not qualified for unattended use; granting administrator
+permission alone is not a verified remedy. The gateway removes the peer, pipes, profile and rule after confirmed workload exit,
 stop or launch failure. A timed-out stop or delete retains them until termination
 is confirmed. An abrupt gateway termination can leave the profile and rule for
 operator cleanup.

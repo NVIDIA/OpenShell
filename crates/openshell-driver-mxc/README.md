@@ -9,8 +9,9 @@ contract and is linked into `openshell-gateway`. It sets
 `driver_reports_runtime_readiness`, so the gateway accepts driver-reported
 readiness without a supervisor session. The gateway composes the create-time
 effective `SandboxPolicy` and carries it on the driver-only copy of
-`DriverSandboxSpec.policy`. `process_container` launches a one-shot AppContainer
-and is the default. The opt-in `isolation_session` backend uses the
+`DriverSandboxSpec.policy`. `process_container` launches a one-shot MXC process
+and is the default. MXC selects BaseContainer when supported, otherwise a
+compatible AppContainer fallback. The opt-in `isolation_session` backend uses the
 state-aware `provision` → `start` → `exec` → `stop` → `deprovision` lifecycle.
 The driver launches and monitors the configured workload and self-reports
 readiness. Optional `openshell-supervisor-relay` wrapping provides launch and
@@ -102,6 +103,41 @@ fallback. If it is combined with `egress_proxy = true`, a sandbox policy
 without explicit network rules is rejected synchronously rather than falling
 through from governed egress to `network.egress.default = "allow"`.
 
+### BaseContainer proxy without UAC
+
+For an unelevated agent harness on a BaseContainer host with
+`baseContainerSupportsIngressHostLoopbackAllow`, use the default host proxy:
+
+```toml
+[openshell.drivers.mxc]
+backend = "process_container"
+egress_proxy = true
+egress_proxy_addr = "127.0.0.1:18080"
+pc_proxy_peer_path = ""
+```
+
+Provide a per-sandbox `cwd` and explicit network policy. This path injects proxy
+and CA environment variables and does not create Windows Firewall rules.
+BaseContainer is the tier selected by MXC, not a separate OpenShell backend
+name. The existing host-loopback access tradeoff still applies.
+
+Run both strict no-UAC qualifications from a non-elevated terminal:
+
+```powershell
+$env:OPENSHELL_WXC_EXEC_PATH = "C:\mxc\wxc-exec.exe"
+$env:OPENSHELL_MXC_QUALIFY_NO_UAC = "1"
+cargo test -p openshell-driver-mxc --test wxc_exec_real pc_basecontainer_ -- --ignored --test-threads=1 --nocapture
+```
+
+The first test drives the OpenShell host proxy and checks HTTPS CA validation
+and L7 denial. The second independently sets MXC's native
+`runtimeConfig.networkProxy` against an ordinary local listener without an
+AppContainer peer. OpenShell's default mode uses proxy environment variables;
+it does not select that native runtime-proxy mapping, which has different
+forwarding constraints. Enabled qualification fails on elevation, an unsuitable
+MXC tier, missing prerequisites, or a skipped HTTPS workload. Without the
+opt-in flag, the generic real-MXC suite skips these two qualifications.
+
 ### Proxy-peer mode
 
 By default a `process_container` sandbox gets `hostLoopback: allow` plus an
@@ -157,7 +193,10 @@ forward:  unsupported in proxy-peer mode
   publishing readiness, the gateway installs an inbound TCP allow rule scoped to
   the helper executable, profile SID, `127.0.0.1` endpoints and listener port.
   Startup fails if permission is missing or active firewall policy ignores
-  inbound rules. The gateway does not change profile defaults or loopback exemptions.
+  inbound rules. The current `INetFwRules::Add` writer specifies
+  `LocalAppPackageId`, which [Windows does not support](https://learn.microsoft.com/en-us/windows/win32/api/netfw/nf-netfw-inetfwrules-add).
+  Peer connectivity is not qualified; elevating the gateway alone is not a
+  verified fix. The gateway does not change profile defaults or loopback exemptions.
 - The peer, pipes, firewall rule and profile are released after confirmed workload
   exit, stop or launch failure, even when the sandbox record is retained. A stop
   or delete timeout retains ownership for retry. If the gateway is killed, the

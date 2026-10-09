@@ -37,10 +37,10 @@ impl Drop for ComApartment {
 fn error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!(
         "MXC proxy peer firewall authorization failed: {error}. Proxy-peer mode requires \
-         permission to manage Windows Firewall rules; run the gateway with that permission \
-         and allow local inbound rules in the active firewall profiles. \
-         The gateway will create only a loopback TCP rule for this peer executable, \
-         AppContainer SID and listener port."
+         permission to manage Windows Firewall rules. The current INetFwRules::Add with \
+         LocalAppPackageId implementation is unsupported by Windows; elevation alone is \
+         not a verified remedy. Default BaseContainer host-proxy mode with \
+         pc_proxy_peer_path unset does not call this firewall API."
     ))
 }
 
@@ -103,7 +103,11 @@ impl PeerFirewallRule {
                 }
             }
             let rule = configured_rule(&name, exe, sid, port).map_err(error)?;
-            policy.Rules().map_err(error)?.Add(&rule).map_err(error)?;
+            policy
+                .Rules()
+                .map_err(error)?
+                .Add(&rule)
+                .map_err(|cause| error(format!("INetFwRules::Add: {cause}")))?;
         }
         Ok(Self { name })
     }
@@ -155,6 +159,11 @@ mod tests {
                 let message = error.to_string();
                 assert!(
                     message.contains("permission to manage Windows Firewall rules"),
+                    "{message}"
+                );
+                assert!(message.contains("INetFwRules::Add:"), "{message}");
+                assert!(
+                    message.contains("elevation alone is not a verified remedy"),
                     "{message}"
                 );
                 assert!(
