@@ -244,11 +244,11 @@ impl SecretResolver {
     }
 
     /// Build workload environment and resolver snapshots with gateway-issued
-    /// stable handles for selected refresh-managed credentials.
+    /// stable handles for selected credentials.
     ///
     /// Stable credentials are registered only in the current resolver. Their
     /// previous values never enter the bounded revision-generation queue, so a
-    /// revoked or replaced handle cannot resolve an older access token.
+    /// revoked or replaced handle cannot resolve an older secret value.
     pub(crate) fn from_provider_env_for_current_revision_with_stable_handles(
         provider_env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,

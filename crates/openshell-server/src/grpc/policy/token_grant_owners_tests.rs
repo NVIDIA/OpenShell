@@ -92,7 +92,7 @@ async fn composed_owners_survive_name_collisions_and_audience_overrides() {
     let policy = config.policy.unwrap();
     assert!(policy.network_policies.contains_key("_provider_team_a"));
     assert!(policy.network_policies.contains_key("_provider_team_a_2"));
-    let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+    let environment = load_sandbox_provider_environment(&state, &sandbox, true, true)
         .await
         .unwrap();
     assert_eq!(environment.policy_hash, deterministic_policy_hash(&policy));
@@ -153,7 +153,7 @@ async fn refreshed_profile_owners_do_not_match_the_previous_policy() {
     let mut replacement = profile("owner-a", "/alpha/**");
     replacement.binaries[0].path = "/usr/bin/replacement-client".into();
     store_profile(&state, replacement).await;
-    let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+    let environment = load_sandbox_provider_environment(&state, &sandbox, true, true)
         .await
         .unwrap();
     let replacement_policy = load_sandbox_config(&state, &sandbox)
@@ -184,7 +184,7 @@ async fn refreshed_profile_owners_do_not_match_the_previous_policy() {
 async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinations() {
     let state = test_server_state().await;
     let sandbox = provider_sandbox(&state).await;
-    let before = load_sandbox_provider_environment(&state, &sandbox, true)
+    let before = load_sandbox_provider_environment(&state, &sandbox, true, true)
         .await
         .unwrap();
     let mut global = ProtoSandboxPolicy {
@@ -228,7 +228,7 @@ async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinat
     assert_eq!(global.network_policies.len(), 1);
     let global_owner = &global.network_policies["global_api"].endpoints[0].token_grant_owner;
     assert_ne!(global_owner, "forged-global-owner");
-    let after = load_sandbox_provider_environment(&state, &sandbox, true)
+    let after = load_sandbox_provider_environment(&state, &sandbox, true, true)
         .await
         .unwrap();
     assert_ne!(before.provider_env_revision, after.provider_env_revision);
@@ -270,7 +270,7 @@ async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinat
         .await
         .unwrap();
     let replacement_config = load_sandbox_config(&state, &sandbox).await.unwrap();
-    let replacement_environment = load_sandbox_provider_environment(&state, &sandbox, true)
+    let replacement_environment = load_sandbox_provider_environment(&state, &sandbox, true, true)
         .await
         .unwrap();
     assert_ne!(

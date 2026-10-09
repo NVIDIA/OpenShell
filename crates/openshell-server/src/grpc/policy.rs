@@ -3540,6 +3540,9 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
+    let supports_stable_placeholder_environment_keys = request
+        .get_ref()
+        .supports_stable_placeholder_environment_keys;
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
@@ -3549,9 +3552,13 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let environment =
-        load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
-            .await?;
+    let environment = load_sandbox_provider_environment(
+        state,
+        &sandbox,
+        supports_static_credential_bindings,
+        supports_stable_placeholder_environment_keys,
+    )
+    .await?;
     Ok(Response::new(environment))
 }
 
@@ -3561,6 +3568,7 @@ pub(super) async fn load_sandbox_provider_environment(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
+    supports_stable_placeholder_environment_keys: bool,
 ) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
@@ -3661,6 +3669,32 @@ pub(super) async fn load_sandbox_provider_environment(
                 .remove(&key);
             provider_environment.static_credential_keys.remove(&key);
         }
+        if !supports_stable_placeholder_environment_keys {
+            let unsupported_stable_keys = provider_environment
+                .stable_placeholder_environment_keys
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unsupported_stable_keys.is_empty() {
+                readiness_reason = ProviderReadinessReason::UnsupportedSupervisor;
+            }
+            for key in unsupported_stable_keys {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    key = %key,
+                    "withholding stable-placeholder credential from incompatible supervisor"
+                );
+                provider_environment.environment.remove(&key);
+                provider_environment
+                    .credential_expiration_times
+                    .remove(&key);
+                provider_environment.static_credential_bindings.remove(&key);
+                provider_environment.static_credential_keys.remove(&key);
+            }
+            provider_environment
+                .stable_placeholder_environment_keys
+                .clear();
+        }
     } else {
         if !provider_environment.static_credential_keys.is_empty() {
             readiness_reason = ProviderReadinessReason::UnsupportedSupervisor;
@@ -3670,6 +3704,9 @@ pub(super) async fn load_sandbox_provider_environment(
             provider_environment.credential_expiration_times.remove(key);
         }
         provider_environment.static_credential_bindings.clear();
+        provider_environment
+            .stable_placeholder_environment_keys
+            .clear();
     }
 
     info!(
@@ -3686,6 +3723,23 @@ pub(super) async fn load_sandbox_provider_environment(
         .filter(|key| !provider_environment.static_credential_keys.contains(*key))
         .cloned()
         .collect();
+    if provider_environment
+        .stable_placeholder_environment_keys
+        .iter()
+        .any(|key| {
+            !provider_environment.environment.contains_key(key)
+                || !provider_environment.static_credential_keys.contains(key)
+        })
+    {
+        return Err(Status::failed_precondition(
+            "provider environment contains an unbound stable placeholder key",
+        ));
+    }
+    let mut stable_placeholder_environment_keys = provider_environment
+        .stable_placeholder_environment_keys
+        .into_iter()
+        .collect::<Vec<_>>();
+    stable_placeholder_environment_keys.sort();
 
     let credential_expiration_times = provider_environment
         .credential_expiration_times
@@ -3705,6 +3759,8 @@ pub(super) async fn load_sandbox_provider_environment(
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
+        stable_placeholder_environment_keys,
+        supports_stable_placeholder_environment_keys: true,
         provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
         policy_hash: deterministic_policy_hash(&effective_policy),
         readiness_reason: readiness_reason.into(),
@@ -11573,6 +11629,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-snapshot-consistency".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13181,6 +13238,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13193,6 +13251,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13265,6 +13324,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-files-and-credentials".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: false,
             })),
         )
         .await
@@ -13312,6 +13372,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-static-ready".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: false,
             })),
         )
         .await
@@ -13370,6 +13431,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-legacy-provider-env".to_string(),
                 supports_static_credential_bindings: false,
+                supports_stable_placeholder_environment_keys: false,
             })),
         )
         .await
@@ -13414,6 +13476,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-unbound-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13443,7 +13506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_environment_uses_policy_binding_for_endpointless_profile() {
+    async fn provider_environment_uses_policy_binding_and_negotiates_stable_placeholders() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
             NetworkCredentialBinding, ProviderProfile, ProviderProfileCategory,
@@ -13466,6 +13529,7 @@ mod tests {
                     credentials: vec![openshell_core::proto::ProviderProfileCredential {
                         name: "cloud_token".to_string(),
                         env_vars: vec!["CLOUD_TOKEN".to_string()],
+                        stable_placeholder: true,
                         ..Default::default()
                     }],
                     endpoints: Vec::new(),
@@ -13519,11 +13583,59 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
+        // Both endpoint enforcement and external stable-handle installation are
+        // required. Neither capability on its own permits credential delivery.
+        for (supports_bindings, supports_stable) in [(false, false), (false, true), (true, false)] {
+            let incompatible_environment = handle_get_sandbox_provider_environment(
+                &state,
+                with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                    sandbox_id: "sb-policy-binding".to_string(),
+                    supports_static_credential_bindings: supports_bindings,
+                    supports_stable_placeholder_environment_keys: supports_stable,
+                })),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert!(incompatible_environment.supports_stable_placeholder_environment_keys);
+            assert_eq!(
+                incompatible_environment.readiness_reason,
+                ProviderReadinessReason::UnsupportedSupervisor as i32,
+            );
+            assert!(
+                !incompatible_environment
+                    .environment
+                    .contains_key("CLOUD_TOKEN")
+            );
+            assert!(
+                !incompatible_environment
+                    .static_credential_bindings
+                    .contains_key("CLOUD_TOKEN")
+            );
+            assert!(
+                !incompatible_environment
+                    .credential_expiration_times
+                    .contains_key("CLOUD_TOKEN")
+            );
+            assert!(
+                !incompatible_environment
+                    .non_secret_environment_keys
+                    .iter()
+                    .any(|key| key == "CLOUD_TOKEN")
+            );
+            assert!(
+                incompatible_environment
+                    .stable_placeholder_environment_keys
+                    .is_empty()
+            );
+        }
+
         let environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13540,12 +13652,24 @@ mod tests {
             Some(&"cloud-secret".to_string())
         );
         assert_eq!(
+            environment.stable_placeholder_environment_keys,
+            vec!["CLOUD_TOKEN".to_string()]
+        );
+        assert!(environment.supports_stable_placeholder_environment_keys);
+        assert_eq!(
             environment.static_credential_bindings["CLOUD_TOKEN"].endpoints,
             vec![StaticCredentialEndpointBinding {
                 host: "api.cloud.example".to_string(),
                 port: 443,
                 path: String::new(),
             }]
+        );
+        assert_eq!(
+            environment.static_credential_bindings["CLOUD_TOKEN"]
+                .workload_credential_handle
+                .len(),
+            64,
+            "stable external credentials must carry an identity-bound handle"
         );
         assert_eq!(
             config.provider_env_revision, environment.provider_env_revision,
@@ -13589,6 +13713,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13610,6 +13735,11 @@ mod tests {
         assert_eq!(
             next_environment.static_credential_bindings["CLOUD_TOKEN"].endpoints[0].host,
             "api2.cloud.example"
+        );
+        assert!(
+            next_environment.static_credential_bindings["CLOUD_TOKEN"].workload_credential_handle
+                != environment.static_credential_bindings["CLOUD_TOKEN"].workload_credential_handle,
+            "changing the effective endpoint must revoke the originally issued handle"
         );
 
         let mut unbound_policy = next_policy;
@@ -13649,6 +13779,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13745,6 +13876,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-mixed-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13853,6 +13985,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-token-exchange-subject".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13920,6 +14053,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -13959,6 +14093,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14005,7 +14140,7 @@ mod tests {
         let mut revisions = HashSet::new();
         for _ in 0..16 {
             let config = load_sandbox_config(&state, &sandbox).await.unwrap();
-            let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+            let environment = load_sandbox_provider_environment(&state, &sandbox, true, true)
                 .await
                 .unwrap();
             assert_eq!(
@@ -14450,6 +14585,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14483,6 +14619,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14524,6 +14661,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14628,6 +14766,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14664,6 +14803,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
@@ -14704,6 +14844,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             })),
         )
         .await
