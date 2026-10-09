@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run standalone CLI conformance, and optionally a focused Rust e2e test,
+# Run conformance suites, and optionally a focused Rust e2e test,
 # against a gateway using the bundled Docker compute driver. Set
 # OPENSHELL_GATEWAY_ENDPOINT=http://host:port to reuse an existing plaintext
 # gateway instead of starting an ephemeral one.

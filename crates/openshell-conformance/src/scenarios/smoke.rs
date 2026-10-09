@@ -31,7 +31,6 @@ struct SandboxListPage {
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
 pub const SMOKE_SCENARIO: Scenario = Scenario {
     name: "smoke",
-    description: "Create, inspect, execute in, and delete a base sandbox.",
     run: run_smoke,
 };
 

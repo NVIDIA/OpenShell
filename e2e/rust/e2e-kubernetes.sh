@@ -66,7 +66,7 @@ is_operator_workspace_mode() {
 
 run_conformance() {
   if is_operator_workspace_mode; then
-    echo "note: skipping standalone CLI conformance in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
+    echo "note: skipping conformance suites in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
     return 0
   fi
 
