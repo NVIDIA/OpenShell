@@ -16,7 +16,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
-mod backend_setup;
+pub mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
@@ -667,33 +667,34 @@ pub async fn run_sandbox(
     .await
 }
 
-struct SandboxRunConfig {
-    command: Vec<String>,
-    workdir: Option<String>,
-    timeout_secs: u64,
-    interactive: bool,
-    await_main_process_attachment: bool,
-    sandbox_id: Option<String>,
-    sandbox: Option<String>,
-    openshell_endpoint: Option<String>,
-    policy_rules: Option<String>,
-    policy_data: Option<String>,
-    ssh_socket_path: Option<String>,
-    health_socket_path: Option<std::path::PathBuf>,
-    health_port: Option<u16>,
-    ocsf_enabled: Arc<AtomicBool>,
-    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
-    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
-    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    admitted_isolation_backend: Option<String>,
-    main_exit_marker: Option<std::path::PathBuf>,
+/// Trusted inputs for one supervisor launch.
+pub struct SandboxRunConfig {
+    pub command: Vec<String>,
+    pub workdir: Option<String>,
+    pub timeout_secs: u64,
+    pub interactive: bool,
+    pub await_main_process_attachment: bool,
+    pub sandbox_id: Option<String>,
+    pub sandbox: Option<String>,
+    pub openshell_endpoint: Option<String>,
+    pub policy_rules: Option<String>,
+    pub policy_data: Option<String>,
+    pub ssh_socket_path: Option<String>,
+    pub health_socket_path: Option<std::path::PathBuf>,
+    pub health_port: Option<u16>,
+    pub ocsf_enabled: Arc<AtomicBool>,
+    pub ocsf_schema_version: Arc<std::sync::Mutex<String>>,
+    pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
+    pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
+    pub admitted_isolation_backend: Option<String>,
+    pub main_exit_marker: Option<std::path::PathBuf>,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
 /// lifecycle handling. Payload contents never select a backend implementation.
 #[allow(clippy::similar_names)]
-async fn run_sandbox_with_backend(
+pub async fn run_sandbox_with_backend(
     backend_setup: &dyn backend_setup::BackendSetup,
     config: SandboxRunConfig,
 ) -> Result<i32> {
@@ -2141,7 +2142,7 @@ enum LocalPolicyIdentity {
 /// init maps the `sandbox` account to this pair; the host must not resolve
 /// guest selectors through its own account database.
 #[derive(Clone, Copy)]
-struct VmPolicyIdentity {
+pub struct VmPolicyIdentity {
     uid: u32,
     gid: u32,
 }

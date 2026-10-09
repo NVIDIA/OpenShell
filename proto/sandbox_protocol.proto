@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.sandbox.protocol.v1;
+
+// Stream entrypoint for per-boundary or shared out-of-process Isolation Backends.
+// Each client stream starts with a boundary_id frame. The backend checks that
+// handle against the authenticated sandbox and generation before accepting any
+// data. Subsequent data fragments carry the existing Sandbox Protocol bytes.
+// OpenBoundary returns the handle before policy discovery and lifecycle traffic.
+service DelegatedIsolationBoundary {
+  rpc Exchange(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
+  rpc Mediate(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
+}
+
+message DelegatedBoundaryChunk {
+  oneof payload {
+    // Nonempty handle required as the first client frame; forbidden on later frames.
+    string boundary_id = 1;
+    // Ordered fragment of the existing Sandbox Protocol. Response frames only
+    // use data. Empty data is allowed and does not bind a stream.
+    bytes data = 2;
+  }
+}

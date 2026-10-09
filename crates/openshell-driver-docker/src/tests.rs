@@ -100,6 +100,7 @@ fn test_sandbox() -> DriverSandbox {
             await_main_process_attachment: false,
             workload_identity: None,
             launch_authentication: test_launch_authentication(),
+            isolation_backend: None,
         }),
         status: None,
         workspace: String::new(),

@@ -19,6 +19,10 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Driver stages operator-selected external isolation routes for the supervisor.
+pub const COMPUTE_ISOLATION_BACKEND_REGISTRATION: &str =
+    "openshell.compute.isolation-backend-registration";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;

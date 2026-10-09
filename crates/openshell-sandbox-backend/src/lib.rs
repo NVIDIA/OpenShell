@@ -9,6 +9,7 @@
 //! types in this crate.
 
 pub mod boundary_protocol;
+pub mod delegated;
 pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
@@ -16,7 +17,7 @@ pub mod sandbox_auth;
 pub use runtime::OpenShellRuntimeBackend;
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
-pub const BACKEND_NAME: &str = "openshell-sandbox";
+pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;
 
 /// Resource claim set by compute drivers when the workload requests GPU access.
 pub const GPU_RESOURCE_CLAIM: &str = "openshell.gpu";
