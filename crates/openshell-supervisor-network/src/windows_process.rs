@@ -3,9 +3,11 @@
 
 //! Windows TCP socket-owner and process-image resolution.
 
+use std::collections::HashMap;
 use std::mem::{offset_of, size_of, size_of_val};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use miette::Result;
 use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
@@ -29,6 +31,80 @@ impl Drop for ProcessHandle {
         // guard is its sole owner.
         #[allow(unsafe_code)]
         let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Aliases for connections that reach the host proxy through a tunnel.
+///
+/// Host-side proxy identity is the owner of the client socket the proxy accepted.
+/// When the sandbox can only reach a relay process (the MXC proxy peer) that
+/// forwards its bytes to the proxy, the accepted socket belongs to the forwarder,
+/// not to the sandbox process that opened the original connection. The forwarder's
+/// owner (the gateway) registers, per tunnelled connection, which original
+/// `workload -> proxy` connection the accepted socket stands for, and identity
+/// resolution then looks up that original connection instead.
+///
+/// Only code holding this handle, which lives inside the gateway process, can
+/// register an alias.
+#[derive(Clone, Default)]
+pub struct ForwardedClients {
+    aliases: Arc<Mutex<HashMap<SocketAddr, WorkloadProxyTcpConnection>>>,
+}
+
+/// Removes its alias when dropped. Keep it alive for as long as the tunnelled
+/// connection is open.
+pub struct ForwardedClientGuard {
+    clients: ForwardedClients,
+    bridge: SocketAddr,
+}
+
+impl ForwardedClients {
+    /// Register that connections accepted from `bridge` (the forwarder's socket as
+    /// the proxy sees it) belong to `original`.
+    #[must_use]
+    pub fn register(
+        &self,
+        bridge: SocketAddr,
+        original: WorkloadProxyTcpConnection,
+    ) -> ForwardedClientGuard {
+        if let Ok(mut aliases) = self.aliases.lock() {
+            aliases.insert(bridge, original);
+        }
+        ForwardedClientGuard {
+            clients: self.clone(),
+            bridge,
+        }
+    }
+
+    /// Whether the connection accepted from `bridge` is a registered tunnel. Such a
+    /// connection arrived through the sandbox's access-controlled peer pipe, which
+    /// only the gateway can register, so it does not need the per-sandbox proxy
+    /// password (the MXC-provided proxy variables carry no credentials).
+    pub(crate) fn is_tunnelled(&self, bridge: SocketAddr) -> bool {
+        self.aliases
+            .lock()
+            .is_ok_and(|aliases| aliases.contains_key(&bridge))
+    }
+
+    /// Map an accepted connection to the original connection it tunnels, or
+    /// return it unchanged when it is not tunnelled.
+    pub(crate) fn resolve(
+        &self,
+        connection: WorkloadProxyTcpConnection,
+    ) -> WorkloadProxyTcpConnection {
+        self.aliases
+            .lock()
+            .ok()
+            .and_then(|aliases| aliases.get(&connection.workload).copied())
+            .unwrap_or(connection)
+    }
+}
+
+impl Drop for ForwardedClientGuard {
+    fn drop(&mut self) {
+        if let Ok(mut aliases) = self.clients.aliases.lock() {
+            aliases.remove(&self.bridge);
+        }
     }
 }
 
@@ -277,6 +353,34 @@ mod tests {
     use super::*;
 
     const CHILD_PORT_ENV: &str = "OPENSHELL_TEST_WINDOWS_SOCKET_OWNER_PORT";
+
+    #[test]
+    fn forwarded_clients_map_tunnelled_connections_and_clean_up() {
+        let clients = ForwardedClients::default();
+        let bridge: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let proxy: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let original = WorkloadProxyTcpConnection::new(
+            "127.0.0.1:61000".parse().unwrap(),
+            "127.0.0.1:62000".parse().unwrap(),
+        );
+        let tunnelled = WorkloadProxyTcpConnection::new(bridge, proxy);
+
+        // Not registered: returned unchanged.
+        assert_eq!(clients.resolve(tunnelled), tunnelled);
+
+        assert!(!clients.is_tunnelled(bridge));
+        let guard = clients.register(bridge, original);
+        assert!(clients.is_tunnelled(bridge));
+        assert!(!clients.is_tunnelled("127.0.0.1:50002".parse().unwrap()));
+        assert_eq!(clients.resolve(tunnelled), original);
+        // A different bridge socket is unaffected.
+        let other = WorkloadProxyTcpConnection::new("127.0.0.1:50001".parse().unwrap(), proxy);
+        assert_eq!(clients.resolve(other), other);
+
+        drop(guard);
+        assert!(!clients.is_tunnelled(bridge));
+        assert_eq!(clients.resolve(tunnelled), tunnelled);
+    }
 
     #[test]
     fn socket_owner_child() {

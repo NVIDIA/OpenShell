@@ -1,69 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! WebSocket relay embedded in the gateway for MXC `ProcessContainer` sandboxes.
+//! Dynamic forwarding relay embedded in the gateway for MXC sandboxes.
 //!
-//! The `AppContainer` needs private-network client access (for example, the
-//! `privateNetworkClientServer` capability used by the qualification profile).
-//! The driver binds a relay listener on demand (`start_relay`, e.g. from
-//! `ForwardSink::open_dynamic_forward`) and tells the in-sandbox spawner its
-//! address over the stdin/stdout control channel; the spawner connects directly
-//! to it as a WebSocket CLIENT (Phase A). Governed egress and its host CONNECT
-//! proxy are not part of this relay path. Host clients connect as raw TCP
-//! (Phase B); the relay tunnels their bytes through Phase A so the in-sandbox
-//! agent can pipe them directly to the target service. Each relay is
-//! per-request and short-lived — bound fresh for each `openshell forward
-//! service` call, torn down when that forward ends.
+//! The driver binds a loopback listener on demand from
+//! `ForwardSink::open_dynamic_forward`. Host clients authenticate with a fresh
+//! per-forward nonce. In the default network mode, the gateway multiplexes
+//! target I/O over the inherited stdin/stdout control channel to
+//! `openshell-supervisor-relay`. Proxy-peer mode deliberately does not provide
+//! dynamic forwarding because MXC denies both sandbox-local loopback and reverse
+//! peer-to-workload connections in that posture. Governed egress and its host
+//! CONNECT proxy are not part of this path. Each relay is per-request and
+//! short-lived.
 //!
 //! ```text
-//! host TCP client  ->  relay (gateway, raw TCP accept)
-//!                          |  tunnel via Phase A WS
-//!                      sandbox agent  ->  local service (openclaw:18889)
+//! host TCP client -> authenticated gateway loopback listener
+//!                 -> control channel -> sandbox-local target (default mode)
 //! ```
 //!
-//! The listener is bound to the host's route-selected IPv4 interface rather
-//! than loopback. `AppContainer` fallback does not map its `127.0.0.1` to the
-//! host, so a loopback listener is unreachable unless traffic is sent through
-//! the CONNECT proxy; that proxy can also capture the bridge's separate
-//! sandbox-local target connection. Binding one concrete host interface keeps
-//! the target hop on sandbox loopback and lets the MXC 1.0 directional ingress
-//! policy authorize only the host callback. In principle another host or local process could
-//! race to connect before the real Phase A/B peer does and
-//! hijack or inject traffic into the forward. Both phases are authenticated
-//! against a fresh, unguessable per-forward nonce (`ForwardSink::
-//! open_dynamic_forward` generates it) instead of trusting connection order:
-//!
-//!   Phase A (sandbox spawner, WS client) must send `TEXT "AUTH:<hex
-//!            nonce>"` as its first message, before anything else is
-//!            accepted from that connection -- see openshell-supervisor-
-//!            relay's `run_relay_bridge`, which sends this immediately
-//!            after connecting.
-//!   Phase B (host client, raw TCP -- normally the gateway process itself,
-//!            connecting right after `open_dynamic_forward` returns) must
-//!            write the raw nonce bytes as the first bytes on the
-//!            connection, before any tunneled application data -- see
-//!            openshell-server's `ForwardTcp` handler.
-//!
-//! A connection that fails or times out on this check is closed and the
-//! relay keeps waiting for the real peer, rather than treating the first
-//! comer as authoritative or tearing the whole relay down (a wrong guess
-//! shouldn't be a viable way to deny service to the real caller either).
-//!
-//! Protocol over Phase A (WS connection from sandbox to relay), after auth:
-//!   TEXT  "`SESSION_START`" — relay opened a Phase B TCP connection
-//!   BINARY <bytes>        — bytes from Phase B TCP stream
-//!   TEXT  "`SESSION_END`"   — Phase B TCP connection closed
-//!   WS Close              — relay shutting down (`delete_sandbox` or error)
-//!
-//! Phase B (host client), after the nonce prefix, is a plain byte stream —
-//! no WS handshake — so the client's full byte stream (including any WS
-//! upgrade request and frames) is tunneled transparently to the in-sandbox
-//! service from that point on.
+//! The host client must write the raw nonce bytes before application data.
+//! A connection that fails or times out on this check is closed, and the relay
+//! keeps accepting so a wrong guess cannot deny service to the real caller.
 
 use crate::control_channel::ControlChannel;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,12 +36,9 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{info, warn};
 
-/// Length in bytes of the per-forward auth nonce (see module docs). Must
-/// match `NONCE_LEN` in `driver.rs` (which generates it) and
-/// `openshell-supervisor-relay`'s copy (which echoes it back on Phase A) --
-/// duplicated rather than shared via a common crate, matching how the rest
-/// of this wire protocol (e.g. the "`SESSION_START`"/"`SESSION_END`" literals)
-/// is already duplicated across the two sides.
+/// Length in bytes of the per-forward auth nonce (see module docs). The gateway
+/// creates it in `driver.rs` and writes it before application bytes on the
+/// host-side connection.
 pub const NONCE_LEN: usize = 32;
 
 /// How long to wait for a freshly-accepted connection to present its auth
@@ -88,12 +48,6 @@ pub const NONCE_LEN: usize = 32;
 /// for long either.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Select the concrete host IPv4 address used to reach the machine's default
-/// route. UDP `connect` performs route selection without sending a packet, so
-/// this does not depend on the probe endpoint being reachable. Binding the
-/// relay to that exact interface avoids exposing it on every interface while
-/// still making it reachable from an `AppContainer` whose loopback is isolated
-/// from the host's loopback.
 /// Fixed-time byte comparison so a wrong guess doesn't leak how many
 /// leading bytes it got right via response timing. The nonce is one-shot
 /// (a fresh relay per forward) so this is defense in depth rather than
@@ -105,12 +59,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Hex-encode `bytes` (lowercase, unpadded). `pub` (crate-visible in
-/// practice, since `relay` isn't a `pub mod`) so `ForwardSink::
-/// open_dynamic_forward` in `driver.rs` can use the exact same encoding to
-/// build the "forward" control-channel request's `nonce` field that this
-/// module expects back from the sandbox on Phase A.
-pub fn encode_hex(bytes: &[u8]) -> String {
+/// Hex-encode `bytes` (lowercase, unpadded) for control-channel session IDs and
+/// the retained legacy relay protocol.
+fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
         .iter()
@@ -120,40 +71,10 @@ pub fn encode_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// Render the first `n` bytes of `data` as a printable-ASCII preview
-/// (non-printable bytes shown as `.`), for hop-by-hop diagnostic logging.
-/// Not a general-purpose formatter -- just enough to eyeball whether e.g. an
-/// HTTP/WS handshake looks intact versus corrupted or empty.
-///
-/// Not called anywhere: forwarded traffic can carry auth headers, cookies, or
-/// other sensitive payload, and this relay's own logs are gateway logs, so no
-/// byte preview is ever logged, at any level. Kept only so a future opt-in
-/// diagnostic mode has a ready-made (still-redaction-worthy) formatter to
-/// start from.
-#[allow(dead_code)]
-fn byte_preview(data: &[u8]) -> String {
-    const MAX: usize = 120;
-    let n = data.len().min(MAX);
-    let mut s: String = data[..n]
-        .iter()
-        .map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect();
-    if data.len() > MAX {
-        s.push_str("...");
-    }
-    s
-}
-
 // ── Public handle ─────────────────────────────────────────────────────────────
 
-/// Owned handle returned by [`start_relay`].  Drop or call [`stop`] to
-/// shut down the relay task and release the listener port.
+/// Owned handle returned by either relay implementation. Drop or call
+/// [`stop`](RelayHandle::stop) to shut down the relay task and release the port.
 pub struct RelayHandle {
     shutdown_tx: oneshot::Sender<()>,
 }
@@ -164,42 +85,16 @@ impl RelayHandle {
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-/// Bind a TCP listener on `bind_addr` and spawn the relay task. The caller
-/// communicates the returned address (and `nonce`) to the sandbox directly
-/// (over the control channel) — this doesn't touch the filesystem at all.
-/// `nonce` must be freshly generated per call (see module docs) — it's what
-/// lets this host-interface relay tell the real Phase A/B peers apart from
-/// any other local process that might race to connect first.
-pub async fn start_relay(
-    bind_addr: SocketAddr,
-    sandbox_name: String,
-    nonce: [u8; NONCE_LEN],
-) -> std::io::Result<(RelayHandle, SocketAddr)> {
-    let listener = TcpListener::bind(bind_addr).await?;
-    let actual = listener.local_addr()?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    tokio::spawn(relay_task(
-        listener,
-        sandbox_name.clone(),
-        nonce,
-        shutdown_rx,
-    ));
-    info!(sandbox = %sandbox_name, relay = %actual, "MXC relay started");
-    Ok((RelayHandle { shutdown_tx }, actual))
-}
-
 /// Start a host-loopback listener whose sandbox leg is multiplexed over the
-/// inherited stdin/stdout control channel. Unlike [`start_relay`], this path
-/// never asks the `AppContainer` to connect back to a host network address.
+/// inherited stdin/stdout control channel. This path never asks the
+/// `AppContainer` to connect back to a host network address.
 pub async fn start_control_channel_relay(
     bind_addr: SocketAddr,
     sandbox_name: String,
     nonce: [u8; NONCE_LEN],
     control_channel: Arc<ControlChannel>,
     target_port: u16,
-) -> std::io::Result<(RelayHandle, SocketAddr)> {
+) -> io::Result<(RelayHandle, SocketAddr)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let actual = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -340,6 +235,9 @@ fn control_response_ok(
     )
 }
 
+// Retained temporarily for legacy callback-protocol compatibility; both
+// production paths above avoid a sandbox-to-host callback socket.
+#[allow(dead_code)]
 async fn relay_task(
     listener: TcpListener,
     sandbox_name: String,

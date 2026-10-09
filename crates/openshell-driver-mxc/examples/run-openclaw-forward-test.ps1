@@ -5,8 +5,7 @@
 #
 # Proves the full path this package exists to demonstrate:
 #   gateway -> MXC driver -> ProcessContainer OR isolation_session sandbox
-#     (neither has an in-sandbox supervisor process; ProcessContainer also
-#     has no inbound network capability at all)
+#     (neither has an in-sandbox supervisor process)
 #     -> openshell-supervisor-relay launches OpenClaw's gateway inside it
 #     -> `openshell forward service --target-port 18889` opens a per-request,
 #        on-demand WebSocket relay (bound fresh for this call, torn down when
@@ -30,7 +29,8 @@
 # only read paths under share_dir, so this script STAGES (copies) your
 # node.exe, the openclaw package, and this package's own
 # openclaw-capture.mjs / openshell-supervisor-relay.exe into share_dir before
-# creating the sandbox -- see the "Stage artifacts" step below. The OpenClaw
+# creating the sandbox -- see the
+# "Stage artifacts" step below. The OpenClaw
 # package can be large (native-addon plugins etc.); the copy uses robocopy
 # and only re-copies changed files on a rerun.
 #
@@ -392,7 +392,6 @@ try {
   Info "staged openclaw-capture.mjs"
   Copy-ItemRetry $relayExe (Join-Path $shareDirNorm "openshell-supervisor-relay.exe")
   Info "staged openshell-supervisor-relay.exe"
-
   New-Item -ItemType Directory -Force $openClawStageDir | Out-Null
   # /MIR deletes files in the destination not present in the source, which
   # is what we want on a rerun after an OpenClaw upgrade/rollback -- without
@@ -765,8 +764,7 @@ openclaw_install    : $OpenClawInstallDir
 target_self_probe   : $selfProbeOutcome ($selfProbeResponseBytes response bytes; diagnostic only)
 
 What PASS means: the gateway created a sandbox on the $Backend backend (no
-in-sandbox supervisor process; ProcessContainer also has no inbound network
-capability at all); openshell-supervisor-relay launched OpenClaw's gateway
+in-sandbox supervisor process); openshell-supervisor-relay launched OpenClaw's gateway
 inside it via the driver's control channel;
 `openshell forward service` opened a fresh, on-demand WebSocket relay for
 this one call (nothing pre-declared beyond the startup liveness port); and a
@@ -774,8 +772,10 @@ REAL OpenClaw client running on this host, talking only through that
 forwarded port, authenticated with a token and got back a real 'ok: true'
 health response. The egress proof also required an allowed HTTPS request to
 pass through the OpenShell proxy while a denied host and direct Internet
-bypass were blocked. Host loopback remains broadly reachable because dynamic
-forwarding uses ephemeral loopback ports.
+bypass were blocked. Host loopback remains broadly reachable in the default
+ProcessContainer mode because dynamic forwarding needs MXC's bidirectional
+loopback posture. Proxy-peer mode removes that exposure but does not support
+dynamic forwarding under MXC 1.0, so this forwarding test leaves it disabled.
 
 Files in this bundle:
   transcript.txt                    full console transcript

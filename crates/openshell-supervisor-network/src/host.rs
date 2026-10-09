@@ -33,6 +33,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::{ProxyHandle, ProxyIdentityMode};
+pub use crate::windows_process::{ForwardedClientGuard, ForwardedClients};
 
 /// Ephemeral credential required from a sandbox before the host proxy will
 /// evaluate or forward its request.
@@ -85,12 +86,21 @@ pub struct HostProxyHandle {
     #[allow(dead_code)]
     tls_dir: Option<tempfile::TempDir>,
     pub policy_local_ctx: Arc<PolicyLocalContext>,
+    forwarded_clients: ForwardedClients,
 }
 
 impl HostProxyHandle {
     #[must_use]
     pub const fn http_addr(&self) -> Option<SocketAddr> {
         self.proxy.http_addr()
+    }
+
+    /// Registry for connections that reach this proxy through a tunnel, so that
+    /// per-process identity still resolves to the sandbox process that opened the
+    /// original connection. See [`ForwardedClients`].
+    #[must_use]
+    pub fn forwarded_clients(&self) -> ForwardedClients {
+        self.forwarded_clients.clone()
     }
 
     #[must_use]
@@ -246,9 +256,11 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             (None, None, None)
         }
     };
+    let forwarded_clients = ForwardedClients::default();
     let identity_mode = ProxyIdentityMode::windows_with_client_auth(Some(
         config.client_auth.expected_proxy_authorization,
     ))
+    .with_forwarded_clients(forwarded_clients.clone())
     .with_event_context(event_context);
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
@@ -271,6 +283,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         ca_file_paths,
         tls_dir,
         policy_local_ctx,
+        forwarded_clients,
     })
 }
 

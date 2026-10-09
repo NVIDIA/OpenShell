@@ -5,7 +5,10 @@
 //! and self-reported readiness.
 
 use crate::control_channel::ControlChannel;
-use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
+use crate::mxc::{
+    MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, MxcProxyPeer, WxcExecInvoker,
+};
+use crate::peer::{EgressTunnel, PeerHandle};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, MappedConfig, PolicyMapper};
 use crate::relay;
 use base64::Engine as _;
@@ -152,7 +155,8 @@ async fn wait_for_target_listener(port: u16) -> std::io::Result<()> {
 /// - `IsolationSession`: persistent, attachable session
 ///   (provision → start → exec → stop → deprovision). Does not support
 ///   `OpenShell` filesystem-policy grants; backend defaults determine visibility.
-/// - `ProcessContainer` (default): one-shot `AppContainer`. Genuinely default-deny: a
+/// - `ProcessContainer` (default): one-shot MXC process. MXC selects `BaseContainer`
+///   when supported and an `AppContainer` fallback otherwise. Genuinely default-deny: a
 ///   write to any ungranted path is denied by the OS. No persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +240,21 @@ pub struct MxcComputeConfig {
     /// Ignored unless `pc_relay_spawner_path` is set. `0` disables spawner
     /// wrapping (default) — the per-sandbox command runs directly.
     pub pc_relay_target_port: u16,
+    /// `processContainer` only: absolute path to `openshell-mxc-peer.exe`. When
+    /// set, each sandbox runs under MXC `networkProxy` + `allowedProxyPeer`
+    /// instead of the loopback-allow network section: the driver starts the peer
+    /// under a per-sandbox `AppContainer` profile and directs MXC egress to its
+    /// proxy listener without a broad host-loopback grant. The peer must be
+    /// readable and executable by "ALL APPLICATION PACKAGES". MXC 1.0 does not
+    /// admit reverse peer-to-workload or sandbox-local loopback connections, so
+    /// dynamic forwarding is unavailable while this mode is enabled.
+    /// With `egress_proxy` enabled, the peer's proxy listener is the sandbox's
+    /// only network endpoint and tunnels the sandbox's proxy connections over a
+    /// named pipe to the gateway's per-sandbox host egress proxy, so policy
+    /// enforcement is unchanged; without it (or for a policy with no network
+    /// rules) the sandbox has no egress. Incompatible with `pc_network_allow` and
+    /// `pc_allow_local_network`. Empty (default) disables the mode.
+    pub pc_proxy_peer_path: String,
     /// Enable Pattern-C governed egress for sandbox policies that contain
     /// explicit network rules. MXC permits loopback-only egress, the driver
     /// injects proxy environment variables, and the host CONNECT proxy receives
@@ -277,7 +296,34 @@ impl MxcComputeConfig {
                 self.wxc_exec_path
             )));
         }
-        Ok(())
+        self.validate_proxy_peer()
+    }
+
+    /// Cross-field rules for `pc_proxy_peer_path`.
+    fn validate_proxy_peer(&self) -> openshell_core::Result<()> {
+        let path = self.pc_proxy_peer_path.trim();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let problem = if !Path::new(path).is_absolute() {
+            Some(format!(
+                "pc_proxy_peer_path must be an absolute path, got '{path}'"
+            ))
+        } else if self.backend != MxcBackend::ProcessContainer {
+            Some("pc_proxy_peer_path only applies to backend = \"process_container\"".to_string())
+        } else if self.pc_network_allow || self.pc_allow_local_network {
+            Some(
+                "pc_proxy_peer_path cannot be combined with pc_network_allow or pc_allow_local_network"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        problem.map_or(Ok(()), |message| {
+            Err(openshell_core::Error::config(format!(
+                "[openshell.drivers.mxc] {message}"
+            )))
+        })
     }
 }
 
@@ -349,6 +395,10 @@ struct SandboxEntry {
     /// wrapping is active (`pc_relay_spawner_path` configured); dropped on
     /// delete, which closes the child's stdin.
     control_channel: Option<Arc<ControlChannel>>,
+    /// Proxy peer process for this sandbox (`pc_proxy_peer_path` mode). Dropping
+    /// the last reference terminates the peer and deletes its `AppContainer`
+    /// profile, so `delete_sandbox` just takes it out of the entry.
+    peer: Option<Arc<PeerHandle>>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -1016,6 +1066,7 @@ impl MxcComputeBackend {
     pub fn forward_sink(&self) -> ForwardSink {
         ForwardSink {
             registry: self.registry.clone(),
+            proxy_peer_mode: !self.config.pc_proxy_peer_path.trim().is_empty(),
         }
     }
 
@@ -1220,6 +1271,7 @@ impl MxcComputeBackend {
                     proxy_addr: mapped.proxy_addr,
                     host_proxy: None,
                     control_channel: None,
+                    peer: None,
                 },
             );
         }
@@ -1353,6 +1405,7 @@ impl MxcComputeBackend {
             }
         }
 
+        release_proxy_peer(&self.registry, &sandbox_id).await;
         let mut registry = self.registry.lock().await;
         if let Some(entry) = registry.get_mut(&sandbox_id) {
             entry.isolation_stopped = isolation_stopped;
@@ -1508,6 +1561,11 @@ impl MxcComputeBackend {
             }
         }
 
+        // The sandbox is gone; stop its proxy peer and delete the peer's
+        // AppContainer profile. Forward bridges may still hold the handle, so
+        // terminate explicitly instead of waiting for the last reference.
+        release_proxy_peer(&self.registry, sandbox_id).await;
+
         let mut registry = self.registry.lock().await;
         if registry.remove(sandbox_id).is_some() {
             if let Ok(mut idx) = self.attribution.lock() {
@@ -1582,6 +1640,10 @@ pub enum OpenDynamicForwardError {
         "sandbox {0} has no control channel (not launched via a relay spawner, or not yet Ready)"
     )]
     NoControlChannel(String),
+    #[error(
+        "sandbox {0} uses MXC proxy-peer networking, which does not support dynamic forwarding without opening bidirectional host loopback"
+    )]
+    ProxyPeerForwardUnsupported(String),
     #[error("failed to bind ephemeral relay listener: {0}")]
     RelayBind(#[source] std::io::Error),
     #[error("control channel request failed: {0}")]
@@ -1595,6 +1657,7 @@ pub enum OpenDynamicForwardError {
 #[derive(Clone)]
 pub struct ForwardSink {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    proxy_peer_mode: bool,
 }
 
 impl ForwardSink {
@@ -1604,16 +1667,18 @@ impl ForwardSink {
     /// directly by the gateway process itself, no `AppContainer` boundary on
     /// that leg — a per-forward auth nonce the caller MUST send as the first
     /// bytes on its own connection to that address (see `relay.rs` module
-    /// docs: the relay is host-interface-bound, so another reachable process
-    /// could otherwise race to connect first and hijack the forward), and a
+    /// docs: another local process could otherwise race to connect first and
+    /// hijack the forward), and a
     /// [`relay::RelayHandle`] the caller must hold for as long as the
     /// forward should stay open, then `.stop()` (or just drop) to tear it
     /// down.
     ///
-    /// Target host is always `127.0.0.1` inside the `AppContainer` (matching
-    /// `TcpRelayTarget`'s existing loopback-only restriction at the gRPC
-    /// layer), so there's no separate `target_host` parameter to thread
-    /// through — the sandbox-side `forward` op only ever dials loopback.
+    /// The requested target is always sandbox loopback (matching
+    /// `TcpRelayTarget`'s existing restriction at the gRPC layer). The default
+    /// mode dials it inside the sandbox through the control-channel relay.
+    /// Proxy-peer mode returns [`OpenDynamicForwardError::ProxyPeerForwardUnsupported`]:
+    /// MXC 1.0 admits workload-to-peer proxy traffic but not reverse
+    /// peer-to-workload or sandbox-local loopback dials.
     pub async fn open_dynamic_forward(
         &self,
         sandbox_id: &str,
@@ -1625,18 +1690,21 @@ impl ForwardSink {
             let entry = reg
                 .get(sandbox_id)
                 .ok_or_else(|| OpenDynamicForwardError::SandboxNotFound(sandbox_id.to_string()))?;
-            let channel = entry
-                .control_channel
-                .clone()
-                .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
-            (channel, entry.sandbox.name.clone())
+            if self.proxy_peer_mode {
+                return Err(OpenDynamicForwardError::ProxyPeerForwardUnsupported(
+                    sandbox_id.to_string(),
+                ));
+            }
+            (entry.control_channel.clone(), entry.sandbox.name.clone())
         };
 
         // Fresh per forward -- see relay.rs module docs for why this matters
-        // on a host-interface listener.
+        // on a host-loopback listener.
         let nonce: [u8; relay::NONCE_LEN] = rand::random();
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let control_channel = control_channel
+            .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
         let (relay_handle, relay_addr) = relay::start_control_channel_relay(
             bind_addr,
             sandbox_name,
@@ -1715,6 +1783,11 @@ async fn run_lifecycle(
     } else {
         None
     };
+    // Taken before the handle moves into the registry below; the proxy peer's
+    // egress tunnel uses it to keep per-process identity (see peer.rs).
+    let forwarded_clients = host_proxy
+        .as_ref()
+        .map(openshell_supervisor_network::host::HostProxyHandle::forwarded_clients);
     let host_proxy_ca_paths = host_proxy
         .as_ref()
         .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
@@ -1751,6 +1824,47 @@ async fn run_lifecycle(
             format!("MXC egress redirected to OpenShell host CONNECT proxy at {addr}"),
         ));
     }
+
+    // Proxy-peer mode: the peer must be listening before wxc-exec starts, because
+    // its address is the sandbox's networkProxy and its profile is the sandbox's
+    // allowedProxyPeer. When a host egress proxy exists (policy has network
+    // rules) the peer tunnels the sandbox's proxy connections to it.
+    let proxy_peer = if config.backend == MxcBackend::ProcessContainer
+        && !config.pc_proxy_peer_path.trim().is_empty()
+    {
+        let egress = match (proxy_addr, forwarded_clients) {
+            (Some(host_proxy_addr), Some(clients)) => Some(EgressTunnel {
+                host_proxy: host_proxy_addr,
+                clients,
+            }),
+            _ => None,
+        };
+        match PeerHandle::spawn(config.pc_proxy_peer_path.trim(), &sandbox_id, egress).await {
+            Ok(peer) => {
+                let peer = Arc::new(peer);
+                {
+                    let mut registry = registry.lock().await;
+                    if let Some(entry) = registry.get_mut(&sandbox_id) {
+                        entry.peer = Some(Arc::clone(&peer));
+                    }
+                }
+                Some(peer)
+            }
+            Err(error) => {
+                set_failed(
+                    &registry,
+                    &watch_tx,
+                    &sandbox,
+                    &sandbox_id,
+                    &format!("failed to start proxy peer: {error}"),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let readwrite_paths = mapped.readwrite_paths;
     let readonly_paths = mapped.readonly_paths;
@@ -1792,7 +1906,15 @@ async fn run_lifecycle(
     // Layer proxy configuration for every env tier using the staged CA copies
     // above. The host proxy's private temporary directory is never shared.
     append_tls_env_vars(&mut env, agent_proxy_ca_paths.as_ref());
-    append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
+    // In proxy-peer mode the driver sets no HTTP(S)_PROXY / NO_PROXY variables:
+    // MXC puts the networkProxy endpoint (the peer's listener) into the
+    // environment of the process it launches, and openshell-supervisor-relay
+    // passes those variables on to the target. Connections that arrive through
+    // the peer tunnel are trusted by the host proxy without the per-sandbox
+    // password, which MXC's variables do not carry.
+    if proxy_peer.is_none() {
+        append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
+    }
     env.sort(); // deterministic order for logging / debugging
     info!(sandbox = %sandbox_name, count = env.len(), "MXC process env vars");
 
@@ -1895,6 +2017,10 @@ async fn run_lifecycle(
             let process_container = MxcProcessContainer {
                 least_privilege: config.pc_least_privilege,
                 capabilities: config.pc_capabilities.clone(),
+                proxy_peer: proxy_peer.as_ref().map(|peer| MxcProxyPeer {
+                    profile: peer.profile().to_string(),
+                    proxy: peer.proxy_addr(),
+                }),
             };
             // Build the effective network config:
             // - egress_proxy: use the proxy-based network (already in `network`)
@@ -1990,9 +2116,9 @@ async fn run_lifecycle(
             // "launch" request that can never arrive -- a silent hang,
             // not a failure. Fail the sandbox now instead.
             let err = "wxc-exec stdin is not piped; control-channel launch cannot proceed";
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, err).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
+            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, err).await;
             return;
         }
     } else {
@@ -2254,6 +2380,7 @@ async fn run_lifecycle(
                     let launch_data = serde_json::json!({
                         "command": sandbox_config.command,
                         "env": env,
+                        "inherit_proxy_env": proxy_peer.is_some(),
                     });
                     match channel
                         .request("launch", launch_data, std::time::Duration::from_mins(2))
@@ -2387,8 +2514,9 @@ async fn run_lifecycle(
                 // wait out the full timeout for a signal that never comes,
                 // while `child` -- which does not kill-on-drop -- leaks.
                 // Kill and reap it directly instead.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                if child.kill().await.is_ok() && child.wait().await.is_ok() {
+                    release_proxy_peer(&registry, &sandbox_id).await;
+                }
             } else if let Some(mut rx) = terminated_rx {
                 // leftover_child was None, so monitor_exec already claimed
                 // exec_child and is the one racing shutdown_tx against
@@ -2513,6 +2641,7 @@ async fn monitor_exec(
                 {
                     idx.retire_launch(&sandbox_id, pid);
                 }
+                release_proxy_peer(&registry, &sandbox_id).await;
                 info!(sandbox = %sandbox.name, "MXC ProcessContainer terminated for sandbox stop/delete");
                 let _ = done_tx.send(true);
                 return;
@@ -2522,6 +2651,7 @@ async fn monitor_exec(
         (child.wait().await, None)
     };
     if wait_result.is_ok() {
+        release_proxy_peer(&registry, &sandbox_id).await;
         if let Some(pid) = wxc_pid
             && let Ok(mut idx) = attribution.lock()
         {
@@ -2589,6 +2719,21 @@ async fn monitor_exec(
     }
 }
 
+/// Release the peer after confirmed workload termination or before a workload
+/// was spawned. A retained terminal sandbox has no peer resources.
+async fn release_proxy_peer(
+    registry: &Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    sandbox_id: &str,
+) {
+    let peer = {
+        let mut reg = registry.lock().await;
+        reg.get_mut(sandbox_id).and_then(|entry| entry.peer.take())
+    };
+    if let Some(peer) = peer {
+        let _ = tokio::task::spawn_blocking(move || peer.terminate()).await;
+    }
+}
+
 /// Control-channel diagnostics can contain the relay's captured workload
 /// stderr. Scrub the decoded text at the diagnostic boundary, leaving protocol
 /// envelopes and successful control-channel payloads untouched.
@@ -2643,7 +2788,11 @@ async fn set_failed(
     }
     entry.sandbox = failed.clone();
     entry.phase_state = PhaseState::Failed(message.to_string());
+    let before_workload = entry.terminated_rx.is_none() && entry.exec_child.is_none();
     drop(reg);
+    if before_workload {
+        release_proxy_peer(registry, sandbox_id).await;
+    }
     let _ = watch_tx.send(sandbox_event(failed));
 }
 
@@ -3071,6 +3220,86 @@ mod lifecycle_tests {
             ..Default::default()
         };
         config.validate_configuration().unwrap();
+    }
+
+    fn proxy_peer_config() -> MxcComputeConfig {
+        MxcComputeConfig {
+            wxc_exec_path: r"C:\mxc-kit\bin\wxc-exec.exe".into(),
+            pc_proxy_peer_path: r"C:\openshell-openclaw\openshell-mxc-peer.exe".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proxy_peer_mode_is_off_by_default_and_does_not_require_the_relay() {
+        assert!(MxcComputeConfig::default().pc_proxy_peer_path.is_empty());
+        proxy_peer_config().validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn proxy_peer_mode_accepts_egress_proxy() {
+        let mut config = proxy_peer_config();
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        config.validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn proxy_peer_mode_rejects_incompatible_settings() {
+        type ConfigMutation = fn(&mut MxcComputeConfig);
+        let cases: [(&str, ConfigMutation); 4] = [
+            ("absolute", |c| {
+                c.pc_proxy_peer_path = "openshell-mxc-peer.exe".into();
+            }),
+            ("process_container", |c| {
+                c.backend = MxcBackend::IsolationSession;
+            }),
+            ("pc_network_allow", |c| c.pc_network_allow = true),
+            ("pc_network_allow", |c| c.pc_allow_local_network = true),
+        ];
+        for (needle, mutate) in cases {
+            let mut config = proxy_peer_config();
+            mutate(&mut config);
+            let error = config.validate_configuration().unwrap_err().to_string();
+            assert!(error.contains(needle), "expected '{needle}' in: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_peer_mode_rejects_dynamic_forward_without_side_effects() {
+        let backend = MxcComputeBackend::new_mocked(proxy_peer_config());
+        let sandbox = driver_sandbox("proxy-peer-forward");
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Running,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: None,
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+
+        let Err(error) = backend
+            .forward_sink()
+            .open_dynamic_forward(&sandbox.id, 22000)
+            .await
+        else {
+            panic!("proxy-peer dynamic forward unexpectedly succeeded");
+        };
+        assert!(matches!(
+            error,
+            OpenDynamicForwardError::ProxyPeerForwardUnsupported(id) if id == sandbox.id
+        ));
     }
 
     #[test]
@@ -3621,6 +3850,7 @@ mod lifecycle_tests {
                 proxy_addr: None,
                 host_proxy: None,
                 control_channel: None,
+                peer: None,
             },
         );
         let mut events = backend.watch_tx.subscribe();
@@ -4231,6 +4461,280 @@ mod lifecycle_tests {
         assert!(failed.is_some(), "sandbox should report ExecFailed");
     }
 
+    async fn attach_test_peer(
+        backend: &MxcComputeBackend,
+        sandbox_id: &str,
+    ) -> (Arc<PeerHandle>, std::process::Child) {
+        let (peer, child) = PeerHandle::test_fixture();
+        let peer = Arc::new(peer);
+        backend
+            .registry
+            .lock()
+            .await
+            .get_mut(sandbox_id)
+            .unwrap()
+            .peer = Some(peer.clone());
+        (peer, child)
+    }
+
+    #[tokio::test]
+    async fn terminal_workload_releases_peer_before_sandbox_deletion() {
+        for (id, code, reason) in [
+            ("peer-success", 0, "AgentCompleted"),
+            ("peer-failure", 17, "ExecFailed"),
+        ] {
+            let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+            // Insert the resource owner before running the actual monitor on a
+            // real short-lived workload; do not race a synthetic sleep.
+            let sandbox = driver_sandbox(id);
+            let mut child = tokio::process::Command::new(inbox_cmd())
+                .args(["/d", "/c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            drop(child.stdin.take());
+            let (done_tx, done_rx) = watch::channel(false);
+            let (_tx, rx) = oneshot::channel();
+            backend.registry.lock().await.insert(
+                id.into(),
+                SandboxEntry {
+                    sandbox: sandbox.clone(),
+                    iso_sandbox_id: None,
+                    isolation_stopped: false,
+                    phase_state: PhaseState::Starting,
+                    lifecycle_gate: Arc::new(Mutex::new(())),
+                    exec_child: Some(child),
+                    shutdown_tx: None,
+                    terminated_rx: Some(done_rx.clone()),
+                    signal_file: None,
+                    trimmed_policy: None,
+                    proxy_addr: None,
+                    host_proxy: None,
+                    control_channel: None,
+                    peer: None,
+                },
+            );
+            let (peer, mut peer_child) = attach_test_peer(&backend, id).await;
+            monitor_exec(
+                backend.registry.clone(),
+                backend.watch_tx.clone(),
+                backend.attribution.clone(),
+                sandbox,
+                id.into(),
+                Some((rx, done_tx)),
+            )
+            .await;
+            assert!(*done_rx.borrow());
+            let retained = backend.get_sandbox(id).await.unwrap();
+            assert_eq!(ready_condition(&retained).unwrap().reason, reason);
+            assert!(
+                backend
+                    .registry
+                    .lock()
+                    .await
+                    .get(id)
+                    .unwrap()
+                    .peer
+                    .is_none()
+            );
+            peer.assert_released(&mut peer_child);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_failure_retains_peer_until_monitor_confirms_termination() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-launch-failure");
+        let child = tokio::process::Command::new(inbox_powershell())
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+            .spawn()
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done_rx) = watch::channel(false);
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Starting,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: Some(child),
+                shutdown_tx: Some(shutdown_tx),
+                terminated_rx: Some(done_rx.clone()),
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut peer_child) = attach_test_peer(&backend, &sandbox.id).await;
+        set_launch_failed(
+            &backend.registry,
+            &backend.watch_tx,
+            &sandbox,
+            &sandbox.id,
+            "target readiness failed",
+            &[],
+        )
+        .await;
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_some()
+        );
+        assert!(peer_child.try_wait().unwrap().is_none());
+        backend
+            .registry
+            .lock()
+            .await
+            .get_mut(&sandbox.id)
+            .unwrap()
+            .shutdown_tx
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        monitor_exec(
+            backend.registry.clone(),
+            backend.watch_tx.clone(),
+            backend.attribution.clone(),
+            sandbox.clone(),
+            sandbox.id.clone(),
+            Some((shutdown_rx, done_tx)),
+        )
+        .await;
+        assert!(*done_rx.borrow());
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut peer_child);
+        assert_eq!(
+            ready_condition(&backend.get_sandbox(&sandbox.id).await.unwrap())
+                .unwrap()
+                .reason,
+            "ProvisionFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_delete_preserves_peer_until_confirmed_retry() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-delete-retry");
+        let (done_tx, done_rx) = watch::channel(false);
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Running,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: Some(done_rx),
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut child) = attach_test_peer(&backend, &sandbox.id).await;
+        let error = backend
+            .delete_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_some()
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "unconfirmed workload must retain its peer"
+        );
+        done_tx.send(true).unwrap();
+        assert!(
+            backend
+                .delete_sandbox(&sandbox.id, &sandbox.name)
+                .await
+                .unwrap()
+        );
+        peer.assert_released(&mut child);
+    }
+
+    #[tokio::test]
+    async fn failure_before_workload_launch_releases_peer() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("peer-startup-failure");
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Starting,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: None,
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+        let (peer, mut child) = attach_test_peer(&backend, &sandbox.id).await;
+        set_failed(
+            &backend.registry,
+            &backend.watch_tx,
+            &sandbox,
+            &sandbox.id,
+            "test spawn failure",
+        )
+        .await;
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut child);
+        assert_eq!(
+            ready_condition(&backend.get_sandbox(&sandbox.id).await.unwrap())
+                .unwrap()
+                .reason,
+            "ProvisionFailed"
+        );
+    }
+
     #[tokio::test]
     async fn stop_terminates_and_reaps_a_running_process_container() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4254,6 +4758,7 @@ mod lifecycle_tests {
         .await
         .expect("long-running child should start");
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let (peer, mut peer_child) = attach_test_peer(&backend, "sb-stop").await;
         let running = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&running).unwrap().reason, "AgentRunning");
 
@@ -4263,6 +4768,17 @@ mod lifecycle_tests {
             .expect("stop should terminate and reap the child");
         let stopped = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&stopped).unwrap().reason, "Stopped");
+        assert!(
+            backend
+                .registry
+                .lock()
+                .await
+                .get("sb-stop")
+                .unwrap()
+                .peer
+                .is_none()
+        );
+        peer.assert_released(&mut peer_child);
     }
 
     /// `delete_sandbox` must await *confirmed* `ProcessContainer` termination

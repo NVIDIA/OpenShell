@@ -39,6 +39,7 @@ flowchart LR
 
     subgraph MXC["MXC isolation boundary"]
         PC["ProcessContainer"]
+        PEER["Per-sandbox proxy peer<br/>(separate AppContainer identity)"]
         ISO["IsolationSession"]
         RELAY["openshell-supervisor-relay"]
         AGENT["Agent process"]
@@ -51,7 +52,10 @@ flowchart LR
 
     WXC --> PC
     WXC --> ISO
-    PC -. "ProcessContainer governed egress only" .-> PROXY
+    PC -. "default governed egress:<br/>host loopback" .-> PROXY
+    PC -->|"proxy-peer mode:<br/>MXC networkProxy / allowedProxyPeer"| PEER
+    PEER -->|"identity-restricted<br/>egress pipe"| DRV
+    DRV -. "policy-governed egress" .-> PROXY
     DRV <-->|"inherited stdin/stdout control channel"| RELAY
     WXC -. "OS Sandboxing events" .-> ETW
 ```
@@ -77,12 +81,12 @@ onto the agent user's default environment.
 
 | Property | `process_container` | `isolation_session` |
 |---|---|---|
-| Runtime model | One-shot AppContainer process; default backend | Persistent MXC session used to run one configured process |
+| Runtime model | One-shot MXC process; prefers BaseContainer, with a compatible AppContainer fallback; default backend | Persistent MXC session used to run one configured process |
 | Driver lifecycle | Launch and monitor `wxc-exec` | `provision` -> `start` -> `exec`; stop/delete issue `stop` and `deprovision` |
 | Filesystem | Read-only/read-write grants with default-deny behavior | OpenShell filesystem-policy grants are unsupported; MXC rejects non-empty read-only/read-write grants |
 | Portable UI policy | Supported completely | Every explicit `ui` section is rejected before provisioning |
 | Governed network policy | Supported through the host proxy when enabled | Rejected because the backend cannot enforce the loopback-only proxy path; without an explicit network policy, the backend retains MXC's default-allow egress |
-| Supervisor relay and dynamic forwarding | Optional | Optional |
+| Supervisor relay and dynamic forwarding | Optional in the default network mode; dynamic forwarding is rejected in proxy-peer mode | Optional |
 
 Neither backend implements interactive `sandbox connect` or interactive exec
 through the standard supervisor protocol. The MXC `StartSandbox` operation is
@@ -119,7 +123,7 @@ The production mapping in
 | Policy area | Windows enforcement |
 |---|---|
 | Filesystem | On ProcessContainer, `read_only` and `read_write` become MXC path grants, and `include_workdir` adds the resolved working directory as read-write. The mapper normalizes separators but does not translate Linux-rooted locations into Windows paths. ProcessContainer supplies the default-deny boundary. IsolationSession cannot accept non-empty filesystem grants; without them, its backend defaults determine filesystem visibility. |
-| Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. This path requires MXC's `baseContainerSupportsIngressHostLoopbackAllow` host capability; fallback tiers without it can run ordinary ProcessContainer workloads but cannot reach the host proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
+| Network | An explicit network policy requires governed egress on ProcessContainer. The default mode gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy; it requires MXC's `baseContainerSupportsIngressHostLoopbackAllow` host capability and also exposes unrelated host-loopback listeners. Proxy-peer mode instead denies host loopback and direct egress, then uses MXC `runtimeConfig.networkProxy` and a per-sandbox `allowedProxyPeer` AppContainer identity to reach only the OpenShell peer. MXC requires `ingress.default = allow` for this arrangement, so private-network clients can still reach servers in the target sandbox. The host proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
 | UI | ProcessContainer maps graphical UI, directional clipboard access, and input injection into MXC's top-level `ui` object. An absent section maps to the restrictive UI posture. Within an explicit section, omitted fields deny. IsolationSession rejects even an empty explicit section. |
 | Process | MXC supplies the Windows process-isolation boundary, but the mapper has no portable equivalent for `run_as_user` or `run_as_group`; callers must not treat those fields as enforced Windows identity controls. The canonical command, environment, and working directory are launch inputs rather than process-policy grants. |
 | Landlock | MXC has no equivalent for the Linux Landlock compatibility mode, including `hard_requirement`. The mapper reports a non-blocking warning; Windows filesystem assurance comes from the selected MXC backend's native semantics, not Landlock. |
@@ -138,17 +142,55 @@ changes require sandbox recreation.
 ## Governed Egress and Credentials
 
 Governed egress uses a split enforcement model. MXC blocks direct Internet
-traffic and permits host loopback; a unique authenticated proxy listener holds
-the full OpenShell network policy. The driver injects standard proxy variables
-for proxy-aware clients and stages only public CA certificates under an
-authorized sandbox path. The ephemeral CA private key remains in host-proxy
-memory.
+traffic, while a unique host CONNECT proxy holds the full OpenShell network
+policy. The driver stages only public CA certificates under an authorized
+sandbox path. The ephemeral CA private key remains in host-proxy memory.
 
-The loopback grant is broader than the proxy listener: a governed sandbox can
+The default mode permits host loopback and injects standard proxy variables.
+That loopback grant is broader than the proxy listener: a governed sandbox can
 reach other host services bound to loopback. Per-sandbox proxy credentials
 prevent another sandbox from using the OpenShell proxy, but they do not isolate
 unrelated host-loopback services or authenticate individual processes within
 one sandbox.
+
+On a host where MXC selects BaseContainer and supports host loopback, the
+default host-proxy mode runs from an unelevated harness without a UAC prompt.
+Leave `pc_proxy_peer_path` empty; this path creates no Windows Firewall rule.
+The OpenShell backend name remains `process_container`; BaseContainer is MXC's
+selected enforcement tier.
+
+Proxy-peer mode narrows that exception. The driver starts
+`openshell-mxc-peer.exe` under a per-sandbox AppContainer identity, names that
+identity as MXC's `allowedProxyPeer`, sets MXC's `networkProxy`, and keeps
+`hostLoopback` and direct egress denied. Governed egress crosses an
+identity-restricted named pipe between the gateway and the peer. The peer is
+only an egress byte tunnel; policy evaluation, TLS interception, credentials,
+and process attribution remain in the gateway. This is not complete inbound
+network isolation: MXC requires `ingress.default = allow` for the target
+ProcessContainer, which enables private-network server traffic, but MXC does
+not provide the gateway or the peer with an identity-scoped reverse path to the
+workload. The driver therefore rejects dynamic forwarding while proxy-peer mode
+is enabled. The peer replaces broad sandbox-to-host-loopback access with an
+identified egress connection, but operators must still accept the remaining
+private-network ingress surface.
+
+Peer readiness includes a Windows Firewall inbound allow rule scoped to the
+peer executable, AppContainer SID, loopback addresses and ephemeral TCP port.
+Proxy-peer mode requires permission to manage local firewall rules; startup
+fails with an actionable diagnostic if permission is missing or active policy
+ignores inbound rules. The current rule writer uses `INetFwRules::Add` with
+`LocalAppPackageId`, a combination Windows does not support. This optional mode
+is not qualified for unattended use; elevation alone does not resolve that
+implementation limitation. The gateway removes the rule, process, pipes and profile
+after confirmed workload termination, including natural exit and launch failure.
+A timed-out stop or delete retains ownership until termination is confirmed.
+Retaining the sandbox record does not retain a live peer. Abrupt gateway death
+can leave a rule and profile for operator cleanup.
+
+The relay launch protocol explicitly enables inheritance of MXC-injected proxy
+variables for peer launches. Other curated launch environments exclude ambient
+proxy settings. Protocol version 5 rejects a stale relay that cannot enforce
+this distinction; restage the gateway and relay together.
 
 Two gateway-wide ProcessContainer compatibility settings can deliberately
 broaden this boundary. `pc_network_allow` permits unrestricted outbound TCP, and
@@ -184,16 +226,20 @@ the command and environment after the relay announces readiness, and waits for
 the configured target port before publishing runtime readiness.
 
 Dynamic `openshell forward service` requests use a dedicated MXC path because
-there is no `ConnectSupervisor` session. The gateway calls the driver's
-`ForwardSink`; the driver creates an authenticated host-loopback listener and
-multiplexes `forward_open`, `forward_read`, `forward_write`, and
+there is no `ConnectSupervisor` session. In the default mode, the gateway calls
+the driver's `ForwardSink`; the driver creates an authenticated host-loopback
+listener and multiplexes `forward_open`, `forward_read`, `forward_write`, and
 `forward_close` operations over the inherited control channel. A fresh nonce
-authenticates each host-side forward. This capability does not add interactive
-shell or general exec support.
+authenticates each gateway-side forward listener. In proxy-peer mode, MXC denies
+the sandbox-local target connection and does not expose an identity-scoped
+reverse connection from the gateway or peer to the workload, so the driver
+rejects the forward request before opening a listener. Neither mode adds
+interactive shell or general exec support.
 
 The implementation boundary spans
 `crates/openshell-driver-mxc/src/control_channel.rs`,
-`crates/openshell-driver-mxc/src/relay.rs`, and
+`crates/openshell-driver-mxc/src/relay.rs`,
+`crates/openshell-driver-mxc/src/peer.rs`, and
 `crates/openshell-supervisor-relay/`.
 
 ## Readiness, Lifecycle, and Persistence
@@ -252,8 +298,9 @@ requests and `agent_socket_path` because it has neither GPU integration nor the
 standard in-sandbox supervisor.
 
 The Windows release-profile build lane produces `openshell-gateway.exe`,
-`openshell.exe`, and `openshell-supervisor-relay.exe` for x64 and ARM64 as
-validation artifacts; the hosted workflow does not publish them. An x64 host
+`openshell.exe`, `openshell-supervisor-relay.exe`, and
+`openshell-mxc-peer.exe` for x64 and ARM64 as validation artifacts; the hosted
+workflow does not publish them. An x64 host
 can cross-check and cross-build ARM64, but native runtime tests and MXC
 qualification must execute on the matching architecture. See
 [Windows build and validation](../CONTRIBUTING.md#windows-build-and-validation)

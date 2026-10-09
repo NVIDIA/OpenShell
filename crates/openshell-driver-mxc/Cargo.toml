@@ -33,7 +33,7 @@ uuid = { workspace = true }
 # ETW/TDH real-time consumer and host CONNECT proxy integration.
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-supervisor-network = { path = "../openshell-supervisor-network" }
-windows = { workspace = true }
+windows = { workspace = true, features = ["Win32_NetworkManagement_WindowsFirewall", "Win32_System_Com"] }
 # WebSocket relay embedded in the gateway for ProcessContainer host<->sandbox
 # connectivity (see src/relay.rs).
 tokio-tungstenite = { workspace = true }

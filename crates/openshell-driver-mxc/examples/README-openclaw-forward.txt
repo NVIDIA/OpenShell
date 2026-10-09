@@ -3,13 +3,13 @@ OpenShell MXC - OpenClaw + dynamic forward test (both backends)
 
 WHAT THIS PROVES
   The full path for reaching a service inside an MXC sandbox that has NO
-  in-sandbox supervisor process (ProcessContainer additionally has NO
-  inbound network capability at all):
+  in-sandbox supervisor process. This forwarding test uses the default network
+  mode; MXC 1.0 proxy-peer mode is egress-only and rejects dynamic forwarding:
     gateway -> MXC driver -> ProcessContainer OR isolation_session sandbox
       -> openshell-supervisor-relay launches OpenClaw's gateway inside it,
          with no relay awareness in OpenClaw itself
       -> `openshell forward service --target-port 18889` opens a fresh,
-         on-demand WebSocket relay for THIS call only (nothing pre-declared
+         on-demand authenticated relay for THIS call only (nothing pre-declared
          in the config beyond the startup liveness port; the relay is torn
          down when the forward ends)
       -> a real OpenClaw client on the HOST, talking only through that
@@ -26,20 +26,12 @@ WHAT THIS PROVES
   what else differs (ProcessContainer-only fields it ignores entirely).
 
 PREREQUISITES (on this test box)
-  - An ELEVATED (Administrator) PowerShell session, for -Backend
-    process_container specifically. On this box's wxc-exec build,
-    process_container falls back to an "AppContainer + DACL" isolation
-    tier that needs two privileged operations: (1) WRITE_DAC on share_dir
-    to stamp the AppContainer's ACL -- fixable non-elevated if you own
-    share_dir yourself (first run wins ownership; icacls /setowner fixes a
-    folder an earlier elevated run left owned by Administrators), but
-    (2) with egress_proxy = true (mxc-openclaw-gateway.toml's default),
-    wxc-exec also calls NetworkIsolationSetAppContainerConfig to grant the
-    AppContainer a loopback exemption so it can reach the host's egress
-    proxy -- that Windows API requires Administrator regardless of file
-    ownership. Non-elevated fails both with ERROR_ACCESS_DENIED (0x5), the
-    second as "Network proxy error: Failed to set loopback exemption:
-    0x00000005". -Backend isolation_session does not hit either path.
+  - An ELEVATED (Administrator) PowerShell session may be required for
+    -Backend process_container on hosts whose probe selects the
+    "AppContainer + DACL" isolation tier. The runner must update ACLs on the
+    staged files. A directory owned by an
+    earlier elevated run can also require ownership repair before a
+    non-elevated rerun. -Backend isolation_session does not use the proxy peer.
   - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe).
     Use a standalone copy in a regular directory, not a copy inside an
     installed MSIX or WindowsApps package directory. If CreateSandbox reports
@@ -125,6 +117,10 @@ FILES IN THIS PACKAGE
                                   launches inside the sandbox in place of
                                   OpenClaw directly (OpenClaw itself has no
                                   relay awareness)
+  openshell-mxc-peer.exe         optional separate AppContainer helper used as
+                                  MXC's per-sandbox allowedProxyPeer for
+                                  governed egress; not used by this forwarding
+                                  test because peer mode rejects forwarding
   openclaw-capture.mjs           thin Node.js wrapper that appends the
                                   sandboxed process's stdout/stderr to a log
                                   file in share_dir and records only the
@@ -149,8 +145,8 @@ NOTES
     the in-process wxc shim. It needs no Node.js or OpenClaw install and does
     not test the relay, WebSocket forwarding, OpenClaw, proxy behavior, or MXC.
   - The control plane between CLI and gateway runs with --disable-tls on
-    loopback (that's a separate test point, T2). This test's relay traffic
-    (host <-> sandbox) is a separate, unrelated WebSocket tunnel.
+    loopback (that's a separate test point, T2). The forwarded application
+    traffic uses the driver's separate authenticated relay.
   - A "supervisor session not connected" / ssh 255 message during sandbox
     create is EXPECTED on MXC and harmless - the agent already ran in-driver.
   - `pc_minimal_env = true` in mxc-openclaw-gateway.toml (process_container
@@ -161,3 +157,9 @@ NOTES
   - The relay is entirely on-demand: nothing is listening on any fixed host
     port before you run `openshell forward service`, and nothing is left
     listening after the forward process exits.
+  - MXC 1.0 dynamic forwarding requires the default mode's broad private-network
+    ingress and host-loopback posture. PASS does not claim sandbox-local-only
+    networking or private-network ingress isolation.
+  - Proxy-peer mode denies the target workload direct Internet and arbitrary
+    host-loopback access, but MXC 1.0 supplies no identity-scoped reverse path
+    for dynamic forwarding. This example leaves `pc_proxy_peer_path` empty.

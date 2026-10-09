@@ -516,7 +516,7 @@ function Invoke-Lint([string] $RustTarget) {
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor-relay $Z3GatewayFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor-relay --bin openshell-mxc-peer $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-release.log"
 
     $z3Runtime = if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
@@ -649,7 +649,7 @@ function Get-Sha256([string] $Path) {
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
-        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "libz3.dll")) {
+        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "openshell-mxc-peer.exe", "libz3.dll")) {
             $path = Join-Path $TargetDir "$rustTarget\release\$binary"
             if (-not (Test-Path $path)) {
                 continue

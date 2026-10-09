@@ -18,6 +18,7 @@ supported deliverables:
 - `openshell-gateway.exe`
 - `openshell.exe`
 - `openshell-supervisor-relay.exe` (Windows-only MXC workload relay)
+- `openshell-mxc-peer.exe` (Windows-only identity-scoped MXC proxy peer)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
@@ -299,8 +300,8 @@ crypto dependency builds.
 |---|---|
 | `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
-| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for x64. |
-| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for ARM64. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor-relay.exe`, and `openshell-mxc-peer.exe` for x64. |
+| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor-relay.exe`, and `openshell-mxc-peer.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
@@ -359,6 +360,40 @@ Docker-stub-only, and MXC plus Docker-stub builds. Their logs use
 The default-feature tests are also included in the full workspace test run.
 The focused task is available for local diagnosis and selective-build
 validation; GitHub Actions does not re-run it after the full suite.
+
+### BaseContainer no-UAC qualification
+
+Run the `pc_basecontainer_` tests in `tests/wxc_exec_real.rs` from an unelevated
+terminal with `OPENSHELL_MXC_QUALIFY_NO_UAC=1` and the real
+`OPENSHELL_WXC_EXEC_PATH`. Use the native target and serial execution. One test
+proves the actual OpenShell host-proxy HTTPS/CA/L7 path with
+`pc_proxy_peer_path` empty; the other independently proves MXC's native
+`runtimeConfig.networkProxy` with an ordinary host listener. Both assert
+`TokenElevation=0` and the BaseContainer probe tier. Once enabled, qualification
+fails on missing prerequisites or a skipped workload. Without the opt-in flag,
+the generic real-MXC task skips them; do not count those skips as proof.
+Neither test creates a Windows Firewall rule or launches an AppContainer peer.
+
+### Proxy-peer firewall validation
+
+Proxy-peer startup requires permission to manage Windows Firewall rules. The
+peer rule is restricted to its executable, AppContainer SID, loopback endpoints
+and ephemeral TCP port; the gateway removes it after confirmed workload exit,
+stop or launch failure. On an unelevated host, validate the actionable startup
+failure and report successful rule installation and real peer egress as unavailable.
+Do not count the permission-denied path as successful peer connectivity.
+For the real peer HTTPS/L7 test, stage an AC-readable `openshell-mxc-peer.exe`,
+set `OPENSHELL_MXC_PEER_EXE` to its absolute path, and run the architecture's
+`windows:test:mxc-real:*` task with firewall-management permission. The peer test
+must execute rather than print SKIP before claiming connectivity coverage.
+The current writer's `INetFwRules::Add` plus `LocalAppPackageId` combination is
+[unsupported by Windows](https://learn.microsoft.com/en-us/windows/win32/api/netfw/nf-netfw-inetfwrules-add).
+Elevation alone is not a verified remedy. A passing permission-denial test
+proves failure handling, not successful firewall installation or peer HTTPS.
+
+Relay protocol version 5 requires matching gateway and relay binaries. The
+compiled relay contract tests cover curated non-peer environments and explicit
+peer proxy inheritance, including override precedence and NO_PROXY exclusion.
 
 ## Test Accounting Guidance
 

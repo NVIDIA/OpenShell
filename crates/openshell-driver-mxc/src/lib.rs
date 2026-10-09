@@ -35,6 +35,10 @@ mod policy_map;
 #[cfg(target_os = "windows")]
 mod etw_consumer;
 #[cfg(target_os = "windows")]
+mod peer;
+#[cfg(target_os = "windows")]
+mod peer_firewall;
+#[cfg(target_os = "windows")]
 mod relay;
 
 #[cfg(target_os = "windows")]

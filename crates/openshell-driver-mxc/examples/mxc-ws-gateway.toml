@@ -18,8 +18,8 @@
 #                     Wrap the sandbox command in openshell-supervisor-relay.exe
 #                     instead of launching it directly (see driver.rs's
 #                     launch handshake). This is what gives the driver a
-#                     control channel into the sandbox, which dynamic
-#                     forwarding depends on.
+#                     control channel for launch, readiness, shutdown, and
+#                     dynamic forwarding.
 #
 # Connectivity: entirely on-demand via `openshell forward service
 # --target-port 22000` (ForwardSink::open_dynamic_forward / the control
@@ -51,10 +51,16 @@ pc_capabilities = ["privateNetworkClientServer"]
 # process_container only: keep standard privilege level (not LPA).
 pc_least_privilege = false
 
-# No governed Internet egress is needed. The relay reaches the driver's
-# on-demand private-interface listener through privateNetworkClientServer above.
+# No governed Internet egress is needed. This forwarding test deliberately
+# leaves proxy-peer mode disabled because MXC 1.0 proxy peers are egress-only.
 egress_proxy      = false
 egress_proxy_addr = ""
+
+# MXC 1.0 requires the broad local-network posture for the in-sandbox relay to
+# dial the workload's loopback listener. This also permits private-network
+# server ingress and host-loopback access; the test documents that residual
+# exposure instead of claiming sandbox-local-only networking.
+pc_allow_local_network = true
 
 # The workload command and cwd are supplied per sandbox by
 # run-ws-agent-test.ps1 through `sandbox create --driver-config-json`.
@@ -63,6 +69,7 @@ egress_proxy_addr = ""
 # Patched at runtime by run-ws-agent-test.ps1.
 pc_relay_spawner_path = "C:/work/openshell-mxc-ws/openshell-supervisor-relay.exe"
 pc_relay_target_port  = 22000
+pc_proxy_peer_path    = ""
 
 # Enable for verbose wxc-exec output during debugging.
 debug = true

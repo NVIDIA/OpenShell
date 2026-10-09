@@ -1982,7 +1982,16 @@ pub(super) async fn handle_forward_tcp(
         let (relay_addr, nonce, relay_handle) = forward_sink
             .open_dynamic_forward(&sandbox_id, target_port)
             .await
-            .map_err(|e| Status::unavailable(format!("driver dynamic forward failed: {e}")))?;
+            .map_err(|error| match error {
+                crate::ComputeDriverForwardError::Unsupported(message) => {
+                    Status::failed_precondition(format!(
+                        "driver dynamic forward is unsupported: {message}"
+                    ))
+                }
+                crate::ComputeDriverForwardError::Other(message) => {
+                    Status::unavailable(format!("driver dynamic forward failed: {message}"))
+                }
+            })?;
 
         // This is a latency-sensitive request/response tunnel, including on
         // loopback -- small agent-protocol/WS frames can otherwise stall
