@@ -119,6 +119,14 @@ struct Args {
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
+    /// Operator-owned endpoint registrations (JSON), outside the workload mount.
+    #[arg(long)]
+    isolation_backends_file: Option<PathBuf>,
+
+    /// Protected driver launch identity and generation-pinned TLS (JSON).
+    #[arg(long)]
+    boundary_launch_file: Option<PathBuf>,
+
     /// Protected gateway-issued credentials for this exact sandbox launch.
     #[arg(long)]
     auth_bundle_file: Option<PathBuf>,
@@ -182,16 +190,62 @@ fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
     Ok(())
 }
 
-fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
+fn backend_descriptor(args: &Args, admitted_backend: &str) -> Result<BackendDescriptor> {
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
     let payload = std::fs::read(path)
         .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
     Ok(BackendDescriptor {
-        backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
+        backend_name: admitted_backend.to_string(),
         payload,
     })
+}
+
+fn backend_setup(
+    args: &Args,
+    admitted_backend: &str,
+) -> Result<Box<dyn openshell_supervisor::backend_setup::BackendSetup>> {
+    use openshell_supervisor::backend_setup::{BackendRegistrations, OpenShellBackendSetup};
+    let registrations = match &args.isolation_backends_file {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|error| {
+                miette::miette!("read isolation backend registrations: {error}")
+            })?;
+            let registrations: BackendRegistrations =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    miette::miette!("decode isolation backend registrations: {error}")
+                })?;
+            registrations.validate()?;
+            registrations
+        }
+        None => BackendRegistrations::default(),
+    };
+    if admitted_backend == openshell_sandbox_backend::BACKEND_NAME {
+        if args.boundary_launch_file.is_some() {
+            return Err(miette::miette!(
+                "--boundary-launch-file is only valid for a registered external backend"
+            ));
+        }
+        return Ok(Box::new(OpenShellBackendSetup));
+    }
+    if !registrations
+        .backends
+        .iter()
+        .any(|backend| backend.name == admitted_backend)
+    {
+        return Err(miette::miette!(
+            "isolation backend {admitted_backend:?} is not registered"
+        ));
+    }
+    let path = args.boundary_launch_file.as_ref().ok_or_else(|| {
+        miette::miette!("--boundary-launch-file is required for a registered external backend")
+    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    let launch = serde_json::from_slice(&bytes)
+        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))?;
+    Ok(Box::new(registrations.resolve(admitted_backend, launch)?))
 }
 
 fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle> {
@@ -237,7 +291,9 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
             }
         }
         SupervisorRole::NetworkProxy => {
-            if args.backend_descriptor_file.is_some()
+            if args.isolation_backends_file.is_some()
+                || args.boundary_launch_file.is_some()
+                || args.backend_descriptor_file.is_some()
                 || args.auth_bundle_file.is_some()
                 || args.sandbox_id.is_some()
                 || args.sandbox.is_some()
@@ -305,13 +361,17 @@ fn main() -> Result<()> {
     arm_parent_liveness(args.parent_liveness_fd)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
-        let descriptor = backend_descriptor(&args)?;
+        let admitted_backend =
+            std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
+                .map_err(|_| miette::miette!("driver must supply an admitted isolation backend"))?;
+        let setup = backend_setup(&args, &admitted_backend)?;
+        let descriptor = backend_descriptor(&args, &admitted_backend)?;
         let auth = auth_bundle(&args)?;
         // Install the driver-provisioned session before starting log push or
         // any other gateway client. `run_sandbox` obtains the same Sandbox
         // Protocol bearer slot after validating the descriptor binding.
         let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
-        Some((descriptor, auth))
+        Some((setup, descriptor, auth, admitted_backend))
     } else {
         None
     };
@@ -416,34 +476,37 @@ fn main() -> Result<()> {
         match args.role {
             SupervisorRole::IsolationBackend => {
                 info!(command = ?command, "Starting sandbox supervision");
-                let Some((backend_descriptor, auth_bundle)) = isolation_inputs else {
+                let Some((backend_setup, backend_descriptor, auth_bundle, admitted_backend)) =
+                    isolation_inputs
+                else {
                     return Err(miette::miette!(
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
-                let admitted_isolation_backend =
-                    std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                Box::pin(openshell_supervisor::run_sandbox(
-                    command,
-                    workdir,
-                    args.timeout,
-                    interactive,
-                    await_main_process_attachment,
-                    args.sandbox_id,
-                    args.sandbox,
-                    args.openshell_endpoint,
-                    args.policy_rules,
-                    args.policy_data,
-                    args.ssh_socket_path,
-                    args.health_socket_path,
-                    args.health_port,
-                    ocsf_enabled,
-                    ocsf_schema_version,
-                    upstream_proxy_args,
-                    backend_descriptor,
-                    auth_bundle,
-                    admitted_isolation_backend,
-                    args.main_exit_marker,
+                Box::pin(openshell_supervisor::run_sandbox_with_backend(
+                    backend_setup.as_ref(),
+                    openshell_supervisor::SandboxRunConfig {
+                        command,
+                        workdir,
+                        timeout_secs: args.timeout,
+                        interactive,
+                        await_main_process_attachment,
+                        sandbox_id: args.sandbox_id,
+                        sandbox: args.sandbox,
+                        openshell_endpoint: args.openshell_endpoint,
+                        policy_rules: args.policy_rules,
+                        policy_data: args.policy_data,
+                        ssh_socket_path: args.ssh_socket_path,
+                        health_socket_path: args.health_socket_path,
+                        health_port: args.health_port,
+                        ocsf_enabled,
+                        ocsf_schema_version,
+                        upstream_proxy_args,
+                        backend_descriptor,
+                        auth_bundle,
+                        admitted_isolation_backend: Some(admitted_backend),
+                        main_exit_marker: args.main_exit_marker,
+                    },
                 ))
                 .await
             }
@@ -519,7 +582,7 @@ mod tests {
         assert_eq!(args.role, SupervisorRole::IsolationBackend);
         assert!(validate_role_arguments(&args).is_ok());
         assert_eq!(
-            backend_descriptor(&args)
+            backend_descriptor(&args, openshell_sandbox_backend::BACKEND_NAME)
                 .expect("runtime descriptor")
                 .payload,
             vec![0]
@@ -530,6 +593,47 @@ mod tests {
     fn isolation_backend_inputs_are_mandatory() {
         let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
         assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn external_backend_names_require_operator_registration() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).unwrap();
+        assert_eq!(
+            backend_setup(&args, openshell_sandbox_backend::BACKEND_NAME)
+                .unwrap()
+                .backend_name(),
+            openshell_sandbox_backend::BACKEND_NAME
+        );
+        assert!(
+            backend_setup(&args, "external")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not registered")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backends.json");
+        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#).unwrap();
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--isolation-backends-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(
+            backend_setup(&args, "external")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("--boundary-launch-file is required")
+        );
+        assert!(
+            backend_setup(&args, "External")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not registered")
+        );
     }
 
     #[test]

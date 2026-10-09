@@ -1301,6 +1301,74 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
+### External isolation backend
+
+After installing a compatible external compute driver and isolation backend,
+set its backend name in `[openshell.drivers.<name>]`, then select that compute
+driver with `openshell.gateway.compute_driver`:
+
+```toml
+[openshell.gateway]
+compute_driver = "agent-substrate"
+
+[openshell.drivers.agent-substrate]
+socket_path = "/run/agent-substrate/compute.sock"
+isolation_backend = "agent-substrate"
+
+[[openshell.supervisor.isolation_backends]]
+name = "agent-substrate"
+endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" }
+```
+
+Endpoint addresses must be reachable from the supervisor's placement. TCP uses
+`{ kind = "tcp", authority = "backend.example:443", addresses = ["192.0.2.10:443"] }`;
+vsock uses `{ kind = "vsock", guest_cid = 3, port = 47000 }`.
+Names match exactly. Unknown names, duplicate registrations, invalid endpoints,
+and registration of the reserved `openshell-sandbox` name fail configuration
+validation, including for unused registrations.
+
+The selected compute driver must advertise
+`openshell.compute.isolation-backend-registration`. The gateway sends the
+resolved name and endpoint on validation, create, start, and recovery. The
+driver places the backend and stages protected supervisor launch files,
+generation-specific TLS, and its opaque descriptor. Gateway launch signing
+must be configured through `gateway_jwt` or the package-managed local signing
+keys. An incompatible driver fails gateway startup; there is no fallback.
+
+Once configured, changing the `compute_driver` line and restarting the gateway
+selects that driver and its isolation backend for new sandboxes. Driver and
+backend names can differ; the gateway never infers one from the other.
+
+Changing the selected driver's `isolation_backend` and restarting also changes
+its backend for new sandboxes. Its existing sandboxes retain their admitted
+backend name; start and recovery reject a different backend before calling the
+driver. Restore the matching backend to start them, or create new sandboxes.
+Legacy records retain `openshell-sandbox`.
+Omit the driver's `isolation_backend` field or set it to `openshell-sandbox`
+to use the driver's built-in runtime. The first-party drivers currently support
+that built-in selection only. Sandbox CLI and API requests do not select
+isolation backends or supply endpoints.
+
+Helm renders these same fields through `gatewayConfig`:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    compute_driver: agent-substrate
+  openshell.drivers.agent-substrate:
+    socket_path: /run/agent-substrate/compute.sock
+    isolation_backend: agent-substrate
+  openshell.supervisor.isolation_backends:
+    - name: agent-substrate
+      endpoint:
+        kind: unix
+        socket_path: /run/agent-substrate/isolation.sock
+```
+
+The driver socket must be mounted in the gateway deployment. The isolation
+endpoint belongs to the supervisor's placement; mounting it in the gateway
+alone does not make it reachable by the supervisor.
+
 ## Preflight package configuration {#gateway-config-preflight}
 
 Before starting a package-managed gateway, validate the selected file without

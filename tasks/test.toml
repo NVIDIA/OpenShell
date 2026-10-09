@@ -98,6 +98,14 @@ depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
 description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
 run = "e2e/run.sh"
 
+["e2e:isolation-protocol"]
+description = "Run the stock supervisor against an independently implemented Python Sandbox Protocol backend"
+run = [
+  "cargo build --locked -p openshell-supervisor",
+  'uv run e2e/isolation/protocol_interop.py "${CARGO_TARGET_DIR:-target}/debug/openshell-supervisor"',
+]
+run_windows = "echo Skipping e2e:isolation-protocol: the workload fixture requires /bin/sleep."
+
 ["e2e:gpu"]
 description = "Run Docker GPU end-to-end tests"
 depends = ["e2e:docker:gpu"]

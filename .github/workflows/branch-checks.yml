@@ -237,6 +237,11 @@ jobs:
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
+      - name: Sandbox Protocol interoperability
+        if: matrix.system == 'x86_64-linux'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: mise run e2e:isolation-protocol
+
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
     needs: pr_metadata

@@ -10,11 +10,13 @@
 
 pub mod boundary_protocol;
 pub mod delegated;
+pub mod isolation_protocol;
 pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
 
-pub use runtime::OpenShellRuntimeBackend;
+pub use openshell_core::proto::isolation::backend::v1 as isolation_proto;
+pub use runtime::{DelegatedRuntimeBackend, OpenShellRuntimeBackend};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;
@@ -37,16 +39,7 @@ pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
 /// tmpfs ownership create this child as the unprivileged sandbox identity.
 pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/material";
 
-/// Generated gRPC transport envelope for the OpenShell Sandbox Protocol.
-#[allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    dead_code,
-    unused_imports,
-    unused_qualifications,
-    rust_2018_idioms
-)]
+/// Generated gRPC transport envelope for the `OpenShell` Sandbox Protocol.
 pub mod proto {
-    tonic::include_proto!("openshell.sandbox.protocol.v1");
+    pub use openshell_core::proto::sandbox::protocol::v1::*;
 }

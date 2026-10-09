@@ -22,6 +22,103 @@ const TEST_BACKEND: &str = "in-process-test";
 // Deliberately not JSON or a SandboxRuntimeDescriptor. Only TestSetup accepts it.
 const TEST_PAYLOAD: &[u8] = b"in-process-v1\0owned-launch";
 
+#[test]
+fn endpoint_registrations_reject_duplicates_builtin_replacement_and_bad_routes() {
+    for config in [
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"relative"}}]}"#,
+        r#"{"backends":[{"name":"openshell-sandbox","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/a"}},{"name":"external","endpoint":{"kind":"unix","socket_path":"/b"}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"tcp","authority":"backend","addresses":["0.0.0.0:443"]}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":2,"port":47000}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":4294967295,"port":47000}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":3,"port":4294967295}}]}"#,
+        r#"{"backends":[{"name":" ","endpoint":{"kind":"unix","socket_path":"/a"}}]}"#,
+    ] {
+        let registrations: BackendRegistrations = serde_json::from_str(config).unwrap();
+        assert!(registrations.validate().is_err(), "{config}");
+    }
+}
+
+#[test]
+fn registered_backend_selects_operator_endpoint_and_preserves_opaque_payload() {
+    use openshell_sandbox_backend::boundary_protocol::SandboxTlsClientConfig;
+    use openshell_sandbox_backend::delegated::DelegatedLaunch;
+    let setup = TestSetup::new();
+    let tls = openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(
+        setup.auth.session_id,
+    )
+    .unwrap();
+    let registrations: BackendRegistrations = serde_json::from_str(
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#,
+    ).unwrap();
+    let launch = DelegatedLaunch {
+        backend_name: "external".into(),
+        sandbox_id: setup.sandbox_id.clone(),
+        generation: setup.auth.runtime_generation.to_string(),
+        session_id: setup.auth.session_id,
+        workload_identity: identity(),
+        tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        resource_claims: BTreeMap::new(),
+        outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
+            "generation-1",
+            [
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::NoUnmanagedEgressPath,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ],
+            b"driver-fence",
+        )
+        .unwrap(),
+    };
+    assert!(registrations.resolve("unknown", launch.clone()).is_err());
+    assert!(registrations.resolve("External", launch.clone()).is_err());
+    for field in ["name", "tls", "fence", "identity"] {
+        let mut invalid = launch.clone();
+        match field {
+            "name" => invalid.backend_name = "other".into(),
+            "tls" => invalid.tls.trust_anchor_pem.clear(),
+            "fence" => invalid.outer_fence.generation = "other".into(),
+            "identity" => invalid.workload_identity.uid = 0,
+            _ => unreachable!(),
+        }
+        assert!(
+            registrations.resolve("external", invalid).is_err(),
+            "{field}"
+        );
+    }
+    let registered = registrations.resolve("external", launch).unwrap();
+    let selected = SelectedBackend::select(
+        &registered,
+        BackendDescriptor {
+            backend_name: "external".into(),
+            payload: TEST_PAYLOAD.to_vec(),
+        },
+        Some("external"),
+        Some("sandbox-1"),
+        &setup.auth,
+    )
+    .unwrap();
+    assert_eq!(selected.descriptor.payload, TEST_PAYLOAD);
+    assert!(
+        SelectedBackend::select(
+            &registered,
+            BackendDescriptor {
+                backend_name: "external".into(),
+                payload: TEST_PAYLOAD.to_vec()
+            },
+            Some("workload-choice"),
+            Some("sandbox-1"),
+            &setup.auth
+        )
+        .is_err()
+    );
+}
+
 #[derive(Default)]
 struct Observed {
     events: Mutex<Vec<&'static str>>,

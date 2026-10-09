@@ -13,13 +13,13 @@ struct RenewingGrpcBoundary {
 }
 
 #[tonic::async_trait]
-impl IsolationBoundary for RenewingGrpcBoundary {
+impl DelegatedIsolationBoundary for RenewingGrpcBoundary {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if self
             .failures
@@ -40,7 +40,7 @@ impl IsolationBoundary for RenewingGrpcBoundary {
 
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         self.exchange(request).await
     }
@@ -87,7 +87,8 @@ async fn renewing_boundary_client(
             let service = server_service.clone();
             connections.spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(IsolationBoundaryServer::new(service))
+                    .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                    .add_service(DelegatedIsolationBoundaryServer::new(service))
                     .serve_with_incoming(
                         tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(Box::new(stream)))])
                             .chain(tokio_stream::pending()),

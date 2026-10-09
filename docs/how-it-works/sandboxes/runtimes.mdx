@@ -44,6 +44,11 @@ driver TOML overrides the compiled release defaults. Helm renders Kubernetes
 image fields into TOML, so they apply when these environment variables are
 unset. Sandbox requests cannot override either trusted image.
 
+Use supervisor and sandbox-runtime images from the same release. The supervisor
+checks their isolation protocol version and required capabilities before
+starting workload code. An incompatible pair fails sandbox startup; update
+both trusted images together when overriding the release defaults.
+
 When building your own gateway or supervisor image, the `GATEWAY_BASE_IMAGE`
 and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
 [Container Image Base Overrides](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
@@ -222,6 +227,28 @@ The driver looks up sandbox images in local Docker or Podman before pulling from
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
+
+## External isolation backends
+
+An external compute driver can launch the stock supervisor against an isolation
+backend maintained outside OpenShell. Register the operator-owned endpoint under
+`openshell.supervisor.isolation_backends`, set its exact name as
+`isolation_backend` in `[openshell.drivers.<name>]`, and select that compute
+driver with `openshell.gateway.compute_driver`. See the
+[gateway configuration reference](/how-it-works/gateways/configuration#external-isolation-backend)
+for TOML and Helm examples.
+
+The gateway passes that registration to a compute driver that advertises support.
+The driver stages protected supervisor launch files, generation-pinned TLS,
+gateway credentials, and its native descriptor. Sandbox requests and workload
+environment cannot select the backend. First-party drivers currently support
+only the built-in `openshell-sandbox` selection.
+
+Backend authors can generate bindings from the public protos and implement
+[Sandbox Protocol 1.0](https://github.com/NVIDIA/OpenShell/tree/main/proto/sandbox_protocol/v1).
+The contract includes lifecycle, framing, replay, process I/O, and TCP/DNS
+mediation. Endpoint registration supports fresh launches; state-preserving
+suspend/resume remains an optional contract awaiting lifecycle integration.
 
 ## Kubernetes Driver
 
