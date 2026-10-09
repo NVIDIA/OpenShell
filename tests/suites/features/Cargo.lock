@@ -919,6 +919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-test-feature-oci-image"
+version = "0.0.0"
+dependencies = [
+ "openshell-conformance",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-test-feature-provider-refresh-keycloak"
 version = "0.0.0"
 dependencies = [

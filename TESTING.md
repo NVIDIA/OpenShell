@@ -311,6 +311,30 @@ binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
+The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
+OCI image identity and working-directory behavior shared by the Docker and
+Podman drivers against installed deb packages on Ubuntu and rpm packages on
+Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+```
+
+The shared suite also runs in the existing ARM64 Docker E2E workflow for
+branch checks and both release workflows. That interim lane compiles the same
+test crate natively and uses the architecture-matched prebuilt candidate CLI
+and gateway plus the candidate multi-architecture sandbox and supervisor
+images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
+x86_64 artifacts; they do not replace ARM64 image coverage.
+
+Run it against a local gateway by naming the command that builds images into
+the gateway's image store:
+
+```shell
+OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh \
+  cargo test --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1
+```
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
@@ -490,7 +514,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:

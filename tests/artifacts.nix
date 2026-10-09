@@ -95,6 +95,14 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
+  ociImageArchive = mkTestArchive {
+    name = "oci-image";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-oci-image";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
+  };
 
   # Follow-up: migrate these wrapper-coupled tests once tmachine provides their
   # managed-gateway controls, SPIFFE fixtures, caller driver-config setting,
@@ -198,6 +206,7 @@ rec {
   inherit
     conformanceCliArchive
     providerRefreshKeycloakArchive
+    ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -246,12 +255,14 @@ rec {
     runtimeInputs = [
       conformanceCliArchive
       providerRefreshKeycloakArchive
+      ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';

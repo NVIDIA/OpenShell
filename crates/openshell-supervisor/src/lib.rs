@@ -65,6 +65,24 @@ use openshell_ocsf::{
 /// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
+/// The sandbox rejected the image working directory while starting the agent.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{0}")]
+pub struct WorkspaceValidationFailed(String);
+
+/// Convert an agent start failure into a report.
+///
+/// The sandbox reports errors across the boundary as text, so a workspace
+/// rejection is recognized here, once, and carried as
+/// [`WorkspaceValidationFailed`] from then on.
+pub fn start_agent_error(message: String) -> miette::Report {
+    if message.contains(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT) {
+        miette::Report::new(WorkspaceValidationFailed(message))
+    } else {
+        miette::miette!(message)
+    }
+}
+
 async fn retain_remote_access_plane(
     proxy_exited: impl Future<Output = ()>,
     shutdown_requested: impl Future<Output = ()>,
@@ -1241,7 +1259,7 @@ async fn run_sandbox_with_backend(
             .start_agent()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| start_agent_error(error.to_string()))?;
         workload_started_tx.send_replace(true);
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();
