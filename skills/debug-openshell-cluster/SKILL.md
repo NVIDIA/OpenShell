@@ -72,7 +72,7 @@ Common findings:
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
-- Fresh Snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published Snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local Snap gateway is expected to run.
+- Fresh snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
@@ -1070,7 +1070,7 @@ When handing results back to the user, include:
 
 ## Package Configuration Preflight
 
-For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
+For a Debian, Ubuntu, or snap gateway that stops before certificate generation or
 daemon startup, validate the selected configuration without starting the service:
 
 ```shell

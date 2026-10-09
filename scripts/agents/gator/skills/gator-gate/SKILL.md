@@ -534,7 +534,7 @@ Validate small and concentrated work when it has clear motivation and one of the
 - TUI, CLI, or API quality-of-life improvement with a clear user path
 - Driver improvement that makes sandbox lifecycle management easier or more efficient
 - Documentation clarification, typo fix, errata, or missing documentation
-- CI/CD/build/release improvement, including Snap, package, release, or test harness work
+- CI/CD/build/release improvement, including snap, package, release, or test harness work
 
 Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
 

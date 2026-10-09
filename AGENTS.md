@@ -226,6 +226,10 @@ When behavior, commands, or development workflows change, review the related age
 - Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
+## Terminology
+
+- Treat `snap` as a common noun. Lowercase it in ordinary prose, but capitalize it where normal English sentence or title casing requires. Preserve proper names such as Snap Store, Snapcraft, and snapd.
+
 ## Security
 
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
