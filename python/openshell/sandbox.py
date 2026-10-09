@@ -1629,7 +1629,7 @@ class Sandbox:
                 "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
             )
 
-        client = SandboxClient.from_active_cluster(
+        self._client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
             auto_refresh=self._auto_refresh,
@@ -1637,8 +1637,17 @@ class Sandbox:
             insecure=self._insecure,
             client_credentials=self._client_credentials,
         )
-        self._client = client
+        try:
+            self._open_session(self._client)
+        except BaseException:
+            # Python skips __exit__ when __enter__ raises, so release here
+            # and keep the original error even if the close fails.
+            with contextlib.suppress(Exception):
+                self._release()
+            raise
+        return self
 
+    def _open_session(self, client: SandboxClient) -> None:
         if self._sandbox_input is None and self._workload_template is not None:
             self._session = client.create_session_from_template(
                 workspace=self._workspace,
@@ -1670,7 +1679,12 @@ class Sandbox:
         )
         self._session = SandboxSession(client, ready)
 
-        return self
+    def _release(self) -> None:
+        client = self._client
+        self._session = None
+        self._client = None
+        if client is not None:
+            client.close()
 
     def __exit__(self, *args: object) -> None:
         try:
@@ -1694,10 +1708,7 @@ class Sandbox:
                         f"unsupported deletion outcome: {result.outcome}"
                     )
         finally:
-            if self._client is not None:
-                self._client.close()
-            self._session = None
-            self._client = None
+            self._release()
 
     def exec(
         self,
