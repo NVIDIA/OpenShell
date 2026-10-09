@@ -1411,6 +1411,131 @@ async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection(
 }
 
 #[tokio::test]
+async fn policy_atomic_write_advances_version_without_projection_changes() {
+    for conditional in [false, true] {
+        for unchanged_annotations in [false, true] {
+            let store = test_store().await;
+            let policy = SandboxPolicy::default();
+            let annotations = StdHashMap::from([("signature".to_string(), "old".to_string())]);
+            let mut sandbox = policy_test_sandbox("sandbox-cas", "cas");
+            sandbox.spec.as_mut().unwrap().policy = Some(policy.clone());
+            sandbox.metadata.as_mut().unwrap().annotations = annotations.clone();
+            store.put_message(&sandbox).await.unwrap();
+            let before = store
+                .get_message::<Sandbox>("sandbox-cas")
+                .await
+                .unwrap()
+                .unwrap();
+            let original_version = before.metadata.as_ref().unwrap().resource_version;
+            let write = AtomicPolicyRevisionWrite {
+                id: "policy-cas-1".to_string(),
+                sandbox_id: "sandbox-cas".to_string(),
+                workspace: "default".to_string(),
+                version: 1,
+                policy_payload: policy.encode_to_vec(),
+                policy_hash: "hash-cas-1".to_string(),
+                provenance: StdHashMap::new(),
+                expected_resource_version: if conditional { original_version } else { 0 },
+                annotations: if unchanged_annotations {
+                    annotations
+                } else {
+                    StdHashMap::new()
+                },
+                backfill_policy: None,
+            };
+
+            let first = store.put_policy_revision_atomic(&write).await.unwrap();
+            let mut expected = before;
+            expected.metadata.as_mut().unwrap().resource_version = original_version + 1;
+            assert_eq!(first, expected);
+            assert_eq!(
+                store.get_message::<Sandbox>("sandbox-cas").await.unwrap(),
+                Some(expected.clone())
+            );
+
+            // Both writers read the original sandbox version. The first policy
+            // changed no projected fields, but the second writer is still stale.
+            let mut second_write = AtomicPolicyRevisionWrite {
+                id: "policy-cas-2".to_string(),
+                version: 2,
+                policy_payload: SandboxPolicy {
+                    version: 2,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                policy_hash: "hash-cas-2".to_string(),
+                expected_resource_version: original_version,
+                annotations: StdHashMap::from([("signature".to_string(), "new".to_string())]),
+                ..write
+            };
+            let error = store
+                .put_policy_revision_atomic(&second_write)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                PersistenceError::Conflict {
+                    current_resource_version: Some(version),
+                } if version == original_version + 1
+            ));
+            assert_eq!(
+                store.get_message::<Sandbox>("sandbox-cas").await.unwrap(),
+                Some(expected)
+            );
+            assert!(
+                store
+                    .get_policy_by_version("sandbox-cas", 2)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let latest = store
+                .get_latest_policy("sandbox-cas")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.version, 1);
+            assert_eq!(latest.status, "pending");
+
+            second_write.expected_resource_version = original_version + 1;
+            let second = store
+                .put_policy_revision_atomic(&second_write)
+                .await
+                .unwrap();
+            assert_eq!(
+                second.metadata.as_ref().unwrap().resource_version,
+                original_version + 2
+            );
+            assert_eq!(
+                second.metadata.as_ref().unwrap().annotations,
+                second_write.annotations
+            );
+            assert_eq!(second.spec.as_ref().unwrap().policy, Some(policy));
+            assert_eq!(
+                store.get_message::<Sandbox>("sandbox-cas").await.unwrap(),
+                Some(second)
+            );
+
+            // Identical policy content still creates a new revision and advances
+            // the version used by the next conditional writer.
+            let third = store
+                .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+                    id: "policy-cas-3".to_string(),
+                    version: 3,
+                    expected_resource_version: original_version + 2,
+                    ..second_write
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                third.metadata.as_ref().unwrap().resource_version,
+                original_version + 3
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts() {
     let store = test_store().await;
     store
@@ -1464,6 +1589,15 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
     );
     assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
     assert!(after.spec.as_ref().unwrap().policy.is_none());
+    assert_eq!(after, before);
+    let revision = store
+        .get_latest_policy("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.id, "existing-policy");
+    assert_eq!(revision.policy_hash, "existing-hash");
+    assert_eq!(revision.status, "pending");
 }
 
 #[tokio::test]
