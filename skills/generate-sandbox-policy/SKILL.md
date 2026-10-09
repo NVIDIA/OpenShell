@@ -182,6 +182,10 @@ When middleware is requested, also read the published [supervisor middleware gui
 
 For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview) and the [default policy reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
 
+Image policies are adopted only during initial sandbox setup and must not
+contain `credential_binding`. Submit credential bindings through the gateway
+with `openshell policy set` as a workspace admin.
+
 Validate the intended provider combination as well as the authored policy.
 An image endpoint can become credentialed after provider composition and block
 startup with `ConfigurationInvalid`. Repair the complete policy or provider

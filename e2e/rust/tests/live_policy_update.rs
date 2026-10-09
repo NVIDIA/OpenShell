@@ -625,22 +625,8 @@ async fn live_policy_update_from_empty_network_policies() {
     guard.cleanup().await;
 }
 
-/// Regression for #2159: a sparse initial policy that the supervisor enriches
-/// with baseline filesystem paths during startup must have its resulting
-/// revision acknowledged as loaded, not left `Pending`.
-///
-/// Reproduction (matches the maintainer's triage): create a sandbox with the
-/// network-only `examples/policy-advisor/sandbox-policy.yaml`. The supervisor
-/// adds baseline filesystem paths, syncs the enriched policy back to the
-/// gateway (creating revision 2, superseding revision 1), builds the OPA engine
-/// and then acknowledges revision 2 as loaded. Before the fix, revision 2
-/// stayed `Pending` even though the sandbox was `Ready` and the policy was
-/// effective.
-///
-/// NOTE: This exercises the Docker-backed supervisor built from this branch.
-/// The exact `policy list` status wording ("Loaded"/"Superseded") may differ by
-/// CLI version; the assertions below key on the effective version reaching 2 and
-/// no revision remaining `Pending` once the acknowledgement lands.
+/// A sparse gateway policy must be acknowledged as loaded after local runtime
+/// filesystem enrichment, without creating a second authored revision.
 #[tokio::test]
 async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     let sparse_policy = write_sparse_policy().expect("write sparse policy fixture");
@@ -663,9 +649,8 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     .await
     .expect("create keep sandbox with sparse policy");
 
-    // The enriched revision (2) is synced during startup; the acknowledgement
-    // (LOADED) is delivered by the supervisor's poll loop shortly after Ready.
-    // Poll until the effective policy is version 2 and no revision is Pending.
+    // Startup enriches locally and acknowledges the original gateway revision.
+    // Poll until that revision is loaded.
     let mut acknowledged = false;
     let mut last_list = String::new();
     for _ in 0..30 {
@@ -676,7 +661,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
         last_list = list.output.clone();
         let pending = list.output.to_lowercase().contains("pending");
 
-        if version == Some(2) && list.success && !pending {
+        if version == Some(1) && list.success && !pending {
             acknowledged = true;
             break;
         }
@@ -685,15 +670,13 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 
     assert!(
         acknowledged,
-        "enriched initial policy should reach revision 2 with no Pending revision.\n\
+        "initial policy should remain revision 1 with no Pending revision.\n\
          last `policy list` output:\n{last_list}"
     );
 
-    // Both the superseded original (1) and the loaded enriched revision (2)
-    // must appear in the revision history.
     assert!(
-        list_output_contains_version(&last_list, 2),
-        "policy list should contain revision 2:\n{last_list}"
+        !list_output_contains_version(&last_list, 2),
+        "local enrichment must not create revision 2:\n{last_list}"
     );
     assert!(
         list_output_contains_version(&last_list, 1),

@@ -1750,6 +1750,34 @@ struct AutoApproveChunkContext<'a> {
     resolved_from: &'a str,
 }
 
+// Binding declarations include rule and process scope as well as destination.
+// Reusing an approved destination in another rule still needs admin approval.
+fn credential_binding_declarations_changed(
+    current: &ProtoSandboxPolicy,
+    candidate: &ProtoSandboxPolicy,
+) -> bool {
+    fn contained(left: &ProtoSandboxPolicy, right: &ProtoSandboxPolicy) -> bool {
+        left.network_policies.iter().all(|(name, rule)| {
+            rule.endpoints
+                .iter()
+                .filter(|endpoint| endpoint.credential_binding.is_some())
+                .all(|endpoint| {
+                    right.network_policies.get(name).is_some_and(|other| {
+                        other.binaries == rule.binaries
+                            && other.endpoints.iter().any(|other_endpoint| {
+                                other_endpoint.credential_binding == endpoint.credential_binding
+                                    && other_endpoint.host == endpoint.host
+                                    && other_endpoint.port == endpoint.port
+                                    && other_endpoint.ports == endpoint.ports
+                                    && other_endpoint.path == endpoint.path
+                            })
+                    })
+                })
+        })
+    }
+    !contained(current, candidate) || !contained(candidate, current)
+}
+
 async fn auto_approve_chunk(
     state: &Arc<ServerState>,
     chunk_id: &str,
@@ -1788,6 +1816,22 @@ async fn auto_approve_chunk(
         None,
     )
     .await?;
+    if live_evaluation
+        .candidate_effective_policy
+        .as_ref()
+        .is_some_and(|candidate| {
+            credential_binding_declarations_changed(
+                &live_evaluation.current_effective_policy,
+                candidate,
+            )
+        })
+    {
+        let error = Status::failed_precondition(
+            "Credential binding changes require workspace admin approval",
+        );
+        persist_pending_application_error(state, chunk_id, &error).await;
+        return Ok(());
+    }
     let validation_result = live_evaluation.validation_result;
     if validation_result != "prover: no new findings" {
         info!(
@@ -2540,8 +2584,19 @@ fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
     )
 }
 
-/// Sandbox-class callers may only perform sandbox-scoped policy sync. They
-/// must not mutate global config or sandbox settings.
+const IMAGE_POLICY_BINDING_ERROR: &str = "Image policy contains credential_binding. A workspace admin must submit the reviewed policy through the gateway.";
+const IMAGE_POLICY_INITIALIZED_ERROR: &str = "Sandbox policy is already initialized; a workspace admin must submit policy changes through the gateway.";
+
+fn image_policy_has_credential_bindings(policy: &ProtoSandboxPolicy) -> bool {
+    policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| endpoint.credential_binding.is_some())
+    })
+}
+
+/// Sandbox callers may only submit an initial sandbox policy. Admission and
+/// persistence are checked under the mutation lock in `UpdateConfig`.
 fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Status> {
     if req.global {
         return Err(Status::permission_denied(
@@ -2942,7 +2997,17 @@ pub(super) async fn load_sandbox_config(
         &policy_credential_bindings,
         &provider_policy_context.endpointless_provider_names,
     );
-    let mut configuration_error = String::new();
+    let mut configuration_error = if policy.is_none()
+        && sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+            .is_some_and(|admission| admission.error == IMAGE_POLICY_BINDING_ERROR)
+    {
+        IMAGE_POLICY_BINDING_ERROR.to_string()
+    } else {
+        String::new()
+    };
     if let Some(effective_policy) = policy.as_mut() {
         stamp_provider_credentialed_endpoints(
             effective_policy,
@@ -4193,6 +4258,78 @@ async fn handle_update_config_inner(
         ));
     }
 
+    // Initial adoption is fenced by a fresh row's resource version in the
+    // atomic policy write, including writes from other gateway replicas.
+    let sandbox = if sandbox_caller {
+        state
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "fetch sandbox for policy update")
+            })?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?
+    } else {
+        sandbox
+    };
+    if sandbox_caller
+        && (sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.policy.is_some())
+            || sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.configuration_activated == Some(true))
+            || state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .map_err(|error| super::persistence_error_to_status(error, "fetch initial policy"))?
+                .is_some())
+    {
+        return Err(Status::failed_precondition(IMAGE_POLICY_INITIALIZED_ERROR));
+    }
+    if sandbox_caller
+        && req
+            .policy
+            .as_ref()
+            .is_some_and(image_policy_has_credential_bindings)
+    {
+        // Persist a gateway-authored diagnostic without storing any rejected policy.
+        let updated = state
+            .store
+            .update_message_cas::<Sandbox, _>(
+                &sandbox_id,
+                sandbox.get_resource_version(),
+                |sandbox| {
+                    if let Some(admission) = sandbox
+                        .status
+                        .as_mut()
+                        .and_then(|status| status.configuration_admission.as_mut())
+                    {
+                        admission.state =
+                            openshell_core::proto::ConfigurationAdmissionState::Rejected.into();
+                        admission.error = IMAGE_POLICY_BINDING_ERROR.to_string();
+                    }
+                    crate::compute::apply_configuration_readiness(sandbox);
+                },
+            )
+            .await
+            .map_err(|error| {
+                if matches!(error, crate::persistence::PersistenceError::Conflict { .. }) {
+                    // An admin repair may have arrived before the rejection.
+                    // Let startup refetch it instead of treating the race as fatal.
+                    Status::failed_precondition(IMAGE_POLICY_BINDING_ERROR)
+                } else {
+                    super::persistence_error_to_status(error, "record image policy rejection")
+                }
+            })?;
+        state.sandbox_index.update_from_sandbox(&updated);
+        state.sandbox_watch_bus.notify(&sandbox_id);
+        return Err(Status::failed_precondition(IMAGE_POLICY_BINDING_ERROR));
+    }
+
     // Sandbox-scoped policy update.
     let mut new_policy = req
         .policy
@@ -4282,6 +4419,10 @@ async fn handle_update_config_inner(
                 .await
                 .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
+            if sandbox_caller && latest.is_some() {
+                return Err(Status::failed_precondition(IMAGE_POLICY_INITIALIZED_ERROR));
+            }
+
             if let Some(ref current) = latest
                 && canonical_policy_record_matches_for_deduplication(current, &hash)
                 && current.provenance == req.annotations
@@ -4319,7 +4460,11 @@ async fn handle_update_config_inner(
                 policy_payload: payload.clone(),
                 policy_hash: hash.clone(),
                 provenance: req.annotations.clone(),
-                expected_resource_version: req.expected_resource_version,
+                expected_resource_version: if sandbox_caller {
+                    sandbox.get_resource_version()
+                } else {
+                    req.expected_resource_version
+                },
                 annotations: req.annotations.clone(),
                 backfill_policy: backfill_policy.clone(),
             };
@@ -4329,6 +4474,17 @@ async fn handle_update_config_inner(
                     committed =
                         Some((next_version, sandbox_metadata_annotations(&updated_sandbox)));
                     break;
+                }
+                Err(error)
+                    if sandbox_caller
+                        && (matches!(
+                            error,
+                            crate::persistence::PersistenceError::Conflict { .. }
+                        ) || error.is_unique_violation_on("objects_version_uq")) =>
+                {
+                    return Err(Status::failed_precondition(
+                        "Initial policy adoption raced with another configuration change; fetch configuration again",
+                    ));
                 }
                 Err(error) if error.is_unique_violation_on("objects_version_uq") => {
                     warn!(
@@ -23136,6 +23292,294 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_leaves_credential_binding_proposal_pending_for_admin() {
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-image-auto".to_string(),
+                    name: "image-auto".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "image-auto".to_string(),
+                    display_name: "Image Auto".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("image-provider", "image-auto"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-binding-auto",
+                "binding-auto",
+                openshell_policy::restrictive_default_policy(),
+                vec!["image-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+        seed_sandbox_approval_mode(&state, "binding-auto", "auto").await;
+        let mut policy =
+            test_policy_with_credential_binding("bound", "api.vendor.example", "image-provider");
+        let rule = policy.network_policies.get_mut("bound").unwrap();
+        rule.endpoints[0].protocol = "rest".to_string();
+        rule.endpoints[0].access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        rule.binaries.push(NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+        });
+        let submitted = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "binding-auto".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "bound".to_string(),
+                    proposed_rule: Some(rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submitted.accepted_chunk_ids.len(), 1);
+        let chunk = state
+            .store
+            .get_draft_chunk(&submitted.accepted_chunk_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.status, "pending");
+        assert!(
+            chunk.application_error.contains("workspace admin approval"),
+            "{}",
+            chunk.application_error
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-binding-auto")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn automatic_proposals_require_admin_for_binding_and_process_scope_changes() {
+        let current = test_policy_with_credential_binding("bound", "api.example.com", "provider");
+        assert!(!credential_binding_declarations_changed(&current, &current));
+        for mutation in [
+            "host", "provider", "path", "port", "binary", "rule", "remove",
+        ] {
+            let mut candidate = current.clone();
+            let rule = candidate.network_policies.get_mut("bound").unwrap();
+            match mutation {
+                "host" => rule.endpoints[0].host = "other.example.com".to_string(),
+                "provider" => {
+                    rule.endpoints[0]
+                        .credential_binding
+                        .as_mut()
+                        .unwrap()
+                        .provider = "other".to_string();
+                }
+                "path" => rule.endpoints[0].path = "/other".to_string(),
+                "port" => rule.endpoints[0].port = 8443,
+                "binary" => rule.binaries.push(NetworkBinary {
+                    path: "/usr/bin/other".to_string(),
+                }),
+                "rule" => {
+                    let rule = rule.clone();
+                    candidate.network_policies.insert("other".to_string(), rule);
+                }
+                "remove" => rule.endpoints[0].credential_binding = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                credential_binding_declarations_changed(&current, &candidate),
+                "{mutation}"
+            );
+        }
+        let mut plain = current.clone();
+        plain.network_policies.get_mut("bound").unwrap().endpoints[0].credential_binding = None;
+        assert!(credential_binding_declarations_changed(&plain, &current));
+        let mut unrelated = current.clone();
+        unrelated.network_policies.insert(
+            "ordinary".to_string(),
+            test_policy_with_rule("ordinary", "other.example.com")
+                .network_policies
+                .remove("ordinary")
+                .unwrap(),
+        );
+        assert!(!credential_binding_declarations_changed(
+            &current, &unrelated
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_policy_adoption_is_once_only_including_concurrent_uploads() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-initial-image",
+            "initial-image",
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+        let upload = || {
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    sandbox: "initial-image".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(test_policy_with_rule("initial", "initial.example.com")),
+                    ..Default::default()
+                }),
+                "sb-initial-image",
+            )
+        };
+        let (first, second) = tokio::join!(
+            handle_update_config(&state, upload()),
+            handle_update_config(&state, upload())
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let refused = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        let refused = handle_update_config(&state, upload()).await.unwrap_err();
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), IMAGE_POLICY_INITIALIZED_ERROR);
+        assert_eq!(
+            state
+                .store
+                .get_latest_policy("sb-initial-image")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn image_policy_binding_refusal_is_visible_and_admin_repair_clears_it() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-image-binding",
+            "image-binding",
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        let status = sandbox.status.get_or_insert_with(Default::default);
+        status.configuration_activated = Some(false);
+        status.configuration_admission = Some(SandboxConfigurationAdmission {
+            instance_id: "supervisor-instance".to_string(),
+            state: ConfigurationAdmissionState::Pending.into(),
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        // Reject before provider validation, including unattached providers and
+        // entries that would otherwise be stripped as provider-derived rules.
+        let image = test_policy_with_credential_binding(
+            "_provider_unattached",
+            "bound.example.com",
+            "unattached",
+        );
+        let error = handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    sandbox: "image-binding".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(image),
+                    ..Default::default()
+                }),
+                "sb-image-binding",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(error.message(), IMAGE_POLICY_BINDING_ERROR);
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-image-binding")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = || {
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "image-binding".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                }),
+                "sb-image-binding",
+            )
+        };
+        let refused = handle_get_sandbox_config(&state, snapshot())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!refused.configuration_admitted);
+        assert!(refused.policy.is_none());
+        assert_eq!(refused.configuration_error, IMAGE_POLICY_BINDING_ERROR);
+        let stored = state
+            .store
+            .get_message::<Sandbox>("sb-image-binding")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .status
+                .unwrap()
+                .configuration_admission
+                .unwrap()
+                .error,
+            IMAGE_POLICY_BINDING_ERROR
+        );
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "image-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(test_policy_with_rule("reviewed", "reviewed.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let repaired = handle_get_sandbox_config(&state, snapshot())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(repaired.configuration_admitted);
+        assert!(repaired.configuration_error.is_empty());
+        assert!(
+            repaired
+                .policy
+                .unwrap()
+                .network_policies
+                .contains_key("reviewed")
+        );
     }
 
     #[tokio::test]

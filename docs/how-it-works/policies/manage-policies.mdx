@@ -45,8 +45,11 @@ To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:
 COPY policy.yaml /etc/openshell/policy.yaml
 ```
 
-OpenShell uses the image policy only when the sandbox has no saved policy, so a
-`--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence. If the image
+OpenShell adopts the image policy once, only when the sandbox has no saved policy, so a
+`--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence. An image policy
+must not contain `credential_binding`; a workspace admin must submit policies
+with credential bindings through the gateway using `openshell policy set`.
+Restarts use the saved policy. If the image
 policy is invalid, the sandbox does not start until you [replace it with a valid
 policy](#a-new-sandbox-stays-in-provisioning). OpenShell
 does not fall back to the default policy.
@@ -366,7 +369,7 @@ check the sandbox log for the specific error:
 openshell sandbox get my-sandbox --output json
 ```
 
-The same repair window applies when the gateway refuses an image-policy upload or a policy update that adds baseline filesystem paths with `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. After the gateway acknowledges the rejection report, startup waits two seconds, reads a fresh configuration, and retries. If your repair reaches the gateway before that report, startup immediately reads the repaired configuration. The sandbox log records the gateway's reason; repeated refusals of the same write, status code, and configuration are logged once. Authentication and authorization failures still stop startup.
+The same repair window applies when the gateway refuses an initial image-policy upload with `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. After the gateway acknowledges the rejection report, startup waits two seconds, reads a fresh configuration, and retries. If your repair reaches the gateway before that report, startup immediately reads the repaired configuration. The sandbox log records the gateway's reason; repeated refusals of the same write, status code, and configuration are logged once. Authentication and authorization failures still stop startup.
 
 You have 300 seconds to fix the configuration after the supervisor starts admission. Image preparation has its own deadline and does not consume that repair time. Replace the policy with `openshell policy set`, or fix the provider configuration. Until the workload first starts, you can also change filesystem, Landlock, and process settings. Each effective change to the policy, providers, or settings restarts the 300 seconds; writing an unchanged value does not.
 

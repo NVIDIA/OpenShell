@@ -689,6 +689,12 @@ Review the proposed scope, candidate hash, prover findings, and application erro
 
 Build a custom container image and run it as a sandbox.
 
+An embedded policy is adopted only during initial setup when no gateway policy
+is saved. Embedded policies must not contain `credential_binding`; a workspace
+admin supplies those through `openshell policy set`. A rejected image policy
+keeps the sandbox in `Provisioning` until repaired, within its existing repair
+window. Check `ConfigurationReady` for the actionable diagnostic.
+
 ### Create a sandbox from a pre-built image
 
 ```bash
