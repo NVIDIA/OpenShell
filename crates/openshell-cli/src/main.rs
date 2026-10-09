@@ -1454,7 +1454,13 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
-        /// Upload local files into the sandbox before running.
+        /// Upload local files into the sandbox before running. A trailing
+        /// `-- <command>` cannot be combined with it: that command is the
+        /// sandbox's main process, which the provider starts at creation, before an
+        /// upload can finish. To feed a large input to a command-driven run, create
+        /// the sandbox with no trailing command, stage the input with
+        /// `openshell sandbox upload`, then start the command with
+        /// `openshell sandbox exec`. Small inputs can stay on `--env` instead.
         ///
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
@@ -4878,6 +4884,41 @@ mod tests {
             result.is_ok(),
             "sandbox create with no --upload should succeed, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_upload_help_documents_trailing_command_restriction() {
+        // #4301: the --upload help must surface the restriction that it cannot be
+        // combined with a trailing `-- <command>` and must name the intended
+        // channel, so users discover it instead of hitting a terse parser error.
+        let cmd = Cli::command();
+        let sandbox = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sandbox")
+            .cloned()
+            .expect("missing sandbox subcommand");
+        let create = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "create")
+            .cloned()
+            .expect("missing sandbox create subcommand");
+
+        let upload = create
+            .get_arguments()
+            .find(|arg| arg.get_id() == "upload")
+            .expect("missing --upload argument");
+
+        let help = upload.get_help().map(|h| h.to_string()).unwrap_or_default();
+        let lower = help.to_lowercase();
+
+        assert!(
+            lower.contains("trailing") && lower.contains("command"),
+            "--upload help should state the trailing-command restriction, got:\n{help}"
+        );
+        assert!(
+            (lower.contains("sandbox exec") || lower.contains("sandbox upload")),
+            "--upload help should name an intended channel (sandbox exec/upload), got:\n{help}"
         );
     }
 
