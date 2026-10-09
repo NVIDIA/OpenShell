@@ -215,7 +215,7 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 
 - Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
-- Confirm that the implementation advertises the requested binding: `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, or `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A host match alone does not enable inspection.
+- Confirm that the implementation advertises the requested binding: `HTTP_REQUEST_V2/PRE_CREDENTIALS` or `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE_V2/PRE_RETURN` or `HTTP_RESPONSE/PRE_RETURN`, or `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A host match alone does not enable inspection.
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement. Never use `fail_open` for a service that implements HTTP protocol 2; the gateway rejects it.
@@ -390,7 +390,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] No HTTP protocol 2 middleware entry uses `on_error: fail_open`
 - [ ] Middleware entries with overlapping selectors use the same HTTP protocol for each HTTP operation they share
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
-- [ ] Any required response control advertises `HTTP_RESPONSE/PRE_RETURN`
+- [ ] Any required response control advertises `HTTP_RESPONSE_V2/PRE_RETURN` or `HTTP_RESPONSE/PRE_RETURN`
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)

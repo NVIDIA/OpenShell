@@ -24,13 +24,10 @@ pub async fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::extension_protocol::{
-        ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_V2, extension_metadata_with_requirements,
-    };
+    use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
     use openshell_core::proto::{
-        HttpBodyMode, HttpRequestResult, MiddlewareBinding, MiddlewareEndpointSelector,
-        MiddlewareManifest, NetworkMiddlewareConfig, SupervisorMiddlewareOperation,
-        SupervisorMiddlewarePhase,
+        HttpRequestResult, MiddlewareBinding, MiddlewareEndpointSelector, MiddlewareManifest,
+        NetworkMiddlewareConfig, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
     };
     use openshell_supervisor_middleware::{HttpRequestView, InProcessMiddleware};
     use std::sync::Arc;
@@ -51,14 +48,12 @@ mod tests {
                 .iter()
                 .map(|operation| MiddlewareBinding {
                     operation: *operation as i32,
-                    phase: if *operation == SupervisorMiddlewareOperation::HttpResponse {
+                    phase: if *operation == SupervisorMiddlewareOperation::HttpResponseV2 {
                         SupervisorMiddlewarePhase::PreReturn as i32
                     } else {
                         SupervisorMiddlewarePhase::PreCredentials as i32
                     },
                     max_payload_bytes: 1024,
-                    http_protocol_version: 2,
-                    supported_http_body_modes: vec![HttpBodyMode::Buffered as i32],
                     ..Default::default()
                 })
                 .collect();
@@ -73,12 +68,11 @@ mod tests {
             MiddlewareManifest {
                 name: self.name.into(),
                 bindings,
-                extension: Some(extension_metadata_with_requirements(
+                extension: Some(extension_metadata(
                     ExtensionFamily::SupervisorMiddleware,
                     self.name,
                     "test",
                     [],
-                    [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
                 )),
                 ..Default::default()
             }
@@ -105,19 +99,19 @@ mod tests {
         services.push(Arc::new(ProtocolTwoMiddleware {
             name: "example/guard",
             operations: &[
-                SupervisorMiddlewareOperation::HttpRequest,
-                SupervisorMiddlewareOperation::HttpResponse,
+                SupervisorMiddlewareOperation::HttpRequestV2,
+                SupervisorMiddlewareOperation::HttpResponseV2,
             ],
             websocket: false,
         }));
         services.push(Arc::new(ProtocolTwoMiddleware {
             name: "example/guard-with-websocket",
-            operations: &[SupervisorMiddlewareOperation::HttpRequest],
+            operations: &[SupervisorMiddlewareOperation::HttpRequestV2],
             websocket: true,
         }));
         services.push(Arc::new(ProtocolTwoMiddleware {
             name: "example/response-guard",
-            operations: &[SupervisorMiddlewareOperation::HttpResponse],
+            operations: &[SupervisorMiddlewareOperation::HttpResponseV2],
             websocket: false,
         }));
         MiddlewareRegistry::connect_services(services, Vec::new())
@@ -238,16 +232,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_lists_http_protocol_2_middleware_for_the_tls_skip_exemption() {
-        let mut names = registry().await.http_protocol_2_middleware();
-        names.sort();
+    async fn tls_skip_rule_exempts_registered_http_protocol_2_middleware() {
+        let registry = registry().await;
+        let tls_skip_policy = |middleware: &str| {
+            let mut policy = SandboxPolicy {
+                network_middlewares: std::collections::HashMap::from([(
+                    "guard".into(),
+                    entry(middleware, 0, "api.example.com", ""),
+                )]),
+                ..Default::default()
+            };
+            policy.network_policies.insert(
+                "api".into(),
+                openshell_core::proto::NetworkPolicyRule {
+                    name: "api".into(),
+                    endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                        host: "api.example.com".into(),
+                        port: 443,
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+            policy
+        };
+        let conflicts = |middleware: &str| {
+            openshell_policy::middleware_tls_skip_conflicts(
+                &tls_skip_policy(middleware),
+                |middleware| registry.is_http_v2(middleware),
+            )
+        };
+
+        assert!(conflicts("example/guard").is_empty());
         assert_eq!(
-            names,
-            [
-                "example/guard",
-                "example/guard-with-websocket",
-                "example/response-guard"
-            ]
+            conflicts(openshell_supervisor_middleware_builtins::BUILTIN_REGEX).len(),
+            1,
+            "HTTP protocol 1 fail-closed middleware cannot cover tls: skip"
         );
     }
 

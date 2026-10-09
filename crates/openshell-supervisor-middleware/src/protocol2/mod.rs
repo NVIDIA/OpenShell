@@ -51,11 +51,8 @@ pub enum ChainHttpProtocol {
     Mixed,
 }
 
-/// Classify a chain described for one HTTP operation.
-///
-/// An unresolved entry counts as HTTP protocol 2 only when the gateway
-/// described its service as such; any other unresolved entry follows its
-/// `on_error` on either path.
+/// Classify a chain described for one HTTP operation by its resolved
+/// entries. An unresolved entry follows its `on_error` on either path.
 #[must_use]
 pub fn chain_http_protocol(entries: &[DescribedChainEntry]) -> ChainHttpProtocol {
     let v2 = entries
@@ -63,7 +60,7 @@ pub fn chain_http_protocol(entries: &[DescribedChainEntry]) -> ChainHttpProtocol
         .any(|entry| entry.http_protocol() == Some(HttpProtocol::V2));
     let v1 = entries
         .iter()
-        .any(|entry| entry.is_resolved() && entry.http_protocol() == Some(HttpProtocol::V1));
+        .any(|entry| entry.http_protocol() == Some(HttpProtocol::V1));
     match (v1, v2) {
         (true, true) => ChainHttpProtocol::Mixed,
         (false, true) => ChainHttpProtocol::V2,

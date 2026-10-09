@@ -5,9 +5,9 @@
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
 //! response bodies through HTTP middleware protocol 2 (`EvaluateHttp`), and
-//! in WebSocket text messages. It requires the
-//! `openshell.supervisor-middleware.http-v2` capability, so a gateway or
-//! supervisor that predates HTTP protocol 2 refuses it at Describe.
+//! in WebSocket text messages. Its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2`
+//! bindings are unknown to gateways and supervisors that predate HTTP
+//! protocol 2, so they refuse it at Describe.
 
 mod guard;
 mod http;
@@ -17,15 +17,14 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use openshell_core::extension_protocol::{
-    ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_V2, extension_metadata_with_requirements,
-    validate_gateway_metadata,
+    ExtensionFamily, extension_metadata, validate_gateway_metadata,
 };
 use openshell_core::middleware::{HttpResultStream, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    HttpBodyMode, HttpEvent, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
+    HttpEvent, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
     MiddlewareDescribeRequest, MiddlewareManifest, SupervisorMiddlewareOperation,
     SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent,
@@ -56,8 +55,6 @@ fn http_binding(
         operation: operation as i32,
         phase: phase as i32,
         max_payload_bytes: MAX_PAYLOAD_BYTES,
-        http_protocol_version: 2,
-        supported_http_body_modes: vec![HttpBodyMode::Buffered as i32, HttpBodyMode::Stream as i32],
         ..Default::default()
     }
 }
@@ -76,11 +73,11 @@ impl SupervisorMiddleware for ContentGuard {
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![
                 http_binding(
-                    SupervisorMiddlewareOperation::HttpRequest,
+                    SupervisorMiddlewareOperation::HttpRequestV2,
                     SupervisorMiddlewarePhase::PreCredentials,
                 ),
                 http_binding(
-                    SupervisorMiddlewareOperation::HttpResponse,
+                    SupervisorMiddlewareOperation::HttpResponseV2,
                     SupervisorMiddlewarePhase::PreReturn,
                 ),
                 MiddlewareBinding {
@@ -91,12 +88,11 @@ impl SupervisorMiddleware for ContentGuard {
                 },
             ],
             expected_audience: String::new(),
-            extension: Some(extension_metadata_with_requirements(
+            extension: Some(extension_metadata(
                 ExtensionFamily::SupervisorMiddleware,
                 MANIFEST_NAME,
                 openshell_core::VERSION,
                 [],
-                [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
             )),
         };
         validate_gateway_metadata(
@@ -187,41 +183,20 @@ mod tests {
         let operations: Vec<_> = manifest
             .bindings
             .iter()
-            .map(|binding| (binding.operation, binding.http_protocol_version))
+            .map(|binding| binding.operation)
             .collect();
         assert_eq!(
             operations,
             [
-                (SupervisorMiddlewareOperation::HttpRequest as i32, 2),
-                (SupervisorMiddlewareOperation::HttpResponse as i32, 2),
-                (SupervisorMiddlewareOperation::WebsocketMessage as i32, 0),
+                SupervisorMiddlewareOperation::HttpRequestV2 as i32,
+                SupervisorMiddlewareOperation::HttpResponseV2 as i32,
+                SupervisorMiddlewareOperation::WebsocketMessage as i32,
             ]
-        );
-        assert!(
-            manifest
-                .extension
-                .unwrap()
-                .required_capabilities
-                .contains(&SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string())
         );
     }
 
     #[tokio::test]
-    async fn describe_refuses_peers_without_http_protocol_2() {
-        let mut released = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
-        released
-            .supported_capabilities
-            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_V2);
-        let error = SupervisorMiddleware::describe(
-            &ContentGuard,
-            Request::new(MiddlewareDescribeRequest {
-                gateway: Some(released),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-
+    async fn describe_rejects_missing_gateway_metadata() {
         let error = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest::default()),

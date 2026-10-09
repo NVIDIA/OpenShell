@@ -14,13 +14,11 @@ HTTP protocol 1, the `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate` 
 
 ## Declare HTTP Protocol 2
 
-Your service declares the protocol for each HTTP binding in its `Describe` manifest:
+The binding operation selects the protocol. In your `Describe` manifest, declare `HTTP_REQUEST_V2` at `PRE_CREDENTIALS` for requests and `HTTP_RESPONSE_V2` at `PRE_RETURN` for responses. `HTTP_REQUEST` and `HTTP_RESPONSE` select HTTP protocol 1. Gateways and supervisors that predate HTTP protocol 2 do not know the new operations, so they refuse your service at startup instead of calling an HTTP protocol 1 RPC.
 
-- Set `http_protocol_version` to `2` on every `HTTP_REQUEST` and `HTTP_RESPONSE` binding. Unset or `0` selects HTTP protocol 1, and any other value is a registration error.
-- List the body modes the binding can use in `supported_http_body_modes`: `HTTP_BODY_MODE_BUFFERED`, `HTTP_BODY_MODE_STREAM`, or both. A binding without body modes is preflight-only. It can only continue or reject, and it may set `max_payload_bytes` to `0`.
-- Add `openshell.supervisor-middleware.http-v2` to the manifest's `required_capabilities`. Gateways and supervisors that run HTTP protocol 2 support this capability, so an older peer refuses your service at startup instead of calling an HTTP protocol 1 RPC.
+A binding's `max_payload_bytes` limits the body your service inspects. A binding that sets it to `0` is offered no body modes, so it can only continue or reject.
 
-A service implements one HTTP protocol. The gateway refuses a manifest that mixes protocol 1 and protocol 2 HTTP bindings, sets body modes on a protocol 1 binding, or has protocol 2 bindings without requiring the `http-v2` capability, or the reverse. WebSocket bindings leave both fields unset. To serve both protocols during a migration, run two registrations.
+A service implements one HTTP protocol. The gateway refuses a manifest that has both protocol 1 and protocol 2 HTTP bindings. To serve both protocols during a migration, run two registrations.
 
 ## Exchange Lifecycle
 
@@ -42,7 +40,7 @@ The preflight describes the message before OpenShell reads any body byte:
 
 - `subject` is the request head (target and headers), the final response head (target, status, and headers), or an [uninspectable connection](#uninspectable-traffic).
 - `context`, `middleware_name`, and `config` identify the sandbox, the middleware, and the validated `config` from the policy entry.
-- `permitted_body_modes` lists the binding's modes that this message allows. `unavailable_body_modes` lists each supported mode that OpenShell removed, with the reason.
+- `permitted_body_modes` lists the modes this message allows. `unavailable_body_modes` lists each mode that OpenShell removed, with the reason. Select a permitted mode your service supports, or continue or reject when none suits it.
 - `limits` carries the chunk size, the largest buffered body, queue sizes, and the STREAM idle timeout.
 - `declared_body_bytes` is the declared length of the original body, when known. An earlier stage may replace the body, so enforce your limits on the body you receive.
 
@@ -113,7 +111,7 @@ HTTP protocol 2 always fails closed, and `on_error` does not apply to it. A stag
 - A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without a terminating chunk or error body and records a high-severity finding.
 - An uninspectable connection is refused.
 
-The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP protocol 2, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP protocol 2 still loads, and supervisors run its HTTP traffic fail-closed. When a supervisor cannot reach the service at startup, HTTP traffic that selects it fails closed too.
+The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP protocol 2, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP protocol 2 still loads. Supervisors run its HTTP traffic fail-closed once they reach the service, and follow its `on_error` while they cannot.
 
 A request or response chain cannot mix HTTP protocol 1 and HTTP protocol 2 entries. [Mix HTTP Protocols](/extensibility/supervisor-middleware/configure#mix-http-protocols) describes the policy rule.
 
@@ -121,7 +119,7 @@ A request or response chain cannot mix HTTP protocol 1 and HTTP protocol 2 entri
 
 To move a service to HTTP protocol 2:
 
-1. In `Describe`, set `http_protocol_version` to `2` and `supported_http_body_modes` on every HTTP binding, and require the `openshell.supervisor-middleware.http-v2` capability.
+1. In `Describe`, replace `HTTP_REQUEST` with `HTTP_REQUEST_V2` and `HTTP_RESPONSE` with `HTTP_RESPONSE_V2`.
 2. Implement `EvaluateHttp` and remove `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. A protocol 1 request evaluation maps to BUFFERED. Response modes map as follows: `HEADERS_ONLY` becomes `continue_without_body` with header mutations, `WHOLE_BODY_BYTES` becomes BUFFERED, `STREAM_BYTES` becomes STREAM, and `block_delivery` becomes `reject`.
 3. Change `on_error: fail_open` to `fail_closed` on policy entries that use the service.
 4. Separate the endpoint selectors of the service from HTTP protocol 1 entries, including `openshell/regex`.

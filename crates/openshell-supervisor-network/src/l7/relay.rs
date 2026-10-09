@@ -4777,7 +4777,6 @@ network_policies:
                             seconds: 2,
                             nanos: 0,
                         }),
-                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -4902,7 +4901,6 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
-                ..Default::default()
             }],
         )
         .await
@@ -6767,7 +6765,6 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
-                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6921,7 +6918,6 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
-                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -7400,7 +7396,6 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     request_timeout: None,
-                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -11498,21 +11493,8 @@ network_policies:
                     replacement: b"",
                 })
                 .await;
-            manifest.bindings[0].http_protocol_version = 2;
-            manifest.bindings[0].supported_http_body_modes =
-                vec![openshell_core::proto::HttpBodyMode::Buffered as i32];
-            manifest.extension = Some(
-                openshell_core::extension_protocol::extension_metadata_with_requirements(
-                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
-                    manifest.name.clone(),
-                    "test",
-                    [],
-                    [
-                        openshell_core::extension_protocol::SUPERVISOR_MIDDLEWARE_HTTP_V2
-                            .to_string(),
-                    ],
-                ),
-            );
+            manifest.bindings[0].operation =
+                openshell_core::proto::SupervisorMiddlewareOperation::HttpRequestV2 as i32;
             manifest
         }
 

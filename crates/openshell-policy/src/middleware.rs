@@ -3,8 +3,7 @@
 
 //! YAML schema and protobuf conversion for supervisor middleware policies.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::RwLock;
+use std::collections::{BTreeMap, HashMap};
 
 use openshell_core::middleware::{MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_SELECTOR_PATTERNS};
 use openshell_core::proto::{
@@ -51,30 +50,6 @@ struct SupervisorRuntimeEndpointJson {
     host: String,
     #[serde(default)]
     tls: String,
-}
-
-/// Middleware implementations known to run HTTP protocol 2, registered by the
-/// composition root: the gateway from its described registry, and a
-/// supervisor from the protocol the gateway delivered for each service.
-static HTTP_PROTOCOL_2_MIDDLEWARE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
-
-/// Replace the set of middleware implementations known to run HTTP protocol 2.
-///
-/// HTTP protocol 2 middleware decides about uninspectable traffic itself, so
-/// policy validation exempts it from the `tls: skip` conflict rule. A
-/// middleware whose protocol is unknown keeps the rule.
-pub fn set_http_protocol_2_middleware(names: impl IntoIterator<Item = String>) {
-    let names = names.into_iter().collect();
-    *HTTP_PROTOCOL_2_MIDDLEWARE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = names;
-}
-
-fn runs_http_protocol_2(middleware: &str) -> bool {
-    HTTP_PROTOCOL_2_MIDDLEWARE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(middleware)
 }
 
 pub fn into_proto(
@@ -272,26 +247,49 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             });
             continue;
         }
-        let mut selector_valid = !selector.include.is_empty();
         for pattern in selector.include.iter().chain(&selector.exclude) {
             if let Err(reason) = HostPattern::new(pattern) {
-                selector_valid = false;
                 violations.push(PolicyViolation::InvalidMiddlewareConfig {
                     name: name.clone(),
                     reason: format!("endpoint selector pattern '{pattern}' is invalid: {reason}"),
                 });
             }
         }
-        let compiled_selector = if selector_valid {
-            HostSelector::new(&selector.include, &selector.exclude).ok()
-        } else {
-            None
-        };
+    }
 
-        // HTTP protocol 2 middleware decides about a `tls: skip` tunnel at
-        // runtime, so only HTTP protocol 1 `fail_closed` middleware conflicts.
-        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed")
-            && !runs_http_protocol_2(&middleware.middleware);
+    violations
+}
+
+/// `fail_closed` middleware whose selector may match a `tls: skip` endpoint,
+/// whose traffic no middleware can inspect.
+///
+/// Middleware for which `decides_uninspectable` returns true, such as HTTP
+/// protocol 2 middleware, allows or refuses such connections at runtime and
+/// is exempt. [`validate`] does not run this rule because the exemption
+/// depends on the middleware's registered protocol; the gateway runs it with
+/// its registry. Whether or not the rule ran, a supervisor denies
+/// uninspectable traffic that a `fail_closed` entry cannot evaluate.
+pub fn tls_skip_conflicts(
+    policy: &SandboxPolicy,
+    decides_uninspectable: impl Fn(&str) -> bool,
+) -> Vec<PolicyViolation> {
+    let mut violations = Vec::new();
+    let mut middlewares: Vec<_> = policy.network_middlewares.iter().collect();
+    middlewares.sort_by_key(|(name, _)| name.as_str());
+    for (name, middleware) in middlewares {
+        if !matches!(middleware.on_error.as_str(), "" | "fail_closed")
+            || decides_uninspectable(&middleware.middleware)
+        {
+            continue;
+        }
+        let Some(selector) = middleware
+            .endpoints
+            .as_ref()
+            .filter(|selector| !selector.include.is_empty())
+            .and_then(|selector| HostSelector::new(&selector.include, &selector.exclude).ok())
+        else {
+            continue;
+        };
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {
                 key
@@ -299,12 +297,9 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 &rule.name
             };
             for endpoint in &rule.endpoints {
-                let overlaps_tls_skip = requires_inspection
-                    && endpoint.tls == NetworkTlsMode::Skip as i32
-                    && compiled_selector.as_ref().is_some_and(|selector| {
-                        HostPattern::new(&endpoint.host)
-                            .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))
-                    });
+                let overlaps_tls_skip = endpoint.tls == NetworkTlsMode::Skip as i32
+                    && HostPattern::new(&endpoint.host)
+                        .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint));
                 if overlaps_tls_skip {
                     violations.push(PolicyViolation::MiddlewareTlsSkipConflict {
                         middleware_name: name.clone(),
@@ -315,6 +310,5 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             }
         }
     }
-
     violations
 }

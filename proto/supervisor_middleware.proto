@@ -21,14 +21,13 @@ service SupervisorMiddleware {
 
   // HTTP protocol 1. Deprecated: removed in 0.2.0; use EvaluateHttp.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
-  // buffered HTTP request. OpenShell calls it only for HTTP_REQUEST bindings
-  // that leave http_protocol_version unset.
+  // buffered HTTP request. OpenShell calls it for HTTP_REQUEST bindings.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 
   // HTTP protocol 2. One stream per HTTP message (request or response) and
   // middleware stage, or per uninspectable connection. The first event is a
-  // preflight that says what is being evaluated. OpenShell calls it only for
-  // services whose HTTP bindings set http_protocol_version to 2.
+  // preflight that says what is being evaluated. OpenShell calls it for
+  // HTTP_REQUEST_V2 and HTTP_RESPONSE_V2 bindings.
   rpc EvaluateHttp(stream HttpEvent) returns (stream HttpResult);
 
   // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
@@ -89,28 +88,15 @@ message MiddlewareBinding {
   // Supported phase.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum request body, WebSocket message, or response body unit/replacement.
-  // Required for payload-bearing operations. An HTTP protocol 2 binding with
-  // no supported body modes may leave this zero: it can only continue or
-  // reject at preflight.
+  // Required for payload-bearing operations. An HTTP_REQUEST_V2 or
+  // HTTP_RESPONSE_V2 binding may leave this zero: OpenShell then offers it no
+  // body modes, so it can only continue or reject at preflight.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
   // A non-empty value may shorten but cannot extend the operator timeout.
   // Values must be between 10ms and 30s.
   google.protobuf.Duration request_timeout = 104;
-  // HTTP middleware protocol of an HTTP_REQUEST or HTTP_RESPONSE binding.
-  // Unset or 0 selects HTTP protocol 1 (EvaluateHttpRequest and
-  // HttpResponsePreReturn.Evaluate), which is removed in 0.2.0. 2 selects HTTP
-  // protocol 2 (EvaluateHttp). OpenShell rejects any other value at
-  // registration. Every HTTP binding of one service must use the same
-  // protocol, and a service with HTTP protocol 2 bindings must require the
-  // openshell.supervisor-middleware.http-v2 capability. WebSocket bindings
-  // leave this unset.
-  uint32 http_protocol_version = 5;
-  // Body modes an HTTP protocol 2 binding can select. OpenShell intersects
-  // this set with message eligibility before every preflight. Empty declares
-  // a preflight-only binding. Only valid with http_protocol_version 2.
-  repeated HttpBodyMode supported_http_body_modes = 6;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
@@ -255,11 +241,12 @@ message HttpPreflight {
   string middleware_name = 5;
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
-  // The binding's supported_http_body_modes intersected with message
-  // eligibility. Empty permits only continue_without_body or reject.
+  // Body modes this message is eligible for. Empty permits only
+  // continue_without_body or reject. The stage selects one of them, or
+  // continues or rejects when none suits it.
   repeated HttpBodyMode permitted_body_modes = 7;
-  // One entry for each supported mode that permitted_body_modes omits, with
-  // the rule that removed it. A stage can tell a bodyless response, which it
+  // One entry for each body mode that permitted_body_modes omits, with the
+  // rule that removed it. A stage can tell a bodyless response, which it
   // may let continue, from a body it cannot inspect.
   repeated HttpBodyModeUnavailable unavailable_body_modes = 8;
   HttpBodyLimits limits = 9;
@@ -794,9 +781,20 @@ message MiddlewareExchangeProtocolError {}
 // Supervisor operation selected for middleware evaluation.
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
+  // HTTP protocol 1 (EvaluateHttpRequest). Deprecated: removed in 0.2.0; use
+  // HTTP_REQUEST_V2.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
+  // HTTP protocol 1 (HttpResponsePreReturn.Evaluate). Deprecated: removed in
+  // 0.2.0; use HTTP_RESPONSE_V2.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;
+  // HTTP protocol 2 (EvaluateHttp) for requests, at PRE_CREDENTIALS. Peers
+  // that predate HTTP protocol 2 reject this operation at Describe. A service
+  // implements one HTTP protocol, so it cannot also bind HTTP_REQUEST or
+  // HTTP_RESPONSE.
+  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST_V2 = 4;
+  // HTTP protocol 2 (EvaluateHttp) for responses, at PRE_RETURN.
+  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE_V2 = 5;
 }
 
 // Ordered phase within a supervisor operation.

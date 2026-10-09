@@ -14,8 +14,10 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttp`, or `EvaluateHttpRequest` for HTTP protocol 1 |
-| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttp`, or `HttpResponsePreReturn.Evaluate` for HTTP protocol 1 |
+| `HTTP_REQUEST_V2` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttp` |
+| `HTTP_RESPONSE_V2` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttp` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | HTTP protocol 1 request inspection, deprecated for removal in 0.2.0. | `EvaluateHttpRequest` |
+| `HTTP_RESPONSE` | `PRE_RETURN` | HTTP protocol 1 response inspection, deprecated for removal in 0.2.0. | `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
@@ -218,7 +220,7 @@ OpenShell reassembles fragmented messages and decompresses `permessage-deflate` 
 
 OpenShell does not send binary messages, control frames, or messages from the external service to middleware. Binary messages pass through unchanged, and OpenShell records an `unsupported_message_type` coverage event. Message sequence numbers count binary messages too, so your service can see gaps between text messages.
 
-Only middleware that declares `WEBSOCKET_MESSAGE` receives messages. Middleware that declares only `HTTP_REQUEST` still inspects the upgrade request, and OpenShell records a `binding_not_selected` coverage event for it.
+Only middleware that declares `WEBSOCKET_MESSAGE` receives messages. Middleware that declares only `HTTP_REQUEST_V2` or `HTTP_REQUEST` still inspects the upgrade request, and OpenShell records a `binding_not_selected` coverage event for it.
 
 </Accordion>
 <Accordion title="Denials and Failures">

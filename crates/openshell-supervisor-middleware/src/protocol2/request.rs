@@ -138,20 +138,16 @@ impl StageHead for RequestHead<'_> {
         if limit == 0 {
             return offer;
         }
-        if entry.supports_http_body_mode(HttpBodyMode::Buffered) {
-            if self
-                .input
-                .declared_body_length
-                .is_none_or(|length| length <= limit as u64)
-            {
-                offer.permit(HttpBodyMode::Buffered);
-            } else {
-                offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::OverLimit);
-            }
+        if self
+            .input
+            .declared_body_length
+            .is_none_or(|length| length <= limit as u64)
+        {
+            offer.permit(HttpBodyMode::Buffered);
+        } else {
+            offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::OverLimit);
         }
-        if entry.supports_http_body_mode(HttpBodyMode::Stream) {
-            offer.permit(HttpBodyMode::Stream);
-        }
+        offer.permit(HttpBodyMode::Stream);
         offer
     }
 }

@@ -313,8 +313,8 @@ pub trait StageHead: Sync {
     /// stages' preflight mutations.
     fn preflight_subject(&self, headers: &[HttpHeader]) -> http_preflight::Subject;
 
-    /// Body modes `entry` may select: its supported modes intersected with
-    /// message eligibility.
+    /// Body modes `entry` may select: those the message is eligible for
+    /// within the entry's payload limit.
     fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer;
 }
 
@@ -524,8 +524,8 @@ pub async fn preflight(
     };
     for entry in entries {
         if !entry.is_resolved() {
-            // An unresolved entry that is not HTTP protocol 2 follows its
-            // on_error, as in HTTP protocol 1.
+            // An unresolved entry follows its on_error, as in HTTP protocol
+            // 1. The gateway rejects fail_open for HTTP protocol 2 services.
             if entry.on_error() == OnError::FailOpen {
                 state
                     .diagnostics

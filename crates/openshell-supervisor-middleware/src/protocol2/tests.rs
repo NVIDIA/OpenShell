@@ -5,10 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use openshell_core::extension_protocol::{
-    ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_V2, extension_metadata,
-    extension_metadata_with_requirements,
-};
+use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBufferedMode, HttpBufferedResult,
     HttpContinue, HttpEvent, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart,
@@ -26,108 +23,76 @@ use crate::{
     OnError, TransformedBodyPolicy, validate_manifest_bindings,
 };
 
-fn binding(protocol: u32, modes: &[HttpBodyMode]) -> MiddlewareBinding {
+fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
+    let phase = match operation {
+        SupervisorMiddlewareOperation::HttpResponse
+        | SupervisorMiddlewareOperation::HttpResponseV2 => SupervisorMiddlewarePhase::PreReturn,
+        _ => SupervisorMiddlewarePhase::PreCredentials,
+    };
     MiddlewareBinding {
-        operation: SupervisorMiddlewareOperation::HttpRequest as i32,
-        phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+        operation: operation as i32,
+        phase: phase as i32,
         max_payload_bytes: 1024,
-        http_protocol_version: protocol,
-        supported_http_body_modes: modes.iter().map(|mode| *mode as i32).collect(),
         ..Default::default()
     }
 }
 
-fn manifest(bindings: Vec<MiddlewareBinding>, requires_http_v2: bool) -> MiddlewareManifest {
+fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     MiddlewareManifest {
         name: "example/guard".into(),
         bindings,
-        extension: Some(if requires_http_v2 {
-            extension_metadata_with_requirements(
-                ExtensionFamily::SupervisorMiddleware,
-                "example/guard",
-                "test",
-                [],
-                [SUPERVISOR_MIDDLEWARE_HTTP_V2.to_string()],
-            )
-        } else {
-            extension_metadata(
-                ExtensionFamily::SupervisorMiddleware,
-                "example/guard",
-                "test",
-                [],
-            )
-        }),
+        extension: Some(extension_metadata(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            "test",
+            [],
+        )),
         ..Default::default()
     }
 }
 
 #[test]
 fn registration_selects_one_http_protocol_per_service() {
-    let response = |protocol| MiddlewareBinding {
-        operation: SupervisorMiddlewareOperation::HttpResponse as i32,
-        phase: SupervisorMiddlewarePhase::PreReturn as i32,
-        ..binding(protocol, &[])
+    use SupervisorMiddlewareOperation::{
+        HttpRequest, HttpRequestV2, HttpResponse, HttpResponseV2, WebsocketMessage,
     };
-    let websocket = |protocol| MiddlewareBinding {
-        operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
-        ..binding(protocol, &[])
-    };
-    let cases: Vec<(&str, MiddlewareManifest, Option<&str>)> = vec![
-        ("protocol 1", manifest(vec![binding(0, &[])], false), None),
+    let cases: Vec<(&str, Vec<MiddlewareBinding>, Option<&str>)> = vec![
+        (
+            "protocol 1",
+            vec![binding(HttpRequest), binding(HttpResponse)],
+            None,
+        ),
         (
             "protocol 2 in both directions",
-            manifest(vec![binding(2, &[HttpBodyMode::Stream]), response(2)], true),
+            vec![binding(HttpRequestV2), binding(HttpResponseV2)],
             None,
         ),
         (
             "protocol 2 with a WebSocket binding",
-            manifest(vec![binding(2, &[]), websocket(0)], true),
+            vec![binding(HttpRequestV2), binding(WebsocketMessage)],
             None,
         ),
         (
-            "unsupported version",
-            manifest(vec![binding(1, &[])], false),
-            Some("unsupported HTTP middleware protocol version 1"),
-        ),
-        (
-            "body modes on protocol 1",
-            manifest(vec![binding(0, &[HttpBodyMode::Buffered])], false),
-            Some("body modes require http_protocol_version 2"),
-        ),
-        (
-            "protocol fields on a WebSocket binding",
-            manifest(vec![websocket(2)], true),
-            Some("not an HTTP binding"),
-        ),
-        (
-            "duplicate body mode",
-            manifest(
-                vec![binding(
-                    2,
-                    &[HttpBodyMode::Buffered, HttpBodyMode::Buffered],
-                )],
-                true,
-            ),
-            Some("invalid or duplicate HTTP body mode"),
-        ),
-        (
             "mixed protocols in one service",
-            manifest(vec![binding(0, &[]), response(2)], true),
+            vec![binding(HttpRequest), binding(HttpResponseV2)],
             Some("mixes HTTP protocol 1 and HTTP protocol 2"),
         ),
         (
-            "protocol 2 without the capability requirement",
-            manifest(vec![binding(2, &[])], false),
-            Some("does not require"),
+            "both protocols for one stage",
+            vec![binding(HttpRequest), binding(HttpRequestV2)],
+            Some("mixes HTTP protocol 1 and HTTP protocol 2"),
         ),
         (
-            "capability requirement on a protocol 1 service",
-            manifest(vec![binding(0, &[])], true),
-            Some("advertises HTTP protocol 1 bindings"),
+            "protocol 2 request operation at the response phase",
+            vec![MiddlewareBinding {
+                phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                ..binding(HttpRequestV2)
+            }],
+            Some("unsupported middleware operation/phase pair"),
         ),
     ];
-    for (case, manifest, expected) in cases {
-        let result = validate_manifest_bindings("test service", &manifest, None);
+    for (case, bindings, expected) in cases {
+        let result = validate_manifest_bindings("test service", &manifest(bindings), None);
         match expected {
             None => result.unwrap_or_else(|error| panic!("{case}: {error}")),
             Some(expected) => {
@@ -137,19 +102,21 @@ fn registration_selects_one_http_protocol_per_service() {
         }
     }
 
-    // A preflight-only protocol 2 binding needs no payload limit.
-    let mut preflight_only = binding(2, &[]);
+    // A protocol 2 binding without a payload limit is preflight-only.
+    let mut preflight_only = binding(HttpRequestV2);
     preflight_only.max_payload_bytes = 0;
+    validate_manifest_bindings("test service", &manifest(vec![preflight_only]), Some(0))
+        .expect("a preflight-only binding carries no payload");
+    let mut payload = binding(HttpRequest);
+    payload.max_payload_bytes = 0;
+    validate_manifest_bindings("test service", &manifest(vec![payload]), None)
+        .expect_err("a protocol 1 binding needs a payload limit");
     validate_manifest_bindings(
         "test service",
-        &manifest(vec![preflight_only], true),
+        &manifest(vec![binding(HttpRequestV2)]),
         Some(0),
     )
-    .expect("a preflight-only binding carries no payload");
-    let mut payload = binding(2, &[HttpBodyMode::Buffered]);
-    payload.max_payload_bytes = 0;
-    validate_manifest_bindings("test service", &manifest(vec![payload], true), None)
-        .expect_err("a binding with body modes needs a payload limit");
+    .expect_err("a protocol 2 binding with a payload limit needs an operator limit");
 }
 
 /// What a scripted stage does at preflight.
@@ -217,10 +184,7 @@ impl InProcessMiddleware for ScriptedStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: self.name.into(),
-            ..manifest(
-                vec![binding(2, &[HttpBodyMode::Buffered, HttpBodyMode::Stream])],
-                true,
-            )
+            ..manifest(vec![binding(SupervisorMiddlewareOperation::HttpRequestV2)])
         }
     }
 

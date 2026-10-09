@@ -23,7 +23,7 @@ use super::pipeline::{
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpProtocol, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
     MiddlewareDenial, MiddlewareWorkAdmissionOutcome, NamespacedFinding, OnError,
-    is_http_operation, sort_chain_entries,
+    operation_http_protocol, sort_chain_entries,
 };
 
 /// A connection `OpenShell` cannot show to middleware as HTTP messages.
@@ -179,11 +179,10 @@ impl ChainRunner {
         let (state, manifest) = manifests.iter().find(|(state, manifest)| {
             Self::attachment_name(state, manifest) == entry.implementation
         })?;
-        let binding = manifest
+        let binding = *manifest
             .bindings
             .iter()
-            .find(|binding| is_http_operation(binding.operation))?
-            .clone();
+            .find(|binding| operation_http_protocol(binding.operation) == Some(HttpProtocol::V2))?;
         let timeout = state.timeout_for_binding(&binding).ok()?;
         Some(DescribedChainEntry {
             entry: entry.clone(),

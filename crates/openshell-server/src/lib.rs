@@ -610,11 +610,6 @@ pub(crate) async fn run_server(
         }
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
-    // HTTP protocol 2 middleware decides about `tls: skip` tunnels itself, so
-    // policy validation exempts it from the static conflict rule.
-    openshell_policy::set_http_protocol_2_middleware(
-        middleware_registry.http_protocol_2_middleware(),
-    );
 
     let store = Arc::new(Store::connect(database_url).await?);
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(

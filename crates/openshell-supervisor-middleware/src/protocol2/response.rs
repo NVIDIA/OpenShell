@@ -262,9 +262,6 @@ impl StageHead for ResponseHead<'_> {
             return offer;
         }
         for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
-            if !entry.supports_http_body_mode(mode) {
-                continue;
-            }
             match self.unavailable(mode, limit) {
                 Some(reason) => offer.withhold(mode, reason),
                 None => offer.permit(mode),
@@ -408,14 +405,9 @@ mod tests {
             },
             service: None,
             binding: Some(MiddlewareBinding {
-                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                operation: SupervisorMiddlewareOperation::HttpResponseV2 as i32,
                 phase: SupervisorMiddlewarePhase::PreReturn as i32,
                 max_payload_bytes: limit as u64,
-                http_protocol_version: 2,
-                supported_http_body_modes: vec![
-                    HttpBodyMode::Buffered as i32,
-                    HttpBodyMode::Stream as i32,
-                ],
                 ..Default::default()
             }),
             max_payload_bytes: limit,
