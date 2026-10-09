@@ -30,6 +30,33 @@ type WatchOptions struct {
 	StopOnTerminal bool
 }
 
+// WatchLogsOptions configures a resumable sandbox log and platform event watch.
+type WatchLogsOptions struct {
+	// FollowLogs streams sandbox log lines.
+	FollowLogs bool
+	// FollowEvents streams platform events.
+	FollowEvents bool
+	// LogSources filters log lines by source (e.g. "gateway", "sandbox").
+	LogSources []string
+	// LogMinLevel sets the minimum log level to include.
+	LogMinLevel string
+	// ResumeAfterCursor replays only what follows an opaque cursor taken from a
+	// WatchLogEvent of an earlier watch on the same sandbox. Empty starts from
+	// the tail bounded by LogTailLines and EventTail.
+	//
+	// If the cursor was already trimmed from the server's buffer, or came from
+	// a cursor space the gateway no longer has (a restart, or a different
+	// replica), the watch fails with ErrorOutOfRange rather than silently
+	// skipping the missing events.
+	ResumeAfterCursor string
+	// LogTailLines bounds the initial log backfill. Ignored when
+	// ResumeAfterCursor is set.
+	LogTailLines uint32
+	// EventTail bounds the initial platform event backfill. Ignored when
+	// ResumeAfterCursor is set.
+	EventTail uint32
+}
+
 // WaitOptions configures wait behavior. Use context for timeout control.
 type WaitOptions struct {
 	PollInterval time.Duration
