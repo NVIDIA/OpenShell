@@ -3166,6 +3166,10 @@ message RelayOpen {
   }
   // Optional service identifier for audit/correlation.
   string service_id = 5;
+  // Gateway-generated HTTP health probe. Routine probe relay activity is logged
+  // at debug instead of producing per-attempt OCSF open/close events. This does
+  // not change target validation or authorization. Older supervisors ignore it.
+  bool health_check = 6;
 }
 
 // Built-in SSH relay target.

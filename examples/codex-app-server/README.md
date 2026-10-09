@@ -103,8 +103,9 @@ openshell service get codex-app-server
 openshell service list codex-app-server --output json
 ```
 
-The gateway continuously checks Codex's `/readyz` endpoint. `Ready` means the
-latest checks passed; `Not ready` appears after three consecutive failures.
+The gateway continuously checks Codex's `/readyz` endpoint. One passing check
+sets `Ready`; it remains ready through two failures and changes to `Not ready`
+after three consecutive failures. One passing check restores `Ready`.
 `Unknown` means no conclusive current observation is available. Checks run every
 five seconds with a one-second timeout and continue while the sandbox runs.
 They do not restart Codex or prevent clients from connecting. The endpoint

@@ -14335,7 +14335,11 @@ type RelayOpen struct {
 	//	*RelayOpen_Tcp
 	Target isRelayOpen_Target `protobuf_oneof:"target"`
 	// Optional service identifier for audit/correlation.
-	ServiceId     string `protobuf:"bytes,5,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
+	ServiceId string `protobuf:"bytes,5,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
+	// Gateway-generated HTTP health probe. Routine probe relay activity is logged
+	// at debug instead of producing per-attempt OCSF open/close events. This does
+	// not change target validation or authorization. Older supervisors ignore it.
+	HealthCheck   bool `protobuf:"varint,6,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14407,6 +14411,13 @@ func (x *RelayOpen) GetServiceId() string {
 		return x.ServiceId
 	}
 	return ""
+}
+
+func (x *RelayOpen) GetHealthCheck() bool {
+	if x != nil {
+		return x.HealthCheck
+	}
+	return false
 }
 
 type isRelayOpen_Target interface {
@@ -19440,14 +19451,15 @@ const file_openshell_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
 	"instanceId\"!\n" +
-	"\x1fFinalizeMainProcessExitResponse\"\xb7\x01\n" +
+	"\x1fFinalizeMainProcessExitResponse\"\xda\x01\n" +
 	"\tRelayOpen\x12\x1d\n" +
 	"\n" +
 	"channel_id\x18\x01 \x01(\tR\tchannelId\x120\n" +
 	"\x03ssh\x18\x02 \x01(\v2\x1c.openshell.v1.SshRelayTargetH\x00R\x03ssh\x120\n" +
 	"\x03tcp\x18\x03 \x01(\v2\x1c.openshell.v1.TcpRelayTargetH\x00R\x03tcp\x12\x1d\n" +
 	"\n" +
-	"service_id\x18\x05 \x01(\tR\tserviceIdB\b\n" +
+	"service_id\x18\x05 \x01(\tR\tserviceId\x12!\n" +
+	"\fhealth_check\x18\x06 \x01(\bR\vhealthCheckB\b\n" +
 	"\x06target\"\x10\n" +
 	"\x0eSshRelayTarget\"8\n" +
 	"\x0eTcpRelayTarget\x12\x12\n" +

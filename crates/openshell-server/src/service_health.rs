@@ -3,7 +3,7 @@
 
 //! Continuous HTTP observations through the existing sandbox service relay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,8 +12,8 @@ use futures::{StreamExt, stream};
 use http::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use openshell_core::proto::{
-    HttpReadinessCheck, Sandbox, SandboxPhase, ServiceEndpoint, ServiceHealth, ServiceHealthState,
-    TcpRelayTarget, relay_open,
+    HttpReadinessCheck, RelayOpen, Sandbox, SandboxPhase, ServiceEndpoint, ServiceHealth,
+    ServiceHealthState, TcpRelayTarget, relay_open,
 };
 use openshell_core::{GetResourceVersion, ObjectId};
 use prost::Message;
@@ -135,10 +135,14 @@ impl ServiceHealthCache {
                 failures: 0,
                 health: unknown("Awaiting first HTTP check"),
             });
-        if entry.generation != generation || now.duration_since(entry.observed_at) >= STALE_AFTER {
+        if entry.generation != generation {
             entry.generation = generation;
             entry.failures = 0;
             entry.health = unknown("Awaiting first HTTP check");
+        } else if now.duration_since(entry.observed_at) >= STALE_AFTER {
+            // A delayed scan invalidates readiness, but consecutive failed
+            // attempts still count when the runtime/configuration is unchanged.
+            entry.health = unknown("HTTP observation is stale");
         }
         entry.observed_at = now;
         entry.health.last_checked_time =
@@ -225,20 +229,26 @@ async fn probe(state: &Arc<ServerState>, endpoint: &ServiceEndpoint) -> ProbeRes
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     let relay = tokio::time::timeout_at(
         deadline,
-        crate::supervisor_session::open_routed_relay_with_target(
+        crate::supervisor_session::open_routed_relay_with_message(
             state,
             &endpoint.sandbox_id,
-            relay_open::Target::Tcp(TcpRelayTarget {
-                host: "127.0.0.1".to_string(),
-                port: endpoint.target_port,
-            }),
-            endpoint.object_id().to_string(),
+            RelayOpen {
+                channel_id: uuid::Uuid::new_v4().to_string(),
+                target: Some(relay_open::Target::Tcp(TcpRelayTarget {
+                    host: "127.0.0.1".to_string(),
+                    port: endpoint.target_port,
+                })),
+                service_id: endpoint.object_id().to_string(),
+                health_check: true,
+            },
             TIMEOUT,
         ),
     )
     .await;
-    let Ok(Ok((channel_id, receiver))) = relay else {
-        return ProbeResult::Unknown("Supervisor relay unavailable");
+    let (channel_id, receiver) = match relay {
+        Ok(Ok(relay)) => relay,
+        Ok(Err(status)) => return relay_failure(&status),
+        _ => return ProbeResult::Unknown("Supervisor relay unavailable"),
     };
     let stream = match tokio::time::timeout_at(deadline, receiver).await {
         Ok(Ok(Ok(stream))) => stream,
@@ -257,6 +267,14 @@ async fn probe(state: &Arc<ServerState>, endpoint: &ServiceEndpoint) -> ProbeRes
     )
     .await
     .unwrap_or(ProbeResult::Failed("HTTP response timed out"))
+}
+
+fn relay_failure(status: &Status) -> ProbeResult {
+    if crate::supervisor_session::is_relay_target_failure(status) {
+        ProbeResult::Failed("Service connection failed")
+    } else {
+        ProbeResult::Unknown("Supervisor relay unavailable")
+    }
 }
 
 async fn check_endpoint(state: &Arc<ServerState>, endpoint: ServiceEndpoint) {
@@ -295,6 +313,7 @@ async fn check_endpoint(state: &Arc<ServerState>, endpoint: ServiceEndpoint) {
 
 async fn scan(state: &Arc<ServerState>) {
     let mut cursor = None;
+    let mut seen = HashSet::new();
     loop {
         let page = match state
             .store
@@ -311,6 +330,11 @@ async fn scan(state: &Arc<ServerState>) {
                 return;
             }
         };
+        seen.extend(
+            page.messages
+                .iter()
+                .map(|endpoint| endpoint.object_id().to_string()),
+        );
         stream::iter(page.messages)
             .for_each_concurrent(MAX_CONCURRENT_CHECKS, |endpoint| {
                 check_endpoint(state, endpoint)
@@ -321,13 +345,14 @@ async fn scan(state: &Arc<ServerState>) {
             break;
         }
     }
-    // Also collect deleted endpoints and observations that no longer refresh.
+    // Collect deleted endpoints. Retain live stale entries so a slow scan does
+    // not discard their failure counts; reads still report stale health unknown.
     state
         .service_health
         .entries
         .lock()
         .unwrap()
-        .retain(|_, entry| entry.observed_at.elapsed() < STALE_AFTER);
+        .retain(|id, _| seen.contains(id));
 }
 
 pub fn spawn_monitor(
@@ -370,6 +395,27 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn peer_target_refusal_fails_but_infrastructure_errors_are_unknown() {
+        let refusal = openshell_core::rpc_error::failed_precondition(
+            "RELAY_TARGET_FAILED",
+            "connection refused",
+        );
+        assert!(matches!(relay_failure(&refusal), ProbeResult::Failed(_)));
+        for status in [
+            Status::unavailable("peer offline"),
+            Status::failed_precondition("peer TLS configuration unavailable"),
+        ] {
+            assert!(matches!(relay_failure(&status), ProbeResult::Unknown(_)));
+        }
+        // Older supervisors omit the marker and continue logging normal relays.
+        assert!(
+            !RelayOpen::decode(&[0x0a, 1, b'x'][..])
+                .unwrap()
+                .health_check
+        );
     }
 
     #[test]
@@ -474,6 +520,36 @@ mod tests {
             cache.read(&endpoint, &[2]).state,
             ServiceHealthState::Unknown as i32
         );
+    }
+
+    #[test]
+    fn delayed_scans_preserve_failures_without_reusing_stale_readiness() {
+        let cache = ServiceHealthCache::default();
+        let endpoint = endpoint(true);
+        for attempt in 1..=3 {
+            cache.record(
+                &endpoint,
+                vec![1],
+                ProbeResult::Failed("HTTP response timed out"),
+            );
+            let expected = if attempt == 3 {
+                ServiceHealthState::Unhealthy
+            } else {
+                ServiceHealthState::Unknown
+            };
+            assert_eq!(cache.read(&endpoint, &[1]).state, expected as i32);
+            cache
+                .entries
+                .lock()
+                .unwrap()
+                .get_mut("service")
+                .unwrap()
+                .observed_at -= STALE_AFTER;
+            assert_eq!(
+                cache.read(&endpoint, &[1]).state,
+                ServiceHealthState::Unknown as i32
+            );
+        }
     }
 
     #[test]

@@ -422,6 +422,23 @@ ThreadingHTTPServer(('127.0.0.1', 4500), Handler).serve_forever()
     assert_eq!(healthy["readiness_check"]["path"], "/readyz");
     assert!(healthy["health"]["last_checked_time"].is_string());
 
+    // Let the existing best-effort log push flush. No client has opened a
+    // service relay yet, so HTTP relay audit events would come from probes.
+    sleep(Duration::from_secs(2)).await;
+    let logs = run_cli(&["logs", &name, "--source", "sandbox", "-n", "200"])
+        .await
+        .unwrap();
+    assert!(logs.status.success());
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        !logs.trim().is_empty(),
+        "sandbox lifecycle logs should be available"
+    );
+    assert!(
+        !logs.contains("tcp relay open"),
+        "health probes must not emit relay audit events: {logs}"
+    );
+
     let mut control =
         ServiceTarget::from_url(created["service_urls"][""].as_str().unwrap()).unwrap();
     control.path = "/toggle".to_string();
