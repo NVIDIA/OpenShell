@@ -5,6 +5,9 @@
 - name: Run OpenShell conformance tests
   hosts: all
   gather_facts: false
+  vars:
+    # Conformance is skipped when the gateway never connects.
+    conformance_failed: "{{ gateway_status is failed or conformance_result.rc != 0 }}"
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -98,33 +101,12 @@
     - name: Show OpenShell conformance diagnostics
       ansible.builtin.debug:
         var: conformance_result
-      when: conformance_result.rc | default(0) != 0
+      when: conformance_failed
 
-    - name: Read OpenShell gateway logs
-      become: true
-      ansible.builtin.command:
-        argv:
-          - journalctl
-          - --no-pager
-          - --lines
-          - "500"
-          - _SYSTEMD_UNIT=openshell-gateway.service
-          - "+"
-          - _SYSTEMD_USER_UNIT=openshell-gateway.service
-      register: openshell_gateway_logs
-      changed_when: false
-      failed_when: false
-      when: conformance_result.rc | default(1) != 0
-
-    - name: Show OpenShell gateway logs
-      ansible.builtin.debug:
-        var: openshell_gateway_logs.stdout_lines
-      when: conformance_result.rc | default(1) != 0
-
-    - name: Collect K3s conformance diagnostics
+    - name: Collect OpenShell gateway diagnostics
       ansible.builtin.include_role:
-        name: openshell_k3s_diagnostics
-      when: conformance_result.rc | default(1) != 0
+        name: openshell_diagnostics
+      when: conformance_failed
 
     - name: Require a connected gateway
       ansible.builtin.assert:

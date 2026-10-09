@@ -245,11 +245,7 @@ gh run rerun <run-id>
    ```bash
    gh run view <run-id> --log-failed
    ```
-4. For tmachine K3s failures, download `tmachine-diagnostics-*` artifacts and
-   preserve the first failure logs before rerunning. Inspect Service routing,
-   EndpointSlices and CLI status alongside the API, node and gateway logs.
-   Readiness polling within a job is different from rerunning a failed suite.
-5. Rerun the failed jobs if needed:
+4. Rerun the failed jobs if needed:
    ```bash
    gh run rerun <run-id> --failed
    ```
