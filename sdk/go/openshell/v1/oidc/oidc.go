@@ -36,6 +36,9 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 	cfg := &loginConfig{}
 	options.Apply(cfg, opts)
 	cfg.applyDefaults()
+	// Login authenticates a user, so the request must be an OIDC one even when
+	// the caller supplied its own scopes.
+	cfg.requireOpenIDScope()
 
 	// Apply configured timeout if the caller's context has no deadline.
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline && cfg.timeout > 0 {
