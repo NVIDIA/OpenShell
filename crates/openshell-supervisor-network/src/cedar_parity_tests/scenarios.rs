@@ -1,233 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decision parity between YAML policies evaluated by Rego and equivalent
-//! Cedar policies.
-//!
-//! Each scenario pairs a YAML policy with a Cedar policy written to mean the
-//! same thing, and runs every request through both engines' per-tunnel
-//! `evaluate_request`, the call the L7 relay makes. A case marked
-//! [`Expect::Same`] fails if the decisions differ. A case marked
-//! [`Expect::Diverges`] records a known difference and fails if the engines
-//! start to agree, so the list stays accurate.
+//! Hand-written parity scenarios for REST, JSON-RPC, MCP, and GraphQL.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
-
-use crate::cedar_only::CedarOnlyEngine;
-use crate::l7::L7RequestInfo;
-use crate::l7::graphql::{GraphqlOperationInfo, GraphqlRequestInfo};
-use crate::l7::jsonrpc::{JsonRpcCallInfo, JsonRpcRequestInfo, McpMethodClassification};
-use crate::l7::relay::L7EvalContext;
-use crate::opa::OpaEngine;
-
-const REGO: &str = include_str!("../data/sandbox-policy.rego");
-const BINARY: &str = "/usr/bin/curl";
-
-/// Whether both engines are expected to decide a case the same way.
-#[derive(Debug, Clone, Copy)]
-enum Expect {
-    Same,
-    /// A known difference, with the reason it exists.
-    Diverges(&'static str),
-}
-
-struct Case {
-    name: &'static str,
-    request: L7RequestInfo,
-    expect: Expect,
-}
-
-struct Scenario {
-    name: &'static str,
-    host: &'static str,
-    yaml: &'static str,
-    cedar: &'static str,
-    cases: Vec<Case>,
-}
-
-fn same(name: &'static str, request: L7RequestInfo) -> Case {
-    Case {
-        name,
-        request,
-        expect: Expect::Same,
-    }
-}
-
-fn diverges(name: &'static str, request: L7RequestInfo, reason: &'static str) -> Case {
-    Case {
-        name,
-        request,
-        expect: Expect::Diverges(reason),
-    }
-}
-
-fn ctx(host: &str) -> L7EvalContext {
-    L7EvalContext {
-        host: host.to_string(),
-        port: 443,
-        binary_path: BINARY.to_string(),
-        ..Default::default()
-    }
-}
-
-fn rest(method: &str, path: &str) -> L7RequestInfo {
-    L7RequestInfo {
-        action: method.to_string(),
-        target: path.to_string(),
-        query_params: HashMap::new(),
-        graphql: None,
-        jsonrpc: None,
-    }
-}
-
-fn operation(operation_type: &str, name: Option<&str>, fields: &[&str]) -> GraphqlOperationInfo {
-    GraphqlOperationInfo {
-        operation_type: operation_type.to_string(),
-        operation_name: name.map(str::to_string),
-        fields: fields.iter().map(ToString::to_string).collect(),
-        persisted_query: false,
-        persisted_query_hash: None,
-        persisted_query_id: None,
-    }
-}
-
-fn graphql(operations: Vec<GraphqlOperationInfo>) -> L7RequestInfo {
-    L7RequestInfo {
-        graphql: Some(GraphqlRequestInfo {
-            operations,
-            error: None,
-        }),
-        ..rest("POST", "/graphql")
-    }
-}
-
-fn jsonrpc_info(calls: Vec<JsonRpcCallInfo>) -> JsonRpcRequestInfo {
-    JsonRpcRequestInfo {
-        calls,
-        is_batch: false,
-        receive_stream: false,
-        has_response: false,
-        mcp_revision: None,
-        mcp_http_metadata: None,
-        error: None,
-    }
-}
-
-fn call(
-    method: &str,
-    tool: Option<&str>,
-    class: Option<McpMethodClassification>,
-) -> JsonRpcCallInfo {
-    let mut params = HashMap::new();
-    if let Some(tool) = tool {
-        params.insert("name".to_string(), tool.to_string());
-    }
-    JsonRpcCallInfo {
-        method: method.to_string(),
-        params,
-        tool: tool.map(str::to_string),
-        mcp_classification: class,
-        is_notification: false,
-    }
-}
-
-fn jsonrpc_request(path: &str, calls: Vec<JsonRpcCallInfo>) -> L7RequestInfo {
-    L7RequestInfo {
-        jsonrpc: Some(jsonrpc_info(calls)),
-        ..rest("POST", path)
-    }
-}
-
-fn mcp(method: &str, tool: Option<&str>, class: McpMethodClassification) -> L7RequestInfo {
-    jsonrpc_request("/mcp", vec![call(method, tool, Some(class))])
-}
-
-/// Returns the YAML decision, or the evaluation error. The relay treats an
-/// evaluation error as a denial.
-fn opa_decision(yaml: &str, host: &str, request: &L7RequestInfo) -> Result<bool, String> {
-    let engine = OpaEngine::from_strings(REGO, yaml).expect("YAML policy loads");
-    let tunnel = engine
-        .clone_engine_for_tunnel(engine.current_generation())
-        .expect("tunnel engine");
-    tunnel
-        .evaluate_request(&ctx(host), request)
-        .map(|(allowed, _)| allowed)
-        .map_err(|error| {
-            error
-                .to_string()
-                .lines()
-                .find(|l| l.contains("error:"))
-                .unwrap_or("evaluation error")
-                .trim()
-                .to_string()
-        })
-}
-
-fn cedar_allows(cedar: &str, host: &str, request: &L7RequestInfo) -> bool {
-    let engine = CedarOnlyEngine::from_policy_str(cedar).expect("Cedar policy loads");
-    engine
-        .l7_handle(engine.current_generation())
-        .evaluate_request(&ctx(host), request)
-        .expect("Cedar request evaluates")
-        .0
-}
-
-/// Runs a scenario and returns its report rows and any failures.
-fn run(scenario: &Scenario) -> (String, Vec<String>) {
-    let mut report = String::new();
-    let mut failures = Vec::new();
-    for case in &scenario.cases {
-        let yaml_result = opa_decision(scenario.yaml, scenario.host, &case.request);
-        if let Err(error) = &yaml_result {
-            println!(
-                "YAML evaluation error in {} / {}: {error}",
-                scenario.name, case.name
-            );
-        }
-        let yaml = yaml_result.unwrap_or(false);
-        let cedar = cedar_allows(scenario.cedar, scenario.host, &case.request);
-        let decision = |allowed: bool| if allowed { "allow" } else { "deny" };
-        let outcome = match (case.expect, yaml == cedar) {
-            (Expect::Same, true) => "same".to_string(),
-            (Expect::Diverges(reason), false) => format!("known difference: {reason}"),
-            (Expect::Same, false) => {
-                failures.push(format!(
-                    "{} / {}: YAML {} but Cedar {}",
-                    scenario.name,
-                    case.name,
-                    decision(yaml),
-                    decision(cedar)
-                ));
-                "MISMATCH".to_string()
-            }
-            (Expect::Diverges(reason), true) => {
-                failures.push(format!(
-                    "{} / {}: expected a difference ({reason}) but both {}",
-                    scenario.name,
-                    case.name,
-                    decision(yaml)
-                ));
-                "UNEXPECTEDLY SAME".to_string()
-            }
-        };
-        let _ = writeln!(
-            report,
-            "| {} | {} | {} | {} | {outcome} |",
-            scenario.name,
-            case.name,
-            decision(yaml),
-            decision(cedar)
-        );
-    }
-    (report, failures)
-}
-
-fn assert_parity(scenario: &Scenario) {
-    let (report, failures) = run(scenario);
-    println!("| Scenario | Case | YAML | Cedar | Result |\n|---|---|---|---|---|\n{report}");
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
+use super::*;
 
 #[test]
 fn rest_parity() {
@@ -596,6 +372,116 @@ when {
             // its own. Rego reports conflicting deny reasons here, which the
             // relay would also treat as a denial.
             same("parse error", parse_error),
+        ],
+    });
+}
+
+#[test]
+fn connection_dns_and_inspection_parity() {
+    assert_parity(&Scenario {
+        name: "Connections",
+        host: "api.example.com",
+        yaml: r#"
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: "*.cdn.example.com"
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+        cedar: r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { context.binary_path == "/usr/bin/curl" };
+permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when {
+    resource.host like("*.cdn.example.com", ".")
+    && resource.port == 443
+    && context.binary_path == "/usr/bin/curl"
+};
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { ["GET", "HEAD", "OPTIONS"].contains(context.method) };
+"#,
+        cases: vec![
+            same_probe(
+                "declared binary connects",
+                Probe::Connect(network("api.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "other binary is refused",
+                Probe::Connect(network("api.example.com", 443, "/usr/bin/wget")),
+            ),
+            same_probe(
+                "other port is refused",
+                Probe::Connect(network("api.example.com", 8443, BINARY)),
+            ),
+            same_probe(
+                "glob host connects",
+                Probe::Connect(network("img.cdn.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "glob does not cross a label",
+                Probe::Connect(network("a.b.cdn.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "exact host is exactly declared",
+                Probe::ExactHost(network("api.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "glob host is not exactly declared",
+                Probe::ExactHost(network("img.cdn.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "inspected endpoint",
+                Probe::Inspection(network("api.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "uninspected endpoint",
+                Probe::Inspection(network("img.cdn.example.com", 443, BINARY)),
+            ),
+            same_probe(
+                "exact host is DNS eligible",
+                Probe::DnsEligible {
+                    name: "api.example.com".to_string(),
+                    port: 443,
+                },
+            ),
+            same_probe(
+                "glob host is DNS eligible",
+                Probe::DnsEligible {
+                    name: "img.cdn.example.com".to_string(),
+                    port: 443,
+                },
+            ),
+            same_probe(
+                "undeclared host is not DNS eligible",
+                Probe::DnsEligible {
+                    name: "example.org".to_string(),
+                    port: 443,
+                },
+            ),
+            same_probe(
+                "read-only preset allows GET",
+                request_in(
+                    l7_ctx("api.example.com", 443, BINARY),
+                    rest("GET", "/anything"),
+                ),
+            ),
+            same_probe(
+                "read-only preset denies POST",
+                request_in(
+                    l7_ctx("api.example.com", 443, BINARY),
+                    rest("POST", "/anything"),
+                ),
+            ),
         ],
     });
 }
