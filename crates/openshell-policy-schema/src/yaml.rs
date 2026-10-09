@@ -4,184 +4,76 @@
 //! YAML compatibility at `OpenShell`'s authored-data boundaries.
 
 use serde::Serialize;
-use serde::de::{DeserializeOwned, IntoDeserializer, Visitor};
+use serde::de::DeserializeOwned;
 use serde_yml::{Error, Value};
 
-/// Reject duplicate keys before typed decoding and retain the previous rule
-/// that a null scalar cannot stand in for a mapping or a struct.
+/// Load authored YAML with bounded parsing and duplicate-key rejection.
 pub fn from_str<T: DeserializeOwned>(source: &str) -> Result<T, Error> {
+    from_str_with_object_paths(source, &[])
+}
+
+/// Reject null at schema-declared object paths before ordinary typed decoding.
+///
+/// A `*` selects each sequence element or mapping value. Missing fields are
+/// left to Serde defaults; optional objects should not be listed themselves.
+pub fn from_str_with_object_paths<T: DeserializeOwned>(
+    source: &str,
+    paths: &[&str],
+) -> Result<T, Error> {
     let config =
         serde_yml::ParserConfig::new().duplicate_key_policy(serde_yml::DuplicateKeyPolicy::Error);
     let value: Value = serde_yml::from_str_with_config(source, &config)?;
-    T::deserialize(Deserializer::new(&value))
+    reject_null_objects(&value, paths)?;
+    T::deserialize(serde_yml::Deserializer::new(&value))
 }
 
-/// A type-directed adapter: null remains valid for options and untyped data,
-/// but is rejected when a typed consumer requests a map or struct.
-pub struct Deserializer<'a>(&'a Value);
-
-impl<'a> Deserializer<'a> {
-    pub fn new(value: &'a Value) -> Self {
-        // YAML tags are transparent to typed consumers, as in noyalib.
-        match value {
-            Value::Tagged(tagged) => Self::new(tagged.value()),
-            _ => Self(value),
-        }
+/// Validate only declared schema objects, not arbitrary user-data mappings.
+pub fn reject_null_objects(value: &Value, paths: &[&str]) -> Result<(), Error> {
+    reject_null_at_path(value, "", "")?;
+    for path in paths {
+        reject_null_at_path(value, path, "")?;
     }
+    Ok(())
 }
 
-impl<'de> IntoDeserializer<'de, Error> for Deserializer<'de> {
-    type Deserializer = Self;
-    fn into_deserializer(self) -> Self {
-        self
+fn reject_null_at_path(value: &Value, remaining: &str, location: &str) -> Result<(), Error> {
+    if let Value::Tagged(tagged) = value {
+        return reject_null_at_path(tagged.value(), remaining, location);
     }
-}
-
-macro_rules! delegate {
-    ($($method:ident),* $(,)?) => {
-        $(fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-            serde::Deserializer::$method(serde_yml::Deserializer::new(self.0), visitor)
-        })*
-    };
-}
-
-impl<'de> serde::Deserializer<'de> for Deserializer<'de> {
-    type Error = Error;
-
-    delegate!(
-        deserialize_bool,
-        deserialize_i8,
-        deserialize_i16,
-        deserialize_i32,
-        deserialize_i64,
-        deserialize_i128,
-        deserialize_u8,
-        deserialize_u16,
-        deserialize_u32,
-        deserialize_u64,
-        deserialize_u128,
-        deserialize_f32,
-        deserialize_f64,
-        deserialize_char,
-        deserialize_str,
-        deserialize_string,
-        deserialize_bytes,
-        deserialize_byte_buf,
-        deserialize_unit,
-        deserialize_identifier,
-        deserialize_ignored_any
-    );
-
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.0 {
-            Value::Mapping(_) => self.deserialize_map(visitor),
-            Value::Sequence(_) => self.deserialize_seq(visitor),
-            _ => {
-                serde::Deserializer::deserialize_any(serde_yml::Deserializer::new(self.0), visitor)
-            }
-        }
-    }
-
-    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        let Value::Mapping(mapping) = self.0 else {
-            if !self.0.is_null() {
-                return serde::Deserializer::deserialize_map(
-                    serde_yml::Deserializer::new(self.0),
-                    visitor,
-                );
-            }
-            return Err(Error::TypeMismatch {
-                expected: "mapping",
-                found: "null".into(),
-            });
-        };
-        let mut access = serde::de::value::MapDeserializer::new(
-            mapping
-                .iter()
-                .map(|(key, value)| (key.as_str(), Self::new(value))),
-        );
-        let result = visitor.visit_map(&mut access)?;
-        access.end()?;
-        Ok(result)
-    }
-
-    fn deserialize_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        self.deserialize_map(visitor)
-    }
-
-    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        let Value::Sequence(sequence) = self.0 else {
-            return serde::Deserializer::deserialize_seq(
-                serde_yml::Deserializer::new(self.0),
-                visitor,
-            );
-        };
-        let mut access = serde::de::value::SeqDeserializer::new(sequence.iter().map(Self::new));
-        let result = visitor.visit_seq(&mut access)?;
-        access.end()?;
-        Ok(result)
-    }
-
-    fn deserialize_tuple<V: Visitor<'de>>(
-        self,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        self.deserialize_seq(visitor)
-    }
-    fn deserialize_tuple_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        self.deserialize_tuple(len, visitor)
-    }
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        if self.0.is_null() {
-            visitor.visit_none()
+    if remaining.is_empty() {
+        return if value.is_null() {
+            Err(Error::Parse(format!(
+                "{}: null is not an object",
+                if location.is_empty() {
+                    ".".to_owned()
+                } else {
+                    crate::bound_path(location.to_owned())
+                }
+            )))
         } else {
-            visitor.visit_some(self)
+            Ok(())
+        };
+    }
+    let (field, rest) = remaining.split_once('.').unwrap_or((remaining, ""));
+    if field == "*" {
+        if let Some(mapping) = value.as_mapping() {
+            for (key, child) in mapping {
+                reject_null_at_path(child, rest, &format!("{location}[{:?}]", key.as_str()))?;
+            }
+        } else if let Some(sequence) = value.as_sequence() {
+            for (index, child) in sequence.iter().enumerate() {
+                reject_null_at_path(child, rest, &format!("{location}[{index}]"))?;
+            }
         }
+    } else if let Some(child) = value.as_mapping().and_then(|mapping| mapping.get(field)) {
+        let path = if location.is_empty() {
+            field.to_owned()
+        } else {
+            format!("{location}.{field}")
+        };
+        reject_null_at_path(child, rest, &path)?;
     }
-    fn deserialize_newtype_struct<V: Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        visitor.visit_newtype_struct(self)
-    }
-    fn deserialize_unit_struct<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        serde::Deserializer::deserialize_unit_struct(
-            serde_yml::Deserializer::new(self.0),
-            name,
-            visitor,
-        )
-    }
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        name: &'static str,
-        variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        // Authored OpenShell enums are scalar enums or untagged enums. The
-        // latter recurse through deserialize_any above.
-        serde::Deserializer::deserialize_enum(
-            serde_yml::Deserializer::new(self.0),
-            name,
-            variants,
-            visitor,
-        )
-    }
+    Ok(())
 }
 
 /// Preserve authored strings even for YAML 1.1 readers (dates, timestamps,
@@ -308,14 +200,61 @@ mod tests {
             "entries: {x: null}",
             "entries: {x: {config: null}}",
         ] {
-            assert!(from_str::<Document>(source).is_err(), "{source}");
+            assert!(
+                from_str_with_object_paths::<Document>(
+                    source,
+                    &["entries", "entries.*", "entries.*.config"]
+                )
+                .is_err(),
+                "{source}"
+            );
         }
-        let parsed: Document = from_str("entries: {x: {config: {optional: null}}}").unwrap();
+        let parsed: Document = from_str_with_object_paths(
+            "entries: {x: {config: {optional: null}}}",
+            &["entries", "entries.*", "entries.*.config"],
+        )
+        .unwrap();
         assert!(parsed.entries["x"].config["optional"].is_null());
     }
     #[test]
     fn duplicate_fields_are_rejected() {
         assert!(from_str::<Document>("entries: {}\nentries: {x: {}}").is_err());
+    }
+    #[test]
+    fn empty_documents_do_not_become_default_objects() {
+        for source in ["", "# comment only", "null", "~"] {
+            assert!(from_str::<Document>(source).is_err(), "{source}");
+        }
+        assert!(from_str::<Document>("{}").is_ok());
+    }
+
+    #[test]
+    fn object_paths_preserve_optional_nulls_and_visit_sequence_elements() {
+        #[derive(Debug, Deserialize)]
+        struct Profile {
+            optional: Option<Entry>,
+            endpoints: Vec<Entry>,
+        }
+        let paths = ["endpoints.*", "endpoints.*.config", "optional.config"];
+        let parsed: Profile = from_str_with_object_paths(
+            "optional: null\nendpoints: [{config: {data: null}}]",
+            &paths,
+        )
+        .unwrap();
+        assert!(parsed.optional.is_none());
+        assert!(parsed.endpoints[0].config["data"].is_null());
+        for source in [
+            "optional: null\nendpoints: [null]",
+            "optional: {config: null}\nendpoints: []",
+        ] {
+            assert!(
+                from_str_with_object_paths::<Profile>(source, &paths).is_err(),
+                "{source}"
+            );
+        }
+        let source = "entries: {'key.with.dots': null}";
+        let error = from_str_with_object_paths::<Document>(source, &["entries.*"]).unwrap_err();
+        assert!(error.to_string().contains("key.with.dots"));
     }
     #[test]
     fn legacy_reader_sensitive_strings_are_quoted_without_changing_values() {

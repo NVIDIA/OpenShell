@@ -194,9 +194,12 @@ impl BinaryRegistry {
 // ---------------------------------------------------------------------------
 
 fn parse_binary_capability(contents: &str, source: &str) -> Result<BinaryCapability> {
-    let raw: BinaryCapabilityDef = openshell_policy_schema::yaml::from_str(contents)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("parsing binary descriptor {source}"))?;
+    let raw: BinaryCapabilityDef = openshell_policy_schema::yaml::from_str_with_object_paths(
+        contents,
+        &["protocols.*", "protocols.*.actions.*"],
+    )
+    .into_diagnostic()
+    .wrap_err_with(|| format!("parsing binary descriptor {source}"))?;
 
     let protocols = raw
         .protocols

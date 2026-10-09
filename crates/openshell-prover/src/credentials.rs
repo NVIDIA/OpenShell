@@ -268,9 +268,10 @@ pub fn load_credentials(path: &Path) -> Result<Vec<Credential>> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading credentials file {}", path.display()))?;
-    let raw: CredentialsFile = openshell_policy_schema::yaml::from_str(&contents)
-        .into_diagnostic()
-        .wrap_err("parsing credentials YAML")?;
+    let raw: CredentialsFile =
+        openshell_policy_schema::yaml::from_str_with_object_paths(&contents, &["credentials.*"])
+            .into_diagnostic()
+            .wrap_err("parsing credentials YAML")?;
 
     Ok(raw
         .credentials
@@ -286,9 +287,16 @@ pub fn load_credentials(path: &Path) -> Result<Vec<Credential>> {
 }
 
 fn parse_api_registry(contents: &str, source: &str) -> Result<ApiCapability> {
-    let raw: ApiRegistryDef = openshell_policy_schema::yaml::from_str(contents)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("parsing API registry {source}"))?;
+    let raw: ApiRegistryDef = openshell_policy_schema::yaml::from_str_with_object_paths(
+        contents,
+        &[
+            "scope_capabilities",
+            "scope_capabilities.*.*",
+            "action_risk",
+        ],
+    )
+    .into_diagnostic()
+    .wrap_err_with(|| format!("parsing API registry {source}"))?;
 
     let scope_capabilities = raw
         .scope_capabilities

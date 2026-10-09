@@ -1974,8 +1974,30 @@ fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperatio
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
-    Ok(openshell_core::yaml::from_str::<ProviderTypeProfile>(
+    Ok(openshell_core::yaml::from_str_with_object_paths::<
+        ProviderTypeProfile,
+    >(
         input,
+        &[
+            "annotations",
+            "discovery",
+            "credentials.*",
+            "files.*",
+            "endpoints.*",
+            "binaries.*",
+            "credentials.*.refresh.material.*",
+            "credentials.*.refresh.additional_outputs.*",
+            "credentials.*.token_grant.audience_overrides.*",
+            "endpoints.*.mcp",
+            "endpoints.*.graphql_persisted_queries",
+            "endpoints.*.graphql_persisted_queries.*",
+            "endpoints.*.rules.*",
+            "endpoints.*.rules.*.allow.query",
+            "endpoints.*.rules.*.allow.params",
+            "endpoints.*.deny_rules.*",
+            "endpoints.*.deny_rules.*.query",
+            "endpoints.*.deny_rules.*.params",
+        ],
     )?)
 }
 

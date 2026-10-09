@@ -520,7 +520,9 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("null is not allowed for this field"))
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
@@ -593,16 +595,47 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
-    let policy: PolicyDocument = serde_path_to_error::deserialize(yaml::Deserializer::new(&value))
-        .map_err(|error| {
-            let path = bound_path(error.path().to_string());
-            if path == "." {
-                miette::miette!("{}", error.inner())
-            } else {
-                miette::miette!("{path}: {}", error.inner())
-            }
-        })
-        .wrap_err("failed to decode sandbox policy fields")?;
+    yaml::reject_null_objects(
+        &value,
+        &[
+            "filesystem_policy",
+            "landlock",
+            "process",
+            "network_policies",
+            "network_policies.*",
+            "network_policies.*.endpoints.*",
+            "network_policies.*.binaries.*",
+            "network_middlewares",
+            "network_middlewares.*",
+            "network_middlewares.*.config",
+            "network_middlewares.*.endpoints",
+            "network_policies.*.endpoints.*.credential_binding",
+            "network_policies.*.endpoints.*.json_rpc",
+            "network_policies.*.endpoints.*.mcp",
+            "network_policies.*.endpoints.*.graphql_persisted_queries",
+            "network_policies.*.endpoints.*.graphql_persisted_queries.*",
+            "network_policies.*.endpoints.*.rules.*",
+            "network_policies.*.endpoints.*.rules.*.allow",
+            "network_policies.*.endpoints.*.rules.*.allow.query",
+            "network_policies.*.endpoints.*.rules.*.allow.params",
+            "network_policies.*.endpoints.*.deny_rules.*",
+            "network_policies.*.endpoints.*.deny_rules.*.query",
+            "network_policies.*.endpoints.*.deny_rules.*.params",
+        ],
+    )
+    .into_diagnostic()
+    .wrap_err("failed to decode sandbox policy fields")?;
+    let policy: PolicyDocument =
+        serde_path_to_error::deserialize(serde_yml::Deserializer::new(&value))
+            .map_err(|error| {
+                let path = bound_path(error.path().to_string());
+                if path == "." {
+                    miette::miette!("{}", error.inner())
+                } else {
+                    miette::miette!("{path}: {}", error.inner())
+                }
+            })
+            .wrap_err("failed to decode sandbox policy fields")?;
     validate_policy(&policy)?;
     Ok(policy)
 }
