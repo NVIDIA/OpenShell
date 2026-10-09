@@ -1683,23 +1683,6 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     modified
 }
 
-fn strip_proto_provider_policy_entries(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    openshell_policy::strip_provider_rule_names(proto)
-}
-
-fn proto_sync_payload_for_enriched_policy(
-    proto: &openshell_core::proto::SandboxPolicy,
-    enriched: bool,
-) -> Option<openshell_core::proto::SandboxPolicy> {
-    if !enriched {
-        return None;
-    }
-
-    let mut sync_policy = proto.clone();
-    strip_proto_provider_policy_entries(&mut sync_policy);
-    Some(sync_policy)
-}
-
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
@@ -1830,89 +1813,6 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_strip_provider_policy_entries_removes_only_reserved_entries() {
-        let mut policy = openshell_policy::restrictive_default_policy();
-        policy.network_policies.insert(
-            "_provider_work_github".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "_provider_work_github".to_string(),
-                ..Default::default()
-            },
-        );
-        policy.network_policies.insert(
-            "sandbox_only".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "sandbox_only".to_string(),
-                ..Default::default()
-            },
-        );
-
-        assert!(strip_proto_provider_policy_entries(&mut policy));
-        assert!(
-            !policy
-                .network_policies
-                .contains_key("_provider_work_github")
-        );
-        assert!(policy.network_policies.contains_key("sandbox_only"));
-        assert!(!strip_proto_provider_policy_entries(&mut policy));
-    }
-
-    #[test]
-    fn proto_sync_payload_not_created_for_provider_entries_without_enrichment() {
-        let mut runtime_policy = openshell_policy::restrictive_default_policy();
-        runtime_policy.network_policies.insert(
-            "_provider_work_github".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "_provider_work_github".to_string(),
-                ..Default::default()
-            },
-        );
-
-        assert!(proto_sync_payload_for_enriched_policy(&runtime_policy, false).is_none());
-        assert!(
-            runtime_policy
-                .network_policies
-                .contains_key("_provider_work_github"),
-            "provider-derived rules alone must not trigger sync or mutate runtime policy"
-        );
-    }
-
-    #[test]
-    fn proto_sync_payload_for_enrichment_strips_provider_entries_without_mutating_runtime_policy() {
-        let mut runtime_policy = openshell_policy::restrictive_default_policy();
-        runtime_policy.network_policies.insert(
-            "_provider_work_github".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "_provider_work_github".to_string(),
-                ..Default::default()
-            },
-        );
-        runtime_policy.network_policies.insert(
-            "sandbox_only".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "sandbox_only".to_string(),
-                ..Default::default()
-            },
-        );
-
-        let sync_policy = proto_sync_payload_for_enriched_policy(&runtime_policy, true)
-            .expect("enrichment should create a sync payload");
-
-        assert!(
-            runtime_policy
-                .network_policies
-                .contains_key("_provider_work_github"),
-            "runtime policy must retain provider-derived rules for OPA input"
-        );
-        assert!(
-            !sync_policy
-                .network_policies
-                .contains_key("_provider_work_github")
-        );
-        assert!(sync_policy.network_policies.contains_key("sandbox_only"));
-    }
-
-    #[test]
     fn no_network_policy_is_unchanged_by_supervisor_baseline() {
         // A CPU-only workload must start with this policy even when the
         // supervisor's host has GPUs. No GPU hardware is needed by this test.
@@ -1932,7 +1832,6 @@ mod baseline_tests {
 
         assert!(!enriched);
         assert_eq!(policy, original);
-        assert!(proto_sync_payload_for_enriched_policy(&policy, enriched).is_none());
     }
 
     #[test]
@@ -2405,7 +2304,6 @@ async fn load_policy_with_gateway(
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
                 enrich_proto_baseline_paths(&mut discovered);
-                strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
                 let ws = snapshot.workspace.clone();
@@ -2418,8 +2316,8 @@ async fn load_policy_with_gateway(
                     Err(error) => {
                         // The gateway stored nothing, so report the rejection
                         // against the snapshot this upload was built from and
-                        // upload again on the next pass. Attaching the missing
-                        // provider or setting a sandbox policy repairs startup.
+                        // retry after fetching current configuration. A workspace
+                        // admin can submit a reviewed policy to repair startup.
                         let rejection =
                             startup_write_rejection("image policy", &error).ok_or(error)?;
                         reject_startup_configuration(
@@ -2459,51 +2357,9 @@ async fn load_policy_with_gateway(
                 }
             };
 
-            // Ensure baseline filesystem paths are present for proxy-mode
-            // sandboxes.  If the policy was enriched, sync the updated version
-            // back to the gateway so users can see the effective policy. Only
-            // a sandbox-sourced policy is written back. The gateway refuses
-            // every sandbox policy write while a global policy is active, so a
-            // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
-            let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
-                .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
-            if let Some(sync_policy) = sync_policy {
-                let synced = grpc_retry("Enriched policy synchronization", || {
-                    gateway.sync(sandbox, &sync_policy, &snapshot.workspace)
-                })
-                .await;
-                let canonical = match synced {
-                    Ok(canonical) => canonical,
-                    Err(error) => {
-                        // The stored policy is unchanged, so report the
-                        // rejection against the snapshot it was read from and
-                        // read again on the next pass, which picks up a
-                        // replacement policy or a provider repair.
-                        let rejection = startup_write_rejection(
-                            "policy update that adds baseline filesystem paths",
-                            &error,
-                        )
-                        .ok_or(error)?;
-                        reject_startup_configuration(
-                            gateway,
-                            &mut rejection_log,
-                            id,
-                            &instance_id,
-                            &snapshot,
-                            &rejection.diagnostic,
-                            Some(&rejection.log_key),
-                        )
-                        .await?;
-                        reconciliation_attempts = 0;
-                        continue;
-                    }
-                };
-                proto_policy = canonical.policy.clone().ok_or_else(|| {
-                    miette::miette!("Gateway returned no effective policy after enrichment")
-                })?;
-                snapshot = canonical;
-            }
+            // Runtime baseline paths are local requirements. Keep the gateway's
+            // authored policy and revision identity unchanged.
+            enrich_proto_baseline_paths(&mut proto_policy);
 
             let loaded_policy_revision = Some({
                 let mut revision = LoadedPolicyRevision::from_snapshot(&snapshot);
@@ -3143,7 +2999,7 @@ struct LoadedPolicyRevision {
 /// Identifies where the policy currently loaded into OPA came from.
 ///
 /// A missing gateway revision means the policy was loaded from the gateway but
-/// could not be bound to an authoritative snapshot (for example, enrichment
+/// could not be bound to an authoritative snapshot (for example, initial adoption
 /// sync failed). That state must reconcile on the first successful poll. A
 /// local-file override is different: gateway policy revisions are observed for
 /// settings/provider refreshes but must never replace the explicit local OPA
@@ -6428,30 +6284,6 @@ network_policies:
         .await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn startup_policy_write_refusal_baseline_write_back_waits_for_repair() {
-        // The gateway policy has network rules but lacks the proxy baseline
-        // paths, so startup writes an enriched copy back. The repaired policy
-        // already carries those paths and needs no write-back.
-        let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
-        assert_refused_startup_write_waits_for_repair(
-            settings_poll_result(
-                Some(proto_tcp_policy_fixture()),
-                1,
-                openshell_core::proto::PolicySource::Sandbox,
-            ),
-            ImagePolicyDiscovery::Missing,
-            "policy update that adds baseline filesystem paths",
-            vec![SyncRefusal::new(
-                tonic::Code::FailedPrecondition,
-                UNATTACHED_PROVIDER_DIAGNOSTIC,
-            )],
-            repaired,
-        )
-        .await;
-    }
-
     /// Install an operator's repair after the refused write but before its
     /// rejection report. The obsolete report must lead straight to a new
     /// snapshot, without resending the write or delaying the repaired launch.
@@ -6553,24 +6385,6 @@ network_policies:
                 UNATTACHED_PROVIDER_DIAGNOSTIC,
             ),
             "image policy",
-        ))
-        .await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
-        let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
-        Box::pin(assert_startup_repair_before_rejection_refetches(
-            settings_poll_result(
-                Some(proto_tcp_policy_fixture()),
-                1,
-                openshell_core::proto::PolicySource::Sandbox,
-            ),
-            ImagePolicyDiscovery::Missing,
-            repaired,
-            SyncRefusal::new(tonic::Code::InvalidArgument, INVALID_MIDDLEWARE_DIAGNOSTIC),
-            "policy update that adds baseline filesystem paths",
         ))
         .await;
     }
@@ -6700,31 +6514,6 @@ network_policies:
         .await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
-        // The same limit applies to a refused baseline-path write-back.
-        let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
-        assert_refused_startup_write_waits_for_repair(
-            settings_poll_result(
-                Some(proto_tcp_policy_fixture()),
-                1,
-                openshell_core::proto::PolicySource::Sandbox,
-            ),
-            ImagePolicyDiscovery::Missing,
-            "policy update that adds baseline filesystem paths",
-            vec![
-                SyncRefusal::new(
-                    tonic::Code::FailedPrecondition,
-                    UNATTACHED_PROVIDER_DIAGNOSTIC
-                );
-                7
-            ],
-            repaired,
-        )
-        .await;
-    }
-
     /// Collects the sandbox log lines that a test's OCSF events render to.
     #[derive(Clone, Default)]
     struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -6788,15 +6577,23 @@ network_policies:
     }
 
     #[tokio::test(start_paused = true)]
+    async fn startup_existing_sandbox_policy_enriches_locally_without_upload() {
+        assert_startup_enriches_locally(openshell_core::proto::PolicySource::Sandbox).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
+        assert_startup_enriches_locally(openshell_core::proto::PolicySource::Global).await;
+    }
+
+    async fn assert_startup_enriches_locally(source: openshell_core::proto::PolicySource) {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         // The gateway serves a global policy that has network rules but lacks
         // the proxy baseline paths. It refuses every sandbox policy write while
         // that policy is active, so startup must add the paths locally and
         // install the policy without writing it back.
-        let mut global =
-            settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Global);
-        global.global_policy_version = 1;
+        let mut global = settings_poll_result(Some(proto_tcp_policy_fixture()), 1, source);
+        global.global_policy_version = u32::from(source == PolicySource::Global);
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
         assert!(enrich_proto_baseline_paths(&mut enriched));
@@ -6864,29 +6661,18 @@ network_policies:
         else {
             panic!("startup must bind the global policy to its gateway revision");
         };
-        assert_eq!(revision.policy_source, PolicySource::Global);
+        assert_eq!(revision.policy_source, source);
     }
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_permanent_codes_still_exit() {
-        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
-        // No policy or provider change repairs these refusals, so startup
-        // keeps exiting instead of holding the sandbox in its repair window.
-        // Both writes are checked: the image policy upload to a gateway with
-        // no policy, and the write-back of a stored policy that lacks the
-        // proxy baseline paths.
-        let writes = [
-            (
-                "image policy upload",
-                unset_policy_snapshot(),
-                ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
-            ),
-            (
-                "baseline write-back",
-                settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox),
-                ImagePolicyDiscovery::Missing,
-            ),
-        ];
+        use openshell_core::proto::ConfigurationAdmissionState;
+        // Authentication failures in initial adoption remain fatal.
+        let writes = [(
+            "image policy upload",
+            unset_policy_snapshot(),
+            ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
+        )];
         for (write, initial, discovery) in writes {
             for code in [
                 tonic::Code::PermissionDenied,

@@ -153,8 +153,10 @@ including automatically. You can also review proposals in the terminal UI with
 ## Approve Proposals Automatically
 
 By default, every proposal waits for your review. In automatic mode, OpenShell
-approves a proposal without review when both of these are true:
+approves a proposal without review when all of these are true:
 
+- The proposal keeps credential bindings and their rule and process scope unchanged.
+  Binding changes require workspace admin approval.
 - The proposal risk check finds none of the risks described in [Proposal Risk
   Check](#proposal-risk-check).
 - OpenShell has not flagged the proposal's destination. OpenShell flags hosts

@@ -381,3 +381,95 @@ binaries:
     drop(resources);
     drop(image);
 }
+
+#[tokio::test]
+async fn image_credential_binding_waits_for_admin_repair_without_launching() {
+    let suffix = format!("{:016x}", rand::random::<u64>());
+    let resources = Resources {
+        sandbox: format!("bi-{suffix}"),
+        standalone_sandbox: format!("bl-{suffix}"),
+        provider: format!("bp-{suffix}"),
+    };
+    let context = tempfile::tempdir().unwrap();
+    let image_policy = POLICY.replace(
+        "        port: 443",
+        &format!(
+            "        port: 443\n        credential_binding:\n          provider: {}",
+            resources.provider
+        ),
+    );
+    std::fs::write(context.path().join("policy.yaml"), image_policy).unwrap();
+    std::fs::write(context.path().join("Dockerfile"), r#"FROM public.ecr.aws/docker/library/python:3.13-slim
+RUN groupadd sandbox && useradd -m -g sandbox sandbox && mkdir -p /sandbox && chown sandbox:sandbox /sandbox
+COPY policy.yaml /etc/openshell/policy.yaml
+WORKDIR /sandbox
+USER sandbox
+"#).unwrap();
+    let image = ImageGuard::build(
+        "image-binding",
+        &context.path().join("Dockerfile"),
+        context.path(),
+    )
+    .unwrap();
+    let mut create = openshell_cmd()
+        .args([
+            "sandbox",
+            "create",
+            "--name",
+            &resources.sandbox,
+            "--detach",
+            "--from",
+            image.tag(),
+            "--",
+            "sh",
+            "-c",
+            WORKLOAD,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let diagnostic = "Image policy contains credential_binding. A workspace admin must submit the reviewed policy through the gateway.";
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            assert!(
+                create.try_wait().unwrap().is_none(),
+                "sandbox create exited before configuration rejection"
+            );
+            let (output, code) =
+                run_cli(&["sandbox", "get", &resources.sandbox, "--output", "json"]).await;
+            if code == 0 && output.contains(diagnostic) {
+                let details: serde_json::Value =
+                    serde_json::from_str(&strip_ansi(&output)).unwrap();
+                assert_eq!(details["phase"].as_str(), Some("Provisioning"), "{output}");
+                assert!(output.contains("ConfigurationReady"), "{output}");
+                assert!(output.contains("ConfigurationInvalid"), "{output}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("image binding must produce an actionable startup diagnostic");
+    let engine = ContainerEngine::from_env().unwrap();
+    let container = container_id(&engine, &resources.sandbox);
+    assert_marker(&engine, &container, false);
+    assert!(create.try_wait().unwrap().is_none());
+    let repaired = context.path().join("reviewed.yaml");
+    std::fs::write(&repaired, POLICY).unwrap();
+    cli_ok(&[
+        "policy",
+        "set",
+        &resources.sandbox,
+        "--policy",
+        repaired.to_str().unwrap(),
+        "--wait",
+    ])
+    .await;
+    let status = tokio::time::timeout(Duration::from_secs(120), create.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+    wait_for_marker(&engine, &container).await;
+}
