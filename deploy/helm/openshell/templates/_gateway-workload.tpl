@@ -97,16 +97,19 @@ spec:
         {{- if not .Values.server.disableTls }}
         - name: OPENSHELL_PEER_TLS_SERVER_NAME
           value: {{ printf "%s.%s.svc.cluster.local" (include "openshell.fullname" .) .Release.Namespace | quote }}
-        {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+        # Peers trust only this CA (the server Secret's ca.crt), never platform
+        # roots. Custom server Secrets must carry ca.crt.
         - name: OPENSHELL_PEER_TLS_CA_FILE
           value: /etc/openshell-tls/server/ca.crt
-        {{- end }}
         {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
         - name: OPENSHELL_PEER_TLS_CERT_FILE
           value: /etc/openshell-tls/peer-client/tls.crt
         - name: OPENSHELL_PEER_TLS_KEY_FILE
           value: /etc/openshell-tls/peer-client/tls.key
         {{- end }}
+        {{- else if eq (include "openshell.peerAllowInsecureTransport" .) "true" }}
+        - name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+          value: "true"
         {{- end }}
         {{- if not $hasExternalCredentialDriver }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}

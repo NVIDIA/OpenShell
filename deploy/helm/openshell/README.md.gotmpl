@@ -193,6 +193,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
+- [`ci/values-high-availability-tls.yaml`](ci/values-high-availability-tls.yaml) - CI overlay for the TLS HA e2e lane: gateway pods serve TLS and mTLS so peers use HTTPS, layered on the high-availability overlay
 
 ### Database backend
 
@@ -278,10 +279,14 @@ namespace to limit access to OpenShell-managed Secrets.
 Append these flags to any of the PostgreSQL commands above for OpenShift:
 
 ```
---set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
 ```
+
+Keep pod TLS on PostgreSQL gateways. The chart refuses to render
+`server.disableTls=true` with PostgreSQL (see [High availability](#high-availability)).
+On OpenShift 4.22+, re-encrypt at the router with `BackendTLSPolicy`, as described in the
+[OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift#end-to-end-tls-using-gateway-api-and-backendtlspolicy-openshift-422).
 
 ### High availability
 
@@ -296,14 +301,27 @@ Gateway peer traffic uses Kubernetes ServiceAccount identity. Each gateway pod
 mounts a projected, pod-bound ServiceAccount token with audience
 `openshell-gateway-peer`; receiving replicas validate that token with the
 Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
-and authorize only the internal `PeerRelay` RPC. The chart does not create or
-accept a shared gateway peer Secret.
+and authorize only the internal peer RPCs: `PeerRelay` and the peer provider
+readiness, endpoint status, and provider status calls. The chart does not
+create or accept a shared gateway peer Secret.
 
-With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
-server verification and mTLS. The client verifies the stable gateway Service
-DNS name while connecting directly to the owning pod. Custom TLS Secrets must
-include that Service DNS name in the server certificate and provide the CA and
-client credentials configured by `server.tls`.
+A gateway on PostgreSQL requires TLS for peer calls. Peer clients trust only
+the `ca.crt` key of the `server.tls.certSecretName` Secret, never platform
+roots, and verify the stable gateway Service DNS name
+(`<fullname>.<namespace>.svc.cluster.local`) while connecting directly to the
+owning pod. When the gateway verifies client certificates, peers also present
+the `server.tls.clientTlsSecretName` certificate. The generated PKI and
+cert-manager modes provide all of this. Custom TLS Secrets must carry `ca.crt`
+and include that Service DNS name in the server certificate, or a gateway on
+PostgreSQL refuses to start.
+
+The chart refuses to render `server.disableTls=true` with PostgreSQL, because
+peer calls share the gateway listener. Behind a Gateway API proxy with an HTTPS
+listener, keep pod TLS and re-encrypt with
+`grpcRoute.backendTLSPolicy.enabled=true` and `server.tls.enableMtls=false`.
+`server.peer.allowInsecureTransport=true` accepts plaintext peer traffic,
+including the peer ServiceAccount token. Use it only on a trusted network, such
+as local development or CI.
 
 Set `autoscaling.enabled=true` to render an `autoscaling/v2`
 HorizontalPodAutoscaler for the gateway workload. The Deployment or

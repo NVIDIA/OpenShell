@@ -30,3 +30,14 @@ test-group = "kubernetes-ha"
 # Relative to the profile store dir (`e2e/rust/target/nextest/e2e-kubernetes/`).
 [profile.e2e-kubernetes.junit]
 path = "../../../../../results/e2e-kubernetes.xml"
+
+# The HA operation inventory keeps one sandbox across gateway scale-up,
+# scale-down, owner loss, and a rolling restart, which takes longer than the
+# profile's five minutes. It shares the kubernetes-ha group because it scales
+# and rolls the same gateway Deployment as the rebalancing tests. Its per-phase
+# summary lines (owner, attempts, durations) are printed on green runs too.
+[[profile.e2e-kubernetes.overrides]]
+filter = "test(/^ha_operation_inventory_/)"
+test-group = "kubernetes-ha"
+slow-timeout = { period = "60s", terminate-after = 20 }
+success-output = "final"

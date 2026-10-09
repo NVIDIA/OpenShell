@@ -466,6 +466,7 @@ Available task variants:
 | `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
+| `e2e:kubernetes:ha-tls` | Two TLS and mTLS gateway replicas with HTTPS peer routing and external PostgreSQL: one sandbox kept across scale-up, scale-down, graceful and forced owner loss, and a rolling restart, with non-interactive and streamed-stdin exec, file transfer, TCP forwarding, policy updates, and provider attachment status through non-owner replicas |
 
 Kubernetes e2e environment variables:
 
@@ -480,6 +481,8 @@ Kubernetes e2e environment variables:
 | `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
 | `SANDBOX_IMAGE` | Trusted sandbox runtime image repository or complete tagged/digest-pinned image reference |
+| `OPENSHELL_E2E_KUBE_POD_TLS` | Set to `1` when the extra values make the gateway pods serve TLS; the harness registers an mTLS CLI gateway over the Service port-forward. Not supported with Envoy or the database scenarios |
+| `OPENSHELL_E2E_KUBE_HA_OPS_BUDGET_SECS` | Overall budget in seconds for `kubernetes_ha_operations`; default and maximum `1020`, so diagnostics and teardown finish before nextest's 1200-second kill |
 
 Run a single test directly with cargo:
 

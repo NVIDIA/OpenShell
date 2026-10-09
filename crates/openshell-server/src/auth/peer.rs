@@ -209,37 +209,12 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
             return Err(Status::not_found("gateway peer pod not found"));
         };
 
-        let actual_uid = pod.metadata.uid.as_deref().unwrap_or_default();
-        if actual_uid != identity.pod_uid {
-            warn!(
-                pod = %identity.pod_name,
-                claimed_uid = %identity.pod_uid,
-                actual_uid,
-                "gateway peer SA token pod UID does not match live pod"
-            );
-            return Err(Status::permission_denied(
-                "gateway peer SA token pod UID mismatch",
-            ));
-        }
-
-        let actual_service_account = pod
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.service_account_name.as_deref())
-            .unwrap_or("default");
-        if actual_service_account != self.expected_service_account {
-            warn!(
-                pod = %identity.pod_name,
-                service_account = %actual_service_account,
-                expected_service_account = %self.expected_service_account,
-                "gateway peer pod service account does not match TokenReview principal"
-            );
-            return Err(Status::permission_denied(
-                "gateway peer pod service account mismatch",
-            ));
-        }
-
-        validate_required_pod_labels(&pod, &self.required_pod_labels)?;
+        validate_live_peer_pod(
+            &pod,
+            &identity,
+            &self.expected_service_account,
+            &self.required_pod_labels,
+        )?;
 
         info!(
             pod_name = %identity.pod_name,
@@ -437,6 +412,48 @@ fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
     Ok(values[0].clone())
 }
 
+/// Checks the live pod named by a verified peer token: UID, `ServiceAccount`,
+/// then required labels.
+#[allow(clippy::result_large_err)]
+fn validate_live_peer_pod(
+    pod: &Pod,
+    identity: &PeerTokenReviewIdentity,
+    expected_service_account: &str,
+    required_labels: &[(String, String)],
+) -> Result<(), Status> {
+    let actual_uid = pod.metadata.uid.as_deref().unwrap_or_default();
+    if actual_uid != identity.pod_uid {
+        warn!(
+            pod = %identity.pod_name,
+            claimed_uid = %identity.pod_uid,
+            actual_uid,
+            "gateway peer SA token pod UID does not match live pod"
+        );
+        return Err(Status::permission_denied(
+            "gateway peer SA token pod UID mismatch",
+        ));
+    }
+
+    let actual_service_account = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.service_account_name.as_deref())
+        .unwrap_or("default");
+    if actual_service_account != expected_service_account {
+        warn!(
+            pod = %identity.pod_name,
+            service_account = %actual_service_account,
+            expected_service_account = %expected_service_account,
+            "gateway peer pod service account does not match TokenReview principal"
+        );
+        return Err(Status::permission_denied(
+            "gateway peer pod service account mismatch",
+        ));
+    }
+
+    validate_required_pod_labels(pod, required_labels)
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_required_pod_labels(
     pod: &Pod,
@@ -567,6 +584,7 @@ pub mod test_support {
 mod tests {
     use super::test_support::FakeGatewayPeerResolver;
     use super::*;
+    use k8s_openapi::api::core::v1::PodSpec;
     use std::collections::BTreeMap;
 
     fn bearer_headers(token: &str) -> http::HeaderMap {
@@ -648,6 +666,160 @@ mod tests {
     }
 
     #[test]
+    fn peer_token_review_identity_rejects_audience_mismatch() {
+        let status = token_review_status(
+            true,
+            vec!["kubernetes"],
+            "system:serviceaccount:openshell:openshell",
+            vec![(POD_NAME_EXTRA, "openshell-0"), (POD_UID_EXTRA, "uid-a")],
+        );
+
+        let err = peer_token_review_identity(
+            &status,
+            DEFAULT_PEER_TOKEN_AUDIENCE,
+            "openshell",
+            "openshell",
+        )
+        .expect_err("token without the peer audience must fail closed");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.message(), "gateway peer token audience not accepted");
+    }
+
+    #[test]
+    fn peer_token_review_identity_rejects_token_without_pod_binding() {
+        let status = token_review_status(
+            true,
+            vec![DEFAULT_PEER_TOKEN_AUDIENCE],
+            "system:serviceaccount:openshell:openshell",
+            vec![],
+        );
+
+        let err = peer_token_review_identity(
+            &status,
+            DEFAULT_PEER_TOKEN_AUDIENCE,
+            "openshell",
+            "openshell",
+        )
+        .expect_err("token without pod binding must fail closed");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("not pod-bound"), "{}", err.message());
+    }
+
+    #[test]
+    fn peer_token_review_identity_ignores_unauthenticated_review() {
+        let status = token_review_status(
+            false,
+            vec![DEFAULT_PEER_TOKEN_AUDIENCE],
+            "system:serviceaccount:openshell:openshell",
+            vec![(POD_NAME_EXTRA, "openshell-0"), (POD_UID_EXTRA, "uid-a")],
+        );
+
+        let identity = peer_token_review_identity(
+            &status,
+            DEFAULT_PEER_TOKEN_AUDIENCE,
+            "openshell",
+            "openshell",
+        )
+        .unwrap();
+        assert!(identity.is_none());
+    }
+
+    fn peer_pod(uid: &str, service_account: &str) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("openshell-0".to_string()),
+                uid: Some(uid.to_string()),
+                labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/instance".to_string(),
+                    "release-a".to_string(),
+                )])),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                service_account_name: Some(service_account.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn token_identity() -> PeerTokenReviewIdentity {
+        PeerTokenReviewIdentity {
+            pod_name: "openshell-0".to_string(),
+            pod_uid: "uid-a".to_string(),
+        }
+    }
+
+    fn release_labels() -> Vec<(String, String)> {
+        vec![(
+            "app.kubernetes.io/instance".to_string(),
+            "release-a".to_string(),
+        )]
+    }
+
+    #[test]
+    fn live_peer_pod_rejects_uid_mismatch() {
+        let err = validate_live_peer_pod(
+            &peer_pod("uid-b", "openshell"),
+            &token_identity(),
+            "openshell",
+            &release_labels(),
+        )
+        .expect_err("a recreated pod must not inherit the old token");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("pod UID mismatch"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn live_peer_pod_rejects_service_account_mismatch() {
+        let err = validate_live_peer_pod(
+            &peer_pod("uid-a", "default"),
+            &token_identity(),
+            "openshell",
+            &release_labels(),
+        )
+        .expect_err("a pod running as another service account must fail closed");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("service account mismatch"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn live_peer_pod_rejects_label_mismatch() {
+        let other_release = vec![(
+            "app.kubernetes.io/instance".to_string(),
+            "release-b".to_string(),
+        )];
+        let err = validate_live_peer_pod(
+            &peer_pod("uid-a", "openshell"),
+            &token_identity(),
+            "openshell",
+            &other_release,
+        )
+        .expect_err("a pod from another release must fail closed");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.message(), "gateway peer pod labels do not match");
+    }
+
+    #[test]
+    fn live_peer_pod_accepts_matching_pod() {
+        validate_live_peer_pod(
+            &peer_pod("uid-a", "openshell"),
+            &token_identity(),
+            "openshell",
+            &release_labels(),
+        )
+        .expect("matching UID, service account and labels must pass");
+    }
+
+    #[test]
     fn validate_required_pod_labels_rejects_mismatch() {
         let pod = Pod {
             metadata: ObjectMeta {
@@ -724,6 +896,32 @@ mod tests {
                 .is_none()
         );
         assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn authenticator_rejects_mismatched_replica_header() {
+        let resolver = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(
+            ResolvedGatewayPeerIdentity {
+                pod_name: "openshell-0".to_string(),
+                pod_uid: "uid-a".to_string(),
+            },
+        ))));
+        let auth = PeerServiceAccountAuthenticator::new(resolver);
+        let mut headers = bearer_headers("token-a");
+        headers.insert(
+            "x-openshell-peer-replica",
+            http::HeaderValue::from_static("openshell-1"),
+        );
+
+        let err = auth
+            .authenticate(&headers, PEER_RELAY_PATH)
+            .await
+            .expect_err("a replica header naming another pod must fail closed");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "gateway peer replica does not match authenticated pod"
+        );
     }
 
     fn identity() -> ResolvedGatewayPeerIdentity {

@@ -1056,6 +1056,7 @@ tests:
       workload.kind: deployment
       server.externalDbSecret: my-pg-secret
       server.disableTls: true
+      server.peer.allowInsecureTransport: true
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env

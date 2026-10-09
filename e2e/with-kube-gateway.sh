@@ -32,6 +32,13 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_POD_TLS=1 when the extra values turn gateway pod TLS
+# back on (for example ci/values-high-availability-tls.yaml). The harness then
+# port-forwards the gateway Service as usual but registers an mTLS CLI gateway
+# at https://localhost:<port> with the chart's openshell-client-tls material.
+# Envoy and the database scenarios still assume plaintext pods, so this mode
+# rejects them.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local
 #     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
@@ -125,6 +132,8 @@ OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
 OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
+# Client mTLS material for OPENSHELL_E2E_KUBE_POD_TLS=1. Removed with WORKDIR.
+POD_TLS_PKI_DIR="${WORKDIR}/pod-tls-pki"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -877,6 +886,68 @@ openshift_register_route_gateway() {
     "${pki_dir}"
 }
 
+use_pod_tls() {
+  case "${OPENSHELL_E2E_KUBE_POD_TLS:-0}" in
+    1 | true | TRUE | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# OPENSHELL_E2E_KUBE_POD_TLS=1 only: port-forward the gateway Service, wait for
+# an mTLS handshake with the chart's client material, and register an mTLS CLI
+# gateway at https://localhost:<port>. localhost is a server SAN in both chart
+# PKI modes. Sets LOCAL_PORT, PORTFORWARD_PID, GATEWAY_NAME, GATEWAY_ENDPOINT.
+kube_register_pod_tls_gateway() {
+  local pki_dir="${POD_TLS_PKI_DIR}"
+  local elapsed=0 timeout=60
+
+  rm -rf "${pki_dir}"
+  mkdir -p "${pki_dir}/client"
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.ca\.crt}' | base64 -d >"${pki_dir}/ca.crt"
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d >"${pki_dir}/client/tls.crt"
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.tls\.key}' | base64 -d >"${pki_dir}/client/tls.key"
+
+  LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward svc/${RELEASE_NAME} ${LOCAL_PORT}:8080 (pod TLS)..."
+  kctl -n "${NAMESPACE}" port-forward "svc/${RELEASE_NAME}" \
+    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      return 1
+    fi
+    if curl -s -o /dev/null --max-time 5 \
+         --cacert "${pki_dir}/ca.crt" \
+         --cert "${pki_dir}/client/tls.crt" \
+         --key "${pki_dir}/client/tls.key" \
+         "https://localhost:${LOCAL_PORT}/"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${timeout}" ]; then
+    echo "ERROR: gateway did not complete an mTLS handshake on https://localhost:${LOCAL_PORT} within ${timeout}s" >&2
+    cat "${PORTFORWARD_LOG}" >&2 || true
+    return 1
+  fi
+
+  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+  GATEWAY_ENDPOINT="https://localhost:${LOCAL_PORT}"
+  e2e_register_mtls_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${GATEWAY_ENDPOINT}" \
+    "${LOCAL_PORT}" \
+    "${pki_dir}"
+}
+
 # Start `kubectl port-forward svc/openshell` for the gRPC endpoint and wait for
 # it to accept TCP. Sets LOCAL_PORT and PORTFORWARD_PID. Prints the port-forward
 # log and returns non-zero on failure. Used for the vanilla-Kubernetes transport
@@ -942,6 +1013,13 @@ start_health_portforward() {
 require_cmd helm
 require_cmd kubectl
 require_cmd curl
+
+if use_pod_tls; then
+  if use_envoy_gateway || [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
+    echo "ERROR: OPENSHELL_E2E_KUBE_POD_TLS=1 does not support Envoy or the database scenarios" >&2
+    exit 2
+  fi
+fi
 
 if [ -n "${OPENSHELL_E2E_KUBE_CONTEXT:-}" ]; then
   KUBE_CONTEXT="${OPENSHELL_E2E_KUBE_CONTEXT}"
@@ -1469,6 +1547,9 @@ else
     # OpenShift: reach the gateway over the passthrough Route with mTLS so the
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
+  elif use_pod_tls; then
+    # Vanilla Kubernetes with pod TLS: mTLS over the Service port-forward.
+    kube_register_pod_tls_gateway || exit 1
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1

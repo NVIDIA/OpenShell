@@ -159,6 +159,17 @@ plaintext by default. Override `server.disableTls=false` to exercise TLS/mTLS.
 |------|---------------------|----------------|
 | Skaffold dev (default) | `true` | `http://` |
 | TLS enabled | `false` (or omitted) | `https://` |
+| HA TLS overlay (`ci/values-high-availability-tls.yaml`) | `false` | `https://`, pod TLS and mTLS, no Envoy, HTTPS peers |
+
+Gateways on PostgreSQL refuse plaintext peer traffic, and the chart refuses to
+render `server.disableTls: true` with PostgreSQL, unless
+`server.peer.allowInsecureTransport` is `true`. `ci/values-skaffold.yaml` sets
+it so the `high-availability` profile and the external-PostgreSQL e2e lanes
+keep running plaintext; gateways on PostgreSQL then log a warning at every
+startup. To exercise HTTPS peer transport, layer
+`ci/values-high-availability-tls.yaml` after `ci/values-high-availability.yaml`
+without `ci/values-gateway.yaml` (the `high-availability` profile adds that
+plaintext Envoy listener), or run `mise run e2e:kubernetes:ha-tls`.
 
 ### Connecting through the forwarding task
 
@@ -298,6 +309,14 @@ KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
 ```
 
 Use the IP that pods in that cluster use to reach listeners on the test host.
+
+Use `mise run e2e:kubernetes:ha-tls` for the TLS HA lane. It layers
+`ci/values-high-availability-tls.yaml` so gateway pods serve TLS and mTLS and
+route peers over HTTPS with the chart CA, skips Envoy, registers an mTLS CLI
+gateway over the Service port-forward (`OPENSHELL_E2E_KUBE_POD_TLS=1`), and
+runs only `kubernetes_ha_operations`: one sandbox kept across scale-up,
+scale-down, graceful and forced owner loss, and a rolling restart, with each
+HA-tested operation class driven through non-owner replicas.
 
 ### BackendTLSPolicy (end-to-end TLS)
 
@@ -455,6 +474,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/helm/openshell/ci/values-credential-driver-vault.yaml` | Vault credential-driver validation overlay with HTTPS and private-CA trust |
+| `deploy/helm/openshell/ci/values-high-availability-tls.yaml` | HA TLS overlay: gateway pods serve TLS and mTLS so peers use HTTPS; layered after the HA overlay; used by `e2e:kubernetes:ha-tls` without Envoy |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for HTTPS gateway peers (mise run e2e:kubernetes:ha-tls).
+# Layer it after ci/values-high-availability.yaml, and after
+# ci/values-skaffold.yaml, which disables TLS and opts in to plaintext peers.
+# Gateway pods serve TLS and mTLS with the chart PKI, so peers dial https://
+# pod endpoints, trust only the chart CA, verify the gateway Service DNS name,
+# and present the chart client certificate. No Gateway API proxy is involved.
+server:
+  disableTls: false
+  peer:
+    allowInsecureTransport: false

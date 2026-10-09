@@ -429,7 +429,18 @@ server:
       operatorNamespaceFile: ""
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
+  # Gateway peer traffic shares this listener, so with PostgreSQL
+  # (server.externalDbSecret) the chart refuses to render unless
+  # server.peer.allowInsecureTransport is also true.
   disableTls: false
+  # Gateway-to-gateway (peer) transport for PostgreSQL-backed gateways.
+  peer:
+    # -- UNSAFE: accept plaintext gateway peer traffic, including the peer
+    # ServiceAccount bearer token, when server.disableTls=true and the gateway
+    # uses PostgreSQL. Use only on a trusted network such as local development
+    # or CI. Ignored when gateway TLS is enabled. The gateway logs a warning at
+    # every startup while it is active.
+    allowInsecureTransport: false
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
@@ -514,6 +525,8 @@ server:
     allowUnauthenticatedUsers: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
+    # With PostgreSQL it must also contain ca.crt, the CA that signs tls.crt;
+    # gateway peers trust only that CA. `kubectl create secret tls` does not add ca.crt.
     certSecretName: openshell-server-tls
     # -- Enable mTLS client certificate authentication. When false, the gateway
     # runs HTTPS-only without requiring client certificates (use OIDC for auth
@@ -718,6 +731,8 @@ grpcRoute:
       # HTTPS terminates TLS at the Envoy Gateway listener; pair it with
       # server.disableTls=true so Envoy forwards plaintext to the gateway pod,
       # and use OIDC for client identity (the gateway never sees the client cert).
+      # With PostgreSQL, keep pod TLS instead: set grpcRoute.backendTLSPolicy.enabled=true
+      # and server.tls.enableMtls=false.
       protocol: HTTP
       # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same

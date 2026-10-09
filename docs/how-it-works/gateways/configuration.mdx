@@ -597,11 +597,11 @@ args = [
 
 ## Gateway Peer Routing
 
-Multi-replica gateways relay session-bound traffic to the replica that owns a sandbox supervisor. The Helm chart sets these variables; set them manually only outside the chart.
+Peer routing lets any gateway replica serve session-bound requests by relaying them to the replica that owns the sandbox supervisor. It is active whenever the gateway uses a PostgreSQL database and has a peer endpoint, either from `OPENSHELL_PEER_ENDPOINT` or derived from the pod identity variables below. That includes a PostgreSQL gateway with one replica. SQLite gateways never route to peers. The Helm chart sets these variables; set them manually only outside the chart.
 
 | Variable | Purpose |
 |---|---|
-| `OPENSHELL_PEER_ENDPOINT` | Address other replicas use to reach this one. Derived from the pod DNS name when unset. |
+| `OPENSHELL_PEER_ENDPOINT` | Address other replicas use to reach this one. Must use `https://` when peer routing is active, unless the plaintext opt-out is active. Derived from the pod DNS name when unset. |
 | `OPENSHELL_PEER_SERVICE_NAME` | Peer Service used to derive the endpoint. |
 | `OPENSHELL_POD_NAME` / `OPENSHELL_POD_NAMESPACE` | Pod identity used for endpoint derivation and peer verification. |
 | `OPENSHELL_SERVICE_ACCOUNT_NAME` | ServiceAccount that peer tokens must present. |
@@ -609,11 +609,32 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 | `OPENSHELL_PEER_TOKEN_AUDIENCE` | Required token audience. Defaults to `openshell-gateway-peer`. |
 | `OPENSHELL_PEER_POD_LABELS` | Comma-separated labels a calling pod must carry. |
 | `OPENSHELL_PEER_TOKEN_CACHE_TTL_SECS` | How long a verified peer identity is cached. Defaults to `60`. |
-| `OPENSHELL_PEER_TLS_CA_FILE` | CA bundle for peer connections. Falls back to the platform trust store. |
-| `OPENSHELL_PEER_TLS_CERT_FILE` / `OPENSHELL_PEER_TLS_KEY_FILE` | Client certificate and key for peer mTLS. Set both or neither. |
-| `OPENSHELL_PEER_TLS_SERVER_NAME` | Name verified on peer certificates. |
+| `OPENSHELL_PEER_TLS_CA_FILE` | PEM bundle that is the only trust source for peer server certificates. Required to dial `https://` peers, which is every peer unless the plaintext opt-out is active. The gateway never uses the platform trust store for peers. |
+| `OPENSHELL_PEER_TLS_CERT_FILE` / `OPENSHELL_PEER_TLS_KEY_FILE` | Client certificate and key presented to peers when gateway mTLS is enabled. Set both or neither. |
+| `OPENSHELL_PEER_TLS_SERVER_NAME` | DNS name or IP address verified on peer server certificates. When unset, the gateway verifies the host of the owner's peer endpoint, so an endpoint with an IPv4 or IPv6 address needs a certificate that carries that address. A gateway whose own peer endpoint uses an IP address logs a warning at startup when this is unset. |
+| `OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT` | Set to `true` to allow plaintext `http://` peers on a gateway that itself serves plaintext. Defaults to `false`. Accepts `true`/`false`, `yes`/`no`, `y`/`n`, `on`/`off`, or `1`/`0`, in any case. An empty value means `false`, and any other value stops the gateway at startup. |
 
-The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
+### Peer Transport Contract
+
+Every `https://` peer connection must meet all three requirements:
+
+| Requirement | Contract |
+|---|---|
+| Peer CA | `OPENSHELL_PEER_TLS_CA_FILE` contains at least one PEM certificate, and that CA signs the server certificate of every replica. The gateway reads the file again whenever it opens a new peer channel; it keeps one channel per owner endpoint and opens a new one after a peer call fails, so rotated material reaches new channels without a restart. |
+| Server identity | Each replica's server certificate carries `OPENSHELL_PEER_TLS_SERVER_NAME` as a subject alternative name. The Helm chart sets it to the gateway Service name, `<fullname>.<namespace>.svc.cluster.local`, while connecting to individual pods. A certificate that does not chain to the peer CA or lacks the name fails the handshake, and the gateway sends no peer token. |
+| Client identity | Every peer RPC carries the caller's projected ServiceAccount token. The receiver validates it with TokenReview and checks the audience, ServiceAccount, live pod UID, and pod labels, and rejects a call whose claimed replica differs from the token's pod. When `OPENSHELL_PEER_TLS_CERT_FILE` is set, the caller also presents that certificate, and the receiver verifies it against its client CA. That certificate does not identify the peer. |
+
+The gateway refuses to start when peer routing is active and any of these conditions apply. Most peer transport startup errors end with a link to this section.
+
+- Peer authentication is unavailable because the pod identity variables are missing, the in-cluster Kubernetes client cannot be built, or the gateway is not running in a cluster.
+- The peer endpoint is not `https://`, and it is not `http://` with `OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT` active. A gateway that serves TLS logs `is plaintext but this gateway serves TLS` for any endpoint that is not `https://`. A plaintext gateway logs `is plaintext, but peer routing (PostgreSQL store with a peer endpoint) requires https` for an `http://` endpoint, and `is not dialable by peers` for any other scheme, such as `unix:`.
+- The peer endpoint is `https://` and `OPENSHELL_PEER_TLS_CA_FILE` is unset, unreadable, or contains no certificate, or the gateway's own server certificate does not chain to it or lacks `OPENSHELL_PEER_TLS_SERVER_NAME`. The gateway checks the certificate peers receive: the external certificate when that name matches `external_server_names`, otherwise `cert_path`. The gateway logs `OPENSHELL_PEER_TLS_CA_FILE is required to dial https gateway peers`, `gateway peer TLS CA ... is unusable`, or `contains no usable CA certificates` for the CA file, and `would fail peer verification` for the server certificate. An expired or not yet valid server certificate only logs a warning.
+- Only one of `OPENSHELL_PEER_TLS_CERT_FILE` and `OPENSHELL_PEER_TLS_KEY_FILE` is set, or the pair does not parse or match. The gateway logs `must be configured together`, `gateway peer TLS client identity ... is unusable`, or `do not match`.
+- `OPENSHELL_PEER_TLS_SERVER_NAME` is not a valid DNS name or IP address.
+
+Each replica also refuses to dial an owner whose advertised peer endpoint is not `https://`, unless it is `http://` and the plaintext opt-out is active, so one misconfigured replica cannot move peer traffic to plaintext. The request fails immediately with `gateway peer transport refused a plaintext http:// peer endpoint` instead of waiting for the owner. A peer whose certificate fails verification is reported as `gateway peer connection failed:` followed by the TLS cause, such as `invalid peer certificate: UnknownIssuer` or `certificate not valid for name`. A relayed request keeps retrying such an owner and fails with `supervisor session not connected` after about 15 seconds, so look for the TLS cause in the gateway logs.
+
+Set `OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT=true` to keep a plaintext `http://` peer endpoint on a gateway that itself serves plaintext. Peer tokens and relayed session traffic then cross the network unencrypted, and every gateway on PostgreSQL logs `gateway peer plaintext transport is enabled` at every startup. A gateway that serves TLS ignores the setting, logs a warning, and still requires `https://` peers.
 
 ## Driver References
 

@@ -132,8 +132,10 @@ Three opt-in labels enable the long-running E2E suites:
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
-  (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
-  (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
+  (`replicaCount: 2` and an external PostgreSQL fixture) in two lanes, plaintext
+  pods behind Envoy (HA rebalancing tests) and TLS pods with HTTPS peer routing
+  (HA operation inventory), plus the credential-driver suite (Kubernetes Secrets
+  plus Vault) in `Branch E2E Checks`
 
 When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
