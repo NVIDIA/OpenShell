@@ -88,7 +88,15 @@ impl HostServer {
         response_body: &str,
         expected_authorization: Option<&str>,
     ) -> Result<Self, String> {
-        let listener = TcpListener::bind(("0.0.0.0", 0))
+        Self::start_on("0.0.0.0", response_body, expected_authorization).await
+    }
+
+    async fn start_on(
+        bind_host: &str,
+        response_body: &str,
+        expected_authorization: Option<&str>,
+    ) -> Result<Self, String> {
+        let listener = TcpListener::bind((bind_host, 0))
             .await
             .map_err(|e| format!("bind host test server: {e}"))?;
         let port = listener
@@ -102,6 +110,7 @@ impl HostServer {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
+                stream.set_nodelay(true).expect("disable Nagle on fixture");
                 let body = response_body.clone();
                 let expected_authorization = expected_authorization.clone();
                 tokio::spawn(async move {
@@ -339,6 +348,59 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         "expected sandbox to receive host echo response:\n{}",
         guard.create_output
     );
+}
+
+/// Docker's supervisor shares the host network and maps the reserved alias to
+/// host loopback. Exercise a host-only service without an SSH reverse tunnel.
+/// Other drivers can resolve the alias to a non-loopback host address instead.
+///
+/// Run on the Docker daemon host, with a gateway endpoint on host loopback:
+///
+///     e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml \
+///       --features e2e-docker --test host_gateway_alias \
+///       sandbox_reaches_host_loopback_service_via_host_gateway_alias -- --ignored --exact
+///
+/// The containerized CI runner has its own loopback namespace.
+#[cfg(feature = "e2e-docker")]
+#[tokio::test]
+#[ignore = "requires the test process and Docker supervisor to share host loopback"]
+async fn sandbox_reaches_host_loopback_service_via_host_gateway_alias() {
+    let server = HostServer::start_on(
+        "127.0.0.1",
+        r#"{"message":"hello-from-host-loopback"}"#,
+        None,
+    )
+    .await
+    .expect("start host echo server on 127.0.0.1 only");
+    let policy = write_policy(server.port).expect("write custom policy");
+    let command = format!(
+        r#"set -eu
+exec 3<>/dev/tcp/host.openshell.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\nConnection: close\r\n\r\n' >&3
+while IFS= read -r -t 5 line <&3 || [[ -n "$line" ]]; do printf '%s\n' "$line"; done
+"#,
+        port = server.port,
+    );
+    let mut sandbox = SandboxGuard::create(&[
+        "--policy",
+        policy.path().to_str().expect("UTF-8 policy path"),
+        "--no-auto-providers",
+        "--",
+        "/usr/bin/bash",
+        "-c",
+        &command,
+    ])
+    .await
+    .expect("sandbox request to host loopback service");
+
+    assert!(
+        sandbox
+            .create_output
+            .contains(r#"{"message":"hello-from-host-loopback"}"#),
+        "expected sandbox to receive the host loopback response:\n{}",
+        sandbox.create_output
+    );
+    sandbox.cleanup().await;
 }
 
 #[tokio::test]
