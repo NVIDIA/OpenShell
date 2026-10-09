@@ -156,3 +156,90 @@ def test_context_cleanup_handles_absence_and_intercepted_errors(
     assert state.closed == [True]
     assert managed._client is None
     assert managed._session is None
+
+
+class _EntryFailureClient:
+    """Fails the named client call and records close()."""
+
+    def __init__(self, fail_at, close_error=None):
+        self.fail_at = fail_at
+        self.close_error = close_error
+        self.closed = 0
+        self.error = RuntimeError(f"{fail_at} failed")
+
+    def _step(self, name):
+        if name == self.fail_at:
+            raise self.error
+        return SimpleNamespace(sandbox=SimpleNamespace(name="s1"))
+
+    def create_session(self, **_kwargs):
+        return self._step("create_session")
+
+    def create_session_from_template(self, **_kwargs):
+        return self._step("create_session_from_template")
+
+    def get_session(self, *_args, **_kwargs):
+        return self._step("get_session")
+
+    def wait_ready(self, *_args, **_kwargs):
+        self._step("wait_ready")
+        return SimpleNamespace(name="s1", workspace="default")
+
+    def close(self):
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "kwargs"),
+    [
+        ("create_session", {}),
+        ("create_session_from_template", {"workload_template": "t"}),
+        ("get_session", {"sandbox": "existing"}),
+        ("wait_ready", {}),
+        ("wait_ready", {"sandbox": "existing"}),
+    ],
+)
+def test_context_entry_failure_closes_client(monkeypatch, fail_at, kwargs):
+    client = _EntryFailureClient(fail_at)
+    monkeypatch.setattr(
+        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
+    )
+    managed = Sandbox(workspace="default", delete_on_exit=False, **kwargs)
+
+    with pytest.raises(RuntimeError) as observed, managed:
+        pass
+
+    assert observed.value is client.error
+    assert client.closed == 1
+    assert managed._client is None
+    assert managed._session is None
+
+
+def test_context_entry_failure_keeps_original_error_when_close_fails(monkeypatch):
+    client = _EntryFailureClient("wait_ready", close_error=OSError("close failed"))
+    monkeypatch.setattr(
+        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
+    )
+    managed = Sandbox(workspace="default")
+
+    with pytest.raises(RuntimeError) as observed, managed:
+        pass
+
+    assert observed.value is client.error
+    assert client.closed == 1
+    assert managed._client is None
+    assert managed._session is None
+
+
+def test_context_closes_client_once_on_success(monkeypatch):
+    client = _EntryFailureClient(None)
+    monkeypatch.setattr(
+        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
+    )
+
+    with Sandbox(workspace="default", delete_on_exit=False):
+        assert client.closed == 0
+
+    assert client.closed == 1
