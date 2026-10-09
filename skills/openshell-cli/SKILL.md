@@ -244,12 +244,22 @@ When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 `LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
 user must obtain a new OAuth grant and run `provider refresh configure`,
 `fix_configuration` means an operator must repair the OAuth client, scopes, or
-administrator policy, and `investigate` means the issuer returned an
-unrecognized response. The gateway parks `reauthorize` records until a manual
-rotate or reconfiguration. It retries
+administrator policy, and `investigate` can mean an unrecognized issuer
+response or an interrupted mint with an uncertain outcome. The gateway parks
+`reauthorize` records until a manual rotate or reconfiguration. It retries
 `fix_configuration` records hourly so externally repaired configuration can
 recover without rapid token-endpoint traffic. The existing access credential
 remains usable only until its recorded expiry.
+
+`refresh_in_progress` and `refresh_committing` can indicate active work. Check
+gateway health and refresh status again before treating them as failures;
+concurrent refresh requests wait for the active mint. If a gateway interruption
+leaves either marker behind and rotation reports an uncertain previous mint,
+the gateway will not reuse the grant automatically. Investigate the issuer state,
+then run `provider refresh configure` with a valid grant. Obtain a new OAuth
+grant first if the previous refresh token may have been consumed. Do not clear
+the marker directly or repeatedly rotate it; reconfiguration revokes old
+workload handles, so restart processes holding them.
 
 ---
 

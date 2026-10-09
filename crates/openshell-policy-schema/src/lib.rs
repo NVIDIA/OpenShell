@@ -17,6 +17,8 @@ use std::str::FromStr;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod yaml;
+
 /// Fixed resource bound for legacy MCP request batches inspected by Tower.
 pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
 
@@ -518,7 +520,9 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("null is not allowed for this field"))
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
@@ -591,6 +595,36 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
+    yaml::reject_null_objects(
+        &value,
+        &[
+            "filesystem_policy",
+            "landlock",
+            "process",
+            "network_policies",
+            "network_policies.*",
+            "network_policies.*.endpoints.*",
+            "network_policies.*.binaries.*",
+            "network_middlewares",
+            "network_middlewares.*",
+            "network_middlewares.*.config",
+            "network_middlewares.*.endpoints",
+            "network_policies.*.endpoints.*.credential_binding",
+            "network_policies.*.endpoints.*.json_rpc",
+            "network_policies.*.endpoints.*.mcp",
+            "network_policies.*.endpoints.*.graphql_persisted_queries",
+            "network_policies.*.endpoints.*.graphql_persisted_queries.*",
+            "network_policies.*.endpoints.*.rules.*",
+            "network_policies.*.endpoints.*.rules.*.allow",
+            "network_policies.*.endpoints.*.rules.*.allow.query",
+            "network_policies.*.endpoints.*.rules.*.allow.params",
+            "network_policies.*.endpoints.*.deny_rules.*",
+            "network_policies.*.endpoints.*.deny_rules.*.query",
+            "network_policies.*.endpoints.*.deny_rules.*.params",
+        ],
+    )
+    .into_diagnostic()
+    .wrap_err("failed to decode sandbox policy fields")?;
     let policy: PolicyDocument =
         serde_path_to_error::deserialize(serde_yml::Deserializer::new(&value))
             .map_err(|error| {
@@ -967,7 +1001,7 @@ fn bound_path(mut path: String) -> String {
 
 /// Serialize the authored representation to YAML.
 pub fn serialize_policy(document: &PolicyDocument) -> Result<String> {
-    serde_yml::to_string(document)
+    yaml::to_string(document)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }
@@ -1196,6 +1230,55 @@ mod tests {
                 "explicit null unexpectedly parsed: {source}"
             );
         }
+    }
+
+    #[test]
+    fn nested_null_objects_remain_invalid() {
+        for spelling in ["null", "~", ""] {
+            for body in [
+                format!("network_policies: {spelling}"),
+                format!("network_policies: {{x: {spelling}}}"),
+                format!("network_middlewares: {spelling}"),
+                format!("landlock: {spelling}"),
+                format!("network_middlewares: {{x: {{middleware: foo, config: {spelling}}}}}"),
+                format!("network_middlewares: {{x: {{middleware: foo, endpoints: {spelling}}}}}"),
+                format!("network_policies: {{x: {{endpoints: [{spelling}]}}}}"),
+            ] {
+                // A bare [] is an empty collection rather than a null entry.
+                if spelling.is_empty() && body.ends_with("[]}}") {
+                    continue;
+                }
+                assert!(
+                    parse_policy(&format!("version: 1\n{body}\n")).is_err(),
+                    "{body}"
+                );
+            }
+            for field in [
+                format!("rules: [{{allow: {spelling}}}]"),
+                format!("deny_rules: [{{method: GET, query: {spelling}}}]"),
+                format!("deny_rules: [{spelling}]"),
+                format!("rules: [{{allow: {{query: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{params: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{tool: {spelling}}}}}]"),
+                format!("deny_rules: [{{tool: {spelling}}}]"),
+                format!("graphql_persisted_queries: {spelling}"),
+                format!("graphql_persisted_queries: {{op: {spelling}}}"),
+                format!("credential_binding: {spelling}"),
+                format!("json_rpc: {spelling}"),
+                format!("mcp: {spelling}"),
+            ] {
+                if field == "deny_rules: []" {
+                    continue;
+                }
+                let yaml = format!(
+                    "version: 1\nnetwork_policies: {{x: {{endpoints: [{{host: example.com, port: 443, {field}}}]}}}}\n"
+                );
+                assert!(parse_policy(&yaml).is_err(), "{yaml}");
+            }
+        }
+        let yaml =
+            "version: 1\nnetwork_middlewares: {x: {middleware: foo, config: {optional: null}}}\n";
+        assert!(parse_policy(yaml).is_ok());
     }
 
     #[test]

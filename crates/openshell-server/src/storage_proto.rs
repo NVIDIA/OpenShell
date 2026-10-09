@@ -145,8 +145,9 @@ mod tests {
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
+    // Operator credential export adds four public messages and no durable types.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e2c1a8b73eed91cfed798faa22aa9cb54a8f9b7009295260f39e1417a75d7d9b";
+        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -561,12 +562,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -574,7 +575,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -618,7 +619,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (307, 27),
+                (311, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

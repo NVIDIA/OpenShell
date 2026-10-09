@@ -359,7 +359,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?path\s*=\s*"/var/openshell/gateway-ocsf\.jsonl".*?schema_version\s*=\s*"1\.3".*?rotation\s*=\s*"daily".*?max_files\s*=\s*14.*?queue_capacity\s*=\s*20000.*?queue_max_bytes\s*=\s*33554432'
+          pattern: '(?ms)\[openshell\.gateway\.ocsf_log\].*?max_files\s*=\s*14.*?path\s*=\s*"/var/openshell/gateway-ocsf\.jsonl".*?queue_capacity\s*=\s*20000.*?queue_max_bytes\s*=\s*33554432.*?rotation\s*=\s*"daily".*?schema_version\s*=\s*"1\.3"'
 
   - it: omits OCSF retention when rotation is disabled
     template: templates/gateway-config.yaml
@@ -502,7 +502,10 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)supervisor_image_pull_policy\s*=\s*"if_not_present".*?sandbox_runtime_image_pull_policy\s*=\s*"if_not_present"'
+          pattern: '(?m)^supervisor_image_pull_policy\s*=\s*"if_not_present"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime_image_pull_policy\s*=\s*"if_not_present"$'
 
   - it: renders canonical image pull policies in the Kubernetes driver table
     template: templates/gateway-config.yaml
@@ -549,7 +552,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace".*?default_image\s*=.*?supervisor_image\s*=.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?client_tls_secret_name\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?enable_user_namespaces\s*=\s*true.*?sa_token_ttl_secs\s*='
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=.*?default_image\s*=.*?enable_user_namespaces\s*=\s*true.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?namespace\s*=\s*"my-namespace".*?sa_token_ttl_secs\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?supervisor_image\s*='
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
@@ -969,6 +972,17 @@ tests:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
 
+  - it: preserves pkiInitJob serverDnsNames as the runtime SAN fallback
+    set:
+      certManager.enabled: false
+      pkiInitJob.serverDnsNames:
+        - "*.apps.example.com"
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'server_sans\s*=\s*\["\*\.apps\.example\.com"\]'
+
   - it: passes sqlite db-url via --db-url arg by default
     template: templates/statefulset.yaml
     asserts:
@@ -1320,7 +1334,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: "(?ms)name\\s*=\\s*\\\"openshell\\\".*?\\[openshell\\.drivers\\.kubernetes\\].*?namespace\\s*=\\s*\\\"my-namespace\\\".*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\""
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\".*?namespace\\s*=\\s*\\\"my-namespace\\\""
 
   - it: uses an explicit server grpc endpoint verbatim
     template: templates/gateway-config.yaml

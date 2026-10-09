@@ -410,6 +410,10 @@ pub struct OidcConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
+    /// Enable gateway-wide operators authenticated by verified certificates with OU=operator.
+    /// Independent of ordinary mTLS user authentication; defaults off.
+    #[serde(default)]
+    pub operator_enabled: bool,
     /// When true, the gateway maps a verified TLS client certificate into a
     /// user principal. Sandbox and supervisor clients use bearer identity, so
     /// this setting is independent of the selected compute driver.

@@ -1980,7 +1980,31 @@ fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperatio
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
-    Ok(serde_yml::from_str::<ProviderTypeProfile>(input)?)
+    Ok(openshell_core::yaml::from_str_with_object_paths::<
+        ProviderTypeProfile,
+    >(
+        input,
+        &[
+            "annotations",
+            "discovery",
+            "credentials.*",
+            "files.*",
+            "endpoints.*",
+            "binaries.*",
+            "credentials.*.refresh.material.*",
+            "credentials.*.refresh.additional_outputs.*",
+            "credentials.*.token_grant.audience_overrides.*",
+            "endpoints.*.mcp",
+            "endpoints.*.graphql_persisted_queries",
+            "endpoints.*.graphql_persisted_queries.*",
+            "endpoints.*.rules.*",
+            "endpoints.*.rules.*.allow.query",
+            "endpoints.*.rules.*.allow.params",
+            "endpoints.*.deny_rules.*",
+            "endpoints.*.deny_rules.*.query",
+            "endpoints.*.deny_rules.*.params",
+        ],
+    )?)
 }
 
 pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
@@ -1988,7 +2012,7 @@ pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileErr
 }
 
 pub fn profile_to_yaml(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profile)?)
+    Ok(openshell_core::yaml::to_string(profile)?)
 }
 
 pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
@@ -1996,7 +2020,7 @@ pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileE
 }
 
 pub fn profiles_to_yaml(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profiles)?)
+    Ok(openshell_core::yaml::to_string(profiles)?)
 }
 
 pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
@@ -3838,9 +3862,18 @@ credentials:
 
         let exact = ProviderTypeProfile::from_proto(&proto);
         let yaml = profile_to_yaml(&exact).unwrap();
-        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
-        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
-        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        // Check string values rather than the emitter's choice of quote style.
+        let document: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        let credential = &document["credentials"][0];
+        assert_eq!(credential["refresh"]["refresh_before"].as_str(), Some("0s"));
+        assert_eq!(
+            credential["refresh"]["max_lifetime"].as_str(),
+            Some("1.500s")
+        );
+        assert_eq!(
+            credential["token_grant"]["cache_ttl"].as_str(),
+            Some("0.500s")
+        );
         assert!(!yaml.contains("refresh_before_seconds"));
         assert!(!yaml.contains("max_lifetime_seconds"));
         assert!(!yaml.contains("cache_ttl_seconds"));
@@ -3854,6 +3887,24 @@ credentials:
             reparsed.credentials[0].token_grant,
             proto.credentials[0].token_grant
         );
+    }
+
+    #[test]
+    fn yaml_profile_rejects_null_objects_and_duplicate_fields() {
+        for field in [
+            "annotations: null",
+            "discovery: null",
+            "endpoints: [null]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {query: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {params: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, graphql_persisted_queries: null}]",
+        ] {
+            let yaml = format!("id: sample\ndisplay_name: Sample\n{field}\n");
+            assert!(parse_profile_yaml(&yaml).is_err(), "{yaml}");
+        }
+        assert!(parse_profile_yaml("id: first\nid: second\ndisplay_name: Sample\n").is_err());
+        // Existing optional fields still accept null as absence.
+        assert!(parse_profile_yaml("id: sample\ndisplay_name: Sample\nendpoints: [{host: example.com, port: 443, rules: [{allow: null}]}]\n").is_ok());
     }
 
     #[test]

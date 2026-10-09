@@ -11,8 +11,11 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
   parentRefs:
-    - name: {{ default $fullname .Values.grpcRoute.gateway.name }}
-      namespace: {{ default .Release.Namespace .Values.grpcRoute.gateway.namespace }}
+    - name: {{ include "openshell.grpcRouteGatewayName" . }}
+      namespace: {{ ternary .Release.Namespace (default .Release.Namespace .Values.grpcRoute.gateway.namespace) .Values.grpcRoute.gateway.create }}
+      {{- with .Values.grpcRoute.gateway.sectionName }}
+      sectionName: {{ . | quote }}
+      {{- end }}
   {{- if .Values.grpcRoute.hostnames }}
   hostnames:
     {{- toYaml .Values.grpcRoute.hostnames | nindent 4 }}

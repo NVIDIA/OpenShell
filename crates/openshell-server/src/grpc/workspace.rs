@@ -67,7 +67,7 @@ fn membership_filter_subject<'a>(
                 Ok(Some(&u.identity.subject))
             }
         }
-        Principal::Sandbox(_) => Ok(None),
+        Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
         Principal::Peer(_) => Err(Status::permission_denied(
             "gateway peer principals cannot list workspaces",
         )),

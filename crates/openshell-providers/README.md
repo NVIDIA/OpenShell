@@ -13,6 +13,9 @@ out of the CLI and gateway control flow.
 - Discover local credentials from environment variables and known config files.
 - Normalize discovered data into provider records.
 - Keep provider-specific parsing rules in provider modules.
+- Use the shared authored-YAML compatibility boundary for profile imports and
+  exports: reject duplicate keys and null objects without coercion, retain
+  optional nulls, and preserve string types for YAML 1.1 readers.
 - Avoid logging credential values.
 
 ## Non-Responsibilities

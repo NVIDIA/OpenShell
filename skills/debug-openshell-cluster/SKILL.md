@@ -72,8 +72,9 @@ Common findings:
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
-- A Snap refresh restarts the gateway with its migrated mTLS config. The secure Snap gateway uses `https://127.0.0.1:17670` and requires a client bundle in the user's Snap state. Refresh replaces insecure configs without keeping a copy; follow the published Snap installation steps to re-register an old HTTP client.
+- Fresh Snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published Snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local Snap gateway is expected to run.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
+- Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 
 ### Step 2: Identify the Compute Platform
@@ -443,6 +444,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When checking a Helm values migration, compare the rendered `gateway.toml`
+with the intended `gatewayConfig` tables. Explicit resource-admission settings
+and the Kubernetes Secrets credential namespace take precedence over deprecated
+aliases. Confirm the credential driver's namespace matches its Role and
+RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
+the global Helm pull policy applies to runtime and supervisor images.
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
@@ -466,8 +474,9 @@ retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
 stores encrypted credential envelopes in the OpenShell database. For
 `workload.kind=deployment` or multi-replica gateways, confirm
 `server.externalDbSecret` points at a shared database. A render/install error
-mentioning `server.credentialDrivers` means the values selected multiple
-external credential backends.
+mentioning multiple credential drivers means the
+`gatewayConfig.openshell.gateway.credential_drivers` list selected more than
+one external credential backend.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
@@ -642,8 +651,9 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
-If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
-render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
+If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
+mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
 and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
@@ -654,7 +664,7 @@ Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
 driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
+helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
 kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
@@ -1036,7 +1046,8 @@ credential failures.
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
-| Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
+| Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Gateway API CRDs | Install the standard Gateway API CRDs and selected controller, then enable `grpcRoute` before applying the optional ingress resources |
+| A custom GatewayClass does not program the chart-created Gateway, or its proxy Service conflicts with the OpenShell Service | The selected controller is unavailable, or the default `grpcRoute.gateway.name` reuses the OpenShell Service name | Check `kubectl get gatewayclass,gateway,grpcroute -A`; set a distinct Gateway name such as `<fullname>-ingress`. For an existing Gateway, set `gateway.create=false` plus `gateway.name`, `gateway.namespace`, and optional `gateway.sectionName` |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | With `grpcRoute.replicaRouting.enabled=true`, sandbox SSH, forward, or exec still relay through a peer replica | A `<release>-replica-<i>` Service has no endpoint, so Envoy returns `Unavailable` and the CLI retries unrouted | `kubectl -n openshell get endpoints <release>-replica-0 <release>-replica-1`; confirm `workload.kind=statefulset` and the GRPCRoute status is `Accepted`/`ResolvedRefs` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |

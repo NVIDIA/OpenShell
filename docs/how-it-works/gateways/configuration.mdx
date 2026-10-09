@@ -16,6 +16,9 @@ The OpenShell gateway reads its configuration from a TOML file when `--config` o
 Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
+For Helm deployments, see [Configure Chart Values](/kubernetes/setup#configure-chart-values)
+for setting `gatewayConfig` and chart-owned Kubernetes resources.
+
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
 On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
@@ -62,7 +65,7 @@ Package-managed gateways use either built-in defaults or a package-seeded TOML f
 | Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml`; the systemd user service seeds this file from the packaged template on first start. |
-| Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
+| Snap | New installations use `$SNAP_USER_COMMON/.config/openshell/gateway.toml`, usually `~/snap/openshell/common/.config/openshell/gateway.toml`. Upgraded legacy installations retain `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. Host-networked Podman supervisors use that same loopback endpoint, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
@@ -242,6 +245,7 @@ allow_unauthenticated_users = false
 
 [openshell.gateway.mtls_auth]
 enabled = false
+operator_enabled = false # Opt-in: trusted OU=operator grants gateway-wide administration.
 
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
@@ -297,6 +301,16 @@ namespace = "openshell"
 ```
 
 Set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This gateway policy is independent of the compute driver and defaults on when a client CA is configured without OIDC. The listener allows bearer-only clients and validates any client certificate presented against the configured CA. Supervisors use `guest_tls_ca` to authenticate the gateway and sandbox bearer tokens to authenticate their RPCs.
+
+Set `[openshell.gateway.mtls_auth] operator_enabled = true`,
+`--enable-operator-auth true`, or `OPENSHELL_ENABLE_OPERATOR_AUTH=true` to enable
+direct mTLS operators. The default is false. TLS and a client CA are required.
+This setting is independent of `enabled` and OIDC. A verified certificate with
+the exact `OU=operator` grants user/platform-admin capabilities across all
+workspaces and access to `GetProviderCredentials`. Do not combine an operator
+certificate with an `Authorization` header. See
+[Authentication](/how-it-works/gateways/authentication#mtls-operators) for the
+certificate trust boundary.
 
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
@@ -532,7 +546,7 @@ credential_drivers = ["vault"]
 
 [openshell.credential_drivers.vault]
 address = "https://vault.vault.svc.cluster.local:8200"
-ca_bundle = "/etc/openshell/vault/ca.pem"
+ca_bundle = "/etc/openshell-tls/vault-ca/ca.crt"
 mount = "secret"
 kv_version = "2"
 auth_method = "kubernetes"
@@ -554,7 +568,7 @@ For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secr
 
 For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
-For Helm deployments, set `server.credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and renders `ca_bundle` automatically.
+For Helm deployments, set `credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and derives `ca_bundle` automatically.
 
 Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles. Before OpenShell 0.1.0, OpenShell does not automatically migrate inline refresh material or credential handles between drivers. Reconfigure refresh grants after an upgrade. Before changing credential drivers, remove affected credentials while the original driver is still available, then select the new driver and create them again. Do not run mixed gateway versions against the same refresh records.
 
@@ -1322,8 +1336,10 @@ Debian and Ubuntu run preflight from the systemd user unit before local certific
 generation. The unit still loads the `gateway.env` environment file and starts the
 gateway with no configuration arguments. Snap replays the exact effective daemon
 arguments through preflight. It gives a nonempty `OPENSHELL_GATEWAY_CONFIG`
-precedence; otherwise it validates and passes its canonical
-`SNAP_COMMON/gateway.toml` only when that path exists in the filesystem. A broken
+precedence; otherwise it validates and passes its canonical service-specific
+path only when that path exists in the filesystem. The legacy system service
+uses `$SNAP_COMMON/gateway.toml`; the user service uses
+`$SNAP_USER_COMMON/.config/openshell/gateway.toml`. A broken
 symlink is therefore rejected instead of being treated as absent.
 
 Package startup does not modify an operator-owned v1 file. Back it up, follow

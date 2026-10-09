@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # OpenShell overlay for local SPIRE-backed provider token grants.
-server:
-  providerTokenGrants:
-    spiffe:
-      enabled: true
-      workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock

@@ -296,6 +296,13 @@ service OpenShell {
     };
   }
 
+  // Export selected usable runtime credentials. Only directly authenticated
+  // mTLS operators may call this method; refresh material is never returned.
+  rpc GetProviderCredentials(GetProviderCredentialsRequest)
+      returns (GetProviderCredentialsResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
+  }
+
   // List providers.
   rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse) {
     option (openshell.options.v1.authorization) = {
@@ -2134,6 +2141,31 @@ message GetProviderRequest {
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string name = 1;
+}
+
+// Retrieve selected runtime credentials from one provider in one workspace.
+// Refresh side effects can persist even when the complete request fails.
+message GetProviderCredentialsRequest {
+  // Required named workspace selection; all_workspaces is not accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Provider canonical name.
+  string name = 2;
+  // Nonempty selection of runtime environment keys (maximum 32).
+  repeated string credential_keys = 3;
+  // Omitted/zero uses a five-minute safety margin. Maximum is 24 hours.
+  google.protobuf.Duration minimum_remaining_lifetime = 4;
+}
+
+// Usable runtime value, never gateway-only minting material.
+message ProviderCredentialValue {
+  string value = 1 [(openshell.options.v1.secret) = true];
+  // Absent for credentials with no declared expiration.
+  google.protobuf.Timestamp expiration_time = 2;
+}
+
+message GetProviderCredentialsResponse {
+  // All requested values or an error; no partial response.
+  map<string, ProviderCredentialValue> credentials = 1;
 }
 
 // List providers request.

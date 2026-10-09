@@ -282,6 +282,10 @@ The launcher streams image-build and provisioning output to the terminal. Import
 - `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
 - `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
+- Large PRs use local Git trees for patch identity instead of GitHub's
+  size-limited full-diff endpoint. An unavailable patch ID alone does not block
+  the ledger; it disables rebase-equivalence shortcuts. Reviewers should inspect
+  oversized changes file-by-file locally.
 
 ### Inspect Active Sandboxes
 

@@ -135,6 +135,8 @@ if TYPE_CHECKING:
     import builtins
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
+    from .providers import ProviderClient
+
 
 @dataclass(frozen=True)
 class TlsConfig:
@@ -928,6 +930,12 @@ class SandboxClient:
 
     def sandbox_templates(self) -> SandboxTemplateClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
+    def providers(self) -> ProviderClient:
+        """Reuse this transport for provider operations; no sandbox is required."""
+        from .providers import ProviderClient
+
+        return ProviderClient(self._channel, timeout=self._timeout)
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(

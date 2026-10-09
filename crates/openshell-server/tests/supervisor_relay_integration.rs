@@ -361,6 +361,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ProviderResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn get_provider_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        Err(Status::unimplemented("not used by this mock"))
+    }
+
     async fn get_provider(
         &self,
         _: tonic::Request<openshell_core::proto::GetProviderRequest>,

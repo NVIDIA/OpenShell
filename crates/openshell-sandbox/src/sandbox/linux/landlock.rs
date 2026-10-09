@@ -149,17 +149,22 @@ fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
         .into_diagnostic()?
         .create()
         .into_diagnostic()?;
-    let entries = capability_free_baseline_entries(root)?;
-    if entries.is_empty() {
-        return Err(miette::miette!(
-            "capability-free Landlock baseline found no usable root entries"
-        ));
-    }
-    for (_, fd) in entries {
+    let mut usable_entries = 0;
+    // Consume the lazy iterator directly so each path descriptor is added and
+    // dropped before the next root entry is opened. Images can contain
+    // thousands of root entries while the boundary has a 1,024-FD limit.
+    for entry in capability_free_baseline_entries(root)? {
+        let (_, fd) = entry?;
+        usable_entries += 1;
         let allowed = access_for_path_fd(&fd, access, abi)?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, allowed))
             .into_diagnostic()?;
+    }
+    if usable_entries == 0 {
+        return Err(miette::miette!(
+            "capability-free Landlock baseline found no usable root entries"
+        ));
     }
     Ok(PreparedRuleset {
         ruleset,
@@ -167,7 +172,9 @@ fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
     })
 }
 
-fn capability_free_baseline_entries(root: &Path) -> Result<Vec<(PathBuf, OwnedFd)>> {
+fn capability_free_baseline_entries(
+    root: &Path,
+) -> Result<impl Iterator<Item = Result<(PathBuf, OwnedFd)>>> {
     use rustix::fs::{Mode, OFlags, open, openat};
     const PRIVATE_ROOT: &str = ".openshell";
 
@@ -200,27 +207,32 @@ fn capability_free_baseline_entries(root: &Path) -> Result<Vec<(PathBuf, OwnedFd
         if entry.file_name() == PRIVATE_ROOT {
             continue;
         }
+        entries.push((entry.path(), entry.file_name()));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries.into_iter().filter_map(move |(path, file_name)| {
         // Open relative to the pinned root and classify this exact descriptor.
         // O_PATH|O_NOFOLLOW opens a symlink itself, never its target. A root
         // alias to `/` or `/.openshell` therefore cannot broaden the allowlist.
         let fd = match openat(
             &root_fd,
-            entry.file_name(),
+            file_name,
             OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS) => continue,
-            Err(error) => return Err(error).into_diagnostic(),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS) => return None,
+            Err(error) => return Some(Err(error).into_diagnostic()),
         };
-        let stat = rustix::fs::fstat(&fd).into_diagnostic()?;
+        let stat = match rustix::fs::fstat(&fd) {
+            Ok(stat) => stat,
+            Err(error) => return Some(Err(error).into_diagnostic()),
+        };
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink {
-            continue;
+            return None;
         }
-        entries.push((entry.path(), fd));
-    }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(entries)
+        Some(Ok((path, fd)))
+    }))
 }
 
 fn prepare_with_path_open_mode(
@@ -627,8 +639,7 @@ mod tests {
         .unwrap();
         let paths: Vec<_> = capability_free_baseline_entries(root.path())
             .unwrap()
-            .into_iter()
-            .map(|(path, _)| path)
+            .map(|entry| entry.unwrap().0)
             .collect();
         assert_eq!(
             paths,
@@ -650,6 +661,30 @@ mod tests {
         std::fs::remove_file(&private).unwrap();
         std::fs::write(&private, b"not a directory").unwrap();
         assert!(capability_free_baseline_entries(root.path()).is_err());
+    }
+
+    #[test]
+    fn capability_free_baseline_drops_each_root_entry_before_opening_the_next() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..128 {
+            std::fs::write(root.path().join(format!("entry-{index:03}")), b"public").unwrap();
+        }
+        std::fs::create_dir(root.path().join(".openshell")).unwrap();
+
+        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let mut visited = 0;
+        let mut peak = baseline;
+        for entry in capability_free_baseline_entries(root.path()).unwrap() {
+            let _entry = entry.unwrap();
+            visited += 1;
+            peak = peak.max(std::fs::read_dir("/proc/self/fd").unwrap().count());
+        }
+
+        assert_eq!(visited, 128);
+        assert!(
+            peak <= baseline + 16,
+            "streamed baseline preparation retained too many descriptors: baseline={baseline} peak={peak}"
+        );
     }
 
     #[test]

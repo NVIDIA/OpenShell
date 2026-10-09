@@ -186,6 +186,10 @@ pub async fn authorize_workspace(
                 grant: AuthGrant::Member(member_role),
             })
         }
+        Principal::Operator(_) => Ok(AuthorizedWorkspace {
+            workspace,
+            grant: AuthGrant::PlatformAdmin,
+        }),
         Principal::Sandbox(_) => Ok(AuthorizedWorkspace {
             workspace,
             grant: AuthGrant::Sandbox,
@@ -219,6 +223,7 @@ pub async fn authorize_sandbox_workspace(
 #[allow(clippy::result_large_err)]
 pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result<(), Status> {
     match principal {
+        Principal::Operator(_) => Ok(()),
         Principal::User(user) if is_platform_admin(&user.identity.roles, admin_role) => Ok(()),
         Principal::User(_) => Err(Status::permission_denied(
             "platform admin role required for cross-workspace operations",
