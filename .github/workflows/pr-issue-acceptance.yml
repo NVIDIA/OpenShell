@@ -22,7 +22,8 @@ jobs:
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
     steps:
-      # Load trusted base code only; never check out or execute the PR head.
+      # pull_request_target supplies the trusted default-branch SHA. Load
+      # only that helper; PR metadata is data, never executable code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
