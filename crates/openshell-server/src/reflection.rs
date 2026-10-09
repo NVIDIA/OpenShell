@@ -7,7 +7,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use prost_reflect::{DescriptorError, DescriptorPool, FileDescriptor};
-use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
+use prost_types::{
+    DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
@@ -78,6 +80,8 @@ pub fn build_gateway_reflection_service(
 struct ReflectionState {
     files: HashMap<String, Arc<ReflectionFile>>,
     symbols: HashMap<String, Arc<ReflectionFile>>,
+    extensions: HashMap<(String, i32), Arc<ReflectionFile>>,
+    extension_numbers: HashMap<String, BTreeSet<i32>>,
 }
 
 #[derive(Debug)]
@@ -91,6 +95,8 @@ impl ReflectionState {
         let mut state = Self {
             files: HashMap::new(),
             symbols: HashMap::new(),
+            extensions: HashMap::new(),
+            extension_numbers: HashMap::new(),
         };
         for descriptor in descriptors {
             let name = descriptor.name().to_string();
@@ -116,6 +122,9 @@ impl ReflectionState {
         }
         for enumeration in &file.descriptor.enum_type {
             self.process_enum(file.clone(), &prefix, enumeration);
+        }
+        for extension in &file.descriptor.extension {
+            self.process_extension(file.clone(), &prefix, extension);
         }
         for service in &file.descriptor.service {
             let Some(name) = service.name.as_deref() else {
@@ -149,6 +158,9 @@ impl ReflectionState {
         for enumeration in &message.enum_type {
             self.process_enum(file.clone(), &message_name, enumeration);
         }
+        for extension in &message.extension {
+            self.process_extension(file.clone(), &message_name, extension);
+        }
         for field in &message.field {
             if let Some(name) = field.name.as_deref() {
                 self.symbols
@@ -173,13 +185,38 @@ impl ReflectionState {
             return;
         };
         let enum_name = qualified_name(prefix, name);
-        self.symbols.insert(enum_name.clone(), file.clone());
+        self.symbols.insert(enum_name, file.clone());
         for value in &enumeration.value {
             if let Some(name) = value.name.as_deref() {
                 self.symbols
-                    .insert(qualified_name(&enum_name, name), file.clone());
+                    .insert(qualified_name(prefix, name), file.clone());
             }
         }
+    }
+
+    fn process_extension(
+        &mut self,
+        file: Arc<ReflectionFile>,
+        prefix: &str,
+        extension: &FieldDescriptorProto,
+    ) {
+        if let Some(name) = extension.name.as_deref() {
+            self.symbols
+                .insert(qualified_name(prefix, name), file.clone());
+        }
+
+        let (Some(containing_type), Some(number)) =
+            (extension.extendee.as_deref(), extension.number)
+        else {
+            return;
+        };
+        let containing_type = normalize_type_name(containing_type).to_string();
+        self.extensions
+            .insert((containing_type.clone(), number), file);
+        self.extension_numbers
+            .entry(containing_type)
+            .or_default()
+            .insert(number);
     }
 
     fn file_by_name(&self, name: &str) -> Result<Arc<ReflectionFile>, Status> {
@@ -194,6 +231,35 @@ impl ReflectionState {
             .get(symbol)
             .cloned()
             .ok_or_else(|| Status::not_found(format!("symbol '{symbol}' not found")))
+    }
+
+    fn file_by_extension(
+        &self,
+        containing_type: &str,
+        extension_number: i32,
+    ) -> Result<Arc<ReflectionFile>, Status> {
+        let containing_type = normalize_type_name(containing_type);
+        self.extensions
+            .get(&(containing_type.to_string(), extension_number))
+            .cloned()
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "extension '{containing_type}:{extension_number}' not found"
+                ))
+            })
+    }
+
+    fn all_extension_numbers(&self, containing_type: &str) -> Result<Vec<i32>, Status> {
+        let containing_type = normalize_type_name(containing_type);
+        if !self.symbols.contains_key(containing_type) {
+            return Err(Status::not_found(format!(
+                "type '{containing_type}' not found"
+            )));
+        }
+        Ok(self
+            .extension_numbers
+            .get(containing_type)
+            .map_or_else(Vec::new, |numbers| numbers.iter().copied().collect()))
     }
 
     fn file_with_dependencies(
@@ -240,6 +306,10 @@ fn qualified_name(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}.{name}")
     }
+}
+
+fn normalize_type_name(name: &str) -> &str {
+    name.strip_prefix('.').unwrap_or(name)
 }
 
 /// Reflection implementation with a quota charged for every stream message.
@@ -298,14 +368,24 @@ impl ServerReflection for GatewayReflectionService {
                                 file_descriptor_proto: descriptors,
                             })
                         }),
-                    Some(MessageRequest::FileContainingExtension(_)) => {
-                        Err(Status::not_found("extensions are not supported"))
-                    }
-                    Some(MessageRequest::AllExtensionNumbersOfType(_)) => {
-                        Ok(MessageResponse::AllExtensionNumbersResponse(
-                            ExtensionNumberResponse::default(),
-                        ))
-                    }
+                    Some(MessageRequest::FileContainingExtension(extension)) => state
+                        .file_by_extension(&extension.containing_type, extension.extension_number)
+                        .and_then(|descriptor| {
+                            state.file_with_dependencies(descriptor, &mut sent_descriptors)
+                        })
+                        .map(|descriptors| {
+                            MessageResponse::FileDescriptorResponse(FileDescriptorResponse {
+                                file_descriptor_proto: descriptors,
+                            })
+                        }),
+                    Some(MessageRequest::AllExtensionNumbersOfType(containing_type)) => state
+                        .all_extension_numbers(containing_type)
+                        .map(|extension_number| {
+                            MessageResponse::AllExtensionNumbersResponse(ExtensionNumberResponse {
+                                base_type_name: normalize_type_name(containing_type).to_string(),
+                                extension_number,
+                            })
+                        }),
                     Some(MessageRequest::ListServices(_)) => {
                         Ok(MessageResponse::ListServicesResponse(ListServiceResponse {
                             service: ADVERTISED_SERVICES

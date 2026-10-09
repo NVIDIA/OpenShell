@@ -2778,6 +2778,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflection_protocol_resolves_canonical_enum_values_and_extensions() {
+        use prost::Message;
+        use tonic_reflection::pb::v1::{
+            ExtensionRequest, ServerReflectionRequest,
+            server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+
+        for (symbol, expected_file) in [
+            ("openshell.v1.SANDBOX_PHASE_READY", "openshell.proto"),
+            (
+                "google.protobuf.FieldDescriptorProto.TYPE_DOUBLE",
+                "google/protobuf/descriptor.proto",
+            ),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for canonical enum value {symbol}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains(expected_file));
+        }
+
+        for (containing_type, extension_number) in [
+            ("google.protobuf.MethodOptions", 50_000),
+            ("google.protobuf.FieldOptions", 50_001),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: containing_type.to_string(),
+                    extension_number,
+                })),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for extension {extension_number}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains("options.proto"));
+        }
+
+        let requests = [
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::AllExtensionNumbersOfType(
+                    "google.protobuf.MethodOptions".to_string(),
+                )),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: "google.protobuf.MethodOptions".to_string(),
+                    extension_number: 49_999,
+                })),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            },
+        ];
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter(requests))
+            .await
+            .unwrap()
+            .into_inner();
+        let extension_numbers = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::AllExtensionNumbersResponse(extension_numbers)) =
+            extension_numbers.message_response
+        else {
+            panic!("expected an extension-number response");
+        };
+        assert_eq!(
+            extension_numbers.base_type_name,
+            "google.protobuf.MethodOptions"
+        );
+        assert_eq!(extension_numbers.extension_number, [50_000]);
+
+        let unknown_extension = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = unknown_extension.message_response else {
+            panic!("expected an in-band error for an unknown extension");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+        assert!(matches!(
+            responses.message().await.unwrap().unwrap().message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn reflection_rate_limit_charges_each_query_on_one_stream() {
         use tonic::Code;
         use tonic_reflection::pb::v1::{
