@@ -9,6 +9,8 @@
 //! aggregate them.
 
 pub mod cedar_only;
+#[cfg(test)]
+mod cedar_parity_tests;
 mod google_cloud_metadata;
 #[cfg(target_os = "windows")]
 pub mod host;

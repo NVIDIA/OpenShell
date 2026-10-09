@@ -66,7 +66,7 @@ Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The
 |---|---|---|---|
 | `ReadFile`, `WriteFile` | `FilesystemPath` | none | Landlock grants, fixed at sandbox start. |
 | `NetworkConnect` | `NetworkEndpoint` | `binary_path`, `ancestors` | Whether a process may open a connection. |
-| `HttpRequest` | `NetworkEndpoint` | `binary_path`, `ancestors`, `method`, `path`, `jsonrpc_method` | Each request on an inspected connection. |
+| `HttpRequest` | `NetworkEndpoint` | `binary_path`, `ancestors`, `method`, `path`, and the protocol fields below | Each request on an inspected connection. |
 
 A `NetworkEndpoint` id is `"host:port"`, with a lowercase host. `NetworkConnect` also declares `method`, `path`, and `command`, but they are always empty because no request has been read at connect time. Put method and path conditions on `HttpRequest`.
 
@@ -151,7 +151,69 @@ The proxy decides at connect time whether to inspect a connection request by req
 
 Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each request to that endpoint needs a matching `permit`.
 
-Endpoints are parsed as REST by default. Add `@protocol("json-rpc")` to an `HttpRequest` policy to inspect JSON-RPC and match on `context.jsonrpc_method`. All policies that declare a protocol for one endpoint must agree. SQL, GraphQL, and MCP inspection need request details the schema does not carry, so those protocols are rejected.
+Endpoints are parsed as REST by default. Add `@protocol("json-rpc")`, `@protocol("mcp")`, or `@protocol("graphql")` to an `HttpRequest` policy to inspect that protocol instead. All policies that declare a protocol for one endpoint must agree. `@protocol("sql")` is rejected, because OpenShell does not inspect SQL traffic.
+
+Fields that do not apply to a request are empty strings, `false`, or empty sets.
+
+| Protocol | Context fields |
+|---|---|
+| REST | `method`, `path` |
+| JSON-RPC | `jsonrpc_method`, `jsonrpc_response` |
+| MCP | `jsonrpc_method`, `mcp_tool`, `mcp_method_class`, `jsonrpc_receive_stream`, `jsonrpc_response` |
+| GraphQL | `graphql_operation_type`, `graphql_operation_name`, `graphql_fields` |
+
+For JSON-RPC and MCP, each call is evaluated on its own, and `method` is empty for a call. OpenShell rejects a request that fails JSON-RPC inspection before evaluating it.
+
+### MCP
+
+`mcp_tool` is the tool name of a `tools/call` request. `mcp_method_class` is `available` for a core method of the selected MCP revision, and `extension` for any other method. An MCP endpoint does not allow its receive stream or client response frames by itself, so permit them explicitly. The revision is the YAML default, `2025-11-25`.
+
+```cedar
+@protocol("mcp")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"mcp.example.com:443"
+)
+when {
+    context.path == "/mcp"
+    && context.mcp_method_class == "available"
+    && (["initialize", "tools/list"].contains(context.jsonrpc_method)
+        || (context.jsonrpc_method == "tools/call" && context.mcp_tool like("github.*", ".")))
+};
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"mcp.example.com:443"
+)
+when {
+    context.path == "/mcp"
+    && ((context.method == "GET" && context.jsonrpc_receive_stream) || context.jsonrpc_response)
+};
+```
+
+### GraphQL
+
+OpenShell evaluates each operation in a request separately and denies the request if any operation is denied. `graphql_operation_type` is lowercase, and empty for a hash-only persisted query, which no YAML-style registry can allow on a Cedar sandbox. Match exact field names with `containsAll` and `containsAny`:
+
+```cedar
+@protocol("graphql")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when {
+    context.path == "/graphql"
+    && (context.graphql_operation_type == "query"
+        || (context.graphql_operation_type == "mutation"
+            && context.graphql_fields.containsAny(["createIssue", "commentOnIssue"])
+            && ["createIssue", "commentOnIssue"].containsAll(context.graphql_fields)))
+};
+```
+
+Field globs, such as YAML `fields: ["create*"]`, cannot be written, because they need every field to match a pattern. Operation name globs work with `like`.
 
 ## Audit Mode
 
@@ -204,6 +266,7 @@ when { context.method == "GET" };
 - Global policies must be YAML.
 - Incremental `openshell policy update` merges are not available for Cedar policies. Use `openshell policy set` with the full policy.
 - Policy templates are not supported.
+- Query parameter matching, WebSocket message rules, and GraphQL persisted-query registries are not available.
 
 ## Next Steps
 

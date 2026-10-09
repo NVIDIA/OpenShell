@@ -51,6 +51,16 @@ with a matching `allow-git` exception in `deny.toml`.
   policy leaves both engines on the previous revision. A rejected revision
   quarantines or retains the Cedar engine according to
   `policy_validation_failure_mode`, as for YAML.
+- `@protocol` selects `rest` (default), `json-rpc`, `mcp`, or `graphql`. The
+  supervisor fills the protocol's `HttpRequest` context fields from the
+  relay's parsed request: one evaluation per JSON-RPC or MCP call (the relay
+  splits batches), and one per GraphQL operation, denying the request if any
+  is denied. Cedar MCP endpoints get the same default MCP revision as YAML.
+  `sql` is rejected because the relay does not inspect SQL.
+- `openshell-supervisor-network`'s `cedar_parity_tests` run paired YAML and
+  Cedar policies for REST, JSON-RPC, MCP, and GraphQL through both engines'
+  per-tunnel evaluation, and fail when decisions differ outside a recorded
+  list of known differences.
 - `@enforcement("audit")` marks an `HttpRequest`-only policy as audit-only.
   An endpoint whose policies are all audit-only gets `enforcement: audit` in its
   L7 config, so the relay logs and forwards denials as it does for YAML. On an

@@ -105,6 +105,7 @@ when { context.method == "GET" && context.path like("/orgs/**", "/") };
                 path: path.to_string(),
                 command: String::new(),
                 jsonrpc_method: String::new(),
+                ..Default::default()
             })
             .unwrap()
             .is_allow()

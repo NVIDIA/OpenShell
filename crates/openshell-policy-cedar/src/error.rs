@@ -102,7 +102,7 @@ pub enum CedarEngineError {
     /// An `@protocol` annotation names a protocol Cedar cannot enforce.
     #[error(
         "policy {policy_id:?} declares @protocol({protocol:?}); supported values are \
-         \"rest\" and \"json-rpc\""
+         \"rest\", \"json-rpc\", \"mcp\", and \"graphql\""
     )]
     #[diagnostic(code(openshell::policy_cedar::unsupported_l7_protocol))]
     UnsupportedL7Protocol {

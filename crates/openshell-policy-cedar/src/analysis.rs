@@ -72,9 +72,8 @@ const ID_ANNOTATION: &str = "id";
 /// Wire protocol the proxy parses on an L7-inspected endpoint.
 ///
 /// Only protocols whose per-request fields the `HttpRequest` context carries
-/// are accepted. SQL, GraphQL, and MCP inspection need request details the
-/// Cedar schema does not expose, so they are rejected at load instead of
-/// being inspected without enforcement.
+/// are accepted. SQL has no request inspection in the proxy, so it is
+/// rejected at load instead of being relayed without enforcement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum L7Protocol {
     /// HTTP/1.1 REST requests, matched on `context.method`/`context.path`.
@@ -82,6 +81,12 @@ pub enum L7Protocol {
     Rest,
     /// JSON-RPC requests, matched on `context.jsonrpc_method`.
     JsonRpc,
+    /// MCP requests, matched on `context.jsonrpc_method`, `context.mcp_tool`,
+    /// and `context.mcp_method_class`.
+    Mcp,
+    /// GraphQL operations, matched on `context.graphql_operation_type`,
+    /// `context.graphql_operation_name`, and `context.graphql_fields`.
+    Graphql,
 }
 
 impl L7Protocol {
@@ -91,6 +96,8 @@ impl L7Protocol {
         match self {
             Self::Rest => "rest",
             Self::JsonRpc => "json-rpc",
+            Self::Mcp => "mcp",
+            Self::Graphql => "graphql",
         }
     }
 
@@ -98,6 +105,8 @@ impl L7Protocol {
         match value {
             "rest" => Some(Self::Rest),
             "json-rpc" => Some(Self::JsonRpc),
+            "mcp" => Some(Self::Mcp),
+            "graphql" => Some(Self::Graphql),
             _ => None,
         }
     }

@@ -120,8 +120,9 @@ impl L7Evaluation {
 ///
 /// Mirrors the fields `openshell_supervisor_network::l7::relay::L7EvalContext`
 /// / `L7RequestInfo` supply, narrowed to what the `Sandbox::HttpRequest`
-/// Cedar action declares in its schema.
-#[derive(Debug, Clone)]
+/// Cedar action declares in its schema. Fields that do not apply to a
+/// request's protocol keep their default (`""`, `false`, or empty).
+#[derive(Debug, Clone, Default)]
 pub struct L7Request {
     /// Sandbox process user identity (`Sandbox::User` entity id), same as
     /// the connection's `NetworkConnect` request. Identity doesn't change
@@ -146,6 +147,22 @@ pub struct L7Request {
     pub command: String,
     /// JSON-RPC method name, when known; empty string when not applicable.
     pub jsonrpc_method: String,
+    /// An MCP GET that opens the server-to-client stream.
+    pub jsonrpc_receive_stream: bool,
+    /// The body carries client-to-server JSON-RPC response frames.
+    pub jsonrpc_response: bool,
+    /// MCP `tools/call` tool name; empty string when not applicable.
+    pub mcp_tool: String,
+    /// MCP method classification (`"available"` or `"extension"`); empty
+    /// string for non-MCP requests.
+    pub mcp_method_class: String,
+    /// GraphQL operation type; empty string for a hash-only persisted query
+    /// or a non-GraphQL request.
+    pub graphql_operation_type: String,
+    /// GraphQL operation name; empty string when anonymous.
+    pub graphql_operation_name: String,
+    /// The GraphQL operation's top-level fields.
+    pub graphql_fields: Vec<String>,
 }
 
 /// Landlock path grants derived from a Cedar policy set.
@@ -336,6 +353,31 @@ impl CedarEngine {
                     (
                         context_fields::JSONRPC_METHOD,
                         string(&request.jsonrpc_method),
+                    ),
+                    (
+                        context_fields::JSONRPC_RECEIVE_STREAM,
+                        RestrictedExpression::new_bool(request.jsonrpc_receive_stream),
+                    ),
+                    (
+                        context_fields::JSONRPC_RESPONSE,
+                        RestrictedExpression::new_bool(request.jsonrpc_response),
+                    ),
+                    (context_fields::MCP_TOOL, string(&request.mcp_tool)),
+                    (
+                        context_fields::MCP_METHOD_CLASS,
+                        string(&request.mcp_method_class),
+                    ),
+                    (
+                        context_fields::GRAPHQL_OPERATION_TYPE,
+                        string(&request.graphql_operation_type),
+                    ),
+                    (
+                        context_fields::GRAPHQL_OPERATION_NAME,
+                        string(&request.graphql_operation_name),
+                    ),
+                    (
+                        context_fields::GRAPHQL_FIELDS,
+                        string_set(&request.graphql_fields),
                     ),
                 ],
             )

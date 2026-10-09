@@ -50,7 +50,7 @@ pub mod actions {
     pub const HTTP_REQUEST: &str = "HttpRequest";
 }
 
-/// `NetworkConnect`'s `context` record attribute names.
+/// `NetworkConnect`'s and `HttpRequest`'s `context` record attribute names.
 ///
 /// Declared in [`SANDBOX_SCHEMA_SRC`]. `String`-typed attributes take `""`
 /// for requests where they don't apply (e.g. `COMMAND` for a REST request).
@@ -69,6 +69,25 @@ pub mod context_fields {
     pub const COMMAND: &str = "command";
     /// JSON-RPC method name for JSON-RPC requests. `HttpRequest`-only.
     pub const JSONRPC_METHOD: &str = "jsonrpc_method";
+    /// `Bool`: an MCP GET that opens the server-to-client stream.
+    /// `HttpRequest`-only.
+    pub const JSONRPC_RECEIVE_STREAM: &str = "jsonrpc_receive_stream";
+    /// `Bool`: the body carries client-to-server JSON-RPC response frames.
+    /// `HttpRequest`-only.
+    pub const JSONRPC_RESPONSE: &str = "jsonrpc_response";
+    /// MCP `tools/call` tool name. `HttpRequest`-only.
+    pub const MCP_TOOL: &str = "mcp_tool";
+    /// MCP method classification: `"available"`, `"extension"`, or `""`.
+    /// `HttpRequest`-only.
+    pub const MCP_METHOD_CLASS: &str = "mcp_method_class";
+    /// GraphQL operation type, or `""` for a hash-only persisted query.
+    /// `HttpRequest`-only.
+    pub const GRAPHQL_OPERATION_TYPE: &str = "graphql_operation_type";
+    /// GraphQL operation name, or `""` when anonymous. `HttpRequest`-only.
+    pub const GRAPHQL_OPERATION_NAME: &str = "graphql_operation_name";
+    /// `Set<String>` of the GraphQL operation's top-level fields.
+    /// `HttpRequest`-only.
+    pub const GRAPHQL_FIELDS: &str = "graphql_fields";
 }
 
 /// `NetworkEndpoint`'s entity attribute names, declared in

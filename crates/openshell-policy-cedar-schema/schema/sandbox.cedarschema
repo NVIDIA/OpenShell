@@ -71,19 +71,38 @@ namespace Sandbox {
   // Per-request L7 enforcement within an already-permitted NetworkConnect
   // tunnel. binary_path/ancestors/method/path/command mirror NetworkConnect's
   // fields (same "" for not-applicable convention; binary identity is
-  // re-checked per request, matching Rego's stateless per-call evaluation);
-  // jsonrpc_method is new, for JSON-RPC method allow-listing.
+  // re-checked per request, matching Rego's stateless per-call evaluation).
+  //
+  // JSON-RPC and MCP (one request per call; batches are split):
+  //   jsonrpc_method          the call's method, "" when there is no call
+  //   jsonrpc_receive_stream  an MCP GET that opens the server-to-client stream
+  //   jsonrpc_response        the body carries client-to-server response frames
+  //   mcp_tool                tools/call params.name, "" otherwise
+  //   mcp_method_class        "available" (core method of the selected MCP
+  //                           revision), "extension", or "" for non-MCP
+  // GraphQL (one request per operation; a batch is denied if any is):
+  //   graphql_operation_type  "query", "mutation", "subscription", or "" for a
+  //                           hash-only persisted query
+  //   graphql_operation_name  the operation name, "" when anonymous
+  //   graphql_fields          the operation's top-level fields
   action "HttpRequest"
     appliesTo {
       principal: [Process],
       resource:  [NetworkEndpoint],
       context: {
-        binary_path:    String,
-        ancestors:      Set<String>,
-        method:         String,
-        path:           String,
-        command:        String,
-        jsonrpc_method: String,
+        binary_path:            String,
+        ancestors:              Set<String>,
+        method:                 String,
+        path:                   String,
+        command:                String,
+        jsonrpc_method:         String,
+        jsonrpc_receive_stream: Bool,
+        jsonrpc_response:       Bool,
+        mcp_tool:               String,
+        mcp_method_class:       String,
+        graphql_operation_type: String,
+        graphql_operation_name: String,
+        graphql_fields:         Set<String>,
       }
     };
 }

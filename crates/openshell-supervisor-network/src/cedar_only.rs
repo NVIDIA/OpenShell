@@ -47,7 +47,7 @@ use openshell_ocsf::{
     Url as OcsfUrl, ocsf_emit,
 };
 use openshell_policy_cedar::{
-    CedarEngine, Decision, L7Endpoint, L7Request, NetworkRequest, normalize_host,
+    CedarEngine, Decision, L7Endpoint, L7Protocol, L7Request, NetworkRequest, normalize_host,
 };
 use tokio::sync::watch;
 
@@ -123,10 +123,7 @@ impl LoadedPolicy {
         if let Some(inspection) = inspection
             && !covers_every_path
         {
-            configs.push(serde_json::json!({
-                "protocol": inspection.protocol.as_str(),
-                "enforcement": inspection.enforcement.as_str(),
-            }));
+            configs.push(serde_json::Value::Object(inspection_fields(inspection)));
         }
         configs
             .into_iter()
@@ -231,14 +228,30 @@ fn with_cedar_inspection(
             fields.remove(*key);
         }
         if let Some(inspection) = inspection {
-            fields.insert("protocol".to_string(), inspection.protocol.as_str().into());
-            fields.insert(
-                "enforcement".to_string(),
-                inspection.enforcement.as_str().into(),
-            );
+            fields.extend(inspection_fields(inspection));
         }
     }
     config
+}
+
+/// The endpoint config keys that select how the relay inspects requests.
+///
+/// MCP endpoints also carry the MCP revision list the relay requires, set to
+/// the same default a YAML MCP endpoint without `mcp.versions` gets.
+fn inspection_fields(inspection: L7Endpoint) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("protocol".to_string(), inspection.protocol.as_str().into());
+    fields.insert(
+        "enforcement".to_string(),
+        inspection.enforcement.as_str().into(),
+    );
+    if inspection.protocol == L7Protocol::Mcp {
+        fields.insert(
+            "mcp_versions".to_string(),
+            serde_json::json!([openshell_policy_schema::DEFAULT_MCP_PROTOCOL_VERSION.as_str()]),
+        );
+    }
+    fields
 }
 
 /// The Cedar text and provider rules a [`LoadedPolicy`] was built from.
@@ -697,36 +710,80 @@ impl CedarL7TunnelEngine {
             ));
         }
 
-        let jsonrpc_method = request
-            .jsonrpc
-            .as_ref()
-            .and_then(|info| info.calls.first())
-            .map(|call| call.method.clone())
-            .unwrap_or_default();
-        let l7_request = L7Request {
+        let mut base = L7Request {
             user: PLACEHOLDER_IDENTITY.to_string(),
             group: PLACEHOLDER_IDENTITY.to_string(),
             binary_path: ctx.binary_path.clone(),
             ancestors: ctx.ancestors.clone(),
             host: ctx.host.clone(),
             port: ctx.port,
-            // `request.action` carries the HTTP method for REST/GraphQL and
-            // is empty for a JSON-RPC-family request (jsonrpc_method covers
-            // that case instead) — same disambiguation-by-empty-string
-            // convention as the rest of the HttpRequest schema.
-            method: if jsonrpc_method.is_empty() {
-                request.action.clone()
-            } else {
-                String::new()
-            },
+            method: request.action.clone(),
             path: request.target.clone(),
-            command: String::new(),
-            jsonrpc_method,
+            ..L7Request::default()
         };
 
-        let evaluation = guard
-            .cedar
-            .evaluate_l7(&l7_request)
+        if let Some(info) = &request.jsonrpc {
+            // Same as the YAML path: a request that failed inspection is
+            // never matched against policy.
+            if info.error.is_some() {
+                return Ok((false, "JSON-RPC request could not be inspected".to_string()));
+            }
+            // The relay splits batches into single calls before policy
+            // evaluation; a batch seen here carries no single method.
+            let call = if info.is_batch {
+                None
+            } else {
+                info.calls.first()
+            };
+            if let Some(call) = call {
+                // `method` stays empty for a call so policies match on
+                // `jsonrpc_method` instead, the schema's not-applicable
+                // convention.
+                base.method = String::new();
+                base.jsonrpc_method.clone_from(&call.method);
+                base.mcp_tool = call.tool.clone().unwrap_or_default();
+                base.mcp_method_class = match call.mcp_classification {
+                    Some(crate::l7::jsonrpc::McpMethodClassification::Available) => "available",
+                    Some(crate::l7::jsonrpc::McpMethodClassification::Extension) => "extension",
+                    None => "",
+                }
+                .to_string();
+            }
+            base.jsonrpc_receive_stream = info.receive_stream;
+            base.jsonrpc_response = info.has_response;
+        }
+
+        let Some(graphql) = &request.graphql else {
+            let allowed = Self::evaluate_one(&guard.cedar, ctx, request, &base)?;
+            return Ok(Self::decision(allowed));
+        };
+        // Same as the YAML path: a GraphQL request is allowed only when it
+        // parsed into at least one operation and every operation is allowed.
+        if graphql.error.is_some() || graphql.operations.is_empty() {
+            return Ok((false, "GraphQL request could not be inspected".to_string()));
+        }
+        for operation in &graphql.operations {
+            let mut l7_request = base.clone();
+            l7_request.graphql_operation_type = operation.operation_type.to_ascii_lowercase();
+            l7_request.graphql_operation_name =
+                operation.operation_name.clone().unwrap_or_default();
+            l7_request.graphql_fields.clone_from(&operation.fields);
+            if !Self::evaluate_one(&guard.cedar, ctx, request, &l7_request)? {
+                return Ok(Self::decision(false));
+            }
+        }
+        Ok(Self::decision(true))
+    }
+
+    /// Evaluates one Cedar request and logs any staged audit decision.
+    fn evaluate_one(
+        cedar: &CedarEngine,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+        l7_request: &L7Request,
+    ) -> Result<bool> {
+        let evaluation = cedar
+            .evaluate_l7(l7_request)
             .map_err(|e| miette::miette!("{e}"))?;
         if let Some(staged) = &evaluation.staged {
             ocsf_emit!(staged_audit_event(
@@ -736,13 +793,17 @@ impl CedarL7TunnelEngine {
                 staged
             ));
         }
-        let allowed = evaluation.is_allow();
+        Ok(evaluation.is_allow())
+    }
+
+    /// Returns the relay's `(allowed, deny_reason)` pair.
+    fn decision(allowed: bool) -> (bool, String) {
         let reason = if allowed {
             String::new()
         } else {
             "denied by Cedar HttpRequest policy".to_string()
         };
-        Ok((allowed, reason))
+        (allowed, reason)
     }
 }
 
@@ -1294,5 +1355,32 @@ when { context.method == "GET" };
         );
         assert_eq!(event["unmapped"]["cedar_audit"], "staged_deny");
         assert_eq!(event["unmapped"]["cedar_audit_policies"], "no-hooks");
+    }
+
+    #[test]
+    fn mcp_and_graphql_endpoint_configs_parse_for_the_relay() {
+        for (protocol, expected) in [
+            ("mcp", openshell_policy::L7Protocol::Mcp),
+            ("graphql", openshell_policy::L7Protocol::Graphql),
+        ] {
+            let engine = CedarOnlyEngine::from_policy_str(&format!(
+                r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443");
+@protocol("{protocol}")
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443");
+"#
+            ))
+            .expect("policy parses");
+            let authorization = engine
+                .authorize_egress(&curl_input("api.example.com"))
+                .expect("request evaluates");
+            assert_eq!(authorization.endpoint_configs.len(), 1, "{protocol}");
+            let config = crate::l7::parse_l7_config(&authorization.endpoint_configs[0])
+                .unwrap_or_else(|| panic!("{protocol} config must parse"));
+            assert_eq!(config.protocol, expected);
+            assert_eq!(config.enforcement, crate::l7::EnforcementMode::Enforce);
+        }
     }
 }

@@ -139,7 +139,8 @@ fn rejects_http_request_policies_without_a_scope_endpoint() {
 
 #[test]
 fn rejects_unsupported_protocols() {
-    for protocol in ["sql", "mcp", "graphql", "http", "REST", "bogus"] {
+    // SQL has no request inspection in the proxy, so it is never accepted.
+    for protocol in ["sql", "http", "REST", "bogus"] {
         let policy = format!(
             r#"@protocol("{protocol}")
                permit(principal, action == Sandbox::Action::"HttpRequest",
@@ -149,6 +150,22 @@ fn rejects_unsupported_protocols() {
         assert!(
             matches!(error, CedarEngineError::UnsupportedL7Protocol { .. }),
             "{protocol}: {error}"
+        );
+    }
+}
+
+#[test]
+fn accepts_mcp_and_graphql_protocols() {
+    for (annotation, protocol) in [("mcp", L7Protocol::Mcp), ("graphql", L7Protocol::Graphql)] {
+        let engine = engine(&format!(
+            r#"@protocol("{annotation}")
+               permit(principal, action == Sandbox::Action::"HttpRequest",
+                      resource == Sandbox::NetworkEndpoint::"api.example.com:443");"#
+        ));
+        assert_eq!(
+            engine.l7_protocol("api.example.com", 443),
+            Some(protocol),
+            "{annotation}"
         );
     }
 }

@@ -41,6 +41,7 @@ fn request(method: &str, path: &str) -> L7Request {
         path: path.to_string(),
         command: String::new(),
         jsonrpc_method: String::new(),
+        ..Default::default()
     }
 }
 
