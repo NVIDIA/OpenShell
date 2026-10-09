@@ -157,8 +157,12 @@ fn shipped_runners_isolate_cli_state_and_gateway_overrides() {
 }
 
 #[test]
-fn shipped_audit_and_websocket_configs_use_current_schema() {
-    for name in ["mxc-ocsf-audit.toml", "mxc-ws-gateway.toml"] {
+fn shipped_audit_and_forwarding_configs_use_current_schema() {
+    for name in [
+        "mxc-ocsf-audit.toml",
+        "mxc-ws-gateway.toml",
+        "mxc-openclaw-gateway.toml",
+    ] {
         let source = read_example(name);
         let parsed: Value = toml::from_str(&source)
             .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
@@ -170,6 +174,43 @@ fn shipped_audit_and_websocket_configs_use_current_schema() {
             openshell.get("version").and_then(Value::as_integer),
             Some(2),
             "{name} must use schema version 2"
+        );
+    }
+}
+
+#[test]
+fn shipped_processcontainer_forwarding_examples_disable_proxy_peer() {
+    for name in ["mxc-ws-gateway.toml", "mxc-openclaw-gateway.toml"] {
+        let parsed: Value = toml::from_str(&read_example(name))
+            .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
+        let mxc = parsed
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("drivers"))
+            .and_then(Value::as_table)
+            .and_then(|drivers| drivers.get("mxc"))
+            .and_then(Value::as_table)
+            .unwrap_or_else(|| panic!("{name} is missing [openshell.drivers.mxc]"));
+        assert_eq!(
+            mxc.get("pc_proxy_peer_path").and_then(Value::as_str),
+            Some(""),
+            "{name} must leave egress-only proxy-peer mode disabled"
+        );
+        assert_eq!(
+            mxc.get("backend").and_then(Value::as_str),
+            Some("process_container")
+        );
+        assert!(
+            mxc.get("pc_relay_spawner_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty()),
+            "{name} must configure the relay required by its forwarding test"
+        );
+        assert!(
+            mxc.get("pc_relay_target_port")
+                .and_then(Value::as_integer)
+                .is_some_and(|port| port > 0),
+            "{name} must configure the target port required by its forwarding test"
         );
     }
 }
@@ -330,6 +371,9 @@ fn shipped_runners_parse_in_windows_powershell() {
         "mxc-provider-credential-probe.ps1",
         "run-ocsf-audit.ps1",
         "run-mxc-e2e.ps1",
+        "run-ws-agent-test.ps1",
+        "run-openclaw-forward-test.ps1",
+        "run-openclaw-forward-mock.ps1",
     ] {
         let path = examples_root().join(name);
         let script = r"

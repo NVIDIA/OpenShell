@@ -242,11 +242,11 @@ pub struct MxcComputeConfig {
     /// `processContainer` only: absolute path to `openshell-mxc-peer.exe`. When
     /// set, each sandbox runs under MXC `networkProxy` + `allowedProxyPeer`
     /// instead of the loopback-allow network section: the driver starts the peer
-    /// under a per-sandbox `AppContainer` profile, which is the only identity
-    /// admitted to the sandbox's listeners, and `openshell forward service`
-    /// reaches the target through that peer over a private named pipe (no
-    /// broad host-loopback grant). The peer must be readable and executable by
-    /// "ALL APPLICATION PACKAGES". Requires the relay spawner settings above.
+    /// under a per-sandbox `AppContainer` profile and directs MXC egress to its
+    /// proxy listener without a broad host-loopback grant. The peer must be
+    /// readable and executable by "ALL APPLICATION PACKAGES". MXC 1.0 does not
+    /// admit reverse peer-to-workload or sandbox-local loopback connections, so
+    /// dynamic forwarding is unavailable while this mode is enabled.
     /// With `egress_proxy` enabled, the peer's proxy listener is the sandbox's
     /// only network endpoint and tunnels the sandbox's proxy connections over a
     /// named pipe to the gateway's per-sandbox host egress proxy, so policy
@@ -305,14 +305,11 @@ impl MxcComputeConfig {
             return Ok(());
         }
         let problem = if !Path::new(path).is_absolute() {
-            Some(format!("pc_proxy_peer_path must be an absolute path, got '{path}'"))
+            Some(format!(
+                "pc_proxy_peer_path must be an absolute path, got '{path}'"
+            ))
         } else if self.backend != MxcBackend::ProcessContainer {
             Some("pc_proxy_peer_path only applies to backend = \"process_container\"".to_string())
-        } else if self.pc_relay_spawner_path.is_empty() || self.pc_relay_target_port == 0 {
-            Some(
-                "pc_proxy_peer_path requires pc_relay_spawner_path and pc_relay_target_port"
-                    .to_string(),
-            )
         } else if self.pc_network_allow || self.pc_allow_local_network {
             Some(
                 "pc_proxy_peer_path cannot be combined with pc_network_allow or pc_allow_local_network"
@@ -321,12 +318,11 @@ impl MxcComputeConfig {
         } else {
             None
         };
-        match problem {
-            Some(message) => Err(openshell_core::Error::config(format!(
+        problem.map_or(Ok(()), |message| {
+            Err(openshell_core::Error::config(format!(
                 "[openshell.drivers.mxc] {message}"
-            ))),
-            None => Ok(()),
-        }
+            )))
+        })
     }
 }
 
@@ -1069,6 +1065,7 @@ impl MxcComputeBackend {
     pub fn forward_sink(&self) -> ForwardSink {
         ForwardSink {
             registry: self.registry.clone(),
+            proxy_peer_mode: !self.config.pc_proxy_peer_path.trim().is_empty(),
         }
     }
 
@@ -1645,6 +1642,10 @@ pub enum OpenDynamicForwardError {
         "sandbox {0} has no control channel (not launched via a relay spawner, or not yet Ready)"
     )]
     NoControlChannel(String),
+    #[error(
+        "sandbox {0} uses MXC proxy-peer networking, which does not support dynamic forwarding without opening bidirectional host loopback"
+    )]
+    ProxyPeerForwardUnsupported(String),
     #[error("failed to bind ephemeral relay listener: {0}")]
     RelayBind(#[source] std::io::Error),
     #[error("control channel request failed: {0}")]
@@ -1658,6 +1659,7 @@ pub enum OpenDynamicForwardError {
 #[derive(Clone)]
 pub struct ForwardSink {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    proxy_peer_mode: bool,
 }
 
 impl ForwardSink {
@@ -1667,57 +1669,52 @@ impl ForwardSink {
     /// directly by the gateway process itself, no `AppContainer` boundary on
     /// that leg — a per-forward auth nonce the caller MUST send as the first
     /// bytes on its own connection to that address (see `relay.rs` module
-    /// docs: the relay is host-interface-bound, so another reachable process
-    /// could otherwise race to connect first and hijack the forward), and a
+    /// docs: another local process could otherwise race to connect first and
+    /// hijack the forward), and a
     /// [`relay::RelayHandle`] the caller must hold for as long as the
     /// forward should stay open, then `.stop()` (or just drop) to tear it
     /// down.
     ///
-    /// Target host is always `127.0.0.1` inside the `AppContainer` (matching
-    /// `TcpRelayTarget`'s existing loopback-only restriction at the gRPC
-    /// layer), so there's no separate `target_host` parameter to thread
-    /// through — the sandbox-side `forward` op only ever dials loopback.
+    /// The requested target is always sandbox loopback (matching
+    /// `TcpRelayTarget`'s existing restriction at the gRPC layer). The default
+    /// mode dials it inside the sandbox through the control-channel relay.
+    /// Proxy-peer mode returns [`OpenDynamicForwardError::ProxyPeerForwardUnsupported`]:
+    /// MXC 1.0 admits workload-to-peer proxy traffic but not reverse
+    /// peer-to-workload or sandbox-local loopback dials.
     pub async fn open_dynamic_forward(
         &self,
         sandbox_id: &str,
         target_port: u16,
     ) -> Result<(SocketAddr, [u8; relay::NONCE_LEN], relay::RelayHandle), OpenDynamicForwardError>
     {
-        let (control_channel, peer, sandbox_name) = {
+        let (control_channel, sandbox_name) = {
             let reg = self.registry.lock().await;
             let entry = reg
                 .get(sandbox_id)
                 .ok_or_else(|| OpenDynamicForwardError::SandboxNotFound(sandbox_id.to_string()))?;
-            let channel = entry
-                .control_channel
-                .clone()
-                .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
-            (channel, entry.peer.clone(), entry.sandbox.name.clone())
+            if self.proxy_peer_mode {
+                return Err(OpenDynamicForwardError::ProxyPeerForwardUnsupported(
+                    sandbox_id.to_string(),
+                ));
+            }
+            (entry.control_channel.clone(), entry.sandbox.name.clone())
         };
 
         // Fresh per forward -- see relay.rs module docs for why this matters
-        // on a host-interface listener.
+        // on a host-loopback listener.
         let nonce: [u8; relay::NONCE_LEN] = rand::random();
 
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // In proxy-peer mode the sandbox only admits the peer identity (and the
-        // in-sandbox relay cannot dial its own loopback target), so the sandbox
-        // leg of the forward goes through the peer instead of the control channel.
-        let (relay_handle, relay_addr) = match peer {
-            Some(peer) => {
-                relay::start_peer_relay(bind_addr, sandbox_name, nonce, peer, target_port).await
-            }
-            None => {
-                relay::start_control_channel_relay(
-                    bind_addr,
-                    sandbox_name,
-                    nonce,
-                    control_channel,
-                    target_port,
-                )
-                .await
-            }
-        }
+        let control_channel = control_channel
+            .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
+        let (relay_handle, relay_addr) = relay::start_control_channel_relay(
+            bind_addr,
+            sandbox_name,
+            nonce,
+            control_channel,
+            target_port,
+        )
+        .await
         .map_err(OpenDynamicForwardError::RelayBind)?;
 
         Ok((relay_addr, nonce, relay_handle))
@@ -3207,15 +3204,13 @@ mod lifecycle_tests {
     fn proxy_peer_config() -> MxcComputeConfig {
         MxcComputeConfig {
             wxc_exec_path: r"C:\mxc-kit\bin\wxc-exec.exe".into(),
-            pc_relay_spawner_path: "C:/openshell-openclaw/openshell-supervisor-relay.exe".into(),
-            pc_relay_target_port: 18889,
             pc_proxy_peer_path: r"C:\openshell-openclaw\openshell-mxc-peer.exe".into(),
             ..Default::default()
         }
     }
 
     #[test]
-    fn proxy_peer_mode_is_off_by_default_and_valid_with_the_spawner() {
+    fn proxy_peer_mode_is_off_by_default_and_does_not_require_the_relay() {
         assert!(MxcComputeConfig::default().pc_proxy_peer_path.is_empty());
         proxy_peer_config().validate_configuration().unwrap();
     }
@@ -3230,11 +3225,14 @@ mod lifecycle_tests {
 
     #[test]
     fn proxy_peer_mode_rejects_incompatible_settings() {
-        let cases: [(&str, fn(&mut MxcComputeConfig)); 6] = [
-            ("absolute", |c| c.pc_proxy_peer_path = "openshell-mxc-peer.exe".into()),
-            ("process_container", |c| c.backend = MxcBackend::IsolationSession),
-            ("pc_relay_spawner_path", |c| c.pc_relay_spawner_path.clear()),
-            ("pc_relay_spawner_path", |c| c.pc_relay_target_port = 0),
+        type ConfigMutation = fn(&mut MxcComputeConfig);
+        let cases: [(&str, ConfigMutation); 4] = [
+            ("absolute", |c| {
+                c.pc_proxy_peer_path = "openshell-mxc-peer.exe".into();
+            }),
+            ("process_container", |c| {
+                c.backend = MxcBackend::IsolationSession;
+            }),
             ("pc_network_allow", |c| c.pc_network_allow = true),
             ("pc_network_allow", |c| c.pc_allow_local_network = true),
         ];
@@ -3244,6 +3242,43 @@ mod lifecycle_tests {
             let error = config.validate_configuration().unwrap_err().to_string();
             assert!(error.contains(needle), "expected '{needle}' in: {error}");
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_peer_mode_rejects_dynamic_forward_without_side_effects() {
+        let backend = MxcComputeBackend::new_mocked(proxy_peer_config());
+        let sandbox = driver_sandbox("proxy-peer-forward");
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Running,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: None,
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+                peer: None,
+            },
+        );
+
+        let Err(error) = backend
+            .forward_sink()
+            .open_dynamic_forward(&sandbox.id, 22000)
+            .await
+        else {
+            panic!("proxy-peer dynamic forward unexpectedly succeeded");
+        };
+        assert!(matches!(
+            error,
+            OpenDynamicForwardError::ProxyPeerForwardUnsupported(id) if id == sandbox.id
+        ));
     }
 
     #[test]

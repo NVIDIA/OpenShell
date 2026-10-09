@@ -133,8 +133,9 @@ fn ui_json(ui: &MxcUi) -> serde_json::Value {
 }
 
 /// Proxy-peer mode: the sandbox runs under MXC `runtimeConfig.networkProxy`
-/// with `processContainer.network.allowedProxyPeer`, so the only identity that
-/// may talk to its listeners is the named `AppContainer` profile (see `peer.rs`).
+/// with `processContainer.network.allowedProxyPeer`, so MXC directs its proxy
+/// traffic to the listener hosted by the named `AppContainer` profile while
+/// general host-loopback access remains denied (see `peer.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcProxyPeer {
     /// `AppContainer` profile name of the peer process (`allowedProxyPeer`).
@@ -276,7 +277,8 @@ fn apply_proxy_peer(config: &mut serde_json::Value, peer: &MxcProxyPeer) {
     });
     config["processContainer"]["network"] =
         serde_json::json!({ "allowedProxyPeer": &peer.profile });
-    config["runtimeConfig"] = serde_json::json!({ "networkProxy": format!("http://{}", peer.proxy) });
+    config["runtimeConfig"] =
+        serde_json::json!({ "networkProxy": format!("http://{}", peer.proxy) });
 }
 
 fn oneshot_config_json(
@@ -1013,11 +1015,20 @@ mod tests {
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
             allow_local_network: false,
         };
-        let config =
-            oneshot_config_json("sb-1", &filesystem, &pc, &process, Some(&loopback_network), None);
+        let config = oneshot_config_json(
+            "sb-1",
+            &filesystem,
+            &pc,
+            &process,
+            Some(&loopback_network),
+            None,
+        );
 
         assert_eq!(config["version"], MXC_SCHEMA_VERSION);
-        assert_eq!(config["runtimeConfig"]["networkProxy"], "http://127.0.0.1:4242");
+        assert_eq!(
+            config["runtimeConfig"]["networkProxy"],
+            "http://127.0.0.1:4242"
+        );
         assert_eq!(
             config["processContainer"]["network"]["allowedProxyPeer"],
             "openshell-mxc-abc"
@@ -1043,7 +1054,8 @@ mod tests {
             env: Vec::new(),
             timeout: 0,
         };
-        let config = oneshot_config_json("sb-1", &MxcFilesystem::default(), &pc, &process, None, None);
+        let config =
+            oneshot_config_json("sb-1", &MxcFilesystem::default(), &pc, &process, None, None);
         assert_eq!(config["version"], MXC_SCHEMA_VERSION);
         assert!(config.get("runtimeConfig").is_none());
         assert!(config["processContainer"].get("network").is_none());

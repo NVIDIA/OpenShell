@@ -4,39 +4,31 @@
 //! Per-sandbox proxy-peer process for MXC `ProcessContainer` sandboxes.
 //!
 //! MXC's `runtimeConfig.networkProxy` mode lets a sandbox reach *only* its
-//! proxy endpoint, and (with `processContainer.network.allowedProxyPeer`) admits
-//! only one named `AppContainer` identity to talk to the sandbox's listeners.
-//! Direct loopback is blocked everywhere else -- including between processes
-//! inside the sandbox -- so the in-sandbox relay can no longer dial the target
-//! service itself. This module provides the missing identity: a small helper
+//! proxy endpoint. This module supplies that endpoint with a small helper
 //! process (`openshell-mxc-peer.exe`) that the driver starts under a
-//! per-sandbox `AppContainer` profile. That profile is the sandbox's
-//! `allowedProxyPeer`, so the peer is allowed to dial the sandbox's loopback
-//! listeners.
+//! per-sandbox `AppContainer` profile. That profile is named as the sandbox's
+//! `processContainer.network.allowedProxyPeer`, so MXC admits the workload's
+//! connection to the proxy while keeping general host-loopback access denied.
 //!
 //! ```text
-//! host client -> gateway forward listener (relay.rs)
-//!                   | data pipe (DACL: gateway user + peer profile SID only)
-//!                peer process (AppContainer profile == allowedProxyPeer)
-//!                   | TCP 127.0.0.1:<target port>  (admitted by identity)
-//!                target service inside the sandbox
+//! sandbox process -> MXC networkProxy -> peer proxy listener
+//!                                      | egress pipe
+//!                                   gateway -> policy proxy -> network
 //! ```
 //!
 //! Control protocol (newline-delimited text over `\\.\pipe\<prefix>-ctl`):
 //!   peer -> gateway: `READY <proxy-port>` once, after binding its proxy listener
-//!   gateway -> peer: `OPEN <id> <target-port>` per forwarded connection
 //!
-//! Each connection gets its own data pipe `\\.\pipe\<prefix>-d<id>`. After the
-//! peer connects to it and dials the target it writes one status line, `OK` or
-//! `ERR <message>`, and then both sides pump raw bytes.
-//!
-//! Egress (sandbox -> network) runs the other way. The peer's proxy listener is
-//! the sandbox's `networkProxy` endpoint; for every connection the sandbox opens
-//! to it, the peer connects to the multi-instance pipe `\\.\pipe\<prefix>-egress`
+//! The peer's proxy listener is the sandbox's `networkProxy` endpoint; for every
+//! connection the sandbox opens to it, the peer connects to the multi-instance
+//! pipe `\\.\pipe\<prefix>-egress`
 //! and pumps raw bytes. The gateway side of that pipe dials the sandbox's host
 //! egress proxy (the existing per-sandbox policy proxy) and pumps bytes to it,
 //! so the peer is a transparent byte tunnel and every policy decision, TLS
 //! interception and credential substitution still happens in the gateway.
+//! Dynamic forwarding is unavailable in proxy-peer mode: MXC admits the
+//! workload's connection to this peer, not a reverse peer-to-workload dial, and
+//! keeps sandbox-local loopback denied.
 //!
 //! Per-process policy (binary rules) keeps working through the tunnel: the first
 //! line the peer writes on an egress pipe is `CLIENT <port>`, the source port the
@@ -54,16 +46,18 @@
 use std::ffi::c_void;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use openshell_supervisor_network::host::ForwardedClients;
+use openshell_supervisor_network::procfs::WorkloadProxyTcpConnection;
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::Mutex;
-use openshell_supervisor_network::host::ForwardedClients;
-use openshell_supervisor_network::procfs::WorkloadProxyTcpConnection;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
@@ -106,7 +100,7 @@ const PEER_BOOTSTRAP_ENV: [&str; 6] = [
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
 /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
-const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
+const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32.cast_signed();
 
 const PEER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,7 +116,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 /// `AppContainer` profile name for a sandbox: `openshell-mxc-<id without dashes>`
 /// (profile names are limited to 64 characters of `[A-Za-z0-9._-]`).
-pub(crate) fn profile_name_for(sandbox_id: &str) -> String {
+fn profile_name_for(sandbox_id: &str) -> String {
     let id: String = sandbox_id
         .chars()
         .filter(char::is_ascii_alphanumeric)
@@ -134,16 +128,12 @@ pub(crate) fn profile_name_for(sandbox_id: &str) -> String {
 /// Pipe DACL: the gateway's own user plus the peer's `AppContainer` SID, nothing
 /// else. An `AppContainer` access check must succeed for both the user SID in
 /// the token and the package SID, so both ACEs are required.
-pub(crate) fn pipe_sddl(user_sid: &str, profile_sid: &str) -> String {
+fn pipe_sddl(user_sid: &str, profile_sid: &str) -> String {
     format!("D:(A;;GA;;;{user_sid})(A;;GA;;;{profile_sid})")
 }
 
 fn ctl_pipe_name(prefix: &str) -> String {
     format!(r"\\.\pipe\{prefix}-ctl")
-}
-
-fn data_pipe_name(prefix: &str, id: u64) -> String {
-    format!(r"\\.\pipe\{prefix}-d{id}")
 }
 
 fn egress_pipe_name(prefix: &str) -> String {
@@ -161,17 +151,20 @@ pub struct EgressTunnel {
 
 /// Parse the peer's `CLIENT <port>` line: the source port the sandbox process
 /// used when it connected to the peer's proxy listener.
-pub(crate) fn parse_client_port(line: &str) -> Option<u16> {
+fn parse_client_port(line: &str) -> Option<u16> {
     line.strip_prefix("CLIENT ")?.trim().parse().ok()
 }
 
 /// Peer command line: `"<exe>" <token> <egress|none>`.
-pub(crate) fn peer_command_line(peer_exe: &str, token: &str, egress: bool) -> String {
-    format!("\"{peer_exe}\" {token} {}", if egress { "egress" } else { "none" })
+fn peer_command_line(peer_exe: &str, token: &str, egress: bool) -> String {
+    format!(
+        "\"{peer_exe}\" {token} {}",
+        if egress { "egress" } else { "none" }
+    )
 }
 
 /// Parse `READY <port>`.
-pub(crate) fn parse_ready(line: &str) -> Option<u16> {
+fn parse_ready(line: &str) -> Option<u16> {
     line.strip_prefix("READY ")?.trim().parse().ok()
 }
 
@@ -203,7 +196,7 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<String
 fn sid_to_string(sid: PSID) -> io::Result<String> {
     let mut text = PWSTR::null();
     // SAFETY: `sid` is a valid SID and `text` is a valid out pointer.
-    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(win_err)?;
+    unsafe { ConvertSidToStringSidW(sid, &raw mut text) }.map_err(win_err)?;
     // SAFETY: on success `text` points to a NUL-terminated wide string allocated
     // by the OS; it is freed with LocalFree right after copying.
     let result = unsafe { text.to_string() }.map_err(|error| io::Error::other(error.to_string()));
@@ -218,16 +211,16 @@ fn current_user_sid() -> io::Result<String> {
     // SAFETY: standard token query with a correctly sized, 8-byte-aligned buffer.
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(win_err)?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token).map_err(win_err)?;
         let mut len = 0_u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &raw mut len);
         let mut buffer = vec![0_u64; (len as usize).div_ceil(8).max(1)];
         let query = GetTokenInformation(
             token,
             TokenUser,
             Some(buffer.as_mut_ptr().cast()),
             len,
-            &mut len,
+            &raw mut len,
         );
         let result = match query {
             Ok(()) => {
@@ -258,7 +251,7 @@ impl SecurityDescriptor {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 PCWSTR(sddl.as_ptr()),
                 SDDL_REVISION_1,
-                &mut descriptor,
+                &raw mut descriptor,
                 None,
             )
         }
@@ -326,7 +319,8 @@ fn capability_sids() -> io::Result<Vec<PSID>> {
             // SID is deliberately leaked for the (short) lifetime of the gateway:
             // it is a few bytes per sandbox and freeing it would require tracking
             // it past `CreateProcessW`.
-            unsafe { ConvertStringSidToSidW(PCWSTR(text.as_ptr()), &mut sid) }.map_err(win_err)?;
+            unsafe { ConvertStringSidToSidW(PCWSTR(text.as_ptr()), &raw mut sid) }
+                .map_err(win_err)?;
             Ok(sid)
         })
         .collect()
@@ -337,8 +331,7 @@ fn ensure_profile(name: &str, capabilities: &[SID_AND_ATTRIBUTES]) -> io::Result
     let name_w = wide(name);
     let name_p = PCWSTR(name_w.as_ptr());
     // SAFETY: all string arguments are NUL-terminated and outlive the call.
-    let created =
-        unsafe { CreateAppContainerProfile(name_p, name_p, name_p, Some(capabilities)) };
+    let created = unsafe { CreateAppContainerProfile(name_p, name_p, name_p, Some(capabilities)) };
     match created {
         Ok(sid) => Ok(OwnedSid(sid)),
         Err(error) if error.code().0 == HRESULT_ALREADY_EXISTS => {
@@ -363,12 +356,12 @@ fn spawn_in_app_container(
     let mut list_size = 0_usize;
     // SAFETY: size query; documented to fail with ERROR_INSUFFICIENT_BUFFER.
     unsafe {
-        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut list_size);
+        let _ = InitializeProcThreadAttributeList(None, 1, None, &raw mut list_size);
     }
     let mut list_buffer = vec![0_u64; list_size.div_ceil(8).max(1)];
     let list = LPPROC_THREAD_ATTRIBUTE_LIST(list_buffer.as_mut_ptr().cast());
     // SAFETY: `list` points to a buffer of at least `list_size` bytes.
-    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut list_size) }
+    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &raw mut list_size) }
         .map_err(win_err)?;
 
     let security_capabilities = SECURITY_CAPABILITIES {
@@ -432,7 +425,7 @@ fn spawn_in_app_container(
             Some(environment.as_ptr().cast::<c_void>()),
             PCWSTR::null(),
             std::ptr::addr_of!(startup).cast::<STARTUPINFOW>(),
-            &mut info,
+            &raw mut info,
         )
     };
     // SAFETY: `list` was initialized above and is no longer needed.
@@ -454,7 +447,6 @@ pub struct PeerHandle {
     descriptor: Arc<SecurityDescriptor>,
     control: Mutex<NamedPipeServer>,
     proxy_addr: SocketAddr,
-    next_id: AtomicU64,
     terminated: AtomicBool,
     /// First instance of the egress pipe, created before the peer starts so the
     /// name cannot be squatted; handed to the accept loop once the peer is ready.
@@ -504,7 +496,9 @@ impl PeerHandle {
             let control = handle.control.get_mut();
             tokio::time::timeout(PEER_READY_TIMEOUT, control.connect())
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy peer did not connect"))??;
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "proxy peer did not connect")
+                })??;
             let line = tokio::time::timeout(PEER_READY_TIMEOUT, read_line(control))
                 .await
                 .map_err(|_| {
@@ -570,25 +564,22 @@ impl PeerHandle {
         };
 
         let command_line = peer_command_line(peer_exe, &token, egress);
-        let process = match spawn_in_app_container(
-            peer_exe,
-            &command_line,
-            sid.as_psid(),
-            &mut capabilities,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                // SAFETY: best-effort profile cleanup on the failure path.
-                unsafe {
-                    let name = wide(&profile);
-                    let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+        let process =
+            match spawn_in_app_container(peer_exe, &command_line, sid.as_psid(), &mut capabilities)
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    // SAFETY: best-effort profile cleanup on the failure path.
+                    unsafe {
+                        let name = wide(&profile);
+                        let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+                    }
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("failed to start proxy peer '{peer_exe}': {error}"),
+                    ));
                 }
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("failed to start proxy peer '{peer_exe}': {error}"),
-                ));
-            }
-        };
+            };
 
         // From here on the handle's Drop cleans up the process and profile.
         Ok(Self {
@@ -598,42 +589,10 @@ impl PeerHandle {
             descriptor: Arc::new(descriptor),
             control: Mutex::new(control),
             proxy_addr: "127.0.0.1:0".parse().expect("static address"),
-            next_id: AtomicU64::new(1),
             terminated: AtomicBool::new(false),
             egress_first,
             egress_task: StdMutex::new(None),
         })
-    }
-
-    /// Ask the peer to dial `127.0.0.1:<target_port>` inside the sandbox and
-    /// return the data pipe carrying the connection's bytes.
-    pub async fn open_data(&self, target_port: u16) -> io::Result<NamedPipeServer> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut data = self
-            .descriptor
-            .create_pipe(&data_pipe_name(&self.prefix, id), true)?;
-        {
-            let mut control = self.control.lock().await;
-            control
-                .write_all(format!("OPEN {id} {target_port}\n").as_bytes())
-                .await?;
-        }
-        tokio::time::timeout(DATA_CONNECT_TIMEOUT, data.connect())
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "proxy peer did not open data pipe")
-            })??;
-        let status = tokio::time::timeout(DATA_CONNECT_TIMEOUT, read_line(&mut data))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy peer sent no status"))??;
-        if status == "OK" {
-            Ok(data)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("proxy peer could not reach 127.0.0.1:{target_port}: {status}"),
-            ))
-        }
     }
 }
 
@@ -702,7 +661,10 @@ async fn bridge_egress(mut pipe: NamedPipeServer, tunnel: EgressTunnel, peer_pro
     let _alias = tcp.local_addr().ok().map(|bridge| {
         tunnel.clients.register(
             bridge,
-            WorkloadProxyTcpConnection::new(SocketAddr::from(([127, 0, 0, 1], client_port)), peer_proxy),
+            WorkloadProxyTcpConnection::new(
+                SocketAddr::from(([127, 0, 0, 1], client_port)),
+                peer_proxy,
+            ),
         )
     });
     let _ = tokio::io::copy_bidirectional(&mut pipe, &mut tcp).await;
@@ -718,10 +680,10 @@ impl PeerHandle {
         if self.terminated.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Ok(mut slot) = self.egress_task.lock() {
-            if let Some(task) = slot.take() {
-                task.abort();
-            }
+        if let Ok(mut slot) = self.egress_task.lock()
+            && let Some(task) = slot.take()
+        {
+            task.abort();
         }
         let process = HANDLE(self.process as *mut c_void);
         // SAFETY: `process` is the handle returned by CreateProcessW and owned by
@@ -768,7 +730,6 @@ mod tests {
     #[test]
     fn pipe_names_are_namespaced_per_prefix() {
         assert_eq!(ctl_pipe_name("p"), r"\\.\pipe\p-ctl");
-        assert_eq!(data_pipe_name("p", 7), r"\\.\pipe\p-d7");
         assert_eq!(egress_pipe_name("p"), r"\\.\pipe\p-egress");
     }
 

@@ -88,7 +88,10 @@ impl ForwardedClients {
 
     /// Map an accepted connection to the original connection it tunnels, or
     /// return it unchanged when it is not tunnelled.
-    pub(crate) fn resolve(&self, connection: WorkloadProxyTcpConnection) -> WorkloadProxyTcpConnection {
+    pub(crate) fn resolve(
+        &self,
+        connection: WorkloadProxyTcpConnection,
+    ) -> WorkloadProxyTcpConnection {
         self.aliases
             .lock()
             .ok()

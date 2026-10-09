@@ -1091,7 +1091,21 @@ pub trait ComputeDriverForwardSink: Send + Sync {
         &self,
         sandbox_id: &str,
         target_port: u16,
-    ) -> std::result::Result<(SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>), String>;
+    ) -> std::result::Result<
+        (SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>),
+        ComputeDriverForwardError,
+    >;
+}
+
+/// Failure returned by a driver's optional dynamic-forward capability.
+#[derive(Debug, thiserror::Error)]
+pub enum ComputeDriverForwardError {
+    /// The selected driver mode cannot provide dynamic forwarding safely.
+    #[error("{0}")]
+    Unsupported(String),
+    /// The driver supports dynamic forwarding, but this attempt failed.
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Factory for a compute driver linked into a gateway binary.

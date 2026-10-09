@@ -1176,7 +1176,10 @@ mod inherited_proxy_env_tests {
     #[test]
     fn launch_request_values_win_case_insensitively() {
         let got = inherited_proxy_env(
-            parent(&[("HTTP_PROXY", "http://parent"), ("HTTPS_PROXY", "http://parent")]),
+            parent(&[
+                ("HTTP_PROXY", "http://parent"),
+                ("HTTPS_PROXY", "http://parent"),
+            ]),
             &[("http_proxy".into(), "http://driver".into())],
         );
         assert_eq!(
