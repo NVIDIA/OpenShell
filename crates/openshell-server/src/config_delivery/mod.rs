@@ -517,7 +517,7 @@ async fn run_build(
     let started = Instant::now();
     let built = tokio::time::timeout(
         build_timeout(component).saturating_sub(load_elapsed),
-        build_component(state, inputs, component),
+        build_component(state, sandbox_id, inputs, component),
     )
     .await;
     let elapsed = load_elapsed + started.elapsed();
@@ -575,10 +575,15 @@ const fn build_timeout(component: ConfigComponentKind) -> Duration {
     name = "config_build",
     level = "debug",
     skip_all,
-    fields(otel.name = "config_delivery.build", sandbox_id, component = component.name())
+    fields(
+        otel.name = "config_delivery.build",
+        sandbox_id = %sandbox_id,
+        component = component.name()
+    )
 )]
 async fn build_component(
     state: &Arc<ServerState>,
+    sandbox_id: &str,
     inputs: &SandboxConfigInputs,
     component: ConfigComponentKind,
 ) -> Result<SupervisorConfigMessage, Status> {

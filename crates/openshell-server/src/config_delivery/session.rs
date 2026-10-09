@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use metrics::counter;
+use metrics::{counter, histogram};
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult, ConfigComponent,
     ConfigComponentApplyResult, ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult,
@@ -193,6 +193,7 @@ struct CompletedConfigUpdate {
     fingerprint: ConfigSnapshotFingerprint,
     outcome: ConfigApplyOutcome,
     admission: Option<SandboxConfigurationAdmission>,
+    sent_at: Instant,
 }
 
 /// Outcome of finishing an in-flight configuration update.
@@ -316,6 +317,7 @@ impl ConfigSessionState {
             fingerprint: in_flight.fingerprint.clone(),
             outcome,
             admission: in_flight.admission.clone(),
+            sent_at: in_flight.sent_at,
         })
     }
 
@@ -913,6 +915,12 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
             return;
         }
     };
+    histogram!(
+        crate::gateway_metrics::SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+        "component" => ConfigComponent::from(completed.component).as_str_name(),
+        "outcome" => completed.outcome.as_str_name(),
+    )
+    .record(completed.sent_at.elapsed().as_secs_f64());
     let finalized = if completed.outcome == ConfigApplyOutcome::AwaitingComponent {
         // A transient ordering result is never recorded. The supervisor keeps
         // this half staged until its counterpart arrives.
@@ -1017,6 +1025,24 @@ async fn record_component_apply_result(
         "outcome" => outcome.as_str_name(),
     )
     .increment(1);
+    if matches!(
+        outcome,
+        ConfigApplyOutcome::FailedRetainedLastKnownGood
+            | ConfigApplyOutcome::FailedClosed
+            | ConfigApplyOutcome::Unsupported
+    ) {
+        let failure = result.failure.as_ref();
+        warn!(
+            sandbox_id,
+            component = component.as_str_name(),
+            outcome = outcome.as_str_name(),
+            failure_code = failure.map_or("", |failure| failure.code.as_str()),
+            failure = failure
+                .map(|failure| failure.message.chars().take(1024).collect::<String>())
+                .unwrap_or_default(),
+            "supervisor failed to apply pushed configuration"
+        );
+    }
     if component != ConfigComponent::SandboxConfig {
         return Ok(());
     }

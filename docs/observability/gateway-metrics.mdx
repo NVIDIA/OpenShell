@@ -138,10 +138,10 @@ curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessi
 
 ## Histograms and Summaries
 
-The multi-replica latency metrics and the configuration build duration are
-Prometheus histograms with `_bucket`, `_sum`, and `_count` series and buckets
-from 1 millisecond to 15 seconds, so
-`histogram_quantile` can aggregate them across replicas. The older
+The multi-replica latency metrics and the configuration build and apply
+durations are Prometheus histograms with `_bucket`, `_sum`, and `_count` series
+and buckets from 1 millisecond to 15 seconds, so `histogram_quantile` can
+aggregate them across replicas. The older
 `*_duration_seconds` metrics and the interceptor latency metric are summaries
 with `quantile` labels that each replica computes on its own. Do not average
 summary quantiles across pods.
@@ -248,6 +248,8 @@ empty in poll mode, where `GetSandboxConfig` and
 | `openshell_supervisor_config_waiting_sessions` | Gauge | None | Sessions waiting for a build slot. |
 | `openshell_supervisor_config_deliveries_total` | Counter | `component`, `outcome` | What happened to each built snapshot. |
 | `openshell_supervisor_config_apply_results_total` | Counter | `component`, `outcome` | Apply results that supervisors reported. |
+| `openshell_supervisor_config_apply_duration_seconds` | Histogram | `component`, `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
+| `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
 | `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
 | `openshell_supervisor_config_bootstrap_revision_mismatches_total` | Counter | None | Bootstrap builds retried because the two components disagreed on provider revision, provider attachments, or effective policy. |
 | `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
@@ -255,9 +257,9 @@ empty in poll mode, where `GetSandboxConfig` and
 The labels take these values:
 
 - `component` is `sandbox_config` or `provider_environment`. On
-  `apply_results_total` it is the protocol name, such as
-  `CONFIG_COMPONENT_SANDBOX_CONFIG`, and `outcome` is a `ConfigApplyOutcome`
-  name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
+  `apply_results_total` and `apply_duration_seconds` it is the protocol name,
+  such as `CONFIG_COMPONENT_SANDBOX_CONFIG`, and `outcome` is a
+  `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
 - `lane` is `sandbox` for a change to one sandbox, or `fanout` for a change
   that reaches many sandboxes, including the 30-second reconcile of each
   session. The reconcile rebuilds the sandbox configuration, and also any

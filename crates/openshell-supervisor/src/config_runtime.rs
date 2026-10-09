@@ -1114,6 +1114,19 @@ impl ConfigRuntime {
                 return (result, admission);
             }
             Err(error) => {
+                // Polling ends its loop on this error; session delivery
+                // reports it instead, so record it here.
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .state(StateId::Other, "failed")
+                    .unmapped("config_revision", serde_json::json!(snapshot.config_revision))
+                    .unmapped("policy_hash", serde_json::json!(&snapshot.policy_hash))
+                    .message(format!(
+                        "Pushed sandbox configuration failed to apply [config_revision:{} error:{error}]",
+                        snapshot.config_revision
+                    ))
+                    .build());
                 let result = config_apply_result(
                     ConfigComponent::SandboxConfig,
                     Some(requested_revision),
