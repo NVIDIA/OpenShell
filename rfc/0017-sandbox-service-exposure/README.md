@@ -84,9 +84,23 @@ Solid arrows carry application traffic; dashed arrows carry control traffic. Dis
 
 Application ingress scales independently of the gateway. Supervisors still share resources between application and control work, so connection, buffer, and per-sandbox concurrency limits must preserve control-plane capacity.
 
+### Driver integration
+
+The app listener and discovery contract are independent of the compute driver. Driver-specific networking provides reachability without changing service identity or supervisor policy enforcement.
+
+Each supported driver provisions a supervisor app listener and a reachable address for it, including any required port allocation or forwarding. The supervisor advertises accepted sandbox services through the gateway. Ingress implementers consume discovery and route to the owning supervisor; they can use existing ingress infrastructure or the optional OpenShell proxy.
+
+Addresses must be reachable from the chosen ingress deployment: loopback is sufficient only when ingress shares that network context. Multiple supervisors on one host need distinct listener ports or addresses.
+
+Drivers manage endpoint allocation, restart, replacement, and deletion; advertisements and discovery must track those changes. The advertised endpoint always reaches the supervisor app listener, never a workload port. These responsibilities leave service identity, discovery, and sandbox policy enforcement unchanged across drivers.
+
+Architectural support does not imply every driver ships in the first release. Enable supervisor ingress only after that driver's endpoint integration is implemented and validated.
+
 ### Kubernetes
 
-Kubernetes operators can use existing ingress plus a discovery adapter to route to supervisor Services. This uses the same app listener and discovery contract, consistent with the [PR discussion](https://github.com/NVIDIA/OpenShell/pull/4267#issuecomment-6053456908).
+Kubernetes operators can use existing ingress plus a discovery adapter to route to supervisor Services. This uses the same app listener and discovery contract.
+
+Supervisor Services are the Kubernetes mapping of the common driver contract; other drivers provide reachability through their own networking.
 
 Several sandbox services can share one supervisor Service. A Service spanning supervisors with different sandbox owners still needs routing that selects the correct owner. Ingress must preserve service SNI or use an explicitly supported TLS termination mode.
 
@@ -152,9 +166,9 @@ Start with one sandbox per supervisor while preserving routing boundaries needed
 
 1. Define ingress policy, TLS, discovery credentials, route leases, and advertisement/discovery APIs following `proto/README.md`.
 2. Add supervisor app listeners, service configuration sync, boundary routing, limits, and OCSF events.
-3. Add gateway discovery and integrate a supported driver and Kubernetes ingress path. Update CLI/SDK URLs, deployment configuration, docs, and related skills.
+3. Add gateway discovery and integrate the first supported drivers and ingress deployment. For each enabled driver, implement reachable endpoint provisioning and lifecycle updates. Update CLI/SDK URLs, deployment configuration, docs, and related skills.
 4. Build the optional `openshell-sandbox-proxy` as a reference integration, with cached routes and direct supervisor connections.
-5. Run sandbox E2E tests for HTTP/WebSockets, SNI/host mismatches, tenant policies, authentication, deletion, replacement, and discovery outages. Use fixtures for shared-supervisor routing until that runtime exists. Measure control-plane responsiveness under application load and test gateway-mode compatibility.
+5. Run sandbox E2E tests for HTTP/WebSockets, SNI/host mismatches, tenant policies, authentication, deletion, replacement, and discovery outages. Validate endpoint reachability and lifecycle for each enabled driver. Use fixtures for shared-supervisor routing until that runtime exists. Measure control-plane responsiveness under application load and test gateway-mode compatibility.
 
 ## Risks
 
