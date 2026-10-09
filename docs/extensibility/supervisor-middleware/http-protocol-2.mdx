@@ -1,0 +1,130 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "HTTP Protocol 2"
+sidebar-title: "HTTP Protocol 2"
+slug: "extensibility/supervisor-middleware/http-protocol-2"
+description: "Build HTTP request and response middleware with the streaming EvaluateHttp contract, and migrate a service from HTTP protocol 1."
+keywords: "Supervisor Middleware, HTTP, EvaluateHttp, Streaming, Body Modes, Preflight, Uninspectable Traffic, Migration"
+---
+
+HTTP protocol 2 is the middleware contract for HTTP requests and responses. Your service implements one bidirectional streaming RPC, `SupervisorMiddleware.EvaluateHttp`, for both directions. At preflight it decides whether to inspect the body, then receives the body either as one buffered piece or as a stream with no size limit. The same RPC lets your service decide about connections that OpenShell cannot inspect.
+
+HTTP protocol 1, the `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate` RPCs described in [Supported Operations](/extensibility/supervisor-middleware/operations), still works and is deprecated for removal in 0.2.0. WebSocket middleware is the same under both protocols.
+
+## Declare HTTP Protocol 2
+
+Your service declares the protocol for each HTTP binding in its `Describe` manifest:
+
+- Set `http_protocol_version` to `2` on every `HTTP_REQUEST` and `HTTP_RESPONSE` binding. Unset or `0` selects HTTP protocol 1, and any other value is a registration error.
+- List the body modes the binding can use in `supported_http_body_modes`: `HTTP_BODY_MODE_BUFFERED`, `HTTP_BODY_MODE_STREAM`, or both. A binding without body modes is preflight-only. It can only continue or reject, and it may set `max_payload_bytes` to `0`.
+- Add `openshell.supervisor-middleware.http-v2` to the manifest's `required_capabilities`. Gateways and supervisors that run HTTP protocol 2 support this capability, so an older peer refuses your service at startup instead of calling an HTTP protocol 1 RPC.
+
+A service implements one HTTP protocol. The gateway refuses a manifest that mixes protocol 1 and protocol 2 HTTP bindings, sets body modes on a protocol 1 binding, or has protocol 2 bindings without requiring the `http-v2` capability, or the reverse. WebSocket bindings leave both fields unset. To serve both protocols during a migration, run two registrations.
+
+## Exchange Lifecycle
+
+OpenShell opens one `EvaluateHttp` stream for each middleware stage and HTTP message, or uninspectable connection, so a request and its response use separate streams. The first event is always a preflight, and the rest of the exchange depends on the preflight result:
+
+| OpenShell sends | Your service returns |
+| --- | --- |
+| `preflight` | `preflight_result` with `continue_without_body` or `inspect`, or `reject`. |
+| `begin`, after `inspect` | Nothing. A STREAM stage may send `output_start` from here on. |
+| `buffered_body`, for BUFFERED | `buffered_result` with `unchanged` or `replacement`, or `reject`. |
+| `input_chunk` events, then one `input_end`, for STREAM | `output_start`, any number of `output_chunk` results, then `finish` after `input_end`, or `reject` at any point. |
+| `session_end`, best effort | Nothing. |
+
+After the result that ends its part of the exchange (`continue_without_body`, `buffered_result`, `finish`, or `reject`), your service may close its result stream or keep it open until `session_end`. An unset or unknown result fails the exchange.
+
+### Preflight
+
+The preflight describes the message before OpenShell reads any body byte:
+
+- `subject` is the request head (target and headers), the final response head (target, status, and headers), or an [uninspectable connection](#uninspectable-traffic).
+- `context`, `middleware_name`, and `config` identify the sandbox, the middleware, and the validated `config` from the policy entry.
+- `permitted_body_modes` lists the binding's modes that this message allows. `unavailable_body_modes` lists each supported mode that OpenShell removed, with the reason.
+- `limits` carries the chunk size, the largest buffered body, queue sizes, and the STREAM idle timeout.
+- `declared_body_bytes` is the declared length of the original body, when known. An earlier stage may replace the body, so enforce your limits on the body you receive.
+
+OpenShell runs every stage's preflight in chain order before any stage receives a body. A preflight result can continue without the body, which skips this stage but leaves the body available to later stages, or inspect it with one permitted mode. `buffered` takes a positive `max_body_bytes` no larger than `limits.max_buffered_body_bytes`. Both results can include header mutations and [diagnostics](/extensibility/supervisor-middleware/operations#common-inputs-and-results). `reject` at preflight denies the message, and a rejected request never reaches the external service.
+
+## Body Modes
+
+Choose the mode that fits your inspection:
+
+| Mode | Behavior |
+| --- | --- |
+| BUFFERED | One `buffered_body` with the complete body and any trailers, up to the selected `max_body_bytes`. Return `unchanged` or a `replacement`, where empty bytes delete the body, plus optional late header and trailer mutations. OpenShell withholds output until the chain finishes. |
+| STREAM | Ordered `input_chunk` events and one `input_end` with any trailers. Your service produces its own output: `output_start`, `output_chunk` results, and `finish`. Return every output byte, including bytes you do not change. Input and output chunk counts are independent. Set `output_body_bytes` on `output_start` when you know the exact output length. |
+
+Each chunk is at most `limits.max_chunk_bytes`, which is 64 KiB or the stage's payload limit if smaller. Trailer mutations can change or remove trailers the message carries, but cannot add new trailer names.
+
+### Body Eligibility
+
+OpenShell offers only the modes a message allows. For requests, it removes BUFFERED when the declared length exceeds the stage's payload limit. For responses, it applies these rules in order:
+
+| Reason | When | Modes removed |
+| --- | --- | --- |
+| `BODYLESS` | `HEAD` request, or status 1xx, 204, or 304. | All |
+| `PARTIAL` | Status 206, a `Content-Range` header, or `multipart/byteranges` content. | All |
+| `NO_TRANSFORM` | `Cache-Control: no-transform`. | All |
+| `ENCODED` | A `Content-Encoding` other than `identity`. | All |
+| `TRUNCATION_UNDETECTABLE` | The client request or the response status line is not HTTP/1.1, so the sandbox cannot detect a truncated stream. | STREAM |
+| `OPEN_ENDED` | `text/event-stream` or `multipart/x-mixed-replace` content. | BUFFERED |
+| `OVER_LIMIT` | The declared length exceeds the stage's payload limit. | BUFFERED |
+
+When no mode is permitted, your service can continue or reject. Use the reason to tell a bodyless response, which has nothing to inspect, from a body your service cannot inspect. To fail because your service cannot inspect a message, end the stream with gRPC status `FAILED_PRECONDITION`. OpenShell fails closed with the reason `middleware_cannot_inspect` and does not record your status message.
+
+## Headers and Delivery
+
+Header mutations follow the [header change rules](/extensibility/supervisor-middleware/operations#requests) of HTTP protocol 1. OpenShell applies them in this order: the original head, then every stage's preflight mutations, then every stage's late mutations from `buffered_result` or `output_start`, each in chain order. `begin` carries the head as it stands for your stage, including the late mutations of earlier stages.
+
+OpenShell commits the outgoing head when the last stage starts its output, so late mutations reach the external service or the sandbox. It injects provider credentials after all middleware mutations, so middleware never sees them.
+
+Request output streams to the external service while the sandbox uploads, except in these cases, where OpenShell withholds the output, up to 4 MiB, and sends it with the head: a stage selects BUFFERED, the route uses SigV4 signing or request body credential rewrite, the request goes through the forward proxy, the endpoint uses JSON-RPC, MCP, or GraphQL, or the request is HTTP/1.0 or carries `Upgrade`. Body-aware endpoints such as JSON-RPC, MCP, and GraphQL check every replaced body against policy before the next stage or the external service sees it.
+
+A response uses `Content-Length` framing when its output declares a length, and chunked framing otherwise. OpenShell flushes every chunk of a server-sent events response.
+
+## Limits and Deadlines
+
+| Limit | Value |
+| --- | --- |
+| Preflight | The binding timeout for each stage, within the 30-second chain budget. |
+| BUFFERED body | The stage's payload limit, up to 4 MiB. |
+| BUFFERED time | 2 minutes to receive, process, and deliver one body. Each exchange is also bounded by the binding timeout. |
+| STREAM size and time | No total limit. |
+| STREAM middleware stall | 30 seconds. A stage fails when it does not accept the next input in time, or returns nothing within 30 seconds after `input_end`. Time the sandbox or the external service takes to produce input does not count. |
+| STREAM request upload stall | 30 seconds without progress from the sandbox. The sandbox receives `408 Request Timeout` with `error: request_timeout`. |
+| Body chunk | 64 KiB, or the stage's payload limit if smaller. |
+
+## Uninspectable Traffic
+
+Some connections select middleware but cannot be shown to it as HTTP messages. For each HTTP protocol 2 entry that selects such a connection, OpenShell opens an `EvaluateHttp` exchange with an `uninspectable` preflight. The preflight carries the destination host and port, the network policy name, and one of these reasons: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
+
+The preflight never permits a body mode. `continue_without_body` allows the connection, and `reject` refuses it. Header mutations, failures, and timeouts refuse it too. OpenShell evaluates entries in chain order and stops at the first denial. HTTP protocol 1 entries in the same chain follow their `on_error`.
+
+Because HTTP protocol 2 middleware decides for itself, a policy can attach it to `tls: skip` endpoints. Supervisors released before HTTP protocol 2 reject such a policy, so recreate those sandboxes with a current supervisor first.
+
+## Failure Behavior
+
+HTTP protocol 2 always fails closed, and `on_error` does not apply to it. A stage error, timeout, unknown or undecodable result, `UNIMPLEMENTED` status, invalid header mutation, oversized body, or lifecycle violation fails the message:
+
+- A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection.
+- A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without a terminating chunk or error body and records a high-severity finding.
+- An uninspectable connection is refused.
+
+The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP protocol 2, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP protocol 2 still loads, and supervisors run its HTTP traffic fail-closed. When a supervisor cannot reach the service at startup, HTTP traffic that selects it fails closed too.
+
+A request or response chain cannot mix HTTP protocol 1 and HTTP protocol 2 entries. [Mix HTTP Protocols](/extensibility/supervisor-middleware/configure#mix-http-protocols) describes the policy rule.
+
+## Migrate from HTTP Protocol 1
+
+To move a service to HTTP protocol 2:
+
+1. In `Describe`, set `http_protocol_version` to `2` and `supported_http_body_modes` on every HTTP binding, and require the `openshell.supervisor-middleware.http-v2` capability.
+2. Implement `EvaluateHttp` and remove `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. A protocol 1 request evaluation maps to BUFFERED. Response modes map as follows: `HEADERS_ONLY` becomes `continue_without_body` with header mutations, `WHOLE_BODY_BYTES` becomes BUFFERED, `STREAM_BYTES` becomes STREAM, and `block_delivery` becomes `reject`.
+3. Change `on_error: fail_open` to `fail_closed` on policy entries that use the service.
+4. Separate the endpoint selectors of the service from HTTP protocol 1 entries, including `openshell/regex`.
+5. Upgrade the gateway before you deploy the new service version, because a gateway that predates HTTP protocol 2 does not start with it. Recreate sandboxes whose supervisors predate HTTP protocol 2, because those supervisors refuse the service.
+
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements HTTP protocol 2 in both modes.

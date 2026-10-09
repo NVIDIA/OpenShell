@@ -4,9 +4,20 @@
 //! Supervisor middleware registration and chain execution.
 
 pub mod headers;
+mod protocol2;
 mod remote;
 mod response;
 mod websocket;
+
+pub use protocol2::{
+    ChainHttpProtocol, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
+    HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish, HttpRequestPreflightInput,
+    HttpRequestPreflightOutcome, HttpRequestSession, HttpResponseDelivery,
+    HttpResponsePipelinePreflight, HttpResponsePipelineSession, HttpStageDiagnostics,
+    HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
+    MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_PROTOCOL_MIXED,
+    UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput, chain_http_protocol,
+};
 
 pub use response::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
@@ -31,24 +42,28 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_V2, gateway_metadata,
+    negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
+    Decision, Finding, HeaderMutation, HttpBodyMode, HttpEvent, HttpHeader, HttpRequestEvaluation,
+    HttpRequestTarget, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, HttpResultStream, InProcessMiddleware,
+    SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
-pub type MiddlewareService =
-    dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
+pub type MiddlewareService = dyn SupervisorMiddleware<
+        EvaluateWebSocketSessionStream = WebSocketResponseStream,
+        EvaluateHttpStream = HttpResultStream,
+    >;
 
 struct GeneratedMiddlewareEndpoint {
     service: Arc<MiddlewareService>,
@@ -202,6 +217,13 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
         self.endpoint.open_http_response_pre_return(requests).await
+    }
+
+    async fn open_http_stage(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        self.endpoint.open_http_stage(requests).await
     }
 }
 
@@ -360,6 +382,154 @@ impl OnError {
     }
 }
 
+/// HTTP middleware protocol of a service's HTTP bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpProtocol {
+    /// HTTP protocol 1 (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
+    /// Removed in 0.2.0.
+    V1,
+    /// HTTP protocol 2 (`EvaluateHttp`). Always fail-closed.
+    V2,
+}
+
+impl HttpProtocol {
+    /// Stable, audit-safe name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "http_protocol_1",
+            Self::V2 => "http_protocol_2",
+        }
+    }
+
+    /// Value of `http_protocol_version` for this protocol.
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        match self {
+            Self::V1 => 0,
+            Self::V2 => 2,
+        }
+    }
+}
+
+fn is_http_operation(operation: i32) -> bool {
+    matches!(
+        SupervisorMiddlewareOperation::try_from(operation),
+        Ok(SupervisorMiddlewareOperation::HttpRequest
+            | SupervisorMiddlewareOperation::HttpResponse)
+    )
+}
+
+/// Protocol of one binding: `None` for a WebSocket binding. Unset or 0 selects
+/// HTTP protocol 1 and 2 selects HTTP protocol 2. Any other version is an
+/// error, never a reason to leave the binding out of a chain.
+fn binding_http_protocol(
+    source: &str,
+    binding: &MiddlewareBinding,
+) -> Result<Option<HttpProtocol>> {
+    if !is_http_operation(binding.operation) {
+        if binding.http_protocol_version != 0 || !binding.supported_http_body_modes.is_empty() {
+            return Err(miette!(
+                "{source} sets HTTP protocol fields on a binding that is not an HTTP binding"
+            ));
+        }
+        return Ok(None);
+    }
+    match binding.http_protocol_version {
+        0 => {
+            if !binding.supported_http_body_modes.is_empty() {
+                return Err(miette!(
+                    "{source} advertises HTTP body modes on an HTTP protocol 1 binding; body modes require http_protocol_version 2"
+                ));
+            }
+            Ok(Some(HttpProtocol::V1))
+        }
+        2 => {
+            let mut modes = HashSet::with_capacity(binding.supported_http_body_modes.len());
+            for mode in &binding.supported_http_body_modes {
+                if !modes.insert(*mode)
+                    || !matches!(
+                        HttpBodyMode::try_from(*mode),
+                        Ok(HttpBodyMode::Buffered | HttpBodyMode::Stream)
+                    )
+                {
+                    return Err(miette!(
+                        "{source} advertises an invalid or duplicate HTTP body mode"
+                    ));
+                }
+            }
+            Ok(Some(HttpProtocol::V2))
+        }
+        version => Err(miette!(
+            "{source} advertises unsupported HTTP middleware protocol version {version}; use 2, or leave it unset for HTTP protocol 1"
+        )),
+    }
+}
+
+/// Protocol of a described service's HTTP bindings, or `None` when it has no
+/// HTTP binding. Registration guarantees every HTTP binding uses one protocol.
+fn manifest_http_protocol(manifest: &MiddlewareManifest) -> Option<HttpProtocol> {
+    manifest
+        .bindings
+        .iter()
+        .find(|binding| is_http_operation(binding.operation))
+        .map(|binding| {
+            if binding.http_protocol_version == 0 {
+                HttpProtocol::V1
+            } else {
+                HttpProtocol::V2
+            }
+        })
+}
+
+fn manifest_requires_http_v2(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_V2)
+    })
+}
+
+/// A service implements HTTP protocol 1 or HTTP protocol 2, never both, and a
+/// protocol 2 service requires the `http-v2` capability so that peers which
+/// predate protocol 2 refuse it at Describe.
+fn validate_manifest_http_protocol(source: &str, manifest: &MiddlewareManifest) -> Result<()> {
+    let mut protocols = HashSet::new();
+    for binding in &manifest.bindings {
+        if let Some(protocol) = binding_http_protocol(source, binding)? {
+            protocols.insert(protocol);
+        }
+    }
+    if protocols.len() > 1 {
+        return Err(miette!(
+            "{source} mixes HTTP protocol 1 and HTTP protocol 2 bindings; one service implements one HTTP protocol, so serve each protocol from its own registration"
+        ));
+    }
+    let requires_http_v2 = manifest_requires_http_v2(manifest);
+    if protocols.contains(&HttpProtocol::V2) && !requires_http_v2 {
+        return Err(miette!(
+            "{source} advertises HTTP protocol 2 bindings but does not require the {SUPERVISOR_MIDDLEWARE_HTTP_V2} capability"
+        ));
+    }
+    if protocols.contains(&HttpProtocol::V1) && requires_http_v2 {
+        return Err(miette!(
+            "{source} requires {SUPERVISOR_MIDDLEWARE_HTTP_V2} but advertises HTTP protocol 1 bindings"
+        ));
+    }
+    Ok(())
+}
+
+/// HTTP protocol 1 bindings and protocol 2 bindings with body modes carry
+/// payloads. A protocol 2 binding without body modes can only continue or
+/// reject at preflight.
+fn binding_requires_payload_limit(
+    binding: &MiddlewareBinding,
+    http_protocol: Option<HttpProtocol>,
+) -> bool {
+    http_protocol != Some(HttpProtocol::V2) || !binding.supported_http_body_modes.is_empty()
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
     pub name: String,
@@ -405,6 +575,9 @@ pub struct DescribedChainEntry {
     binding: Option<MiddlewareBinding>,
     max_payload_bytes: usize,
     timeout: Duration,
+    /// HTTP protocol of the resolved binding, or of an undescribed service
+    /// the gateway described as HTTP protocol 2.
+    http_protocol: Option<HttpProtocol>,
 }
 
 struct DescribedChain {
@@ -417,8 +590,14 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
+    /// Effective failure policy. HTTP protocol 2 entries always fail closed,
+    /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        self.entry.on_error
+        if self.http_protocol == Some(HttpProtocol::V2) {
+            OnError::FailClosed
+        } else {
+            self.entry.on_error
+        }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -431,6 +610,34 @@ impl DescribedChainEntry {
     /// imposes no payload-buffering limit on the chain.
     pub fn is_resolved(&self) -> bool {
         self.binding.is_some()
+    }
+
+    /// HTTP protocol of this entry: the resolved HTTP binding's protocol, or
+    /// HTTP protocol 2 for an undescribed service the gateway described as
+    /// such. `None` for WebSocket bindings and other unresolved entries.
+    #[must_use]
+    pub fn http_protocol(&self) -> Option<HttpProtocol> {
+        self.http_protocol
+    }
+
+    /// Policy-local middleware config name.
+    #[must_use]
+    pub fn config_name(&self) -> &str {
+        &self.entry.name
+    }
+
+    /// Built-in middleware name or operator-owned registration name.
+    #[must_use]
+    pub fn implementation(&self) -> &str {
+        &self.entry.implementation
+    }
+
+    /// True when the resolved HTTP protocol 2 binding can select `mode`.
+    #[must_use]
+    pub fn supports_http_body_mode(&self, mode: HttpBodyMode) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.supported_http_body_modes.contains(&(mode as i32)))
     }
 }
 
@@ -651,6 +858,16 @@ impl MiddlewareDispatch {
             Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
         }
     }
+
+    async fn open_http_stage(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_stage(receiver).await,
+            Self::Grpc(service) => service.open_http_stage(receiver).await,
+        }
+    }
 }
 
 struct MiddlewareServiceState {
@@ -729,6 +946,12 @@ impl MiddlewareDiagnosticPolicy {
 pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
+    /// Delivered services this registry could not describe, keyed by
+    /// registration name, with the HTTP protocol the gateway described.
+    undescribed_services: Arc<HashMap<String, SupervisorMiddlewareService>>,
+    /// Policy configs already warned that `fail_open` does not apply to their
+    /// HTTP protocol 2 service.
+    fail_open_warnings: Arc<std::sync::Mutex<HashSet<String>>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
     work_admission: Arc<Semaphore>,
@@ -765,6 +988,8 @@ impl Default for MiddlewareRegistry {
         Self {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
+            undescribed_services: Arc::default(),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(HashSet::new()),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
@@ -847,8 +1072,12 @@ fn middleware_denial_reason(config_name: &str, reason_code: Option<&str>) -> Str
     )
 }
 
-fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
-    if binding.max_payload_bytes == 0 {
+fn validate_payload_limit(
+    source: &str,
+    binding: &MiddlewareBinding,
+    required: bool,
+) -> Result<usize> {
+    if required && binding.max_payload_bytes == 0 {
         return Err(miette!("{source} must advertise a non-zero payload limit"));
     }
     if binding.max_payload_bytes > MAX_MIDDLEWARE_PAYLOAD_BYTES as u64 {
@@ -905,6 +1134,7 @@ fn validate_manifest_bindings(
         return Err(miette!("{source} describes no bindings"));
     }
 
+    validate_manifest_http_protocol(source, manifest)?;
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
         supported_binding(source, binding)?;
@@ -913,18 +1143,22 @@ fn validate_manifest_bindings(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let advertised = validate_payload_limit(source, binding)?;
+        let payload_limit_required =
+            binding_requires_payload_limit(binding, binding_http_protocol(source, binding)?);
+        let advertised = validate_payload_limit(source, binding, payload_limit_required)?;
         if binding.request_timeout.is_some() {
             middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
+        if payload_limit_required
+            && operator_max_payload_bytes.is_some_and(|limit| limit > advertised)
+        {
             return Err(miette!(
                 "{source} max_payload_bytes ({}) exceeds the binding capability ({advertised})",
                 operator_max_payload_bytes.expect("operator limit checked above")
             ));
         }
-        if operator_max_payload_bytes == Some(0) {
+        if payload_limit_required && operator_max_payload_bytes == Some(0) {
             return Err(miette!(
                 "{source} must configure max_payload_bytes for every payload-bearing binding"
             ));
@@ -1252,6 +1486,13 @@ impl MiddlewareRegistry {
                 )
                 .map_err(|error| miette!(error.to_string()))?,
             );
+            // Supervisors use the described protocol while they cannot
+            // describe the service themselves.
+            let registration = SupervisorMiddlewareService {
+                http_protocol_version: manifest_http_protocol(&manifest)
+                    .map_or(0, HttpProtocol::version),
+                ..registration
+            };
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -1270,12 +1511,155 @@ impl MiddlewareRegistry {
         Ok(Self {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
+            undescribed_services: Arc::default(),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(middleware_names),
             negotiated_extensions: Arc::new(negotiated_extensions),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         })
+    }
+
+    /// Keep delivered services this registry could not describe, such as when
+    /// a supervisor starts while they are unreachable. While a service stays
+    /// undescribed, HTTP traffic that selects it fails closed when the gateway
+    /// described it as HTTP protocol 2, instead of following `on_error`.
+    #[must_use]
+    pub fn with_undescribed_services(mut self, services: &[SupervisorMiddlewareService]) -> Self {
+        self.undescribed_services = Arc::new(
+            services
+                .iter()
+                .filter(|service| !self.middleware_names.contains(&service.name))
+                .map(|service| (service.name.clone(), service.clone()))
+                .collect(),
+        );
+        self
+    }
+
+    /// HTTP protocol of a registered or delivered middleware, without a
+    /// network call. `None` when the middleware has no HTTP binding or its
+    /// protocol is unknown, such as an undescribed service the gateway did not
+    /// describe as HTTP protocol 2.
+    #[must_use]
+    pub fn http_protocol_of(&self, implementation: &str) -> Option<HttpProtocol> {
+        for state in self.services.iter() {
+            let Some(manifest) = state.manifest.get() else {
+                continue;
+            };
+            if ChainRunner::attachment_name(state, manifest) == implementation {
+                return manifest_http_protocol(manifest);
+            }
+        }
+        self.undescribed_services
+            .get(implementation)
+            .filter(|service| service.http_protocol_version == HttpProtocol::V2.version())
+            .map(|_| HttpProtocol::V2)
+    }
+
+    /// Names of registered and delivered middleware that runs HTTP protocol
+    /// 2. Policy validation exempts them from the `tls: skip` conflict rule.
+    #[must_use]
+    pub fn http_protocol_2_middleware(&self) -> Vec<String> {
+        self.middleware_names
+            .iter()
+            .chain(self.undescribed_services.keys())
+            .filter(|name| self.is_http_v2(name))
+            .cloned()
+            .collect()
+    }
+
+    /// True when `implementation` runs HTTP protocol 2. Policy validation uses
+    /// it to exempt such middleware from the `tls: skip` conflict rule: an
+    /// HTTP protocol 2 service decides about uninspectable traffic itself.
+    #[must_use]
+    pub fn is_http_v2(&self, implementation: &str) -> bool {
+        self.http_protocol_of(implementation) == Some(HttpProtocol::V2)
+    }
+
+    /// Gateway rules for policies that use HTTP protocol 2 middleware.
+    ///
+    /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
+    ///   protocol 2, including one with WebSocket bindings, until 0.2.0. HTTP
+    ///   protocol 2 is always fail-closed, and a supervisor that predates it
+    ///   cannot describe the service and would skip it under `fail_open`.
+    /// - Two entries whose endpoint selectors may overlap must use the same
+    ///   HTTP protocol for every HTTP operation both serve: one HTTP message
+    ///   never runs both protocols.
+    ///
+    /// Supervisors do not apply these rules to stored policies; they run an
+    /// HTTP protocol 2 entry fail-closed and refuse a mixed chain at runtime.
+    pub async fn validate_http_protocol_rules(&self, policy: &SandboxPolicy) -> Result<()> {
+        let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
+        let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
+        configs.sort_unstable_by_key(|(name, _)| name.as_str());
+        let manifest_for = |implementation: &str| {
+            manifests
+                .iter()
+                .find(|(state, manifest)| {
+                    ChainRunner::attachment_name(state, manifest) == implementation
+                })
+                .map(|(_, manifest)| manifest)
+        };
+        for (name, config) in &configs {
+            let Some(manifest) = manifest_for(&config.middleware) else {
+                continue;
+            };
+            if OnError::parse(&config.on_error)? == OnError::FailOpen
+                && manifest_http_protocol(manifest) == Some(HttpProtocol::V2)
+            {
+                return Err(miette!(
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP protocol 2 middleware is always fail-closed, and until 0.2.0 supervisors that predate HTTP protocol 2 would skip it under fail_open; use fail_closed",
+                    config.middleware
+                ));
+            }
+        }
+        for (index, (left_name, left)) in configs.iter().enumerate() {
+            let Some(left_manifest) = manifest_for(&left.middleware) else {
+                continue;
+            };
+            for (right_name, right) in &configs[index + 1..] {
+                let Some(right_manifest) = manifest_for(&right.middleware) else {
+                    continue;
+                };
+                for operation in [
+                    SupervisorMiddlewareOperation::HttpRequest,
+                    SupervisorMiddlewareOperation::HttpResponse,
+                ] {
+                    let protocol = |manifest: &MiddlewareManifest| {
+                        manifest
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.operation == operation as i32)
+                            .map(|_| manifest_http_protocol(manifest))
+                    };
+                    let (Some(left_protocol), Some(right_protocol)) =
+                        (protocol(left_manifest), protocol(right_manifest))
+                    else {
+                        continue;
+                    };
+                    if left_protocol == right_protocol
+                        || !selectors_may_overlap(left.endpoints.as_ref(), right.endpoints.as_ref())
+                    {
+                        continue;
+                    }
+                    let describe = |protocol: Option<HttpProtocol>| match protocol {
+                        Some(HttpProtocol::V2) => "HTTP protocol 2",
+                        _ => "HTTP protocol 1",
+                    };
+                    let operation_name = match operation {
+                        SupervisorMiddlewareOperation::HttpResponse => "HTTP responses",
+                        _ => "HTTP requests",
+                    };
+                    return Err(miette!(
+                        "middleware configs '{left_name}' ({}) and '{right_name}' ({}) may select the same destination for {operation_name}, and one HTTP message cannot run both protocols; separate their endpoint selectors, or move both services to the same HTTP protocol",
+                        describe(left_protocol),
+                        describe(right_protocol),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate implementation-owned configuration for every middleware entry.
@@ -1372,6 +1756,8 @@ impl ChainRunner {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
+                undescribed_services: Arc::default(),
+                fail_open_warnings: Arc::default(),
                 middleware_names: Arc::new(HashSet::new()),
                 negotiated_extensions: Arc::new(Vec::new()),
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
@@ -1555,30 +1941,48 @@ impl ChainRunner {
             let Some((state, manifest)) = manifests.iter().find(|(state, manifest)| {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
+                // HTTP protocol 2 is fail-closed also while this registry
+                // cannot describe the service.
+                let http_protocol = is_http_operation(operation as i32)
+                    .then(|| self.registry.http_protocol_of(&entry.implementation))
+                    .flatten();
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
                     binding: None,
                     max_payload_bytes: 0,
                     timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
+                    http_protocol,
                 });
                 continue;
             };
-            let Some(binding) = Self::binding(manifest, operation, phase).copied() else {
+            let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
                 // The config remains globally ordered, but it does not
                 // participate in this exact operation/phase chain.
                 unbound.push(entry);
                 continue;
             };
+            let http_protocol =
+                binding_http_protocol(&format!("middleware '{}'", entry.implementation), &binding)?;
+            if http_protocol == Some(HttpProtocol::V2) && entry.on_error == OnError::FailOpen {
+                self.warn_fail_open_not_applied(&entry);
+            }
             let timeout = state.timeout_for_binding(&binding)?;
-            let advertised = validate_payload_limit("middleware manifest", &binding)?;
-            let max_payload_bytes = state.operator_max_payload_bytes.unwrap_or(advertised);
+            let payload_limit_required = binding_requires_payload_limit(&binding, http_protocol);
+            let advertised =
+                validate_payload_limit("middleware manifest", &binding, payload_limit_required)?;
+            let max_payload_bytes = if payload_limit_required {
+                state.operator_max_payload_bytes.unwrap_or(advertised)
+            } else {
+                0
+            };
             described_entries.push(DescribedChainEntry {
                 entry,
                 service: Some(Arc::clone(state)),
                 binding: Some(binding),
                 max_payload_bytes,
                 timeout,
+                http_protocol,
             });
         }
         ensure_chain_capacity(described_entries.len())?;
@@ -1586,6 +1990,33 @@ impl ChainRunner {
             entries: described_entries,
             unbound,
         })
+    }
+
+    /// HTTP protocol of a registered or delivered middleware, without a
+    /// network call. See [`MiddlewareRegistry::http_protocol_of`].
+    #[must_use]
+    pub fn http_protocol_of(&self, implementation: &str) -> Option<HttpProtocol> {
+        self.registry.http_protocol_of(implementation)
+    }
+
+    /// Warn once per policy config that its `fail_open` does not apply to an
+    /// HTTP protocol 2 service. The gateway rejects such policies, but one
+    /// stored before the service moved to HTTP protocol 2 still loads.
+    fn warn_fail_open_not_applied(&self, entry: &ChainEntry) {
+        let key = format!("{}\0{}", entry.name, entry.implementation);
+        let first = self
+            .registry
+            .fail_open_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+        if first {
+            tracing::warn!(
+                config = %entry.name,
+                middleware = %entry.implementation,
+                "middleware config sets on_error: fail_open, but its service runs HTTP protocol 2, which always fails closed; HTTP traffic fails closed"
+            );
+        }
     }
 
     pub async fn validate_config(
@@ -1684,6 +2115,30 @@ impl ChainRunner {
         admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
+        // This engine runs HTTP protocol 1 only. A chain with an HTTP protocol
+        // 2 entry runs on the protocol 2 pipeline; one that reaches here mixes
+        // both protocols and fails closed.
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.http_protocol() == Some(HttpProtocol::V2))
+        {
+            return Ok(ChainOutcome {
+                allowed: false,
+                reason: format!("middleware_failed: {MIDDLEWARE_PROTOCOL_MIXED}"),
+                body: input.body,
+                header_mutations: Vec::new(),
+                findings: Vec::new(),
+                metadata: BTreeMap::new(),
+                applied: vec![MiddlewareInvocation {
+                    name: entry.entry.name.clone(),
+                    implementation: entry.entry.implementation.clone(),
+                    decision: Decision::Deny,
+                    transformed: false,
+                    failed: true,
+                }],
+                denial: None,
+            });
+        }
         let HttpRequestInput {
             request_id,
             sandbox_id,
@@ -2054,6 +2509,34 @@ impl ChainRunner {
     }
 }
 
+/// Conservatively determine whether two endpoint selectors can select the same
+/// host. Invalid selectors are reported by static policy validation.
+fn selectors_may_overlap(
+    left: Option<&openshell_core::proto::MiddlewareEndpointSelector>,
+    right: Option<&openshell_core::proto::MiddlewareEndpointSelector>,
+) -> bool {
+    use openshell_core::host_pattern::{HostPattern, HostSelector};
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let (Ok(left_selector), Ok(right_selector)) = (
+        HostSelector::new(&left.include, &left.exclude),
+        HostSelector::new(&right.include, &right.exclude),
+    ) else {
+        return false;
+    };
+    let overlaps = |selector: &HostSelector, other: &HostSelector, patterns: &[String]| {
+        patterns
+            .iter()
+            .filter_map(|pattern| HostPattern::new(pattern).ok())
+            .any(|pattern| {
+                selector.may_match_pattern(&pattern) && other.may_match_pattern(&pattern)
+            })
+    };
+    overlaps(&left_selector, &right_selector, &right.include)
+        || overlaps(&right_selector, &left_selector, &left.include)
+}
+
 /// Sort middleware by policy-defined priority. Valid policies have unique order
 /// values; the name comparison only keeps direct internal callers deterministic.
 pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
@@ -2231,6 +2714,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: self.advertise_protocol.then(|| {
@@ -2376,6 +2860,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2473,6 +2958,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: Some(proto_duration("10ms")),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2740,6 +3226,15 @@ mod tests {
     impl SupervisorMiddleware for ScriptedService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn evaluate_web_socket_session(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
@@ -2760,6 +3255,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2801,6 +3297,15 @@ mod tests {
     impl SupervisorMiddleware for SlowService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn evaluate_web_socket_session(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
@@ -2821,6 +3326,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: self.binding_timeout,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -2866,6 +3372,15 @@ mod tests {
     impl SupervisorMiddleware for TwoStageService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn evaluate_web_socket_session(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
@@ -2886,6 +3401,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 256 * 1024,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3142,6 +3658,15 @@ mod tests {
     impl SupervisorMiddleware for RecordingService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn evaluate_web_socket_session(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
@@ -3162,6 +3687,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3224,6 +3750,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3269,6 +3796,15 @@ mod tests {
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn evaluate_web_socket_session(
             &self,
             _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
@@ -3289,6 +3825,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3600,6 +4137,8 @@ mod tests {
                 }),
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
+            undescribed_services: Arc::default(),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
@@ -3795,6 +4334,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3828,6 +4368,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: u64::MAX,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3850,6 +4391,7 @@ mod tests {
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_payload_bytes: 4096,
             request_timeout: None,
+            ..Default::default()
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -3887,6 +4429,7 @@ mod tests {
                     seconds: 0,
                     nanos: 500_000_000,
                 }),
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3908,6 +4451,7 @@ mod tests {
             phase: phase as i32,
             max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
             request_timeout: Some(proto_duration("500ms")),
+            ..Default::default()
         };
         let mut manifest = MiddlewareManifest {
             name: "example/websocket".into(),
@@ -3941,6 +4485,7 @@ mod tests {
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -3971,6 +4516,7 @@ mod tests {
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -4051,6 +4597,7 @@ mod tests {
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_payload_bytes: 4096,
                     request_timeout: Some(proto_duration(timeout)),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -5114,6 +5661,15 @@ mod tests {
     impl SupervisorMiddleware for OpenAiRedactionService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
+        type EvaluateHttpStream = HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: Request<tonic::Streaming<HttpEvent>>,
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpStream>, TonicStatus> {
+            Err(TonicStatus::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn describe(
             &self,
             _request: Request<MiddlewareDescribeRequest>,
@@ -5135,6 +5691,7 @@ mod tests {
                         seconds: 1,
                         nanos: 0,
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(

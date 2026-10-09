@@ -14,8 +14,8 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttpRequest` |
-| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpResponsePreReturn.Evaluate` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttp`, or `EvaluateHttpRequest` for HTTP protocol 1 |
+| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttp`, or `HttpResponsePreReturn.Evaluate` for HTTP protocol 1 |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
@@ -39,6 +39,12 @@ OpenShell never forwards free-form text from your service to the sandbox or to l
 ## HTTP
 
 HTTP middleware can check a request before it leaves the sandbox, and the response before the sandbox receives it. A service can support either operation or both.
+
+<Note>
+
+This section describes HTTP protocol 1, which is deprecated for removal in 0.2.0. [HTTP Protocol 2](/extensibility/supervisor-middleware/http-protocol-2) describes its replacement, including its limits and how to migrate.
+
+</Note>
 
 ### Requests
 
@@ -246,6 +252,6 @@ A denied message closes the connection with code `1008`. When middleware fails, 
 | Time to assemble a message | WebSocket messages | 30 seconds without progress, or 2 minutes in total. |
 | Time to forward a message | WebSocket messages | 2 minutes. |
 
-When a payload exceeds one middleware's limit, that middleware fails. Other middleware keep their own limits.
+When a payload exceeds one middleware's limit, that middleware fails. Other middleware keep their own limits. This table describes HTTP protocol 1 for HTTP traffic. [HTTP Protocol 2](/extensibility/supervisor-middleware/http-protocol-2#limits-and-deadlines) lists its own limits.
 
 Middleware evaluation capacity in each sandbox is shared by all operations. When it is full, OpenShell returns `503 Service Unavailable` for an HTTP request before reading its body. When WebSocket message assembly capacity is full, OpenShell closes the connection with code `1013`.

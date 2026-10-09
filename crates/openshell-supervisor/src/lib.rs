@@ -2591,12 +2591,15 @@ async fn load_policy_with_gateway(
 
             // Install the in-process catalog before any external connection can
             // fail. A newly started sandbox must always be able to resolve built-in
-            // bindings, even while operator-run services are unavailable.
-            install_builtin_middleware_registry(&engine).await?;
+            // bindings, even while operator-run services are unavailable. Entries
+            // that use those services follow their on_error, except HTTP traffic
+            // that selects a service the gateway described as HTTP protocol 2,
+            // which fails closed.
+            install_builtin_middleware_registry(&engine, &snapshot.supervisor_middleware_services)
+                .await?;
 
             // Connect operator-registered middleware services. A connect/describe
-            // failure keeps the built-in registry active so each request's
-            // `on_error` policy governs matched traffic. The policy poll loop
+            // failure keeps the built-in registry active. The policy poll loop
             // retries the install without waiting for a config change.
             let middleware_services = snapshot.supervisor_middleware_services.clone();
             let middleware_registry_status = if middleware_services.is_empty() {
@@ -2642,7 +2645,7 @@ async fn load_policy_with_gateway(
                         serde_json::json!(middleware_services.len())
                     )
                     .message(format!(
-                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, matched traffic follows on_error except HTTP protocol 2 middleware, which fails closed [error:{error}]"
                     ))
                     .build()
             );
@@ -2764,6 +2767,7 @@ fn prepare_startup_configuration(
             "Provider environment revision changed during configuration preparation"
         ));
     }
+    register_http_protocol_2_middleware(&snapshot.supervisor_middleware_services);
     let engine = OpaEngine::from_proto(policy)?;
     let process_policy = SandboxPolicy::try_from(policy.clone())?;
     let credentials = prepare_provider_environment(provider)?;
@@ -3023,6 +3027,7 @@ async fn reload_gateway_configuration_runtime(
     vm_identity: Option<VmPolicyIdentity>,
     commit_credentials: impl FnOnce(),
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
+    register_http_protocol_2_middleware(middleware.desired_services);
     if let (Some(identity), Some(policy)) = (vm_identity, policy) {
         // Global policy changes also reach this path. Validate before any
         // policy generation, middleware or provider credentials are committed.
@@ -3768,13 +3773,31 @@ async fn connect_middleware_registry(
     }
 }
 
-async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
+async fn install_builtin_middleware_registry(
+    opa_engine: &OpaEngine,
+    undescribed: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> Result<()> {
     let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
         openshell_supervisor_middleware_builtins::services(),
         Vec::new(),
     )
-    .await?;
+    .await?
+    .with_undescribed_services(undescribed);
     opa_engine.replace_middleware_registry(registry)
+}
+
+/// Register the delivered services the gateway described as HTTP protocol 2.
+/// They decide about `tls: skip` tunnels at runtime, so policy validation
+/// exempts them from the static conflict rule.
+fn register_http_protocol_2_middleware(
+    services: &[openshell_core::proto::SupervisorMiddlewareService],
+) {
+    openshell_policy::set_http_protocol_2_middleware(
+        services
+            .iter()
+            .filter(|service| service.http_protocol_version == 2)
+            .map(|service| service.name.clone()),
+    );
 }
 
 /// Wait the configured poll interval, but never past the point at which an
@@ -8446,7 +8469,7 @@ network_policies:
     async fn assert_gateway_reload_rejects_and_repairs(registry_changed: bool) {
         let policy = proto_provenance_policy_fixture();
         let engine = OpaEngine::from_proto(&policy).expect("build initial gateway policy");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install initial registry");
         let generation = engine.current_generation();
@@ -8641,7 +8664,7 @@ network_policies:
     #[tokio::test]
     async fn failed_external_startup_registry_build_preserves_installed_builtins() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install built-in middleware registry");
         let builtins_generation = engine.current_generation();
@@ -8663,7 +8686,7 @@ network_policies:
     #[tokio::test]
     async fn unavailable_middleware_reload_keeps_last_known_good_runtime_active() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&engine, &[])
             .await
             .expect("install built-in middleware registry");
         let active_generation = engine.current_generation();

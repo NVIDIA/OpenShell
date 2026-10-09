@@ -90,6 +90,8 @@ navigation:
       path: extensibility/supervisor-middleware/configure.mdx
     - page: "Supported Operations"
       path: extensibility/supervisor-middleware/operations.mdx
+    - page: "HTTP Protocol 2"
+      path: extensibility/supervisor-middleware/http-protocol-2.mdx
   - page: "Gateway Interceptors"
     path: extensibility/gateway-interceptors.mdx
   - page: "Drivers"

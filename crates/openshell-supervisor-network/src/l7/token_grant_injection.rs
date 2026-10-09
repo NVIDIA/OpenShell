@@ -74,11 +74,39 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
     Arc::new(SpiffeTokenGrantResolver)
 }
 
+/// Token grant headers injected into a request head.
+///
+/// A streamed request body commits its head after late middleware header
+/// mutations, so the relay re-applies these over them. On every other path
+/// injection follows all middleware mutations.
+#[derive(Default)]
+pub struct InjectedHeaders(Vec<(String, String)>);
+
+impl InjectedHeaders {
+    pub fn apply(&self, raw_header: &[u8]) -> Result<Vec<u8>> {
+        let mut raw_header = raw_header.to_vec();
+        for (name, value) in &self.0 {
+            raw_header = inject_header(&raw_header, name, value)?;
+        }
+        Ok(raw_header)
+    }
+}
+
 /// Resolves one endpoint-bound grant per protected header before rewriting a request.
 ///
 /// Each header independently uses its most-specific matching binding. Every selected
 /// grant must succeed; callers must not forward the request when this returns an error.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
+    inject_token_grants(req, ctx)
+        .await
+        .map(|(request, _injected)| request)
+}
+
+/// [`inject_if_needed`], also returning the injected headers.
+pub async fn inject_token_grants(
+    req: L7Request,
+    ctx: &L7EvalContext,
+) -> Result<(L7Request, InjectedHeaders)> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
     let credentials = match ctx.dynamic_credentials.as_ref() {
         Some(dynamic_credentials) => {
@@ -110,7 +138,7 @@ pub(super) async fn inject_for_admitted_owners(
     ctx: &L7EvalContext,
     snapshot: &ProviderCredentialSnapshot,
     admitted_owners: &HashSet<String>,
-) -> Result<L7Request> {
+) -> Result<(L7Request, InjectedHeaders)> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
     if snapshot
         .dynamic_credentials
@@ -147,10 +175,10 @@ async fn inject_selected(
     req: L7Request,
     ctx: &L7EvalContext,
     credentials: Vec<(String, ProviderProfileCredential)>,
-) -> Result<L7Request> {
+) -> Result<(L7Request, InjectedHeaders)> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
     if credentials.is_empty() {
-        return Ok(req);
+        return Ok((req, InjectedHeaders::default()));
     }
     let resolver = ctx
         .token_grant_resolver
@@ -202,10 +230,8 @@ async fn inject_selected(
         }
     }
 
-    let mut raw_header = req.raw_header;
-    for (name, value) in headers {
-        raw_header = inject_header(&raw_header, &name, &value)?;
-    }
+    let injected = InjectedHeaders(headers);
+    let raw_header = injected.apply(&req.raw_header)?;
     for (provider_key, _) in credentials {
         ocsf_emit!(
             HttpActivityBuilder::new(ocsf_ctx())
@@ -227,7 +253,7 @@ async fn inject_selected(
                 .build()
         );
     }
-    Ok(L7Request { raw_header, ..req })
+    Ok((L7Request { raw_header, ..req }, injected))
 }
 
 fn select_token_grants(

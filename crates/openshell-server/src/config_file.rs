@@ -378,6 +378,9 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
                     ToString::to_string,
                 ),
             allow_insecure_transport: config.allow_insecure_transport,
+            // The middleware registry records it when it describes the
+            // service.
+            http_protocol_version: 0,
         })
     }
 }

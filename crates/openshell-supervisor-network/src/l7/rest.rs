@@ -8,16 +8,22 @@
 //! and chunked transfer encoding for body framing.
 
 mod http_response;
+mod request_body;
 
 pub(crate) use http_response::{
     DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
 };
-use http_response::{RelayResponseOptions, relay_response};
+use http_response::{RelayResponseOptions, finish_response, relay_response};
 #[cfg(test)]
 use http_response::{
     http_response_middleware_fail_open_finding_event, http_response_middleware_invocation_events,
     parse_connection_close, parse_status_code, response_is_event_stream,
     strip_response_integrity_headers,
+};
+pub(crate) use request_body::{
+    LiveRequestFailure, RequestBodyReader, prepare_request_body_stream,
+    rebuild_request_for_live_body, rebuild_request_headers_only,
+    rebuild_request_with_middleware_body,
 };
 
 use crate::l7::EndpointObserver;
@@ -900,6 +906,33 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    Box::pin(relay_http_request_with_body_guarded_observed(
+        req,
+        client,
+        upstream,
+        options,
+        None,
+        response_middleware,
+        observer,
+    ))
+    .await
+}
+
+/// Relay one request and its response. `live_body` carries a body that HTTP
+/// protocol 2 request middleware streams; `req` then holds only its head.
+pub(crate) async fn relay_http_request_with_body_guarded_observed<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    live_body: Option<&mut crate::l7::middleware::RequestBodyStream>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
     ensure_credential_generation_current(options)?;
@@ -911,6 +944,39 @@ where
     let header_str = std::str::from_utf8(&req.raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let client_requested_upgrade = client_requested_upgrade(header_str);
+    if let Some(body) = live_body {
+        // Signing, body rewriting, and MCP validation need the whole body, so
+        // their routes withhold middleware output instead.
+        if options.credential_signing.is_sigv4()
+            || options.request_body_credential_rewrite
+            || options.mcp_request_validation.is_some()
+        {
+            return Err(miette!(
+                "this route cannot stream a request middleware body to the upstream"
+            ));
+        }
+        let relayed = request_body::relay_live_request_and_response(
+            req,
+            client,
+            upstream,
+            body,
+            options,
+            RelayResponseOptions {
+                websocket_extensions: options.websocket_extensions,
+                websocket: None,
+                client_requested_upgrade,
+                observer,
+            },
+            response_middleware,
+        )
+        .await;
+        if let Err(error) = &relayed
+            && let Some(reason) = error.downcast_ref::<BodyCredentialError>()
+        {
+            emit_uninspected_body_credential_denial(req, &options, *reason);
+        }
+        return relayed;
+    }
     let is_websocket_request = request_is_websocket_upgrade(&req.raw_header[..header_end]);
     let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
         None
@@ -2502,7 +2568,7 @@ pub(crate) fn upgrade_refusal_for_protocol(
 /// upstream `101` may reach the client. A refusal based on this test therefore
 /// covers every request either one treats as an upgrade. Headers that are not
 /// UTF-8 return false; the shared relay rejects them before forwarding.
-fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+pub(crate) fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -2892,6 +2958,26 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
     send_json_response(policy_name, body, client, "503 Service Unavailable").await
+}
+
+/// Send a platform-owned 408 when the sandbox stops sending a request body
+/// that request middleware is processing.
+pub(crate) async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("error".to_string(), serde_json::json!("request_timeout"));
+        fields.insert(
+            "detail".to_string(),
+            serde_json::json!("Request body was not received in time"),
+        );
+    }
+    send_json_response(policy_name, body, client, "408 Request Timeout").await
 }
 
 async fn send_forbidden_json<C: AsyncWrite + Unpin>(
@@ -3848,6 +3934,7 @@ mod tests {
                     } as i32,
                     max_payload_bytes: 4096,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6818,6 +6905,7 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
         }
     }
 

@@ -299,9 +299,10 @@ async fn admitted_owners_select_grants_independently_per_header() {
             .map(|owner| (*owner).to_string())
             .collect::<HashSet<_>>();
 
-        let rewritten = inject_for_admitted_owners(request(), &ctx, &state.snapshot(), &owners)
-            .await
-            .unwrap();
+        let (rewritten, _) =
+            inject_for_admitted_owners(request(), &ctx, &state.snapshot(), &owners)
+                .await
+                .unwrap();
         let bytes = String::from_utf8(rewritten.raw_header).unwrap();
 
         // A grant whose owner did not admit the request is never acquired, and its

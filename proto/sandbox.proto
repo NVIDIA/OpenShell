@@ -478,4 +478,12 @@ message SupervisorMiddlewareService {
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;
+  // HTTP middleware protocol of the service's HTTP bindings, as the gateway
+  // described it: 2 for HTTP protocol 2, and 0 for HTTP protocol 1 or no HTTP
+  // binding. Set by the gateway, never by operators. HTTP protocol 2 is always
+  // fail-closed, so while a supervisor cannot describe the service itself,
+  // HTTP traffic that selects it fails closed whatever on_error says.
+  // Supervisors that predate this field ignore it; they cannot run services
+  // that require HTTP protocol 2.
+  uint32 http_protocol_version = 8;
 }

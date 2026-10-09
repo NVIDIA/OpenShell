@@ -3,14 +3,15 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, SupervisorMiddlewareEndpoint,
+    HttpRequestView, HttpResponseResultStream, HttpResultStream, SupervisorMiddlewareEndpoint,
     WebSocketResponseStream,
 };
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent, MiddlewareDescribeRequest,
-    MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
+    HttpEvent, HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent,
+    MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -117,6 +118,14 @@ impl GrpcMiddlewareService {
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         self.service.open_http_response_pre_return(receiver).await
     }
+
+    /// Open a remote HTTP protocol 2 exchange through the gRPC adapter.
+    pub async fn open_http_stage(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        self.service.open_http_stage(receiver).await
+    }
 }
 
 #[derive(Clone)]
@@ -207,6 +216,20 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         let mut client = self.response_client.clone();
         let responses = client
             .evaluate(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
+    }
+
+    async fn open_http_stage(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_http(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?

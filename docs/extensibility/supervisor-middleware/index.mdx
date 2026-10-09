@@ -47,13 +47,13 @@ OpenShell checks network policy first, so middleware only sees traffic that poli
 
 Each middleware decides whether to allow, deny, or change the traffic. A denial blocks the request even when network policy allows it. If middleware fails or its service is unavailable, OpenShell blocks the affected traffic by default.
 
-Middleware can handle three operations: HTTP requests, HTTP responses, and the text messages an agent sends over a WebSocket connection. Each middleware declares which operations it supports. [Supported Operations](/extensibility/supervisor-middleware/operations) describes each one.
+Middleware can handle three operations: HTTP requests, HTTP responses, and the text messages an agent sends over a WebSocket connection. Each middleware declares which operations it supports. [Supported Operations](/extensibility/supervisor-middleware/operations) describes each one. HTTP middleware uses one of two protocols. [HTTP Protocol 2](/extensibility/supervisor-middleware/http-protocol-2) streams request and response bodies and always fails closed. HTTP protocol 1 is deprecated for removal in 0.2.0.
 
 ## Current Limitations
 
 - Middleware does not inspect WebSocket binary messages or messages that the external service sends to the agent.
 - Response middleware cannot inspect the body of compressed, partial, or `Cache-Control: no-transform` responses.
-- Middleware cannot inspect traffic to endpoints that use `tls: skip`.
+- Middleware cannot inspect traffic to endpoints that use `tls: skip`, h2c, unsupported tunnels, raw TCP, or SQL passthrough. HTTP protocol 2 middleware can [allow or refuse](/extensibility/supervisor-middleware/http-protocol-2#uninspectable-traffic) such connections, but cannot see their content.
 
 If your deployment requires inspection of this traffic, middleware cannot enforce that requirement today.
 
@@ -85,7 +85,7 @@ Every middleware service implements these RPCs:
 - `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/overview#protocol-negotiation) metadata and the [expected audience](/extensibility/overview#confirm-the-audience-at-startup).
 - `ValidateConfig` checks the `config` object from a policy entry. The gateway calls it before it accepts a policy.
 
-The service then implements an evaluation RPC for each operation it supports, as described in [Supported Operations](/extensibility/supervisor-middleware/operations).
+The service then implements an evaluation RPC for each operation it supports, as described in [Supported Operations](/extensibility/supervisor-middleware/operations). New HTTP middleware should implement [HTTP Protocol 2](/extensibility/supervisor-middleware/http-protocol-2).
 
 Most gRPC servers reject incoming messages larger than 4 MiB by default. Raise your server's limit to at least 4.5 MiB so that a maximum-size payload and the rest of the message fit.
 
@@ -96,6 +96,11 @@ These guides cover the rest of the service contract:
 <Card title="Supported Operations" href="/extensibility/supervisor-middleware/operations">
 
 When OpenShell calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
+</Card>
+
+<Card title="HTTP Protocol 2" href="/extensibility/supervisor-middleware/http-protocol-2">
+
+The streaming HTTP contract: body modes, limits, uninspectable traffic, failure rules, and migration from HTTP protocol 1.
 </Card>
 
 <Card title="Authenticating Extensions" href="/extensibility/overview#authenticating-extensions">

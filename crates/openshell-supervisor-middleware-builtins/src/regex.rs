@@ -56,12 +56,17 @@ pub fn describe() -> Vec<MiddlewareBinding> {
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            // HTTP protocol 1 until the regex middleware moves to protocol 2.
+            http_protocol_version: 0,
+            supported_http_body_modes: Vec::new(),
         },
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            http_protocol_version: 0,
+            supported_http_body_modes: Vec::new(),
         },
     ]
 }

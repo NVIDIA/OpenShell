@@ -51,6 +51,7 @@ pub use merge::{
     policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
+pub use middleware::set_http_protocol_2_middleware;
 pub use middleware::validate_json as validate_network_middleware_json;
 pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
@@ -3356,6 +3357,39 @@ network_policies:
 
         validate_sandbox_policy(&policy)
             .expect("fail-open middleware may select uninspectable tls: skip traffic");
+    }
+
+    #[test]
+    fn validate_exempts_http_protocol_2_middleware_from_the_tls_skip_conflict() {
+        // A name no other test uses: the registered set is process-wide.
+        let implementation = "example/tls-skip-protocol-2-guard";
+        let mut policy = restrictive_default_policy();
+        add_middleware(&mut policy, "guard", middleware_config(implementation));
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("middleware of unknown protocol keeps the tls: skip rule");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict { middleware_name, .. }
+                if middleware_name == "guard"
+        )));
+
+        set_http_protocol_2_middleware([implementation.to_string()]);
+        let validated = validate_sandbox_policy(&policy);
+        set_http_protocol_2_middleware([]);
+        validated.expect("HTTP protocol 2 middleware decides about tls: skip tunnels at runtime");
     }
 
     #[test]

@@ -3,7 +3,8 @@
 
 //! YAML schema and protobuf conversion for supervisor middleware policies.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::RwLock;
 
 use openshell_core::middleware::{MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_SELECTOR_PATTERNS};
 use openshell_core::proto::{
@@ -50,6 +51,30 @@ struct SupervisorRuntimeEndpointJson {
     host: String,
     #[serde(default)]
     tls: String,
+}
+
+/// Middleware implementations known to run HTTP protocol 2, registered by the
+/// composition root: the gateway from its described registry, and a
+/// supervisor from the protocol the gateway delivered for each service.
+static HTTP_PROTOCOL_2_MIDDLEWARE: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+
+/// Replace the set of middleware implementations known to run HTTP protocol 2.
+///
+/// HTTP protocol 2 middleware decides about uninspectable traffic itself, so
+/// policy validation exempts it from the `tls: skip` conflict rule. A
+/// middleware whose protocol is unknown keeps the rule.
+pub fn set_http_protocol_2_middleware(names: impl IntoIterator<Item = String>) {
+    let names = names.into_iter().collect();
+    *HTTP_PROTOCOL_2_MIDDLEWARE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = names;
+}
+
+fn runs_http_protocol_2(middleware: &str) -> bool {
+    HTTP_PROTOCOL_2_MIDDLEWARE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(middleware)
 }
 
 pub fn into_proto(
@@ -263,7 +288,10 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             None
         };
 
-        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed");
+        // HTTP protocol 2 middleware decides about a `tls: skip` tunnel at
+        // runtime, so only HTTP protocol 1 `fail_closed` middleware conflicts.
+        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed")
+            && !runs_http_protocol_2(&middleware.middleware);
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {
                 key

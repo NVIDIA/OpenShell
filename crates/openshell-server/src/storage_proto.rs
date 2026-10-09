@@ -142,8 +142,11 @@ mod tests {
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
+    // The HTTP middleware protocol the gateway describes adds a field to the
+    // public-only SupervisorMiddlewareService, which sandbox config responses
+    // compute on demand.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3fead4a66e57e6828072109564fa25b5b65ef541b35098d9ed7f0785387fe0aa";
+        "0f483f4283ad9a0ef232c5d61faff8ff807ce6222a62fabeca22b3b7c0344eac";
     const DURABLE_SCHEMA_SHA256: &str =
         "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -555,7 +558,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(

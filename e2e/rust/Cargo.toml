@@ -215,6 +215,11 @@ path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "supervisor_middleware_http_v2"
+path = "tests/supervisor_middleware_http_v2.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]

@@ -8,8 +8,9 @@
 //! and either forwards or denies the request.
 
 use crate::l7::middleware::{
-    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain_with_request_id,
-    emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
+    MiddlewareApplyResult, RequestBodyDelivery, UninspectableTrafficGate,
+    apply_middleware_chain_with_request_id, apply_middleware_chain_with_request_id_and_delivery,
+    emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_decision,
 };
 #[cfg(test)]
 use crate::l7::middleware::{
@@ -151,7 +152,11 @@ pub(crate) async fn prepare_inspected_request(
     engine: &TunnelPolicyEngine,
     config: &L7EndpointConfig,
     request_info: &L7RequestInfo,
-) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
+) -> Result<(
+    crate::l7::provider::L7Request,
+    L7EvalContext,
+    crate::l7::token_grant_injection::InjectedHeaders,
+)> {
     let mut scoped = ctx.clone();
     let snapshot = ctx
         .provider_credentials
@@ -169,7 +174,7 @@ pub(crate) async fn prepare_inspected_request(
             .values()
             .any(|credential| credential.token_grant.is_some())
     });
-    let req = if let Some(snapshot) = grant_snapshot {
+    let (req, injected) = if let Some(snapshot) = grant_snapshot {
         // Middleware can replace an inspected body. Recompute owner admission for
         // the body that will be sent, even when another endpoint allowed both the
         // original and transformed requests. Request method/path/query are immutable.
@@ -205,7 +210,10 @@ pub(crate) async fn prepare_inspected_request(
         )
         .await?
     } else {
-        req
+        (
+            req,
+            crate::l7::token_grant_injection::InjectedHeaders::default(),
+        )
     };
     if engine.is_stale() {
         return Err(miette!("policy changed during token grant resolution"));
@@ -214,7 +222,7 @@ pub(crate) async fn prepare_inspected_request(
         guard.ensure_current()?;
     }
     let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
-    Ok((req, scoped))
+    Ok((req, scoped, injected))
 }
 
 fn request_authority_matches_endpoint(
@@ -634,6 +642,8 @@ struct InspectedForwarding<'a> {
     response_chain: &'a [openshell_supervisor_middleware::ChainEntry],
     websocket_middleware: bool,
     observation_context: Option<&'a openshell_core::endpoint_status::EndpointObservationContext>,
+    /// The request body request middleware streams, when it does.
+    live_body: Option<&'a mut crate::l7::middleware::RequestBodyStream>,
 }
 
 // Every inspected HTTP relay enters here after policy and request middleware.
@@ -658,8 +668,9 @@ where
         response_chain,
         websocket_middleware,
         observation_context,
+        mut live_body,
     } = forwarding;
-    let (request, grant_ctx) =
+    let (request, grant_ctx, injected) =
         match prepare_inspected_request(request, ctx, engine, config, request_info).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -669,6 +680,11 @@ where
             }
         };
     *ctx = grant_ctx;
+    // A streamed body commits its head after late middleware mutations, which
+    // must not override the injected grants.
+    if let Some(body) = live_body.as_deref_mut() {
+        body.reapply_injected_headers(injected);
+    }
     let observer = EndpointObserver::begin_captured(
         ctx.endpoint_observation_tx.as_ref(),
         config,
@@ -676,7 +692,7 @@ where
         ctx.provider_credential_revision,
         Some(engine.generation_guard()),
     );
-    relay_http_request_with_credential_rejection_observed(
+    Box::pin(relay_http_request_with_body_observed(
         &request,
         client,
         upstream,
@@ -704,6 +720,7 @@ where
             port: ctx.port,
         },
         ctx,
+        live_body,
         Some(http_response_middleware_relay(
             &request,
             ctx,
@@ -714,10 +731,11 @@ where
             Some(engine.generation_guard()),
         )),
         observer.as_ref(),
-    )
+    ))
     .await
 }
 
+#[cfg(test)]
 async fn relay_http_request_with_credential_rejection<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -742,6 +760,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn relay_http_request_with_credential_rejection_observed<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -755,12 +774,44 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    Box::pin(relay_http_request_with_body_observed(
+        request,
+        client,
+        upstream,
+        options,
+        ctx,
+        None,
+        response_middleware,
+        observer,
+    ))
+    .await
+}
+
+/// Relay a request, with its body streamed by request middleware when
+/// `live_body` is present, answering credential and middleware failures that
+/// happen before any response byte.
+#[allow(clippy::too_many_arguments)]
+async fn relay_http_request_with_body_observed<C, U>(
+    request: &crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: crate::l7::rest::RelayRequestOptions<'_>,
+    ctx: &L7EvalContext,
+    live_body: Option<&mut crate::l7::middleware::RequestBodyStream>,
+    response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     match Box::pin(
-        crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
+        crate::l7::rest::relay_http_request_with_body_guarded_observed(
             request,
             client,
             upstream,
             options,
+            live_body,
             response_middleware,
             observer,
         ),
@@ -769,6 +820,11 @@ where
     {
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
+            if let Some(failure) = report.downcast_ref::<crate::l7::rest::LiveRequestFailure>() {
+                let _ = upstream.shutdown().await;
+                reject_live_request_body(client, ctx, request, failure, observer).await?;
+                return Ok(None);
+            }
             if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
                 // Body classification includes credentials for other destinations,
                 // so denial does not establish that this endpoint lacks credentials.
@@ -798,6 +854,79 @@ where
                 Err(report)
             }
         }
+    }
+}
+
+/// Answer a streamed request body that request middleware rejected or failed,
+/// or that the sandbox stopped sending, then close the client connection.
+async fn reject_live_request_body<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    ctx: &L7EvalContext,
+    request: &crate::l7::provider::L7Request,
+    failure: &crate::l7::rest::LiveRequestFailure,
+    observer: Option<&EndpointObserver>,
+) -> Result<()> {
+    let redacted_target = secrets::redact_target_for_policy(&request.target)
+        .unwrap_or_else(|_| "[REDACTED]".to_string());
+    let rejected = crate::l7::provider::L7Request {
+        action: request.action.clone(),
+        target: redacted_target.clone(),
+        query_params: request.query_params.clone(),
+        raw_header: Vec::new(),
+        body_length: crate::l7::provider::BodyLength::None,
+    };
+    let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
+    match failure {
+        crate::l7::rest::LiveRequestFailure::Middleware { denial, .. } => {
+            if let Some(observer) = observer {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
+            if let Some(denial) = denial {
+                crate::l7::rest::send_middleware_deny_response(
+                    &rejected,
+                    &ctx.policy_name,
+                    denial,
+                    client,
+                    Some(&redacted_target),
+                    context,
+                )
+                .await?;
+            } else {
+                crate::l7::rest::send_middleware_failure_response(
+                    &rejected,
+                    &ctx.policy_name,
+                    client,
+                    Some(&redacted_target),
+                    context,
+                )
+                .await?;
+            }
+        }
+        crate::l7::rest::LiveRequestFailure::ClientTimeout => {
+            crate::l7::rest::send_request_timeout_response(
+                &rejected,
+                &ctx.policy_name,
+                client,
+                Some(&redacted_target),
+                context,
+            )
+            .await?;
+        }
+    }
+    // Signal EOF before the caller tears down the tunnel: the client may
+    // still be sending the body.
+    client.shutdown().await.into_diagnostic()
+}
+
+/// Credential signing and body rewriting need the complete request body
+/// before upstream contact, so middleware output is withheld on those routes.
+fn request_body_delivery(config: &L7EndpointConfig) -> RequestBodyDelivery {
+    if config.credential_signing.is_sigv4()
+        || (config.protocol == L7Protocol::Rest && config.request_body_credential_rewrite)
+    {
+        RequestBodyDelivery::Withhold
+    } else {
+        RequestBodyDelivery::Incremental
     }
 }
 
@@ -832,6 +961,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
         policy_name: &ctx.policy_name,
         generation_guard,
         whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+        client_accepts_chunked: crate::l7::middleware::request_line_is_http11(&request.raw_header),
     }
 }
 
@@ -1067,7 +1197,14 @@ where
             // chain can never inspect this stream: gate it like any other
             // uninspectable protocol.
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            match uninspectable_traffic_gate(&chain) {
+            match uninspectable_traffic_decision(
+                engine.middleware_runner(),
+                &chain,
+                ctx,
+                openshell_core::proto::UninspectableTrafficReason::SqlPassthrough,
+            )
+            .await
+            {
                 UninspectableTrafficGate::Deny => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", true);
                     return Ok(());
@@ -1075,7 +1212,7 @@ where
                 UninspectableTrafficGate::BypassWithFinding => {
                     emit_middleware_uninspectable(ctx, "sql passthrough", false);
                 }
-                UninspectableTrafficGate::Unrestricted => {}
+                UninspectableTrafficGate::Unrestricted | UninspectableTrafficGate::Allowed => {}
             }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {
@@ -1387,19 +1524,40 @@ where
             // stage (a no-op for REST and websocket, whose policy inputs the
             // chain cannot mutate).
             let validate = transformed_body_validator(config, &engine, ctx, &request_info);
-            let middleware_result = apply_middleware_chain_with_request_id(
+            let transformed_body_policy = if matches!(
+                config.protocol,
+                L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql
+            ) {
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant
+            } else {
+                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate)
+            };
+            let middleware_result = apply_middleware_chain_with_request_id_and_delivery(
                 req,
                 client,
                 ctx,
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
-                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                transformed_body_policy,
                 &request_id,
+                request_body_delivery(config),
             )
             .await;
-            let req = match middleware_result? {
-                MiddlewareApplyResult::Allowed(request) => request,
+            let middleware_result = middleware_result?;
+            let (req, mut live_body) = match middleware_result {
+                MiddlewareApplyResult::Allowed(request) => (request, None),
+                MiddlewareApplyResult::Streamed { request, body } => (request, Some(body)),
+                MiddlewareApplyResult::RequestTimeout => {
+                    crate::l7::middleware::send_request_timeout_response(
+                        &request_info.action,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -1487,6 +1645,7 @@ where
                     response_chain: &response_chain,
                     websocket_middleware: middleware_session.is_some(),
                     observation_context: observation_context.as_ref(),
+                    live_body: live_body.as_deref_mut(),
                 },
             )
             .await;
@@ -2132,7 +2291,7 @@ where
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
             // per-stage body re-check is needed.
-            let middleware_result = apply_middleware_chain_with_request_id(
+            let middleware_result = apply_middleware_chain_with_request_id_and_delivery(
                 req,
                 client,
                 ctx,
@@ -2141,10 +2300,23 @@ where
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
                 &request_id,
+                request_body_delivery(config),
             )
             .await;
-            let req = match middleware_result? {
-                MiddlewareApplyResult::Allowed(request) => request,
+            let middleware_result = middleware_result?;
+            let (req, mut live_body) = match middleware_result {
+                MiddlewareApplyResult::Allowed(request) => (request, None),
+                MiddlewareApplyResult::Streamed { request, body } => (request, Some(body)),
+                MiddlewareApplyResult::RequestTimeout => {
+                    crate::l7::middleware::send_request_timeout_response(
+                        &request_info.action,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -2229,6 +2401,7 @@ where
                     response_chain: &response_chain,
                     websocket_middleware: middleware_session.is_some(),
                     observation_context: None,
+                    live_body: live_body.as_deref_mut(),
                 },
             )
             .await;
@@ -2561,7 +2734,7 @@ where
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain_with_request_id(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2571,9 +2744,14 @@ where
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
                 &request_id,
             )
-            .await?
-            {
+            .await?;
+            let req = match middleware_result {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Streamed { .. } | MiddlewareApplyResult::RequestTimeout => {
+                    return Err(miette!(
+                        "body-aware request middleware must collect the request body"
+                    ));
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -2627,6 +2805,7 @@ where
                     response_chain: &response_chain,
                     websocket_middleware: false,
                     observation_context: observation_context.as_ref(),
+                    live_body: None,
                 },
             )
             .await?
@@ -2838,7 +3017,7 @@ where
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain_with_request_id(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2848,9 +3027,14 @@ where
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
                 &request_id,
             )
-            .await?
-            {
+            .await?;
+            let req = match middleware_result {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Streamed { .. } | MiddlewareApplyResult::RequestTimeout => {
+                    return Err(miette!(
+                        "body-aware request middleware must collect the request body"
+                    ));
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -2901,6 +3085,7 @@ where
                     response_chain: &response_chain,
                     websocket_middleware: false,
                     observation_context: None,
+                    live_body: None,
                 },
             )
             .await?
@@ -3529,6 +3714,7 @@ where
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut response_selection = None;
+        let mut live_body = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
@@ -3555,6 +3741,20 @@ where
                 .await?;
             let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Streamed { request, body } => {
+                    live_body = Some(body);
+                    request
+                }
+                MiddlewareApplyResult::RequestTimeout => {
+                    crate::l7::middleware::send_request_timeout_response(
+                        "HTTP",
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
@@ -3597,20 +3797,25 @@ where
             req
         };
 
-        let req_with_auth = match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    error = %e,
-                    "Token grant failed in passthrough relay"
-                );
-                write_bad_gateway_response(client).await?;
-                return Ok(());
-            }
-        };
+        let req_with_auth =
+            match crate::l7::token_grant_injection::inject_token_grants(req, ctx).await {
+                Ok((req, injected)) => {
+                    if let Some(body) = live_body.as_deref_mut() {
+                        body.reapply_injected_headers(injected);
+                    }
+                    req
+                }
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "Token grant failed in passthrough relay"
+                    );
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+            };
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
@@ -3621,7 +3826,7 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let Some(outcome) = relay_http_request_with_credential_rejection(
+        let Some(outcome) = relay_http_request_with_body_observed(
             &req_with_auth,
             client,
             upstream,
@@ -3632,7 +3837,9 @@ where
                 ..Default::default()
             },
             ctx,
+            live_body.as_deref_mut(),
             response_middleware,
+            None,
         )
         .await?
         else {
@@ -4538,6 +4745,15 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
+        type EvaluateHttpStream = openshell_core::middleware::HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn describe(
             &self,
             _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
@@ -4561,6 +4777,7 @@ network_policies:
                             seconds: 2,
                             nanos: 0,
                         }),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -4685,6 +4902,7 @@ network_policies:
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -6549,6 +6767,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6702,6 +6921,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -7132,6 +7352,7 @@ network_policies:
 
     #[test]
     fn uninspectable_gate_reflects_chain_on_error() {
+        use crate::l7::middleware::uninspectable_traffic_gate;
         use openshell_supervisor_middleware::{ChainEntry, OnError};
 
         let entry = |on_error| ChainEntry {
@@ -7179,6 +7400,7 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -7304,6 +7526,9 @@ network_policies:
             }
             MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("test middleware work admission must be available")
+            }
+            MiddlewareApplyResult::Streamed { .. } | MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
             }
         }
     }
@@ -11241,6 +11466,261 @@ network_policies:
                             assert_eq!(names, [tool_name]);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Where a version 2 stage writes the sessionless `Mcp-Name` mirror.
+    #[derive(Clone, Copy, Debug)]
+    enum McpNameMirror {
+        Late,
+        Preflight,
+        Missing,
+    }
+
+    /// HTTP protocol 2 counterpart of [`McpToolReplacingService`]: a BUFFERED stage
+    /// that replaces the tool call and writes the sessionless `Mcp-Name`
+    /// mirror as a late mutation in its body result, at preflight, or not at
+    /// all.
+    struct McpToolReplacingV2Service {
+        replacement: Vec<u8>,
+        tool_name: &'static str,
+        mirror: McpNameMirror,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for McpToolReplacingV2Service {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            let mut manifest =
+                openshell_core::middleware::InProcessMiddleware::describe(&BodyReplacingService {
+                    replacement: b"",
+                })
+                .await;
+            manifest.bindings[0].http_protocol_version = 2;
+            manifest.bindings[0].supported_http_body_modes =
+                vec![openshell_core::proto::HttpBodyMode::Buffered as i32];
+            manifest.extension = Some(
+                openshell_core::extension_protocol::extension_metadata_with_requirements(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    manifest.name.clone(),
+                    "test",
+                    [],
+                    [
+                        openshell_core::extension_protocol::SUPERVISOR_MIDDLEWARE_HTTP_V2
+                            .to_string(),
+                    ],
+                ),
+            );
+            manifest
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Err(miette!("version 2 test middleware"))
+        }
+
+        async fn open_http_stage(
+            &self,
+            mut requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpEvent>,
+        ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
+        {
+            use openshell_core::proto::{
+                ExistingHeaderAction, HeaderMutation, HttpBufferedMode, HttpBufferedResult,
+                HttpInspect, HttpPreflightResult, HttpResult, WriteHeader, header_mutation,
+                http_buffered_result, http_event, http_inspect, http_preflight_result, http_result,
+            };
+            let mirror = vec![HeaderMutation {
+                operation: Some(header_mutation::Operation::Write(WriteHeader {
+                    name: "Mcp-Name".into(),
+                    value: self.tool_name.into(),
+                    on_existing: ExistingHeaderAction::Overwrite as i32,
+                })),
+            }];
+            let (preflight_mutations, late_mutations) = match self.mirror {
+                McpNameMirror::Late => (Vec::new(), mirror),
+                McpNameMirror::Preflight => (mirror, Vec::new()),
+                McpNameMirror::Missing => (Vec::new(), Vec::new()),
+            };
+            let replacement = self.replacement.clone();
+            let invocations = Arc::clone(&self.invocations);
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = requests.recv().await {
+                    let result = match event.event {
+                        Some(http_event::Event::Preflight(preflight)) => {
+                            http_result::Result::PreflightResult(HttpPreflightResult {
+                                decision: Some(http_preflight_result::Decision::Inspect(
+                                    HttpInspect {
+                                        mode: Some(http_inspect::Mode::Buffered(
+                                            HttpBufferedMode {
+                                                max_body_bytes: preflight
+                                                    .limits
+                                                    .map_or(1, |limits| {
+                                                        limits.max_buffered_body_bytes
+                                                    }),
+                                            },
+                                        )),
+                                    },
+                                )),
+                                header_mutations: preflight_mutations.clone(),
+                                diagnostics: None,
+                            })
+                        }
+                        Some(http_event::Event::BufferedBody(body)) => {
+                            let original: serde_json::Value =
+                                serde_json::from_slice(&body.data).unwrap();
+                            assert_eq!(original["params"]["name"], "read_status");
+                            invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            http_result::Result::BufferedResult(HttpBufferedResult {
+                                body: Some(http_buffered_result::Body::Replacement(
+                                    replacement.clone(),
+                                )),
+                                header_mutations: late_mutations.clone(),
+                                ..Default::default()
+                            })
+                        }
+                        Some(http_event::Event::SessionEnd(_)) | None => break,
+                        Some(_) => continue,
+                    };
+                    if sender
+                        .send(Ok(HttpResult {
+                            result: Some(result),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_version_2_tool_rewrites_check_the_name_mirror_after_late_mutations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let body_for = |name, arguments| {
+            sessionless_mcp_body(
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+        };
+        let original = body_for("read_status", serde_json::json!({}));
+        let headers = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: read_status\r\n";
+        // The final MCP validation checks the body against the late-mutated
+        // head; the preflight variant mutates the head before the body.
+        for mirror in [
+            McpNameMirror::Late,
+            McpNameMirror::Preflight,
+            McpNameMirror::Missing,
+        ] {
+            for (route_selected, enforcement, tool_name) in [
+                (false, "enforce", "read_status"),
+                (true, "enforce", "read_status"),
+                (false, "enforce", "delete_resource"),
+                (false, "audit", "delete_resource"),
+                (true, "audit", "delete_resource"),
+            ] {
+                {
+                    let case = format!(
+                        "mirror={mirror:?}, route_selected={route_selected}, enforcement={enforcement}, tool={tool_name}"
+                    );
+                    let replacement = body_for(tool_name, serde_json::json!({"rewritten": true}));
+                    let invocations = Arc::new(AtomicUsize::new(0));
+                    let data = format!(
+                        r#"
+network_middlewares:
+  rewriter:
+    middleware: test/rewriter
+    on_error: fail_closed
+    endpoints:
+      include: ["mcp.example.test"]
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: {enforcement}
+        mcp:
+          versions: ["2026-07-28"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+                    );
+                    let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+                    engine.set_middleware_runner_for_tests(
+                        openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+                            McpToolReplacingV2Service {
+                                replacement: replacement.as_bytes().to_vec(),
+                                tool_name,
+                                mirror,
+                                invocations: Arc::clone(&invocations),
+                            },
+                        )),
+                    );
+                    let (response, forwarded) = run_mcp_relay_case(
+                        mcp_relay_context_from_engine(engine),
+                        route_selected,
+                        headers,
+                        &original,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    assert_eq!(invocations.load(Ordering::SeqCst), 1, "{case}");
+                    if tool_name == "delete_resource" && enforcement == "enforce" {
+                        assert_middleware_failure_response(&response, "mcp_api");
+                        assert!(forwarded.is_empty(), "{case}: denied tool reached upstream");
+                        continue;
+                    }
+                    if tool_name == "delete_resource" && matches!(mirror, McpNameMirror::Missing) {
+                        assert!(!response.starts_with("HTTP/1.1 204"), "{case}: {response}");
+                        assert!(
+                            forwarded.is_empty(),
+                            "{case}: stale mirror reached upstream"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        response.starts_with("HTTP/1.1 204 No Content"),
+                        "{case}: {response}"
+                    );
+                    let forwarded = String::from_utf8(forwarded).unwrap();
+                    let (header, body) = forwarded.split_once("\r\n\r\n").unwrap();
+                    assert_eq!(body, replacement, "{case}");
+                    let names = header
+                        .lines()
+                        .filter_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("mcp-name").then(|| value.trim())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(names, [tool_name], "{case}");
                 }
             }
         }

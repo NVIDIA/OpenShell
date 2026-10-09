@@ -1244,7 +1244,12 @@ async fn handle_transparent_tcp_connection(
             endpoint_observation: None,
         },
     );
-    let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
+    let middleware_gate = middleware_uninspectable_gate(
+        &opa_engine,
+        &ctx,
+        openshell_core::proto::UninspectableTrafficReason::RawTcp,
+    )
+    .await?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
         return Ok(());
@@ -1743,16 +1748,22 @@ fn unsupported_l7_tunnel_protocol_detail(
 
 /// Gate for traffic that would bypass L7 inspection entirely: query the
 /// middleware chain matching this destination and process identity, and
-/// decide whether raw relay is allowed. Uninspectable traffic is denied when
-/// any matching entry is `fail_closed`; an all-`fail_open` chain passes it
-/// through with a bypass detection finding.
-fn middleware_uninspectable_gate(
+/// decide whether raw relay is allowed. Under HTTP protocol 1, uninspectable
+/// traffic is denied when any matching entry is `fail_closed`, and an
+/// all-`fail_open` chain passes it through with a bypass detection finding.
+/// HTTP protocol 2 middleware decides itself at an uninspectable preflight.
+async fn middleware_uninspectable_gate(
     opa_engine: &OpaEngine,
     ctx: &crate::l7::relay::L7EvalContext,
+    reason: openshell_core::proto::UninspectableTrafficReason,
 ) -> Result<crate::l7::middleware::UninspectableTrafficGate> {
     let input = crate::l7::middleware::middleware_network_input(ctx);
     let (chain, _generation) = opa_engine.query_middleware_chain_with_generation(&input)?;
-    Ok(crate::l7::middleware::uninspectable_traffic_gate(&chain))
+    if chain.is_empty() {
+        return Ok(crate::l7::middleware::UninspectableTrafficGate::Unrestricted);
+    }
+    let runner = opa_engine.middleware_runner()?;
+    Ok(crate::l7::middleware::uninspectable_traffic_decision(&runner, &chain, ctx, reason).await)
 }
 
 async fn peek_tunnel_protocol<C>(client: &mut C) -> Result<Option<TunnelProtocol>>
@@ -1854,13 +1865,16 @@ impl ForwardMiddlewarePipeline<'_> {
             None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         };
 
+        // The forward proxy writes the request as one buffer, so middleware
+        // output is withheld and inlined.
         self.exchange
-            .apply_request(
+            .apply_request_with_delivery(
                 request,
                 client,
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
+                crate::l7::middleware::RequestBodyDelivery::Withhold,
             )
             .await
     }
@@ -3041,9 +3055,16 @@ async fn handle_mediated_connection(
     );
 
     if effective_tls_skip {
-        // Policy validation rejects fail-closed middleware overlapping
-        // `tls: skip` endpoints; this runtime gate is defense in depth.
-        match middleware_uninspectable_gate(&opa_engine, &ctx)? {
+        // Policy validation rejects fail-closed HTTP protocol 1 middleware
+        // overlapping `tls: skip` endpoints; this runtime gate is defense in
+        // depth. HTTP protocol 2 middleware decides here at runtime.
+        match middleware_uninspectable_gate(
+            &opa_engine,
+            &ctx,
+            openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+        )
+        .await?
+        {
             crate::l7::middleware::UninspectableTrafficGate::Deny => {
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
                 respond(
@@ -3065,7 +3086,8 @@ async fn handle_mediated_connection(
                     false,
                 );
             }
-            crate::l7::middleware::UninspectableTrafficGate::Unrestricted => {}
+            crate::l7::middleware::UninspectableTrafficGate::Unrestricted
+            | crate::l7::middleware::UninspectableTrafficGate::Allowed => {}
         }
         // tls: skip — raw tunnel, no termination, no credential injection.
         debug!(
@@ -3230,7 +3252,16 @@ async fn handle_mediated_connection(
             }
         }
     } else {
-        let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
+        let middleware_gate = middleware_uninspectable_gate(
+            &opa_engine,
+            &ctx,
+            if tunnel_protocol == TunnelProtocol::H2cPriorKnowledge {
+                openshell_core::proto::UninspectableTrafficReason::H2c
+            } else {
+                openshell_core::proto::UninspectableTrafficReason::UnsupportedTunnel
+            },
+        )
+        .await?;
         let requirement = inspection_requirement(should_inspect_l7, middleware_gate);
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
@@ -5270,7 +5301,7 @@ async fn inject_token_grant_for_forward_request(
         forward_request_bytes,
     )?;
     if let Some(inspection) = inspection {
-        let (request, prepared_ctx) = crate::l7::relay::prepare_inspected_request(
+        let (request, prepared_ctx, _) = crate::l7::relay::prepare_inspected_request(
             request,
             l7_ctx,
             inspection.engine,
@@ -6291,8 +6322,25 @@ async fn handle_forward_proxy(
             exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client).await? {
+        let middleware_result = pipeline.apply(request, client).await?;
+        forward_request_bytes = match middleware_result {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                return Err(miette::miette!(
+                    "forward proxy request middleware must withhold its output"
+                ));
+            }
+            crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                let response = build_json_error_response(
+                    408,
+                    "Request Timeout",
+                    "request_timeout",
+                    "Request body was not received in time",
+                );
+                respond(client, &response).await?;
+                return Ok(());
+            }
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = denial.as_ref().map_or_else(
@@ -8433,6 +8481,7 @@ process:
                             seconds: 1,
                             nanos: 0,
                         }),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -8529,6 +8578,7 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -8641,6 +8691,7 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -10495,6 +10546,10 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("test middleware work admission must be available")
             }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
+            }
         }
     }
 
@@ -10591,6 +10646,10 @@ network_policies:
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("blocking middleware should already hold admission")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
             }
         };
 

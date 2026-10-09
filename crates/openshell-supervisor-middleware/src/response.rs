@@ -1245,6 +1245,15 @@ mod tests {
     {
         type EvaluateWebSocketSessionStream = super::super::WebSocketResponseStream;
 
+        type EvaluateHttpStream = super::super::HttpResultStream;
+
+        async fn evaluate_http(
+            &self,
+            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> Result<tonic::Response<Self::EvaluateHttpStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("HTTP protocol 1 test service"))
+        }
+
         async fn describe(
             &self,
             _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
@@ -1375,6 +1384,7 @@ mod tests {
                         openshell_core::time::duration_from_std(Duration::from_millis(10))
                             .expect("test timeout is in protobuf range")
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -1721,6 +1731,7 @@ mod tests {
                 phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                 max_payload_bytes: 4096,
                 request_timeout: None,
+                ..Default::default()
             }],
             expected_audience: String::new(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -1914,6 +1925,7 @@ mod tests {
             binding: None,
             max_payload_bytes: 1,
             timeout: Duration::from_millis(500),
+            http_protocol: None,
         };
 
         let modes = permitted_body_modes(&input(200), &described, None);

@@ -11,12 +11,19 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent, WebSocketSessionEventResult,
+    HttpEvent, HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget,
+    HttpResponseEvent, HttpResponseEventResult, HttpResult, MiddlewareDescribeRequest,
+    MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
+/// Transport-neutral result stream for one HTTP protocol 2 exchange
+/// (`EvaluateHttp`).
+pub type HttpResultStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
+
+/// HTTP protocol 1. Removed in 0.2.0.
+///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
@@ -63,6 +70,16 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     ) -> Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one HTTP protocol 2 exchange (`EvaluateHttp`).
+    async fn open_http_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP protocol 2",
         ))
     }
 }
@@ -193,7 +210,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
-///                 request_timeout: None,
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -276,6 +293,19 @@ pub trait InProcessMiddleware: Send + Sync {
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one HTTP protocol 2 exchange (`EvaluateHttp`).
+    ///
+    /// Implementations without HTTP protocol 2 bindings may keep the default
+    /// unsupported response.
+    async fn open_http_stage(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP protocol 2",
         ))
     }
 }
