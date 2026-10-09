@@ -362,6 +362,7 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
     socket_path: PathBuf,
+    socket_dir: Option<tempfile::TempDir>,
 }
 
 impl ManagedDriverProcess {
@@ -370,7 +371,16 @@ impl ManagedDriverProcess {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
+            socket_dir: None,
         }
+    }
+
+    /// Keep a private socket directory until the managed process is dropped.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_socket_dir(mut self, socket_dir: tempfile::TempDir) -> Self {
+        self.socket_dir = Some(socket_dir);
+        self
     }
 
     #[cfg(unix)]

@@ -1209,6 +1209,8 @@ kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
 
 [openshell.drivers.vm]
+# Persistent VM state stays here. The gateway keeps the driver control socket
+# in a private temporary directory under /tmp, independent of state_dir.
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
