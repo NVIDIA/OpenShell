@@ -56,7 +56,9 @@ with a matching `allow-git` exception in `deny.toml`.
   relay's parsed request: one evaluation per JSON-RPC or MCP call (the relay
   splits batches), and one per GraphQL operation, denying the request if any
   is denied. Cedar MCP endpoints get the same default MCP revision as YAML.
-  `sql` is rejected because the relay does not inspect SQL.
+  `sql` is rejected because the relay does not inspect SQL. The supervisor
+  uppercases the request method, and denies JSON-RPC calls and response
+  frames not sent with `POST` before evaluation, matching YAML.
 - `openshell-supervisor-network`'s `cedar_parity_tests` run paired YAML and
   Cedar policies for REST, JSON-RPC, MCP, and GraphQL through both engines'
   per-tunnel evaluation, and fail when decisions differ outside a recorded

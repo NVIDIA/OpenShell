@@ -162,7 +162,9 @@ Fields that do not apply to a request are empty strings, `false`, or empty sets.
 | MCP | `jsonrpc_method`, `mcp_tool`, `mcp_method_class`, `jsonrpc_receive_stream`, `jsonrpc_response` |
 | GraphQL | `graphql_operation_type`, `graphql_operation_name`, `graphql_fields` |
 
-For JSON-RPC and MCP, each call is evaluated on its own, and `method` is empty for a call. OpenShell rejects a request that fails JSON-RPC inspection before evaluating it.
+`context.method` is always uppercase. Unlike YAML, a `GET` condition does not also allow `HEAD`, so list `HEAD` when you want it allowed.
+
+For JSON-RPC and MCP, each call is evaluated on its own, and `method` is empty for a call. OpenShell denies a request that fails JSON-RPC inspection, and a call or response frame that is not sent with `POST`, before evaluating it.
 
 ### MCP
 

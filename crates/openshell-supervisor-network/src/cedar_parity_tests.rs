@@ -281,6 +281,12 @@ when { context.path like("/repos/*/*/hooks/**", "/") };
             ),
             same("other method", rest("DELETE", "/repos/nvidia/openshell")),
             same("other path", rest("GET", "/orgs/nvidia")),
+            same("lowercase method", rest("get", "/repos/nvidia/openshell")),
+            diverges(
+                "HEAD under a GET rule",
+                rest("HEAD", "/repos/nvidia/openshell"),
+                "YAML lets a GET rule allow HEAD; a Cedar policy must list HEAD",
+            ),
             same("empty trailing segment", rest("GET", "/repos/")),
             same("no trailing segment", rest("GET", "/repos")),
             same(
@@ -339,6 +345,13 @@ when {
             same(
                 "listed method",
                 jsonrpc_request("/rpc", vec![call("eth_call", None, None)]),
+            ),
+            same(
+                "listed method sent with GET",
+                L7RequestInfo {
+                    action: "GET".to_string(),
+                    ..jsonrpc_request("/rpc", vec![call("eth_call", None, None)])
+                },
             ),
             same(
                 "unlisted method",
@@ -418,6 +431,13 @@ when { context.jsonrpc_method == "tools/call" && context.mcp_tool == "github.del
 "#,
         cases: vec![
             same("initialize", mcp("initialize", None, Available)),
+            same(
+                "allowed tool call sent with GET",
+                L7RequestInfo {
+                    action: "GET".to_string(),
+                    ..mcp("tools/call", Some("github.search"), Available)
+                },
+            ),
             same("tools/list", mcp("tools/list", None, Available)),
             same(
                 "tool matching the glob",
@@ -441,7 +461,14 @@ when { context.jsonrpc_method == "tools/call" && context.mcp_tool == "github.del
             ),
             same("extension method", mcp("x/custom", None, Extension)),
             same("receive stream", receive_stream),
-            same("response frame", response_frame),
+            same("response frame", response_frame.clone()),
+            same(
+                "response frame sent with GET",
+                L7RequestInfo {
+                    action: "GET".to_string(),
+                    ..response_frame
+                },
+            ),
         ],
     });
 }

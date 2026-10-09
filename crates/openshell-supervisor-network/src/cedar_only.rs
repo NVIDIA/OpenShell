@@ -717,7 +717,9 @@ impl CedarL7TunnelEngine {
             ancestors: ctx.ancestors.clone(),
             host: ctx.host.clone(),
             port: ctx.port,
-            method: request.action.clone(),
+            // YAML matches methods case-insensitively, and the request parser
+            // keeps the client's case, so normalize before Cedar compares.
+            method: request.action.to_ascii_uppercase(),
             path: request.target.clone(),
             ..L7Request::default()
         };
@@ -735,6 +737,18 @@ impl CedarL7TunnelEngine {
             } else {
                 info.calls.first()
             };
+            // Same as the YAML path: calls and response frames are only ever
+            // allowed in a POST, so a body carried by any other method is
+            // denied before Cedar sees it. An MCP receive stream (a GET with
+            // no body) is unaffected.
+            if (!info.calls.is_empty() || info.has_response)
+                && !request.action.eq_ignore_ascii_case("POST")
+            {
+                return Ok((
+                    false,
+                    "JSON-RPC calls and responses must be sent with POST".to_string(),
+                ));
+            }
             if let Some(call) = call {
                 // `method` stays empty for a call so policies match on
                 // `jsonrpc_method` instead, the schema's not-applicable
