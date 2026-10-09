@@ -5,7 +5,8 @@
 
 use async_trait::async_trait;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, LoopbackTarget,
+    BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, BoundaryLoopbackListener,
+    LoopbackTarget,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -465,6 +466,64 @@ impl BoundaryLoopbackConnector for LocalLoopbackConnector {
         }
         Ok(Box::new(stream))
     }
+
+    async fn listen(
+        &self,
+        target: LoopbackTarget,
+    ) -> Result<Box<dyn BoundaryLoopbackListener>, BackendError> {
+        if let Some(runtime) = &self.runtime {
+            runtime.ensure_active()?;
+        }
+        let address = std::net::SocketAddr::new(target.host(), target.port());
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|error| {
+                BackendError::Process(format!(
+                    "bind boundary loopback listener {address}: {error}"
+                ))
+            })?;
+        let local_addr = listener.local_addr().map_err(|error| {
+            BackendError::Process(format!("read boundary loopback listener address: {error}"))
+        })?;
+        if let Some(runtime) = &self.runtime {
+            runtime.ensure_active()?;
+        }
+        Ok(Box::new(LocalLoopbackListener {
+            listener,
+            local_addr,
+            runtime: self.runtime.clone(),
+        }))
+    }
+}
+
+struct LocalLoopbackListener {
+    listener: tokio::net::TcpListener,
+    local_addr: std::net::SocketAddr,
+    runtime: Option<Arc<BoundaryRuntimeState>>,
+}
+
+#[async_trait]
+impl BoundaryLoopbackListener for LocalLoopbackListener {
+    fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    async fn accept(&self) -> Result<(BoundaryDuplexStream, std::net::SocketAddr), BackendError> {
+        if let Some(runtime) = &self.runtime {
+            runtime.ensure_active()?;
+        }
+        let (stream, peer) = self.listener.accept().await.map_err(|error| {
+            BackendError::Process(format!(
+                "accept boundary loopback listener {}: {error}",
+                self.local_addr
+            ))
+        })?;
+        openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+        if let Some(runtime) = &self.runtime {
+            runtime.ensure_active()?;
+        }
+        Ok((Box::new(stream), peer))
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +553,27 @@ mod tests {
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_accepts_and_round_trips() {
+        let connector = LocalLoopbackConnector::new(None);
+        let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), 0).unwrap();
+        let listener = connector.listen(target).await.expect("bind listener");
+        let address = listener.local_addr();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut echoed = [0_u8; 4];
+            stream.read_exact(&mut echoed).await.unwrap();
+            echoed
+        });
+        let (mut stream, peer) = listener.accept().await.expect("accept listener");
+        assert!(peer.ip().is_loopback());
+        let mut payload = [0_u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        assert_eq!(client.await.unwrap(), *b"ping");
     }
 
     /// Drive the port-forward interface through a generic `&dyn` consumer, proving a

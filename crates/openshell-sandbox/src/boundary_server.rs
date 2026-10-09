@@ -1254,6 +1254,106 @@ mod linux {
                 })?;
                 return Ok(());
             }
+            Request::LoopbackListen { host, port } => {
+                let target = match LoopbackTarget::new(host, port) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response: guest_error(
+                                    BoundaryErrorKind::Process,
+                                    format!("validate loopback listener target: {error}"),
+                                ),
+                            },
+                        )
+                        .map_err(|error| {
+                            format!("write loopback listener error response: {error}")
+                        })?;
+                        return Ok(());
+                    }
+                };
+                let (listener_id, address) = match runtime
+                    .process_runtime
+                    .block_on(runtime.bind_loopback_listener(target))
+                {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response: guest_error(BoundaryErrorKind::Process, error),
+                            },
+                        )
+                        .map_err(|error| {
+                            format!("write loopback listener error response: {error}")
+                        })?;
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = write_frame(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::PortListening {
+                            listener_id: listener_id.clone(),
+                            address,
+                        },
+                    },
+                ) {
+                    runtime.close_loopback_listener(&listener_id);
+                    return Err(format!("write loopback listener response: {error}"));
+                }
+                let lease_result = runtime.process_runtime.block_on(async move {
+                    let mut stream = stream.into_tokio()?;
+                    let mut unexpected = [0_u8; 1];
+                    match stream.read(&mut unexpected).await {
+                        Ok(0) => Ok(()),
+                        Ok(_) => Err("loopback listener lease sent unexpected data".to_string()),
+                        Err(error) => Err(format!("watch loopback listener lease: {error}")),
+                    }
+                });
+                runtime.close_loopback_listener(&listener_id);
+                return lease_result;
+            }
+            Request::LoopbackAccept { listener_id } => {
+                let (mut accepted, peer) = match runtime
+                    .process_runtime
+                    .block_on(runtime.accept_loopback_listener(&listener_id))
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response: guest_error(BoundaryErrorKind::Process, error),
+                            },
+                        )
+                        .map_err(|error| {
+                            format!("write loopback accept error response: {error}")
+                        })?;
+                        return Ok(());
+                    }
+                };
+                write_frame(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::PortAccepted { peer },
+                    },
+                )
+                .map_err(|error| format!("write loopback accept response: {error}"))?;
+                runtime.process_runtime.block_on(async move {
+                    let mut stream = stream.into_tokio()?;
+                    tokio::io::copy_bidirectional(&mut stream, &mut accepted)
+                        .await
+                        .map_err(|error| format!("bridge accepted loopback stream: {error}"))
+                })?;
+                return Ok(());
+            }
             Request::AcceptNetwork => {
                 let broker = runtime.network_accept_context()?;
                 let request_id = request.request_id;
@@ -1379,6 +1479,9 @@ mod linux {
         /// any launch input or start a second workload.
         started_agent: Mutex<Option<StartedAgent>>,
         next_exec_id: AtomicU64,
+        next_loopback_listener_id: AtomicU64,
+        loopback_listeners:
+            Mutex<std::collections::HashMap<String, Arc<BoundaryLoopbackListenerEntry>>>,
         mediation_active: tokio::sync::Mutex<()>,
         next_mediation_stream_id: AtomicU64,
         exec_handles: Mutex<std::collections::HashMap<String, ExecHandle>>,
@@ -1390,6 +1493,12 @@ mod linux {
         workload_launcher:
             openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
         qualification: crate::RuntimeQualification,
+    }
+
+    struct BoundaryLoopbackListenerEntry {
+        listener: tokio::net::TcpListener,
+        address: std::net::SocketAddr,
+        cancelled: tokio::sync::watch::Sender<()>,
     }
 
     #[derive(Clone)]
@@ -1677,6 +1786,8 @@ mod linux {
                 attached_policy: Mutex::new(None),
                 started_agent: Mutex::new(None),
                 next_exec_id: AtomicU64::new(1),
+                next_loopback_listener_id: AtomicU64::new(1),
+                loopback_listeners: Mutex::new(std::collections::HashMap::new()),
                 mediation_active: tokio::sync::Mutex::new(()),
                 next_mediation_stream_id: AtomicU64::new(1),
                 exec_handles: Mutex::new(std::collections::HashMap::new()),
@@ -1949,6 +2060,7 @@ mod linux {
             // Revocation happens before process shutdown so no concurrent or
             // replacement connection can race the terminal transition.
             self.connections.mark_terminal();
+            self.close_all_loopback_listeners();
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -2001,6 +2113,7 @@ mod linux {
         }
 
         fn shutdown(&self) {
+            self.close_all_loopback_listeners();
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -2012,6 +2125,74 @@ mod linux {
             };
             if let Some(process) = process {
                 process.boundary_runtime.deactivate();
+            }
+        }
+
+        async fn bind_loopback_listener(
+            &self,
+            target: LoopbackTarget,
+        ) -> Result<(String, std::net::SocketAddr), String> {
+            let requested = std::net::SocketAddr::new(target.host(), target.port());
+            let listener = tokio::net::TcpListener::bind(requested)
+                .await
+                .map_err(|error| format!("bind boundary loopback listener {requested}: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("read boundary loopback listener address: {error}"))?;
+            let listener_id = format!(
+                "loopback-{}",
+                self.next_loopback_listener_id
+                    .fetch_add(1, Ordering::Relaxed)
+            );
+            let (cancelled, _) = tokio::sync::watch::channel(());
+            lock(&self.loopback_listeners).insert(
+                listener_id.clone(),
+                Arc::new(BoundaryLoopbackListenerEntry {
+                    listener,
+                    address,
+                    cancelled,
+                }),
+            );
+            Ok((listener_id, address))
+        }
+
+        async fn accept_loopback_listener(
+            &self,
+            listener_id: &str,
+        ) -> Result<(tokio::net::TcpStream, std::net::SocketAddr), String> {
+            let listener = lock(&self.loopback_listeners)
+                .get(listener_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("boundary loopback listener {listener_id} is unavailable")
+                })?;
+            let mut cancelled = listener.cancelled.subscribe();
+            tokio::select! {
+                result = listener.listener.accept() => {
+                    let (stream, peer) = result.map_err(|error| {
+                        format!("accept boundary loopback listener {}: {error}", listener.address)
+                    })?;
+                    openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+                    Ok((stream, peer))
+                }
+                result = cancelled.changed() => {
+                    let _ = result;
+                    Err(format!("boundary loopback listener {listener_id} was closed"))
+                }
+            }
+        }
+
+        fn close_loopback_listener(&self, listener_id: &str) {
+            let listener = lock(&self.loopback_listeners).remove(listener_id);
+            if let Some(listener) = listener {
+                let _ = listener.cancelled.send(());
+            }
+        }
+
+        fn close_all_loopback_listeners(&self) {
+            let listeners = std::mem::take(&mut *lock(&self.loopback_listeners));
+            for listener in listeners.into_values() {
+                let _ = listener.cancelled.send(());
             }
         }
 
@@ -2107,6 +2288,8 @@ mod linux {
                 | Request::TerminateBoundary
                 | Request::AttachProcess { .. }
                 | Request::LoopbackConnect { .. }
+                | Request::LoopbackListen { .. }
+                | Request::LoopbackAccept { .. }
                 | Request::AcceptNetwork => guest_error(
                     BoundaryErrorKind::Invalid,
                     "streaming request used on control path",
