@@ -364,6 +364,7 @@ fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
 
 #[cfg(target_os = "linux")]
 fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Digest, ResolveError> {
+    use std::fmt::Write as _;
     use std::io::Read as _;
 
     let path = format!("/proc/{pid}/exe");
@@ -380,7 +381,10 @@ fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Dig
         digest.update(&buffer[..length]).map_err(crypto_error)?;
     }
     let bytes = digest.finish().map_err(crypto_error)?;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut hex = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
     hex.parse()
 }
 
