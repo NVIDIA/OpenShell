@@ -6899,12 +6899,11 @@ mod tests {
         format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
         has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
-        policy_revision_list_json,
-        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
-        ready_false_condition_message, relay_local_socket, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
+        provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
+        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
+        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
+        service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 

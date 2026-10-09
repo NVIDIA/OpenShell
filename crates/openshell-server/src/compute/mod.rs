@@ -1327,7 +1327,7 @@ impl ComputeRuntime {
         // cancelled. Keep the creation guard until its public identity and
         // protected launch bundle have been committed.
         let prepared = async {
-            if let Some(encoded) = launch_authentication {
+            if let Some(encoded) = runtime_inputs.launch_authentication {
                 let authentication = serde_json::from_slice(&encoded)
                     .map_err(|_| Status::internal("invalid sandbox launch authentication"))?;
                 let encoded = self
@@ -1362,7 +1362,7 @@ impl ComputeRuntime {
         }
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
-            spec.launch_authentication = runtime_inputs.launch_authentication.unwrap_or_default();
+            spec.launch_authentication = launch_authentication.unwrap_or_default();
         }
         let result = Box::pin(self.await_provisioning_operation(
             &sandbox,
@@ -8666,7 +8666,7 @@ mod tests {
             version: 2,
             ..Default::default()
         });
-        let launch_authentication = b"protected-launch-material".to_vec();
+        let launch_authentication = test_launch_authentication(&sandbox);
         runtime_inputs.launch_authentication = Some(launch_authentication.clone());
 
         runtime

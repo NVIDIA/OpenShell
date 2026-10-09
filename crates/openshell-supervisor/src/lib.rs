@@ -803,7 +803,9 @@ async fn run_sandbox_with_backend(
     #[cfg(not(unix))]
     let ssh_host_key = {
         if ssh_socket_path.is_some() {
-            return Err(miette::miette!("SSH access sockets are unsupported on this host"));
+            return Err(miette::miette!(
+                "SSH access sockets are unsupported on this host"
+            ));
         }
         None
     };

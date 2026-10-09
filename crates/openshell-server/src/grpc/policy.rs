@@ -3555,7 +3555,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_from_records(
+    let (effective_policy, _) = current_effective_policy_from_records(
         state,
         &provider_profile_catalog,
         sandbox,
