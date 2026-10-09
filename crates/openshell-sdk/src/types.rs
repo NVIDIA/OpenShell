@@ -298,6 +298,8 @@ pub struct ServiceExposure {
     pub target_port: u16,
     /// Whether the gateway strips or forwards an application bearer credential.
     pub authorization_mode: ServiceAuthorizationMode,
+    /// HTTP readiness path. None checks listener responsiveness.
+    pub readiness_path: Option<String>,
 }
 
 /// Handling for an incoming application `Authorization` header.

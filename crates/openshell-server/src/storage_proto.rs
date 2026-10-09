@@ -144,11 +144,11 @@ mod tests {
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "83be88b4b1c19ce3d58ae92a1fed8220f5843c85774b71eabfbf1a8ce86b58e5";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "d123931bc3ff7dd3be871ce4d51aa23486c7860424353be3d2a6b033e50ed97e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "4710c85fc70c7049abd35952bedbc271d614166af27984d27e22af567ae6cf02";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -613,9 +613,11 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                // HttpReadinessCheck is durable endpoint configuration;
+                // ServiceHealth and its enum are public observations only.
+                (313, 28),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

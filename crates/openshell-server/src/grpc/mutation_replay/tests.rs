@@ -112,6 +112,7 @@ async fn create_sandbox_replay_preserves_service_urls() {
         spec: Some(SandboxSpec::default()),
         workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         service_exposures: vec![SandboxServiceExposure {
+            readiness_check: None,
             service: "web".into(),
             target_port: 8080,
             authorization_mode: ServiceAuthorizationMode::Strip as i32,

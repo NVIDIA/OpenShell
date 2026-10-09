@@ -90,10 +90,15 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxServiceExposure {
 	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
 	for _, exposure := range exposures {
+		var readiness *pb.HttpReadinessCheck
+		if exposure.ReadinessCheck != nil {
+			readiness = &pb.HttpReadinessCheck{Path: exposure.ReadinessCheck.Path}
+		}
 		result = append(result, &pb.SandboxServiceExposure{
 			Service:           exposure.Service,
 			TargetPort:        exposure.TargetPort,
 			AuthorizationMode: serviceAuthorizationModeToProto(exposure.AuthorizationMode),
+			ReadinessCheck:    readiness,
 		})
 	}
 	return result
