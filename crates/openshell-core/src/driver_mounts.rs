@@ -239,7 +239,8 @@ pub fn path_is_or_under(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
+/// Return true when either path is the other or contains it.
+pub fn paths_overlap(left: &Path, right: &Path) -> bool {
     path_is_or_under(left, right) || path_is_or_under(right, left)
 }
 

@@ -75,6 +75,11 @@ path = "tests/rootfs_tar.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
+name = "vm_bind_mount"
+path = "tests/vm_bind_mount.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "docker_preflight"
 path = "tests/docker_preflight.rs"
 required-features = ["e2e-docker"]

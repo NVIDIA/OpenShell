@@ -32,6 +32,14 @@ pub struct VsockPortMap {
     pub host_initiated: bool,
 }
 
+/// A host directory shared into the VM guest via virtiofs.
+#[derive(Debug, Clone)]
+pub struct VmMount {
+    pub tag: String,
+    pub host_path: PathBuf,
+    pub read_only: bool,
+}
+
 pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
     pub overlay_disk: PathBuf,
@@ -49,6 +57,7 @@ pub struct VmLaunchConfig {
     pub gpu_bdf: Option<String>,
     pub vsock_cid: Option<u32>,
     pub vsock_port_map: Option<VsockPortMap>,
+    pub mounts: Vec<VmMount>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -59,6 +68,9 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
 }
 
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    if !config.mounts.is_empty() {
+        return Err("virtiofs mounts are not yet supported with the QEMU backend".to_string());
+    }
     let gpu_bdf = config
         .gpu_bdf
         .as_deref()
@@ -307,7 +319,8 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     // Arm procguard before forking libkrun so the VM worker cannot outlive
     // the launcher. No network helper is started: the only host/guest data
-    // path is the protected vsock mapping below.
+    // paths are the protected vsock mapping below and any operator-enabled
+    // virtiofs shares.
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
     }
@@ -334,6 +347,10 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     if let Some(port_map) = &config.vsock_port_map {
         let _ = std::fs::remove_file(&port_map.host_socket);
         vm.add_vsock_port(port_map)?;
+    }
+
+    for mount in &config.mounts {
+        vm.add_virtiofs(&mount.tag, &mount.host_path, mount.read_only)?;
     }
 
     vm.set_console_output(&config.console_output)?;
@@ -661,6 +678,32 @@ impl VmContext {
         )
     }
 
+    fn add_virtiofs(&self, tag: &str, host_path: &Path, read_only: bool) -> Result<(), String> {
+        // KRUN_SEMANTICS_LINUX_SIMPLIFIED: guest ownership is not recorded on
+        // host files and permission bits are stored on the host directly, not
+        // in extended attributes. Only the macOS passthrough applies that; on
+        // Linux the mode just disables attribute caching and idmapped mounts.
+        const SEMANTICS_SIMPLIFIED: u32 = 1;
+        let tag_c = CString::new(tag).map_err(|e| format!("invalid virtiofs tag: {e}"))?;
+        let path_c = path_to_cstring(host_path)?;
+        let add_virtiofs4 = *self.krun.krun_add_virtiofs4.as_ref().map_err(|err| {
+            format!("VM bind mounts need a libkrun runtime with virtiofs support: {err}")
+        })?;
+        check(
+            unsafe {
+                add_virtiofs4(
+                    self.ctx_id,
+                    tag_c.as_ptr(),
+                    path_c.as_ptr(),
+                    0,
+                    read_only,
+                    SEMANTICS_SIMPLIFIED,
+                )
+            },
+            "krun_add_virtiofs4",
+        )
+    }
+
     fn start_enter(&self) -> i32 {
         unsafe { (self.krun.krun_start_enter)(self.ctx_id) }
     }
@@ -777,6 +820,7 @@ mod tests {
             gpu_bdf: Some("0000:01:00.0".to_string()),
             vsock_cid: Some(4),
             vsock_port_map: None,
+            mounts: Vec::new(),
         }
     }
 
