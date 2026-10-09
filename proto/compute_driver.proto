@@ -208,6 +208,37 @@ message DriverSandboxSpec {
   // material between the host supervisor and workload-side sandbox runtime;
   // it must never expose the supervisor bearer tokens to the workload.
   bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
+  // Operator-selected external isolation backend. Never derived from the
+  // public sandbox spec or workload environment. Omitted for the built-in
+  // runtime. Requires openshell.compute.isolation-backend-registration.
+  IsolationBackendRegistration isolation_backend = 17;
+}
+
+// Trusted operator registration delivered to the compute driver on every
+// launch. The driver stages this route outside workload mounts, admits this
+// exact name, and supplies its opaque descriptor and generation-specific launch
+// coordinates to the stock supervisor. It must reject unsupported selections
+// before provisioning; it must never fall back to another isolation backend.
+message IsolationBackendRegistration {
+  string name = 1;
+  oneof endpoint {
+    // Absolute path in the supervisor's filesystem namespace.
+    string unix_socket_path = 2;
+    IsolationBackendTcpEndpoint tcp = 3;
+    IsolationBackendVsockEndpoint vsock = 4;
+  }
+}
+
+message IsolationBackendTcpEndpoint {
+  // Logical HTTP authority; generation-specific TLS identity is driver-owned.
+  string authority = 1;
+  // Operator-pinned socket addresses reachable from the supervisor.
+  repeated string addresses = 2;
+}
+
+message IsolationBackendVsockEndpoint {
+  uint32 guest_cid = 1;
+  uint32 port = 2;
 }
 
 // Identity inputs admitted by the gateway before workload provisioning.
@@ -424,6 +455,11 @@ message StartSandboxRequest {
   // stable resource represented by this identity while replacing only the
   // generation-specific runtime component.
   string expected_runtime_identity = 5;
+  // Same trusted selection as create; applies to this new generation.
+  // The gateway pins the backend name at creation and rejects start/recovery
+  // under a different selection. Operator endpoints may change without
+  // changing that identity; the driver still validates the retained resource.
+  IsolationBackendRegistration isolation_backend = 6;
 }
 
 message StartSandboxResponse {
