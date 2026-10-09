@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod boundary_protocol;
+pub mod delegated;
 pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
