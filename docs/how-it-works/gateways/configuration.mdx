@@ -1220,6 +1220,11 @@ overlay_disk_mib = 4096
 # Values must fall within OpenShell's allowed non-root sandbox identity range.
 # sandbox_uid = 20001
 # sandbox_gid = 20001
+# Seconds between each sandbox supervisor's polls for a changed policy or
+# settings, 1 to 600. A policy change takes effect at the next poll, so a
+# shorter interval makes it load sooner at the cost of more config requests to
+# the gateway. Omit to keep the supervisor default of 10 seconds.
+# supervisor_policy_poll_interval_secs = 2
 # Corporate forward proxy for sandbox egress. The keys, their semantics, and
 # the fail-closed contract are identical to the Podman driver above: only TLS
 # (CONNECT) egress is chained, plain-HTTP destination requests always dial

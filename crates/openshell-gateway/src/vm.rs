@@ -105,6 +105,10 @@ pub struct VmComputeConfig {
     /// Maximum accepted rootfs tar size, in bytes, before and after decompression.
     pub rootfs_tar_max_bytes: Option<u64>,
 
+    /// Seconds between each sandbox supervisor's polls for a changed policy
+    /// or settings (1 to 600). Unset keeps the supervisor default of 10 s.
+    pub supervisor_policy_poll_interval_secs: Option<u64>,
+
     /// Host-side CA certificate used to authenticate the gateway.
     pub guest_tls_ca: Option<PathBuf>,
 
@@ -187,6 +191,14 @@ impl VmComputeConfig {
                 "rootfs_tar_max_bytes must be greater than zero when set",
             ));
         }
+        if let Some(secs) = self.supervisor_policy_poll_interval_secs
+            && !(1..=openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS_MAX).contains(&secs)
+        {
+            return Err(Error::config(format!(
+                "supervisor_policy_poll_interval_secs {secs} is outside the allowed range [1, {}]",
+                openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS_MAX
+            )));
+        }
         self.validate_proxy_config()?;
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
@@ -249,6 +261,7 @@ impl Default for VmComputeConfig {
             sandbox_gid: None,
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
+            supervisor_policy_poll_interval_secs: None,
             guest_tls_ca: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
@@ -571,6 +584,7 @@ pub async fn spawn(
         .arg(vm_config.overlay_disk_mib.to_string());
     append_vm_identity_args(&mut command, vm_config);
     append_vm_rootfs_tar_args(&mut command, vm_config);
+    append_vm_supervisor_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
@@ -627,6 +641,15 @@ fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
         command
             .arg("--rootfs-tar-max-bytes")
             .arg(max_bytes.to_string());
+    }
+}
+
+#[cfg(unix)]
+fn append_vm_supervisor_args(command: &mut Command, config: &VmComputeConfig) {
+    if let Some(secs) = config.supervisor_policy_poll_interval_secs {
+        command
+            .arg("--supervisor-policy-poll-interval-secs")
+            .arg(secs.to_string());
     }
 }
 
@@ -754,10 +777,10 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        validate_vm_sandbox_identity,
+        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, append_vm_supervisor_args,
+        compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
+        resolve_driver_search_dirs, validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
     use openshell_server::config_file::OtlpConfig;
@@ -961,6 +984,55 @@ mod tests {
                 "1073741824",
             ]
         );
+    }
+
+    #[test]
+    fn vm_gateway_toml_forwards_supervisor_policy_poll_interval() {
+        let config: VmComputeConfig = toml::from_str(
+            r#"
+                grpc_endpoint = "http://127.0.0.1:50051"
+                supervisor_policy_poll_interval_secs = 1
+            "#,
+        )
+        .expect("the poll interval must deserialize");
+        config
+            .validate_configuration()
+            .expect("a one-second poll interval is valid");
+
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_supervisor_args(&mut command, &config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--supervisor-policy-poll-interval-secs", "1"]);
+
+        let mut unset = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_supervisor_args(&mut unset, &VmComputeConfig::default());
+        assert_eq!(unset.as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn vm_gateway_rejects_a_poll_interval_outside_its_range() {
+        for secs in [
+            0,
+            openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS_MAX + 1,
+        ] {
+            let error = VmComputeConfig {
+                grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+                supervisor_policy_poll_interval_secs: Some(secs),
+                ..Default::default()
+            }
+            .validate_configuration()
+            .expect_err("an out-of-range poll interval must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("supervisor_policy_poll_interval_secs"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
