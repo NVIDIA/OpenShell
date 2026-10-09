@@ -215,7 +215,6 @@ macro_rules! request_id_middleware {
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
-
 /// Concurrent HTTP/2 streams allowed per connection. Sits above the
 /// per-replica pending relay budget so pooled peer connections are bounded by
 /// the relay caps rather than by the transport.
@@ -259,6 +258,7 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        let reflection = self.state.reflection_service.clone();
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -266,7 +266,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            openshell,
+            GrpcRouter::new(openshell, reflection),
             authenticator_chain,
             authz_policy,
             self.state
@@ -751,7 +751,7 @@ impl GrpcRateLimiter {
         })
     }
 
-    fn allow(&self) -> bool {
+    pub(crate) fn allow(&self) -> bool {
         let now = Instant::now();
         let mut state = self
             .state
@@ -869,6 +869,56 @@ where
         }
         let future = self.inner.call(req);
         Box::pin(future)
+    }
+}
+
+/// Combined gRPC service that routes between `OpenShell` and reflection.
+#[derive(Clone)]
+pub struct GrpcRouter<N, R> {
+    openshell: N,
+    reflection: R,
+}
+
+impl<N, R> GrpcRouter<N, R> {
+    fn new(openshell: N, reflection: R) -> Self {
+        Self {
+            openshell,
+            reflection,
+        }
+    }
+}
+
+pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
+
+impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+where
+    N: tower::Service<Request<B>> + Clone + Send + 'static,
+    N::Response: Send,
+    N::Future: Send,
+    N::Error: Send,
+    R: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    R::Future: Send,
+    B: Send + 'static,
+{
+    type Response = N::Response;
+    type Error = N::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
+            let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else {
+            let mut svc = self.openshell.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        }
     }
 }
 
@@ -2583,6 +2633,464 @@ mod tests {
         assert_eq!(grpc_method_from_path(""), "");
     }
 
+    #[tokio::test]
+    async fn grpc_router_dispatches_gateway_and_reflection_paths() {
+        #[derive(Clone)]
+        struct RouteRecorder {
+            name: &'static str,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for RouteRecorder {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                self.calls.lock().unwrap().push(self.name);
+                Box::pin(async { Ok(Response::new(tonic::body::Body::empty())) })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = |name| RouteRecorder {
+            name,
+            calls: calls.clone(),
+        };
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+
+        for path in [
+            "/openshell.v1.OpenShell/Health",
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+        ] {
+            router
+                .call(
+                    Request::builder()
+                        .uri(path)
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+    }
+
+    #[tokio::test]
+    async fn reflection_protocol_serves_complete_public_descriptors_and_recovers_from_errors() {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use prost_reflect::{DescriptorPool, Value};
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let rejecting_oidc = Arc::new(MockAuthenticator::returning(Err(
+            tonic::Status::unauthenticated("OIDC credentials required"),
+        )));
+        let grpc = AuthGrpcRouter::with_peer_identity(
+            GrpcRouter::new(unrouted, reflection),
+            Some(AuthenticatorChain::new(vec![rejecting_oidc])),
+            None,
+            None,
+            true,
+            false,
+        );
+        let service = MultiplexedService::new(grpc, unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let list_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let descriptor_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.OpenShell".to_string(),
+            )),
+        };
+        let missing_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.DoesNotExist".to_string(),
+            )),
+        };
+        let list_after_error_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([
+                list_request,
+                descriptor_request,
+                missing_request,
+                list_after_error_request,
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ListServicesResponse(response)) = response.message_response
+        else {
+            panic!("expected a reflection list-services response");
+        };
+        let mut names: Vec<_> = response
+            .service
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+
+        let descriptor_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::FileDescriptorResponse(response)) =
+            descriptor_response.message_response
+        else {
+            panic!("expected a reflection file-descriptor response");
+        };
+        let mut reflected_pool = DescriptorPool::new();
+        for descriptor in &response.file_descriptor_proto {
+            reflected_pool
+                .decode_file_descriptor_proto(descriptor.as_slice())
+                .unwrap();
+        }
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.OpenShell")
+                .is_some(),
+            "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_message_by_name("openshell.v1.HealthRequest")
+                .is_some(),
+            "the response must include imported public message descriptors"
+        );
+
+        let source_pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let source_auth = source_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let reflected_auth = reflected_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let source_health = source_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let reflected_health = reflected_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let source_options = source_health.options();
+        let reflected_options = reflected_health.options();
+        let Value::Message(source_auth_value) = &*source_options.get_extension(&source_auth) else {
+            panic!("source authorization option must be a message");
+        };
+        let Value::Message(reflected_auth_value) =
+            &*reflected_options.get_extension(&reflected_auth)
+        else {
+            panic!("reflected authorization option must be a message");
+        };
+        assert_eq!(
+            source_auth_value.encode_to_vec(),
+            reflected_auth_value.encode_to_vec()
+        );
+
+        let source_secret = source_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let reflected_secret = reflected_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let source_field = source_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        let reflected_field = reflected_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        assert_eq!(
+            source_field.options().get_extension(&source_secret),
+            reflected_field.options().get_extension(&reflected_secret),
+            "secret-field annotations must retain their original value"
+        );
+
+        let error_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = error_response.message_response else {
+            panic!("expected an in-band reflection error response");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+
+        let response_after_error = responses.message().await.unwrap().unwrap();
+        assert!(matches!(
+            response_after_error.message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflection_protocol_resolves_canonical_enum_values_and_extensions() {
+        use prost::Message;
+        use tonic_reflection::pb::v1::{
+            ExtensionRequest, ServerReflectionRequest,
+            server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+
+        for (symbol, expected_file) in [
+            ("openshell.v1.SANDBOX_PHASE_READY", "openshell.proto"),
+            (
+                "google.protobuf.FieldDescriptorProto.TYPE_DOUBLE",
+                "google/protobuf/descriptor.proto",
+            ),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for canonical enum value {symbol}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains(expected_file));
+        }
+
+        for (containing_type, extension_number) in [
+            ("google.protobuf.MethodOptions", 50_000),
+            ("google.protobuf.FieldOptions", 50_001),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: containing_type.to_string(),
+                    extension_number,
+                })),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for extension {extension_number}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains("options.proto"));
+        }
+
+        let requests = [
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::AllExtensionNumbersOfType(
+                    "google.protobuf.MethodOptions".to_string(),
+                )),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: "google.protobuf.MethodOptions".to_string(),
+                    extension_number: 49_999,
+                })),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            },
+        ];
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter(requests))
+            .await
+            .unwrap()
+            .into_inner();
+        let extension_numbers = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::AllExtensionNumbersResponse(extension_numbers)) =
+            extension_numbers.message_response
+        else {
+            panic!("expected an extension-number response");
+        };
+        assert_eq!(
+            extension_numbers.base_type_name,
+            "google.protobuf.MethodOptions"
+        );
+        assert_eq!(extension_numbers.extension_number, [50_000]);
+
+        let unknown_extension = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = unknown_extension.message_response else {
+            panic!("expected an in-band error for an unknown extension");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+        assert!(matches!(
+            responses.message().await.unwrap().unwrap().message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflection_rate_limit_charges_each_query_on_one_stream() {
+        use tonic::Code;
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest,
+        };
+
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let reflection = crate::reflection::build_gateway_reflection_service(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let query = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([query.clone(), query]))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(responses.message().await.unwrap().is_some());
+        let status = responses
+            .message()
+            .await
+            .expect_err("second query on the same stream must be rate limited");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        server.abort();
+    }
+
+    #[test]
+    fn reflection_descriptor_excludes_internal_service_protos() {
+        let descriptors = crate::reflection::gateway_reflection_descriptors().unwrap();
+        let names: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .map(prost_reflect::FileDescriptor::name)
+            .collect();
+
+        assert!(names.contains("openshell.proto"));
+        assert!(names.contains("sandbox.proto"));
+        assert!(!names.contains("compute_driver.proto"));
+        assert!(!names.contains("credential_driver.proto"));
+        assert!(!names.contains("gateway_interceptor.proto"));
+        assert!(!names.contains("supervisor_middleware.proto"));
+    }
+
     #[test]
     fn normalize_ws_tunnel() {
         assert_eq!(normalize_http_path("/_ws_tunnel"), "/_ws_tunnel");
@@ -2827,6 +3335,31 @@ mod tests {
 
             assert!(seen.lock().unwrap().is_none());
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn reflection_bypasses_oidc_and_mtls_user_authentication() {
+            let oidc = Arc::new(MockAuthenticator::returning(Err(
+                tonic::Status::unauthenticated("OIDC credentials required"),
+            )));
+            let chain = AuthenticatorChain::new(vec![oidc]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, true, false);
+
+            let res = router
+                .call(empty_request(
+                    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert_eq!(grpc_status(&res), None);
+            assert!(
+                seen.lock().unwrap().is_none(),
+                "reflection must not receive an authenticated user principal"
+            );
         }
 
         #[tokio::test]
