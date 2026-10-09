@@ -1,7 +1,8 @@
 ---
 authors:
   - "@drew"
-state: review
+  - "@TaylorMutch"
+state: draft
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4266
   - https://github.com/NVIDIA/OpenShell/pull/4267
@@ -20,107 +21,157 @@ links:
 
 ## Summary
 
-For this proposal, the data plane is sandbox service exposure: HTTP and WebSocket traffic to applications running inside sandboxes. Compare three ways to separate it from the control plane while keeping gateway-routed traffic available for simple deployments.
+Add a dedicated application listener to supervisors and an optional `openshell-sandbox-proxy`. Supervisors advertise sandbox services to the gateway. The proxy discovers those services through the gateway and uses TLS Server Name Indication (SNI) to select the correct supervisor. The supervisor resolves the hostname and forwards traffic to the service inside its sandbox.
+
+HTTP and WebSocket traffic bypasses the gateway and its supervisor control connection. Operators can scale application ingress separately or use existing ingress infrastructure against the same supervisor listeners. Keep gateway routing available for simple deployments.
 
 ## Motivation
 
-Service exposure needs four things:
+Service exposure needs the following:
 
 1. **Independent scaling.** Prevent application traffic from consuming resources needed for responsive control-plane operations.
 2. **Independent access restrictions.** Apply separate network rules to control-plane and application traffic.
 3. **Application-owned authentication.** Serve applications without requiring OpenShell request authentication, so applications can authenticate their own clients.
 4. **Platform-managed authentication.** Protect applications through the authentication infrastructure used for the control plane, such as Cloudflare tunnels and zero-trust proxies.
+5. **Routing to shared supervisors.** Support a future supervisor serving several sandboxes, each with its own policy.
+6. **Optional proxy deployment.** Discover routes through the gateway while supporting OpenShell's proxy and existing ingress infrastructure.
 
 ## Non-goals
 
-- Move port forwarding or file uploads out of the gateway/control plane.
-- Add arbitrary TCP/UDP exposure or scale the sandbox application itself.
-- Remove the simple gateway-routed deployment.
+- Implement multi-tenant supervisors; accommodate them in the routing design.
+- Move SSH, execution, CLI port forwarding, or file uploads out of their current paths.
+- Add arbitrary TCP/UDP exposure, automatic port discovery, or application replication.
+- Replace egress policy, provider handling, or the isolation backend contract.
+- Remove gateway routing or automatically migrate existing URLs.
 
 ## Proposal
 
 ### What we have today
 
-```shell
-openshell service expose my-sandbox 8080 web
-```
+`openshell service expose my-sandbox 8080 web` registers a service and returns a URL shaped like `https://default--my-sandbox--web.<gateway-base-domain>/`.
 
-OpenShell creates an endpoint and returns a URL shaped like:
-
-```text
-https://default--my-sandbox--web.<gateway-base-domain>/
-```
-
-SNI selects the server certificate during TLS. HTTP hostname routing selects the application endpoint after the gRPC/HTTP dispatch decision. All of this runs in the gateway process and deployment.
+The gateway resolves the HTTP hostname and carries application traffic through a supervisor relay to the sandbox's loopback port. Service requests bypass control-plane RPC authorization but share the gateway process, listener TLS requirements, and supervisor transport.
 
 ### What is missing
 
-**Independent scaling:** the gateway handles application requests and carries their payloads over supervisor relays. Adding an external frontend alone leaves those payloads in the gateway process.
+- **Independent scaling.** Another frontend or gateway listener still sends application payloads through the gateway. We need a separate path to supervisor app listeners.
+- **Independent access restrictions.** Applications need separate listener ports and TLS policies. Different hostnames alone do not provide a network access boundary.
+- **Authentication flexibility.** Applications can already receive bearer credentials or sit behind edge authentication, but inherit gateway TLS requirements. They need an independent application listener; service routes do not automatically inherit OpenShell OIDC or workspace authorization.
+- **Service discovery.** Ingress needs to find the supervisor serving each sandbox and follow ownership changes, including when one supervisor serves several sandboxes.
 
-**Independent access restrictions:** Gateway API can describe separate listeners for `gateway.example.com` (control plane) and `*.gateway.example.com` (applications), but hostname routing alone does not restrict access. An ingress controller can apply separate listener or route policies. Standard Kubernetes NetworkPolicy needs distinct pod or port targets; two hostnames on the same proxy pod and port do not provide that boundary.
+### Architecture
 
-**Authentication:** application routes already bypass control-plane RPC authentication and support optional bearer-token passthrough, but inherit the shared listener's TLS requirements. An upstream edge proxy can protect application routes; they do not automatically inherit OpenShell's native OIDC or workspace authorization.
+The gateway manages service declarations and discovery. Supervisors have application-only listeners, separate from their gateway connections and management APIs. The optional proxy connects directly to these listeners.
 
-### Option 1: Add a dedicated application proxy
+Supervisors reach services through each sandbox's isolation backend loopback connector, as defined in [RFC 0012](../0012-isolation-backend/README.md). Traffic never reaches sandboxes directly.
 
-Build a small proxy from the gateway's existing application proxy and relay components, or evaluate an existing proxy such as Envoy. The gateway manages exposure configuration; the dedicated proxy carries application bytes independently of the gateway.
+```mermaid
+flowchart TB
+    Client["Application clients"] -->|"Service SNI"| Proxy["Optional openshell-sandbox-proxy"]
+    Proxy -.->|"Discovery"| Gateway["OpenShell gateway"]
+    SA["Supervisor A: app listener"] -.->|"Control and advertisements"| Gateway
+    SB["Supervisor B: app listener"] -.->|"Control and advertisements"| Gateway
+    Proxy -->|"A/web, B/web, B/portal"| SA
+    Proxy -->|"C/web"| SB
+    SA --> A["Sandbox A: web; policy A"]
+    SA --> B["Sandbox B: web and portal; policy B"]
+    SB --> C["Sandbox C: web; policy C"]
+```
 
-There are two ways to connect the proxy to supervisors:
+Solid arrows carry application traffic; dashed arrows carry control traffic. Discovery identifies the supervisor app endpoint independently of which gateway replica owns its control session.
 
-- **Direct connections.** The proxy connects to a new, authenticated application-only supervisor listener. It finds the owning supervisor through a Kubernetes Service or endpoint discovery. One listener can serve multiple sandboxes; the proxy must select the correct supervisor and the supervisor must validate the requested service. This can reuse the Kubernetes backends described in option 3.
-- **Reverse tunnels.** The supervisor opens an authenticated outbound connection to the proxy, separate from its gateway management connection. The proxy requests application streams over that connection, and the supervisor bridges them to permitted sandbox targets. No inbound supervisor listener or supervisor Kubernetes Service is needed. Proxy replicas must locate the connection serving each sandbox and handle reconnection and draining. Envoy's [reverse tunnels](https://www.envoyproxy.io/docs/envoy/latest/configuration/other_features/reverse_tunnel) are one candidate to evaluate.
+Proxy replicas scale independently of the gateway. Supervisors still share resources between application and control work, so connection, buffer, and per-sandbox concurrency limits must preserve control-plane capacity.
 
-Both variants keep application bytes out of the gateway, allowing independent scaling and network access controls. A multi-tenant supervisor must identify and authorize the sandbox and service for each request or stream. Direct connections require reachable supervisor endpoints; reverse tunnels require coordination of connection ownership across proxy replicas.
+### Services and discovery
 
-### Option 2: Add separate control-plane and application listeners
+Keep the existing workflow, including create-time exposure and unnamed services:
 
-This is the approach in [PR #4213](https://github.com/NVIDIA/OpenShell/pull/4213), tracked by [#4210](https://github.com/NVIDIA/OpenShell/issues/4210): add a dedicated application ingress port while retaining the primary gateway listener.
+```shell
+openshell service expose sandbox-a 8080 web
+openshell service expose sandbox-b 8080 web
+openshell service expose sandbox-b 9000 portal
+openshell service expose sandbox-c 8080 web
+```
 
-- Application ingress serves HTTP and WebSockets without gateway RPC, authentication, or gateway-tunnel handlers.
-- Operators can restrict the ports independently and use different TLS client-authentication requirements.
-- Both listeners share the gateway process, deployment resources, and gateway-owned relays.
+The gateway sends declarations to the owning supervisor. The supervisor installs permitted routes under each sandbox's policy and advertises them back. The gateway validates ownership and publishes accepted routes. An advertisement cannot broaden a declaration, and an advertised route does not prove the application is healthy.
 
-This addresses access restrictions, but does not provide independent scaling.
+Add authenticated, read-only discovery with a snapshot and a watch for changes. Each route contains its hostname, sandbox and service IDs, supervisor identity and app address, revision, runtime generation, and expiry. Addresses come from trusted operator/driver configuration. Discovery access is scoped to the router's workspaces and includes no workload secrets.
 
-### Option 3: Expose supervisor application listeners through Kubernetes Services
+Routers cache routes rather than querying the gateway for each connection. Revisions and generations distinguish updates and sandbox replacements. Deletion, rejected configuration, or loss of ownership withdraws a route. Supervisors reject stale routes even if a proxy still has them cached; new owners advertise only after accepting the route.
 
-Use a Kubernetes Service per supervisor or supervisor shard to expose a dedicated application listener. Multiple sandbox service routes share that backend, including when a supervisor manages multiple tenants. Creating an OpenShell service adds a logical route; it does not require another Kubernetes Service. Per-application Kubernetes Services remain an optional integration choice.
+During discovery outages, the proposed default permits unexpired routes and rejects new connections after expiry. Revocation or sandbox teardown closes affected connections. Lease and draining rules remain open questions. Failures do not automatically fall back through the gateway.
 
-Application ingress routes to the owning supervisor's Service, keeping application bytes out of the gateway. The supervisor resolves the hostname or trusted ingress metadata to a declared service and forwards to its permitted target inside the correct sandbox. The new listener is necessary because a Kubernetes Service cannot directly reach sandbox loopback. It must not expose supervisor management handlers.
+### SNI routing and policy
 
-A Kubernetes Service selects pods and ports, not HTTP hostnames. Its backends must be able to serve every route sent to it. A single Service across supervisors that own different sandboxes therefore needs additional routing or forwarding. Separate Services targeting the same shared listener do not themselves isolate tenants: the supervisor must validate sandbox identity and effective policy, with authentication, quotas, and accounting scoped to the service or tenant.
+The proposed default is TLS passthrough: the proxy reads SNI, selects the advertised supervisor, and forwards the TLS stream. The supervisor terminates TLS and proxies HTTP/WebSockets to the declared loopback port. Missing SNI and unknown or expired routes are rejected.
 
-This allows separate ingress scaling and access policies while supporting a future multi-tenant supervisor. It is Kubernetes-specific and requires route and backend reconciliation as sandbox ownership changes. Applications still share supervisor resources; this does not scale the applications themselves.
+For workspace `default`, the example routes are:
 
-All options retain gateway-owned service declarations and the existing CLI workflow. Keep gateway routing available for low-volume deployments. The choice between the options remains open.
+| Service URL | Supervisor | Sandbox destination |
+| --- | --- | --- |
+| `https://default--sandbox-a--web.svc.openshell.internal/` | A | A: web, port 8080 |
+| `https://default--sandbox-b--web.svc.openshell.internal/` | A | B: web, port 8080 |
+| `https://default--sandbox-b--portal.svc.openshell.internal/` | A | B: portal, port 9000 |
+| `https://default--sandbox-c--web.svc.openshell.internal/` | B | C: web, port 8080 |
+
+The supervisor checks each HTTP `Host` or HTTP/2 `:authority` against the connection's SNI and installed route. Mismatches are rejected. WebSockets stay bound to their admitted service.
+
+Before opening the sandbox connector, the supervisor checks ownership, generation, readiness, and that sandbox's policy. Clients cannot choose arbitrary ports. Connection pools, quotas, and logs stay scoped to the sandbox and service. A future shared supervisor must authenticate its authority over each sandbox separately.
+
+The ingress policy schema needs definition. Existing egress rules must not implicitly grant ingress access.
+
+### TLS and authentication
+
+Application TLS is configured separately from gateway TLS. Operators provide DNS and certificates; `svc.openshell.internal` is an example domain. Certificate provisioning and rotation remain open questions.
+
+SNI selects a route; it does not authenticate a user. Applications can handle authentication, or operators can apply an edge access policy. Preserve existing header handling: strip `Authorization` by default, allow explicit `bearer-passthrough`, and strip gateway/edge identity headers and edge authentication cookies. Native OpenShell user/workspace authorization is not the proposed default for application requests.
+
+A passthrough proxy cannot inspect HTTP credentials. An edge that terminates TLS must reconnect with the correct service SNI and authority. Restrict supervisor listener access to prevent bypassing required edge authentication; use authenticated backend transport where network restrictions are insufficient.
+
+### Deployment and compatibility
+
+`openshell-sandbox-proxy` is a separate binary with its own listener, discovery credentials, cache, limits, and metrics. Replicas can sit behind a load balancer and discover routes independently.
+
+The proxy is optional, consistent with the [PR discussion](https://github.com/NVIDIA/OpenShell/pull/4267#issuecomment-6053456908). Kubernetes operators can use existing ingress plus a discovery adapter to route to supervisor Services. Several sandbox services can share one supervisor Service. A Service spanning supervisors with different sandbox owners still needs routing that selects the correct owner. Ingress must preserve service SNI or use an explicitly supported TLS termination mode.
+
+Enable the new path explicitly and retain existing gateway-mode behavior. CLI/SDK URLs must use the application ingress domain and public port independently of the gateway endpoint. Status should distinguish configured, advertised, and unavailable routes. Domain migrations require coordinated DNS, TLS, and client changes.
 
 ## Implementation plan
 
-1. Select the data path and define configuration, supervisor trust, and service lifecycle behavior.
-2. Add the selected mode as opt-in, preserving existing service declarations and URLs where possible; document any DNS, TLS, or endpoint migration.
-3. Test HTTP/WebSockets, tenant and authentication boundaries, sandbox ownership changes, deletion and restart behavior, and control-plane responsiveness under application load in the relevant E2E lane. Update deployment docs and related skills before release.
+Start with one sandbox per supervisor while preserving routing boundaries needed for shared supervisors.
+
+1. Define ingress policy, TLS, discovery credentials, route leases, and advertisement/discovery APIs following `proto/README.md`.
+2. Add supervisor app listeners, service configuration sync, boundary routing, limits, and OCSF events.
+3. Add gateway discovery and build `openshell-sandbox-proxy` with cached routes and direct supervisor connections.
+4. Integrate a supported driver and Kubernetes ingress path. Update CLI/SDK URLs, deployment configuration, docs, and related skills.
+5. Run sandbox E2E tests for HTTP/WebSockets, SNI/host mismatches, tenant policies, authentication, deletion, replacement, and discovery outages. Use fixtures for shared-supervisor routing until that runtime exists. Measure control-plane responsiveness under application load and test gateway-mode compatibility.
 
 ## Risks
 
-- A separate data path adds routing state, certificates, and deployment lifecycle work.
-- Stale routes must not expose undeclared targets or route to another sandbox. Backend access must not bypass edge authentication or expose management handlers.
-- Application traffic can still exhaust supervisor resources even when the gateway is removed from its path.
+- **Supervisor contention.** Application traffic still shares supervisor resources. Limits and load tests must show that control operations remain responsive.
+- **Stale discovery.** Ownership changes and outages can interrupt service. Revisions, generations, expiry, and local checks must prevent routing to another sandbox.
+- **Ingress security.** New listeners increase supervisor exposure. Bound connection/parser work, reject undeclared services, and prevent edge-authentication bypass.
+- **Operational complexity.** Certificates, direct supervisor reachability, and two supported data paths add deployment and maintenance work.
 
 ## Alternatives
 
-Keeping the current gateway path is simplest, but retains resource coupling. Adding only an external frontend improves edge policy without removing application traffic from the gateway. The three options above compare progressively different deployment boundaries; separate listeners alone do not meet all four requirements.
+- **Keep gateway routing or split gateway listeners.** Separate listeners (#4210 / #4213) improve access control but retain gateway payload traffic.
+- **Require the proxy everywhere.** This standardizes ingress but adds a component where operators already have suitable infrastructure.
+- **Terminate TLS at the proxy.** This centralizes certificates and enables HTTP authentication, but requires a trusted proxy-to-supervisor routing contract.
+- **Use reverse application tunnels.** These avoid inbound supervisor reachability but add tunnel ownership and reconnection machinery. Consider them for deployments behind NAT.
 
 ## Prior art
 
-- [Kubernetes API server proxy](https://kubernetes.io/docs/tasks/access-application-cluster/access-cluster-services/#discovering-builtin-services): a comparison for the current management-server-mediated application path.
-- [#994](https://github.com/NVIDIA/OpenShell/issues/994): portable service declarations, supervisor enforcement, and delegated data paths. This RFC focuses on HTTP/WebSocket deployment choices; broader protocol and policy questions remain separate.
-- [#1791](https://github.com/NVIDIA/OpenShell/issues/1791): Kubernetes-native exposure, closed as a duplicate of #994 rather than implemented.
-- [#1794](https://github.com/NVIDIA/OpenShell/issues/1794) and [#3402](https://github.com/NVIDIA/OpenShell/issues/3402): application bearer-token handling and create-time exposure, whose workflows should remain compatible.
-- [#4229](https://github.com/NVIDIA/OpenShell/issues/4229), [#2469](https://github.com/NVIDIA/OpenShell/issues/2469), and [#3715](https://github.com/NVIDIA/OpenShell/issues/3715): related service-readiness and dedicated/shared agentgateway integration work.
+- #4266 and [PR #4267](https://github.com/NVIDIA/OpenShell/pull/4267) define the original requirements and options. This revision proposes supervisor listeners with an optional proxy.
+- [RFC 0012](../0012-isolation-backend/README.md) provides the protected loopback connector into each sandbox.
+- #994 and #1791 cover service declarations and Kubernetes ingress; #1794 and #3402 cover bearer handling and create-time exposure.
+- #4229 covers service health. #2469 and #3715 cover dedicated/shared ingress integrations.
 
 ## Open questions
 
-- Which path should come first: a dedicated proxy, Kubernetes Services, or both? How does the listener split fit?
-- How are service configuration, supervisor connections, and Kubernetes resources reconciled? For shared supervisors, how does ingress find the owning supervisor and follow sandbox ownership changes?
-- How should declarations map to effective sandbox policy, and where should per-service authentication be configured?
-- What happens to active requests and WebSockets on service deletion, sandbox replacement, or control-plane failure?
+- Should TLS terminate at supervisors or the proxy? How are certificates provisioned and rotated?
+- Does `service expose` grant ingress permission, or must policy also allow it? Which policy and middleware checks apply?
+- How are discovery credentials scoped, and how does a shared supervisor authenticate ownership of each sandbox?
+- What route expiry, outage grace, revocation acknowledgement, and connection-draining rules should apply?
+- Which driver and ingress integration ship first? What backend authentication is required?
+- What per-sandbox limits and control-plane latency targets demonstrate adequate resource isolation?
