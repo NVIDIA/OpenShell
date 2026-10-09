@@ -1167,6 +1167,19 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# additional_ca_bundle points at a PEM CA bundle (on the gateway host) trusted
+# for direct, policy-inspected HTTPS egress to a destination signed by a
+# private CA — independent of proxy_ca_bundle above, this applies whether or
+# not https_proxy is set. The Podman supervisor runs as its own container,
+# separate from the workload image, so it cannot inherit a private CA baked
+# into the workload's own trust store; this setting restores that trust
+# without rebuilding the supervisor image. The gateway bind-mounts the file
+# read-only into the supervisor container and folds it into the upstream
+# trust store alongside (not instead of) the system CA bundle. The file must
+# exist and contain at least one certificate; this is validated on the
+# gateway host at sandbox-create time, not deferred until the supervisor
+# container starts.
+# additional_ca_bundle      = "/etc/openshell/tls/additional-ca.pem"
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"

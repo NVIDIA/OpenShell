@@ -501,6 +501,7 @@ pub async fn run_network_proxy(
     policy_data: String,
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
 ) -> Result<i32> {
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
@@ -568,6 +569,7 @@ pub async fn run_network_proxy(
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
+        additional_ca_bundle.as_deref(),
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
@@ -633,6 +635,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -1039,6 +1042,7 @@ async fn run_sandbox_with_backend(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
+            additional_ca_bundle.as_deref(),
             None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
