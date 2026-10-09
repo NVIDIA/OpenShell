@@ -375,6 +375,10 @@ pub async fn inspect_workload(
     let supervisor = client
         .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
         .await;
+    let supervisor_exit_code = supervisor
+        .as_ref()
+        .ok()
+        .and_then(|supervisor| exited_exit_code(&supervisor.state));
     if workload.state.running {
         match supervisor {
             Ok(supervisor) if supervisor.state.running => {
@@ -391,12 +395,7 @@ pub async fn inspect_workload(
             // Both containers exist before initial start. A missing or exited
             // companion therefore requires containment, including after a
             // gateway restart that missed the original Podman exit event.
-            Ok(supervisor) => {
-                client.stop_container(&workload.id, 0).await?;
-                workload = client.inspect_container(&workload.id).await?;
-                workload.state.supervisor_exit_code = exited_exit_code(&supervisor.state);
-            }
-            Err(PodmanApiError::NotFound(_)) => {
+            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
                 client.stop_container(&workload.id, 0).await?;
                 workload = client.inspect_container(&workload.id).await?;
             }
@@ -408,10 +407,8 @@ pub async fn inspect_workload(
             .await
             .ok()
             .and_then(|logs| boundary_startup_termination_marker(&logs));
-        workload.state.supervisor_exit_code = supervisor
-            .ok()
-            .and_then(|supervisor| exited_exit_code(&supervisor.state));
     }
+    workload.state.supervisor_exit_code = supervisor_exit_code;
     Ok(workload)
 }
 

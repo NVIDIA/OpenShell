@@ -5335,40 +5335,45 @@ async fn wait_for_docker_supervisor_ready(
     sandbox_id: &str,
     failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
 ) -> Result<(), Status> {
+    // The monitor records a workspace rejection before it removes the
+    // supervisor, so a later failed inspection must still report it.
+    match poll_docker_supervisor_ready(docker, supervisor_id, workload_container_id, sandbox_id)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(status) => Err(recorded_workspace_validation_failure(failures, sandbox_id)
+            .await
+            .unwrap_or(status)),
+    }
+}
+
+async fn poll_docker_supervisor_ready(
+    docker: &Docker,
+    supervisor_id: &str,
+    workload_container_id: &str,
+    sandbox_id: &str,
+) -> Result<(), Status> {
     // Gateway provisioning deadlines own startup expiration, including policy
     // repairs that extend the window. Unhealthy means not ready while the
     // supervisor is quarantined; only a stopped process is a startup failure.
     loop {
-        if let Some(status) = recorded_workspace_validation_failure(failures, sandbox_id).await {
-            return Err(status);
-        }
-        let sandbox = match docker.inspect_container(workload_container_id, None).await {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                return Err(recorded_workspace_validation_failure(failures, sandbox_id)
-                    .await
-                    .unwrap_or_else(|| {
-                        Status::internal(format!("inspect Docker sandbox container: {error}"))
-                    }));
-            }
-        };
+        let sandbox = docker
+            .inspect_container(workload_container_id, None)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("inspect Docker sandbox container: {error}"))
+            })?;
         if sandbox.state.unwrap_or_default().running == Some(false) {
-            return Err(recorded_workspace_validation_failure(failures, sandbox_id)
-                .await
-                .unwrap_or_else(|| {
-                    Status::unavailable("Docker sandbox exited before supervisor became ready")
-                }));
+            return Err(Status::unavailable(
+                "Docker sandbox exited before supervisor became ready",
+            ));
         }
-        let inspected = match docker.inspect_container(supervisor_id, None).await {
-            Ok(inspected) => inspected,
-            Err(error) => {
-                return Err(recorded_workspace_validation_failure(failures, sandbox_id)
-                    .await
-                    .unwrap_or_else(|| {
-                        Status::internal(format!("inspect Docker supervisor container: {error}"))
-                    }));
-            }
-        };
+        let inspected = docker
+            .inspect_container(supervisor_id, None)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("inspect Docker supervisor container: {error}"))
+            })?;
         let state = inspected.state.unwrap_or_default();
         match state.health.and_then(|health| health.status) {
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
@@ -5381,11 +5386,6 @@ async fn wait_for_docker_supervisor_ready(
                 return Err(workspace_validation_status());
             }
             _ if state.running == Some(false) => {
-                if let Some(status) =
-                    recorded_workspace_validation_failure(failures, sandbox_id).await
-                {
-                    return Err(status);
-                }
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
                 return Err(Status::unavailable(format!(
@@ -5439,7 +5439,7 @@ async fn recorded_workspace_validation_failure(
 
 /// Startup failure for a supervisor that exited because the sandbox rejected
 /// the image working directory. The message is fixed text, because supervisor
-/// output may contain secrets; the fixed message identifies the failure for
+/// output may contain secrets, and identifies the failure for
 /// [`supervisor_start_failure_reason`].
 fn workspace_validation_status() -> Status {
     Status::failed_precondition(WORKSPACE_VALIDATION_FAILED_MESSAGE)
@@ -5448,9 +5448,7 @@ fn workspace_validation_status() -> Status {
 /// Condition reason for a supervisor that failed before becoming ready.
 fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'static str {
     if status.code() == tonic::Code::FailedPrecondition
-        && status
-            .message()
-            .starts_with(WORKSPACE_VALIDATION_FAILED_MESSAGE)
+        && status.message() == WORKSPACE_VALIDATION_FAILED_MESSAGE
     {
         CONDITION_WORKSPACE_VALIDATION_FAILED
     } else {

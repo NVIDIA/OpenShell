@@ -184,17 +184,14 @@ USER app
                 }
                 continue;
             }
-            if create.success()
-                || create.stdout().contains("workspace-access-marker")
-                || create.stderr().contains("workspace-access-marker")
-            {
+            let printed =
+                |text: &str| create.stdout().contains(text) || create.stderr().contains(text);
+            if create.success() || printed("workspace-access-marker") {
                 return Err(
                     create.failure_diagnostic("sandbox creation fails before the command runs")
                 );
             }
-            if !create.stdout().contains(WORKSPACE_VALIDATION_FAILED)
-                && !create.stderr().contains(WORKSPACE_VALIDATION_FAILED)
-            {
+            if !printed(WORKSPACE_VALIDATION_FAILED) {
                 return Err(create.failure_diagnostic(&format!(
                     "sandbox creation fails with {WORKSPACE_VALIDATION_FAILED}"
                 )));
@@ -291,14 +288,18 @@ async fn sandbox_cleanup_precedes_image_removal_on_success_and_failure() {
 }
 
 /// Shell checks for the identity, working directory, and `HOME` of a sandbox
-/// child. With `image_file`, also check that root-owned image content is
-/// present and unchanged in the workspace.
+/// child. A custom workspace must not also get the managed `/sandbox`. With
+/// `image_file`, also check that root-owned image content is present and
+/// unchanged in the workspace.
 fn workspace_checks(identity: &str, workspace: &str, image_file: bool) -> String {
     let mut checks = format!(
         "test \"$(id -u):$(id -g)\" = {identity}; \
          test \"$(pwd -P)\" = {workspace}; \
          test \"$HOME\" = {workspace};"
     );
+    if workspace != "/sandbox" {
+        checks.push_str(" test ! -e /sandbox;");
+    }
     if image_file {
         checks.push_str(
             " test \"$(cat root-owned.txt)\" = root-owned; \
@@ -330,16 +331,16 @@ async fn create_sandbox(
         args.extend(["--policy", policy]);
     }
     args.extend(["--detach", "--", "sh", "-c", &main]);
-    runner
-        .step(format!("{suffix}/create"))
-        .description("sandbox starts from the test image")
-        .with_timeout(CREATE_TIMEOUT)
-        .run(&args)
-        .await
-        .map_err(|error| error.to_string())?
-        .require_success()?;
+    run_ok(
+        runner,
+        format!("{suffix}/create"),
+        "sandbox starts from the test image",
+        CREATE_TIMEOUT,
+        &args,
+    )
+    .await?;
 
-    let exec = format!(
+    let script = format!(
         "set -eu; i=0; \
          while [ ! -f /tmp/oci-main.status ]; do \
            i=$((i + 1)); [ \"$i\" -le 60 ] || {{ echo main process checks did not finish >&2; exit 1; }}; \
@@ -350,16 +351,14 @@ async fn create_sandbox(
          fi; \
          test -f main-write; {checks} touch exec-write"
     );
-    runner
-        .step(format!("{suffix}/exec"))
-        .description("main process and exec children see the image workspace")
-        .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox", "exec", "--name", &name, "--no-tty", "--", "sh", "-c", &exec,
-        ])
-        .await
-        .map_err(|error| error.to_string())?
-        .require_success()?;
+    exec(
+        runner,
+        &name,
+        format!("{suffix}/exec"),
+        "main process and exec children see the image workspace",
+        &script,
+    )
+    .await?;
     Ok(name)
 }
 
@@ -372,49 +371,39 @@ async fn file_transfer_uses_workspace(
     let upload = local.path().join("oci-transfer.txt");
     std::fs::write(&upload, "oci-transfer-ok").map_err(|error| format!("write upload: {error}"))?;
     let upload = upload.to_str().ok_or("upload path is not UTF-8")?;
-    runner
-        .step("named/upload")
-        .description("upload without a destination writes to the workspace")
-        .with_timeout(COMMAND_TIMEOUT)
-        .run(&["sandbox", "upload", sandbox, upload, "--no-git-ignore"])
-        .await
-        .map_err(|error| error.to_string())?
-        .require_success()?;
-    runner
-        .step("named/uploaded")
-        .description("uploaded file is in the workspace")
-        .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            sandbox,
-            "--no-tty",
-            "--",
-            "sh",
-            "-c",
-            "test \"$(cat oci-transfer.txt)\" = oci-transfer-ok",
-        ])
-        .await
-        .map_err(|error| error.to_string())?
-        .require_success()?;
+    run_ok(
+        runner,
+        "named/upload",
+        "upload without a destination writes to the workspace",
+        COMMAND_TIMEOUT,
+        &["sandbox", "upload", sandbox, upload, "--no-git-ignore"],
+    )
+    .await?;
+    exec(
+        runner,
+        sandbox,
+        "named/uploaded",
+        "uploaded file is in the workspace",
+        "test \"$(cat oci-transfer.txt)\" = oci-transfer-ok",
+    )
+    .await?;
 
     let download = local.path().join("downloaded.txt");
     let download_path = download.to_str().ok_or("download path is not UTF-8")?;
-    runner
-        .step("named/download")
-        .description("download resolves relative paths in the workspace")
-        .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
+    run_ok(
+        runner,
+        "named/download",
+        "download resolves relative paths in the workspace",
+        COMMAND_TIMEOUT,
+        &[
             "sandbox",
             "download",
             sandbox,
             "oci-transfer.txt",
             download_path,
-        ])
-        .await
-        .map_err(|error| error.to_string())?
-        .require_success()?;
+        ],
+    )
+    .await?;
     let downloaded =
         std::fs::read_to_string(&download).map_err(|error| format!("read download: {error}"))?;
     if downloaded != "oci-transfer-ok" {
@@ -430,44 +419,71 @@ async fn file_transfer_uses_workspace(
         .and_then(|()| std::fs::write(merge.join("added.txt"), "local-added"))
         .map_err(|error| format!("write merge files: {error}"))?;
     let merge = merge.to_str().ok_or("merge path is not UTF-8")?;
-    let seed = "mkdir merge-upload && printf remote-conflict > merge-upload/conflict.txt \
-                && printf remote-preserved > merge-upload/unrelated.txt";
-    let verify = "test \"$(cat merge-upload/conflict.txt)\" = local-conflict \
-                  && test \"$(cat merge-upload/added.txt)\" = local-added \
-                  && test \"$(cat merge-upload/unrelated.txt)\" = remote-preserved";
-    for (step, description, args) in [
-        (
-            "named/merge-seed",
-            "seed an existing workspace directory",
-            [
-                "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", seed,
-            ]
-            .as_slice(),
-        ),
-        (
-            "named/merge-upload",
-            "directory upload merges into the existing directory",
-            ["sandbox", "upload", sandbox, merge, "--no-git-ignore"].as_slice(),
-        ),
-        (
-            "named/merged",
-            "upload overwrites conflicts and keeps unrelated files",
-            [
-                "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", verify,
-            ]
-            .as_slice(),
-        ),
-    ] {
-        runner
-            .step(step)
-            .description(description)
-            .with_timeout(COMMAND_TIMEOUT)
-            .run(args)
-            .await
-            .map_err(|error| error.to_string())?
-            .require_success()?;
-    }
-    Ok(())
+    exec(
+        runner,
+        sandbox,
+        "named/merge-seed",
+        "seed an existing workspace directory",
+        "mkdir merge-upload && printf remote-conflict > merge-upload/conflict.txt \
+         && printf remote-preserved > merge-upload/unrelated.txt",
+    )
+    .await?;
+    run_ok(
+        runner,
+        "named/merge-upload",
+        "directory upload merges into the existing directory",
+        COMMAND_TIMEOUT,
+        &["sandbox", "upload", sandbox, merge, "--no-git-ignore"],
+    )
+    .await?;
+    exec(
+        runner,
+        sandbox,
+        "named/merged",
+        "upload overwrites conflicts and keeps unrelated files",
+        "test \"$(cat merge-upload/conflict.txt)\" = local-conflict \
+         && test \"$(cat merge-upload/added.txt)\" = local-added \
+         && test \"$(cat merge-upload/unrelated.txt)\" = remote-preserved",
+    )
+    .await
+}
+
+/// Run a CLI step that must succeed.
+async fn run_ok(
+    runner: &OpenShellRunner,
+    step: impl Into<String>,
+    description: &str,
+    timeout: Duration,
+    args: &[&str],
+) -> Result<(), String> {
+    runner
+        .step(step)
+        .description(description)
+        .with_timeout(timeout)
+        .run(args)
+        .await
+        .map_err(|error| error.to_string())?
+        .require_success()
+}
+
+/// Run a shell script in `sandbox` through `sandbox exec`.
+async fn exec(
+    runner: &OpenShellRunner,
+    sandbox: &str,
+    step: impl Into<String>,
+    description: &str,
+    script: &str,
+) -> Result<(), String> {
+    run_ok(
+        runner,
+        step,
+        description,
+        COMMAND_TIMEOUT,
+        &[
+            "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", script,
+        ],
+    )
+    .await
 }
 
 /// An image owned by `run`, kept alive until sandbox cleanup completes.

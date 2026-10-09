@@ -66,18 +66,9 @@ use openshell_ocsf::{
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
 /// The sandbox rejected the image working directory while starting the agent.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{0}")]
 pub struct WorkspaceValidationFailed(String);
-
-impl std::fmt::Display for WorkspaceValidationFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for WorkspaceValidationFailed {}
-
-impl miette::Diagnostic for WorkspaceValidationFailed {}
 
 /// Convert an agent start failure into a report.
 ///

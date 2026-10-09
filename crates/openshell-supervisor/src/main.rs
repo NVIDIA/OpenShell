@@ -423,7 +423,7 @@ fn main() -> Result<()> {
                 };
                 let admitted_isolation_backend =
                     std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                Box::pin(openshell_supervisor::run_sandbox(
+                let result = Box::pin(openshell_supervisor::run_sandbox(
                     command,
                     workdir,
                     args.timeout,
@@ -445,9 +445,8 @@ fn main() -> Result<()> {
                     admitted_isolation_backend,
                     args.main_exit_marker,
                 ))
-                .await
-                .map(supervisor_exit_status)
-                .or_else(workspace_validation_exit)
+                .await;
+                supervisor_exit(result)
             }
             SupervisorRole::NetworkProxy => {
                 let listen = args.listen.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
@@ -488,31 +487,27 @@ fn otlp_span_filter(log_level: &str) -> EnvFilter {
     EnvFilter::new(format!("info,openshell={level}"))
 }
 
-/// Exit with the reserved status when the sandbox rejects the image working
-/// directory, so the compute driver can report the specific failure.
-fn workspace_validation_exit(error: miette::Report) -> Result<i32> {
+/// Choose the supervisor's exit status for a sandbox run.
+///
+/// The reserved status tells the compute driver that the sandbox rejected the
+/// image working directory. After the workload exits, the supervisor exits
+/// with the workload's status, so a workload that itself exits with the
+/// reserved status is reported as 1 instead. The gateway receives the
+/// workload's exact status separately.
+fn supervisor_exit(result: Result<i32>) -> Result<i32> {
     use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
-    if error
-        .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
-        .is_none()
-    {
-        return Err(error);
-    }
-    error!("Image workspace validation failed");
-    eprintln!("{error:?}");
-    Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
-}
-
-/// The supervisor exits with the workload's status after the workload exits.
-/// Keep the reserved workspace-validation status for workspace rejections, so
-/// drivers do not misreport a workload that itself exited with it. The gateway
-/// receives the workload's exact status separately.
-fn supervisor_exit_status(workload_status: i32) -> i32 {
-    use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
-    if workload_status == SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED {
-        1
-    } else {
-        workload_status
+    match result {
+        Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) => Ok(1),
+        Err(error)
+            if error
+                .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
+                .is_some() =>
+        {
+            error!("Image workspace validation failed");
+            eprintln!("{error:?}");
+            Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
+        }
+        other => other,
     }
 }
 
@@ -530,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_validation_failure_exits_with_reserved_status() {
+    fn only_workspace_validation_failure_exits_with_reserved_status() {
         use miette::WrapErr as _;
         use openshell_core::driver_utils::{
             SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
@@ -546,34 +541,31 @@ mod tests {
             "process error: boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
         ));
         assert_eq!(
-            workspace_validation_exit(error).expect("reserved exit status"),
+            supervisor_exit(Err(error)).expect("reserved exit status"),
             SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
         );
         assert!(
-            workspace_validation_exit(openshell_supervisor::start_agent_error(
+            supervisor_exit(Err(openshell_supervisor::start_agent_error(
                 "connect failed".into()
-            ))
+            )))
             .is_err()
         );
         // Only an agent start failure carries the rejection, even when another
         // error's text contains the same words.
         assert!(
-            workspace_validation_exit(miette::miette!(
+            supervisor_exit(Err(miette::miette!(
                 "policy sync failed: {WORKSPACE_VALIDATION_ERROR_CONTEXT}"
-            ))
+            )))
             .is_err()
         );
-    }
 
-    #[test]
-    fn workload_exit_does_not_use_reserved_workspace_status() {
-        use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
+        // A workload's own exit with the reserved status is not a rejection.
         assert_eq!(
-            supervisor_exit_status(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            supervisor_exit(Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)).unwrap(),
             1
         );
-        assert_eq!(supervisor_exit_status(0), 0);
-        assert_eq!(supervisor_exit_status(143), 143);
+        assert_eq!(supervisor_exit(Ok(0)).unwrap(), 0);
+        assert_eq!(supervisor_exit(Ok(143)).unwrap(), 143);
     }
 
     #[test]

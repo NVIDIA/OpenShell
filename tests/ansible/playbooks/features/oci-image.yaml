@@ -7,6 +7,8 @@
   gather_facts: false
   vars:
     oci_image_test_root: /var/lib/openshell-oci-image/tests
+    # The tests are skipped when the gateway never connects.
+    oci_image_failed: "{{ gateway_status is failed or oci_image_result.rc != 0 }}"
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -61,6 +63,20 @@
       register: openshell_cli
       changed_when: false
 
+    # Every test boot restarts the gateway, and some installers take minutes to
+    # recover. Wait once here; the runner's per-scenario preflight stays short.
+    - name: Wait for the registered gateway
+      ansible.builtin.command:
+        argv: [timeout, 10s, "{{ openshell_cli.stdout }}", status, --output, json]
+      register: gateway_status
+      changed_when: false
+      until: >-
+        gateway_status.rc == 0 and
+        (gateway_status.stdout | from_json).status == 'connected'
+      retries: 60
+      delay: 5
+      ignore_errors: true
+
     - name: Run OCI image archive
       ansible.builtin.command:
         argv:
@@ -84,32 +100,23 @@
       register: oci_image_result
       changed_when: false
       failed_when: false
+      when: gateway_status is succeeded
 
     - name: Show OCI image diagnostics
       ansible.builtin.debug:
         var: oci_image_result
-      when: oci_image_result.rc != 0
+      when: oci_image_failed
 
-    - name: Read OpenShell gateway logs
-      become: true
-      ansible.builtin.command:
-        argv:
-          - journalctl
-          - --no-pager
-          - --lines
-          - "500"
-          - _SYSTEMD_UNIT=openshell-gateway.service
-          - "+"
-          - _SYSTEMD_USER_UNIT=openshell-gateway.service
-      register: openshell_gateway_logs
-      changed_when: false
-      failed_when: false
-      when: oci_image_result.rc != 0
+    - name: Collect OpenShell gateway diagnostics
+      ansible.builtin.include_role:
+        name: openshell_diagnostics
+      when: oci_image_failed
 
-    - name: Show OpenShell gateway logs
-      ansible.builtin.debug:
-        var: openshell_gateway_logs.stdout_lines
-      when: oci_image_result.rc != 0
+    - name: Require a connected gateway
+      ansible.builtin.assert:
+        that:
+          - gateway_status is succeeded
+        fail_msg: OpenShell gateway did not connect before the OCI image tests; see gateway diagnostics
 
     - name: Require OCI image success
       ansible.builtin.assert:
