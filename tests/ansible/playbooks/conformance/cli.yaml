@@ -55,6 +55,20 @@
       register: openshell_cli
       changed_when: false
 
+    # Every test boot restarts the gateway, and some installers take minutes to
+    # recover. Wait once here; the runner's per-scenario preflight stays short.
+    - name: Wait for the registered gateway
+      ansible.builtin.command:
+        argv: [timeout, 10s, "{{ openshell_cli.stdout }}", status, --output, json]
+      register: gateway_status
+      changed_when: false
+      until: >-
+        gateway_status.rc == 0 and
+        (gateway_status.stdout | from_json).status == 'connected'
+      retries: 60
+      delay: 5
+      ignore_errors: true
+
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
@@ -77,13 +91,14 @@
       register: conformance_result
       changed_when: false
       failed_when: false
+      when: gateway_status is succeeded
 
     # Preserve both streams for failures without adding passing-test output to
     # every tmachine run.
     - name: Show OpenShell conformance diagnostics
       ansible.builtin.debug:
         var: conformance_result
-      when: conformance_result.rc != 0
+      when: conformance_result.rc | default(0) != 0
 
     - name: Read OpenShell gateway logs
       become: true
@@ -99,17 +114,23 @@
       register: openshell_gateway_logs
       changed_when: false
       failed_when: false
-      when: conformance_result.rc != 0
+      when: conformance_result.rc | default(1) != 0
 
     - name: Show OpenShell gateway logs
       ansible.builtin.debug:
         var: openshell_gateway_logs.stdout_lines
-      when: conformance_result.rc != 0
+      when: conformance_result.rc | default(1) != 0
 
     - name: Collect K3s conformance diagnostics
       ansible.builtin.include_role:
         name: openshell_k3s_diagnostics
-      when: conformance_result.rc != 0
+      when: conformance_result.rc | default(1) != 0
+
+    - name: Require a connected gateway
+      ansible.builtin.assert:
+        that:
+          - gateway_status is succeeded
+        fail_msg: OpenShell gateway did not connect before conformance; see gateway diagnostics
 
     - name: Require OpenShell conformance success
       ansible.builtin.assert:

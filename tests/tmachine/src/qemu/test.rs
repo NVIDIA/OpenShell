@@ -26,11 +26,6 @@ pub async fn test(
     let image = QemuImage::create(&install_disk, test_disk).await;
     let vm = QemuVm::start(&image).await;
 
-    // Installation readiness does not survive the shutdown of the cached VM.
-    // Keep the interactive shell accessible when diagnosing boot failures.
-    if !testsuite.interactive {
-        run_playbooks(&installer.prepare_playbooks, &installer.inputs).await?;
-    }
     run_playbooks(&testsuite.playbooks, &testsuite.inputs).await?;
 
     if testsuite.interactive {

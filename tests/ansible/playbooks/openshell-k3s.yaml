@@ -139,16 +139,27 @@
           environment:
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
 
-        - name: Discover the gateway ClusterIP
-          ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=10s --namespace openshell get service openshell --output=jsonpath={.spec.clusterIP}
-          register: k3s_gateway_ip
+        - name: Discover the gateway ClusterIP and gRPC port
+          ansible.builtin.command:
+            argv:
+              - /usr/local/bin/k3s
+              - kubectl
+              - --request-timeout=10s
+              - --namespace
+              - openshell
+              - get
+              - service
+              - openshell
+              - --output=jsonpath={.spec.clusterIP}:{.spec.ports[?(@.name=="grpc")].port}
+          register: k3s_gateway_address
           changed_when: false
 
+        # Rejects headless Services (ClusterIP "None") and a missing grpc port.
         - name: Require a gateway Service address
           ansible.builtin.assert:
             that:
-              - k3s_gateway_ip.stdout | length > 0
-              - k3s_gateway_ip.stdout != 'None'
+              - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
+            fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
       rescue:
         - name: Collect K3s installation diagnostics
           ansible.builtin.include_role:
@@ -162,7 +173,6 @@
   hosts: all
   gather_facts: false
   vars:
-    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_ip.stdout }}:8080"
+    openshell_client_gateway_endpoint: "http://{{ k3s_gateway_address.stdout }}"
   roles:
     - openshell_client
-    - openshell_k3s_ready

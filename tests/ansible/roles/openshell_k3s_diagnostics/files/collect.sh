@@ -23,8 +23,14 @@ collect() {
     -p ExecMainPID -p ActiveEnterTimestamp -p ExecMainStartTimestamp \
     -p StartLimitIntervalUSec -p StartLimitBurst -p RestartUSec
   collect 'K3s boot journal' journalctl -b --no-pager --lines=500 -u k3s.service
-  collect 'Gateway Service routing rules' bash -c \
-    'iptables-save | awk "/openshell\/openshell:grpc/ { print }"'
+  # kube-proxy may program either iptables backend; dump whichever exist.
+  # shellcheck disable=SC2016 # Expanded by the inner shell.
+  collect 'Gateway Service routing rules' bash -c '
+    for save in iptables-nft-save iptables-legacy-save; do
+      command -v "$save" >/dev/null || continue
+      echo "# $save"
+      "$save" 2>/dev/null | awk "/openshell\/openshell:grpc/ { print }"
+    done'
   collect 'K3s version' /usr/local/bin/k3s --version
   collect 'API readiness' /usr/local/bin/k3s kubectl --request-timeout=5s get --raw=/readyz
   collect 'Nodes' /usr/local/bin/k3s kubectl --request-timeout=5s get nodes -o wide
