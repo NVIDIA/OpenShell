@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: ""
+      include-deb-upgrade-source:
+        description: Include the latest published release DEB and runtime images as upgrade inputs
+        required: false
+        type: boolean
+        default: false
     outputs:
       source_sha:
         description: Source revision of the candidate artifacts
@@ -129,6 +134,66 @@ jobs:
           mv "${cli_rpms[0]}" artifacts/packages/rpm/openshell.rpm
           mv "${gateway_rpms[0]}" artifacts/packages/rpm/openshell-gateway.rpm
           rm -rf "$download_dir"
+
+      - name: Resolve released upgrade source
+        if: inputs['include-deb-upgrade-source']
+        id: upgrade-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')
+          echo "tag=${source_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Download released Debian upgrade source
+        if: inputs['include-deb-upgrade-source']
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ steps.upgrade-source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'openshell_*_amd64.deb' \
+            --pattern openshell-checksums-sha256.txt \
+            --dir artifacts/upgrade/deb/source/download
+
+      - name: Stage released Debian upgrade source
+        if: inputs['include-deb-upgrade-source']
+        run: |
+          set -euo pipefail
+          source_dir=artifacts/upgrade/deb/source
+          download_dir="${source_dir}/download"
+          deb_path=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell_*_amd64.deb' -print -quit)
+          if [[ -z "$deb_path" || ! -f "${download_dir}/openshell-checksums-sha256.txt" ]]; then
+            echo "released source artifact did not contain the expected Debian package and checksums" >&2
+            exit 1
+          fi
+          (
+            cd "$download_dir"
+            grep -F " $(basename "$deb_path")" openshell-checksums-sha256.txt | sha256sum --check --status
+          )
+          mv "$deb_path" "${source_dir}/openshell.deb"
+          mv "${download_dir}/openshell-checksums-sha256.txt" "${source_dir}/openshell-checksums-sha256.txt"
+          rmdir "$download_dir"
+          dpkg-deb --field "${source_dir}/openshell.deb" Version > "${source_dir}/version"
+
+      # Packages do not embed OCI image payloads. Their gateway binaries pin
+      # this release tag, while tmachine consumes tarballs to keep guest setup
+      # independent of registry access.
+      - name: Export released runtime images for upgrade sources
+        if: inputs['include-deb-upgrade-source']
+        env:
+          IMAGE_TAG: ${{ steps.upgrade-source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE_TAG#v}"
+          mkdir -p artifacts/upgrade/source-images
+
+          docker pull "ghcr.io/nvidia/openshell/sandbox:${image_tag}"
+          docker save --output artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar "ghcr.io/nvidia/openshell/sandbox:${image_tag}"
+
+          docker pull "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
+          docker save --output artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
 
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
