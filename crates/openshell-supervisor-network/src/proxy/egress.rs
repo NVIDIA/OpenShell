@@ -44,6 +44,8 @@ pub(super) struct EndpointDecision {
     pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
+    /// For a Cedar sandbox, how resolved addresses are checked.
+    pub(super) cedar_destination: Option<crate::cedar_only::CedarDestination>,
 }
 
 impl Default for EndpointDecision {
@@ -55,6 +57,7 @@ impl Default for EndpointDecision {
             policy_configs: Vec::new(),
             matched_endpoints: Vec::new(),
             exact_declared_host: false,
+            cedar_destination: None,
         }
     }
 }
@@ -65,6 +68,7 @@ impl EndpointDecision {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
+            cedar_destination: authorization.cedar_destination.clone(),
             ..Self::default()
         }
     }
@@ -156,6 +160,8 @@ pub(super) struct EgressDecision {
     pub(super) action: NetworkAction,
     /// Policy generation used for the complete authorization snapshot.
     pub(super) policy_generation: u64,
+    /// Engine that made the decision (`opa` or `cedar`), for OCSF events.
+    pub(super) engine: &'static str,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.
@@ -248,6 +254,7 @@ mod tests {
             intent,
             action,
             policy_generation: 1,
+            engine: "opa",
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,

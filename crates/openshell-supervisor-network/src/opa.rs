@@ -112,6 +112,10 @@ pub struct EgressAuthorization {
     pub matched_endpoints: Vec<MatchedEndpoint>,
     pub exact_declared_endpoint_host: bool,
     pub generation: u64,
+    /// For a Cedar sandbox's allowed connection, how its resolved addresses
+    /// are checked; `None` for YAML, whose endpoint configs carry
+    /// `allowed_ips` instead.
+    pub cedar_destination: Option<crate::cedar_only::CedarDestination>,
 }
 
 /// Input for a network access policy evaluation.
@@ -211,6 +215,29 @@ pub struct PolicyGenerationGuard {
     generation_rx: watch::Receiver<u64>,
 }
 
+/// Builds a [`PolicyGenerationGuard`] for any engine holding a plain
+/// `Arc<AtomicU64>` generation counter and matching `watch::Sender<u64>` —
+/// both `OpaEngine` and `CedarOnlyEngine` use this same shape, so the guard
+/// itself (and callers that only read it, e.g. DNS-staleness checks) don't
+/// need to know which engine produced it.
+pub(crate) fn generation_guard_for(
+    expected_generation: u64,
+    current_generation_value: u64,
+    current_generation: &Arc<AtomicU64>,
+    generation_tx: &watch::Sender<u64>,
+) -> Result<PolicyGenerationGuard> {
+    if current_generation_value != expected_generation {
+        return Err(miette::miette!(
+            "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{current_generation_value}]"
+        ));
+    }
+    Ok(PolicyGenerationGuard {
+        captured_generation: current_generation_value,
+        current_generation: Arc::clone(current_generation),
+        generation_rx: generation_tx.subscribe(),
+    })
+}
+
 impl PolicyGenerationGuard {
     pub fn captured_generation(&self) -> u64 {
         self.captured_generation
@@ -256,9 +283,29 @@ pub struct TunnelPolicyEngine {
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    /// Set for a Cedar-sourced sandbox: [`Self::evaluate_request`] delegates
+    /// here instead of evaluating this tunnel's Rego engine, which then only
+    /// supplies middleware. See [`crate::policy_engine::PolicyEngine::tunnel_engine`].
+    cedar_l7: Option<crate::cedar_only::CedarL7TunnelEngine>,
 }
 
 impl TunnelPolicyEngine {
+    /// Makes Cedar authoritative for this tunnel.
+    ///
+    /// Replaces the generation guard with one pinned to Cedar's generation,
+    /// so a Cedar reload closes the tunnel and an unrelated change to the
+    /// plumbing OPA engine does not, and routes L7 decisions to `cedar_l7`.
+    #[must_use]
+    pub(crate) fn with_cedar(
+        mut self,
+        generation_guard: PolicyGenerationGuard,
+        cedar_l7: crate::cedar_only::CedarL7TunnelEngine,
+    ) -> Self {
+        self.generation_guard = generation_guard;
+        self.cedar_l7 = Some(cedar_l7);
+        self
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.generation_guard.captured_generation()
     }
@@ -273,10 +320,6 @@ impl TunnelPolicyEngine {
 
     pub fn generation_guard(&self) -> &PolicyGenerationGuard {
         &self.generation_guard
-    }
-
-    pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
-        &self.engine
     }
 
     pub(crate) fn middleware_runner(&self) -> &ChainRunner {
@@ -299,6 +342,139 @@ impl TunnelPolicyEngine {
     }
 }
 
+impl TunnelPolicyEngine {
+    /// Evaluates one L7 request and returns `(allowed, deny_reason)`.
+    ///
+    /// For a Cedar-sourced sandbox the decision comes from Cedar; otherwise
+    /// from this tunnel's Rego engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel's policy generation is stale or the
+    /// evaluation fails. Callers treat an error as a denial.
+    pub fn evaluate_request(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<(bool, String)> {
+        if let Some(cedar) = &self.cedar_l7 {
+            return cedar.evaluate_request(ctx, request);
+        }
+        if self.is_stale() {
+            return Err(miette::miette!(
+                "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
+                self.captured_generation(),
+                self.current_generation(),
+            ));
+        }
+
+        let input = crate::l7::relay::l7_request_policy_input(ctx, request);
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        set_regorus_input(&mut engine, input)?;
+
+        let allowed = engine
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let allowed = allowed == regorus::Value::from(true);
+
+        let reason = if allowed {
+            String::new()
+        } else {
+            let val = engine
+                .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            match val {
+                regorus::Value::String(s) => s.to_string(),
+                regorus::Value::Undefined => "request denied by policy".to_string(),
+                other => other.to_string(),
+            }
+        };
+
+        Ok((allowed, reason))
+    }
+
+    /// Returns the token-grant owners whose own endpoint admits one request.
+    ///
+    /// For a Cedar-sourced sandbox the owners come from Cedar; see
+    /// [`crate::cedar_only::CedarL7TunnelEngine::admitted_token_grant_owners`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel's policy generation is stale or the
+    /// evaluation fails. Callers inject no token on error.
+    pub(crate) fn admitted_token_grant_owners(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<std::collections::HashSet<String>> {
+        if self.is_stale() {
+            return Err(miette::miette!(
+                "policy changed before token grant selection"
+            ));
+        }
+        if let Some(cedar) = &self.cedar_l7 {
+            return cedar.admitted_token_grant_owners(ctx, request);
+        }
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        eval_admitted_token_grant_owners(&mut engine, ctx, request)
+    }
+}
+
+impl OpaEngine {
+    /// Returns the token-grant owners whose own endpoint admits one request.
+    ///
+    /// The same rule [`TunnelPolicyEngine::admitted_token_grant_owners`]
+    /// evaluates, against this engine's current policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned or the evaluation fails.
+    pub(crate) fn admitted_token_grant_owners(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        eval_admitted_token_grant_owners(&mut engine, ctx, request)
+    }
+}
+
+/// Evaluates `allowed_token_grant_owners` for one L7 request.
+fn eval_admitted_token_grant_owners(
+    engine: &mut regorus::Engine,
+    ctx: &crate::l7::relay::L7EvalContext,
+    request: &crate::l7::L7RequestInfo,
+) -> Result<std::collections::HashSet<String>> {
+    set_regorus_input(
+        engine,
+        crate::l7::relay::l7_request_policy_input(ctx, request),
+    )?;
+    let owners = engine
+        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+        .map_err(|error| miette::miette!("{error}"))?;
+    let regorus::Value::Array(owners) = owners else {
+        return Err(miette::miette!("invalid credential owner admission result"));
+    };
+    owners
+        .iter()
+        .map(|owner| match owner {
+            regorus::Value::String(owner) => Ok(owner.to_string()),
+            _ => Err(miette::miette!("invalid credential owner identity")),
+        })
+        .collect()
+}
+
 impl OpaEngine {
     pub(crate) fn websocket_assembly_budget(
         &self,
@@ -318,6 +494,25 @@ impl OpaEngine {
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
+    }
+
+    /// Loads YAML policy data as written, skipping the validation and
+    /// normalization [`Self::from_strings`] applies.
+    ///
+    /// For tests of the Rego rules' defense in depth against policies that
+    /// validation would reject.
+    #[cfg(test)]
+    pub(crate) fn from_strings_unvalidated(policy: &str, data_yaml: &str) -> Result<Self> {
+        let data: serde_json::Value = serde_yml::from_str(data_yaml)
+            .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+        let mut engine = new_regorus_engine()?;
+        engine
+            .add_policy("policy.rego".into(), policy.into())
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
+        engine
+            .add_data_json(&data.to_string())
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        Ok(Self::with_engine(engine, true))
     }
 
     /// Whether network authorization requires a workload binary identity.
@@ -627,6 +822,7 @@ impl OpaEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
+                cedar_destination: None,
             });
         }
 
@@ -666,6 +862,7 @@ impl OpaEngine {
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
+            cedar_destination: None,
         })
     }
 
@@ -873,7 +1070,6 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
-    #[allow(dead_code)]
     pub(crate) fn with_current_generation<T>(
         &self,
         expected_generation: u64,
@@ -1137,6 +1333,7 @@ impl OpaEngine {
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
+            cedar_l7: None,
         })
     }
 }
@@ -1598,6 +1795,12 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         PolicyViolation::McpOptionsOnNonMcpEndpoint { .. } => "MCP options require MCP protocol",
         PolicyViolation::UnsupportedMcpVersion { .. } => "unsupported MCP protocol version",
         PolicyViolation::DuplicateMcpVersion { .. } => "duplicate MCP protocol version",
+        PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies => {
+            "cedar_policy_source combined with network_policies"
+        }
+        PolicyViolation::InvalidCedarPolicy { .. } => "invalid Cedar policy",
+        PolicyViolation::EndpointSettingsRequireCedar => "endpoint settings require Cedar",
+        PolicyViolation::InvalidEndpointSetting { .. } => "invalid endpoint setting",
     }
 }
 
@@ -2219,6 +2422,54 @@ fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> Bina
     BinaryResolution::Literal
 }
 
+/// Resolves a policy binary path through the container's root filesystem
+/// and logs the outcome.
+///
+/// Returns the canonical target when `policy_path` is a symlink inside the
+/// container that resolves to a different path, which YAML adds as another
+/// binary entry; see [`resolve_binary_in_container`]. A Cedar sandbox
+/// resolves the paths its policies test in `context.binary_aliases` with
+/// this same function.
+pub(crate) fn resolve_policy_binary(policy_path: &str, entrypoint_pid: u32) -> Option<String> {
+    match resolve_binary_in_container(policy_path, entrypoint_pid) {
+        BinaryResolution::Resolved(resolved) => {
+            tracing::info!(
+                "Resolved policy binary symlink: original={policy_path} resolved={resolved} pid={entrypoint_pid}"
+            );
+            return Some(resolved);
+        }
+        BinaryResolution::Absent => {
+            tracing::debug!(
+                "Policy binary candidate not present in container: path={policy_path} pid={entrypoint_pid}. Matched literally."
+            );
+        }
+        BinaryResolution::Inaccessible(kind) => {
+            tracing::warn!(
+                "Cannot access container filesystem for symlink resolution: path={policy_path} pid={entrypoint_pid} \
+                error_kind={kind:?}. Binary paths in policy will be matched literally. \
+                If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                use the canonical path instead, or run with CAP_SYS_PTRACE."
+            );
+        }
+        BinaryResolution::CandidateInaccessible(kind) => {
+            tracing::warn!(
+                "Cannot access policy binary candidate path: path={policy_path} pid={entrypoint_pid} \
+                error_kind={kind:?}. Binary path will be matched literally. \
+                A parent component is permission-denied or the path forms a symlink loop; \
+                the process root itself is reachable."
+            );
+        }
+        BinaryResolution::ChainBroken(kind) => {
+            tracing::warn!(
+                "Symlink chain broken during resolution: path={policy_path} pid={entrypoint_pid} error_kind={kind:?}. \
+                Matched by original path only."
+            );
+        }
+        BinaryResolution::Literal => {}
+    }
+    None
+}
+
 fn l7_matchers_to_json(
     matchers: &std::collections::HashMap<String, openshell_core::proto::L7QueryMatcher>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -2235,6 +2486,227 @@ fn l7_matchers_to_json(
             (key.clone(), matcher_json)
         })
         .collect()
+}
+
+/// Converts one policy endpoint into the JSON shape the L7 config parser reads.
+///
+/// Shared by the Rego data builder and the Cedar engine, which emits provider
+/// endpoint settings for connections it allows. `policy_hash` identifies the
+/// policy for MCP endpoint observation.
+pub(crate) fn endpoint_policy_value(
+    e: &openshell_core::proto::NetworkEndpoint,
+    policy_hash: &str,
+) -> serde_json::Value {
+    // Normalize port/ports: ports takes precedence, then
+    // single port promoted to array. Rego always sees "ports".
+    let ports: Vec<u32> = if !e.ports.is_empty() {
+        e.ports.clone()
+    } else if e.port > 0 {
+        vec![e.port]
+    } else {
+        vec![]
+    };
+    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
+    if !e.path.is_empty() {
+        ep["path"] = e.path.clone().into();
+    }
+    if !e.protocol.is_empty() {
+        ep["protocol"] = e.protocol.clone().into();
+    }
+    if e.tls != 0 {
+        ep["tls"] = openshell_policy::network_tls_mode_to_str(e.tls)
+            .map_or_else(|| format!("unknown({})", e.tls), str::to_owned)
+            .into();
+    }
+    if e.enforcement != 0 {
+        ep["enforcement"] = openshell_policy::network_enforcement_mode_to_str(e.enforcement)
+            .map_or_else(|| format!("unknown({})", e.enforcement), str::to_owned)
+            .into();
+    }
+    if e.access != 0 {
+        ep["access"] = openshell_policy::network_access_preset_to_str(e.access)
+            .map_or_else(|| format!("unknown({})", e.access), str::to_owned)
+            .into();
+    }
+    if !e.rules.is_empty() {
+        let rules: Vec<serde_json::Value> = e
+            .rules
+            .iter()
+            .map(|r| {
+                let a = r.allow.as_ref();
+                let mut allow = serde_json::Map::new();
+                if let Some(a) = a {
+                    // Proto3 represents absent scalar selectors as empty
+                    // strings. Omit them so protobuf and YAML rules expose
+                    // the same selector families to runtime validation.
+                    if !a.method.is_empty() {
+                        allow.insert("method".to_string(), a.method.clone().into());
+                    }
+                    if !a.path.is_empty() {
+                        allow.insert("path".to_string(), a.path.clone().into());
+                    }
+                    if !a.command.is_empty() {
+                        allow.insert("command".to_string(), a.command.clone().into());
+                    }
+                    if !a.operation_type.is_empty() {
+                        allow.insert(
+                            "operation_type".to_string(),
+                            a.operation_type.clone().into(),
+                        );
+                    }
+                    if !a.operation_name.is_empty() {
+                        allow.insert(
+                            "operation_name".to_string(),
+                            a.operation_name.clone().into(),
+                        );
+                    }
+                    if !a.fields.is_empty() {
+                        allow.insert("fields".to_string(), a.fields.clone().into());
+                    }
+                }
+                let query = a.map_or_else(serde_json::Map::new, |allow| {
+                    l7_matchers_to_json(&allow.query)
+                });
+                if !query.is_empty() {
+                    allow.insert("query".to_string(), query.into());
+                }
+                let params = a.map_or_else(serde_json::Map::new, |allow| {
+                    l7_matchers_to_json(&allow.params)
+                });
+                if !params.is_empty() {
+                    allow.insert("params".to_string(), params.into());
+                }
+                serde_json::json!({ "allow": allow })
+            })
+            .collect();
+        ep["rules"] = rules.into();
+    }
+    if !e.allowed_ips.is_empty() {
+        ep["allowed_ips"] = e.allowed_ips.clone().into();
+    }
+    if e.advisor_proposed {
+        ep["advisor_proposed"] = true.into();
+    }
+    if !e.deny_rules.is_empty() {
+        let deny_rules: Vec<serde_json::Value> = e
+            .deny_rules
+            .iter()
+            .map(|d| {
+                let mut deny = serde_json::json!({});
+                if !d.method.is_empty() {
+                    deny["method"] = d.method.clone().into();
+                }
+                if !d.path.is_empty() {
+                    deny["path"] = d.path.clone().into();
+                }
+                if !d.command.is_empty() {
+                    deny["command"] = d.command.clone().into();
+                }
+                if !d.operation_type.is_empty() {
+                    deny["operation_type"] = d.operation_type.clone().into();
+                }
+                if !d.operation_name.is_empty() {
+                    deny["operation_name"] = d.operation_name.clone().into();
+                }
+                if !d.fields.is_empty() {
+                    deny["fields"] = d.fields.clone().into();
+                }
+                let query = l7_matchers_to_json(&d.query);
+                if !query.is_empty() {
+                    deny["query"] = query.into();
+                }
+                let params = l7_matchers_to_json(&d.params);
+                if !params.is_empty() {
+                    deny["params"] = params.into();
+                }
+                deny
+            })
+            .collect();
+        ep["deny_rules"] = deny_rules.into();
+    }
+    if e.allow_encoded_slash {
+        ep["allow_encoded_slash"] = true.into();
+    }
+    if e.websocket_credential_rewrite {
+        ep["websocket_credential_rewrite"] = true.into();
+    }
+    if e.request_body_credential_rewrite {
+        ep["request_body_credential_rewrite"] = true.into();
+    }
+    if e.allow_uninspected_credentials {
+        ep["allow_uninspected_credentials"] = true.into();
+    }
+    if e.provider_credentialed {
+        ep["provider_credentialed"] = true.into();
+    }
+    if !e.token_grant_owner.is_empty() {
+        // Preserve the gateway's endpoint identity so admission
+        // can select its grants without reconstructing ownership
+        // from overlapping host and path selectors.
+        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
+    }
+    if is_mcp_protocol(&e.protocol) {
+        // Derive endpoint identity from the policy endpoint while
+        // it is still available. Request handling carries this
+        // opaque value through exact path selection and never
+        // recomputes identity from a concrete request host.
+        ep["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(e).into();
+        // The selected endpoint must retain its policy identity
+        // so it cannot bind to a replacement observation inventory.
+        ep["policy_hash"] = policy_hash.into();
+    }
+    if !e.credential_signing.is_empty() {
+        ep["credential_signing"] = e.credential_signing.clone().into();
+    }
+    if !e.signing_service.is_empty() {
+        ep["signing_service"] = e.signing_service.clone().into();
+    }
+    if !e.signing_region.is_empty() {
+        ep["signing_region"] = e.signing_region.clone().into();
+    }
+    if let Some(binding) = &e.credential_binding {
+        ep["credential_binding"] = serde_json::json!({
+            "provider": binding.provider.clone(),
+        });
+    }
+    if !e.persisted_queries.is_empty() {
+        ep["persisted_queries"] = e.persisted_queries.clone().into();
+    }
+    if !e.graphql_persisted_queries.is_empty() {
+        let persisted: serde_json::Map<String, serde_json::Value> = e
+            .graphql_persisted_queries
+            .iter()
+            .map(|(key, op)| {
+                (
+                    key.clone(),
+                    serde_json::json!({
+                        "operation_type": op.operation_type,
+                        "operation_name": op.operation_name,
+                        "fields": op.fields,
+                    }),
+                )
+            })
+            .collect();
+        ep["graphql_persisted_queries"] = persisted.into();
+    }
+    if e.graphql_max_body_bytes > 0 {
+        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
+    }
+    if e.json_rpc_max_body_bytes > 0 {
+        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
+    }
+    if let Some(mcp) = &e.mcp {
+        if e.protocol.eq_ignore_ascii_case("mcp") {
+            ep["mcp_versions"] = mcp.versions.clone().into();
+        }
+        if let Some(strict_tool_names) = mcp.strict_tool_names {
+            ep["mcp_strict_tool_names"] = strict_tool_names.into();
+        }
+        if let Some(allow_all_known_mcp_methods) = mcp.allow_all_known_mcp_methods {
+            ep["mcp_allow_all_known_mcp_methods"] = allow_all_known_mcp_methods.into();
+        }
+    }
+    ep
 }
 
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
@@ -2298,225 +2770,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             let endpoints: Vec<serde_json::Value> = rule
                 .endpoints
                 .iter()
-                .map(|e| {
-                    // Normalize port/ports: ports takes precedence, then
-                    // single port promoted to array. Rego always sees "ports".
-                    let ports: Vec<u32> = if !e.ports.is_empty() {
-                        e.ports.clone()
-                    } else if e.port > 0 {
-                        vec![e.port]
-                    } else {
-                        vec![]
-                    };
-                    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
-                    if !e.path.is_empty() {
-                        ep["path"] = e.path.clone().into();
-                    }
-                    if !e.protocol.is_empty() {
-                        ep["protocol"] = e.protocol.clone().into();
-                    }
-                    if e.tls != 0 {
-                        ep["tls"] = openshell_policy::network_tls_mode_to_str(e.tls)
-                            .map_or_else(|| format!("unknown({})", e.tls), str::to_owned)
-                            .into();
-                    }
-                    if e.enforcement != 0 {
-                        ep["enforcement"] =
-                            openshell_policy::network_enforcement_mode_to_str(e.enforcement)
-                                .map_or_else(
-                                    || format!("unknown({})", e.enforcement),
-                                    str::to_owned,
-                                )
-                                .into();
-                    }
-                    if e.access != 0 {
-                        ep["access"] = openshell_policy::network_access_preset_to_str(e.access)
-                            .map_or_else(|| format!("unknown({})", e.access), str::to_owned)
-                            .into();
-                    }
-                    if !e.rules.is_empty() {
-                        let rules: Vec<serde_json::Value> = e
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                let a = r.allow.as_ref();
-                                let mut allow = serde_json::Map::new();
-                                if let Some(a) = a {
-                                    // Proto3 represents absent scalar selectors as empty
-                                    // strings. Omit them so protobuf and YAML rules expose
-                                    // the same selector families to runtime validation.
-                                    if !a.method.is_empty() {
-                                        allow.insert("method".to_string(), a.method.clone().into());
-                                    }
-                                    if !a.path.is_empty() {
-                                        allow.insert("path".to_string(), a.path.clone().into());
-                                    }
-                                    if !a.command.is_empty() {
-                                        allow
-                                            .insert("command".to_string(), a.command.clone().into());
-                                    }
-                                    if !a.operation_type.is_empty() {
-                                        allow.insert(
-                                            "operation_type".to_string(),
-                                            a.operation_type.clone().into(),
-                                        );
-                                    }
-                                    if !a.operation_name.is_empty() {
-                                        allow.insert(
-                                            "operation_name".to_string(),
-                                            a.operation_name.clone().into(),
-                                        );
-                                    }
-                                    if !a.fields.is_empty() {
-                                        allow.insert("fields".to_string(), a.fields.clone().into());
-                                    }
-                                }
-                                let query = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.query)
-                                });
-                                if !query.is_empty() {
-                                    allow.insert("query".to_string(), query.into());
-                                }
-                                let params = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.params)
-                                });
-                                if !params.is_empty() {
-                                    allow.insert("params".to_string(), params.into());
-                                }
-                                serde_json::json!({ "allow": allow })
-                            })
-                            .collect();
-                        ep["rules"] = rules.into();
-                    }
-                    if !e.allowed_ips.is_empty() {
-                        ep["allowed_ips"] = e.allowed_ips.clone().into();
-                    }
-                    if e.advisor_proposed {
-                        ep["advisor_proposed"] = true.into();
-                    }
-                    if !e.deny_rules.is_empty() {
-                        let deny_rules: Vec<serde_json::Value> = e
-                            .deny_rules
-                            .iter()
-                            .map(|d| {
-                                let mut deny = serde_json::json!({});
-                                if !d.method.is_empty() {
-                                    deny["method"] = d.method.clone().into();
-                                }
-                                if !d.path.is_empty() {
-                                    deny["path"] = d.path.clone().into();
-                                }
-                                if !d.command.is_empty() {
-                                    deny["command"] = d.command.clone().into();
-                                }
-                                if !d.operation_type.is_empty() {
-                                    deny["operation_type"] = d.operation_type.clone().into();
-                                }
-                                if !d.operation_name.is_empty() {
-                                    deny["operation_name"] = d.operation_name.clone().into();
-                                }
-                                if !d.fields.is_empty() {
-                                    deny["fields"] = d.fields.clone().into();
-                                }
-                                let query = l7_matchers_to_json(&d.query);
-                                if !query.is_empty() {
-                                    deny["query"] = query.into();
-                                }
-                                let params = l7_matchers_to_json(&d.params);
-                                if !params.is_empty() {
-                                    deny["params"] = params.into();
-                                }
-                                deny
-                            })
-                            .collect();
-                        ep["deny_rules"] = deny_rules.into();
-                    }
-                    if e.allow_encoded_slash {
-                        ep["allow_encoded_slash"] = true.into();
-                    }
-                    if e.websocket_credential_rewrite {
-                        ep["websocket_credential_rewrite"] = true.into();
-                    }
-                    if e.request_body_credential_rewrite {
-                        ep["request_body_credential_rewrite"] = true.into();
-                    }
-                    if e.allow_uninspected_credentials {
-                        ep["allow_uninspected_credentials"] = true.into();
-                    }
-                    if e.provider_credentialed {
-                        ep["provider_credentialed"] = true.into();
-                    }
-                    if !e.token_grant_owner.is_empty() {
-                        // Preserve the gateway's endpoint identity so admission
-                        // can select its grants without reconstructing ownership
-                        // from overlapping host and path selectors.
-                        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
-                    }
-                    if is_mcp_protocol(&e.protocol) {
-                        // Derive endpoint identity from the policy endpoint while
-                        // it is still available. Request handling carries this
-                        // opaque value through exact path selection and never
-                        // recomputes identity from a concrete request host.
-                        ep["endpoint_id"] =
-                            openshell_core::endpoint_status::endpoint_id(e).into();
-                        // The selected endpoint must retain its policy identity
-                        // so it cannot bind to a replacement observation inventory.
-                        ep["policy_hash"] = policy_hash.clone().into();
-                    }
-                    if !e.credential_signing.is_empty() {
-                        ep["credential_signing"] = e.credential_signing.clone().into();
-                    }
-                    if !e.signing_service.is_empty() {
-                        ep["signing_service"] = e.signing_service.clone().into();
-                    }
-                    if !e.signing_region.is_empty() {
-                        ep["signing_region"] = e.signing_region.clone().into();
-                    }
-                    if let Some(binding) = &e.credential_binding {
-                        ep["credential_binding"] = serde_json::json!({
-                            "provider": binding.provider.clone(),
-                        });
-                    }
-                    if !e.persisted_queries.is_empty() {
-                        ep["persisted_queries"] = e.persisted_queries.clone().into();
-                    }
-                    if !e.graphql_persisted_queries.is_empty() {
-                        let persisted: serde_json::Map<String, serde_json::Value> = e
-                            .graphql_persisted_queries
-                            .iter()
-                            .map(|(key, op)| {
-                                (
-                                    key.clone(),
-                                    serde_json::json!({
-                                        "operation_type": op.operation_type,
-                                        "operation_name": op.operation_name,
-                                        "fields": op.fields,
-                                    }),
-                                )
-                            })
-                            .collect();
-                        ep["graphql_persisted_queries"] = persisted.into();
-                    }
-                    if e.graphql_max_body_bytes > 0 {
-                        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
-                    }
-                    if e.json_rpc_max_body_bytes > 0 {
-                        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
-                    }
-                    if let Some(mcp) = &e.mcp {
-                        if e.protocol.eq_ignore_ascii_case("mcp") {
-                            ep["mcp_versions"] = mcp.versions.clone().into();
-                        }
-                        if let Some(strict_tool_names) = mcp.strict_tool_names {
-                            ep["mcp_strict_tool_names"] = strict_tool_names.into();
-                        }
-                        if let Some(allow_all_known_mcp_methods) = mcp.allow_all_known_mcp_methods {
-                            ep["mcp_allow_all_known_mcp_methods"] =
-                                allow_all_known_mcp_methods.into();
-                        }
-                    }
-                    ep
-                })
+                .map(|e| endpoint_policy_value(e, &policy_hash))
                 .collect();
             let binaries: Vec<serde_json::Value> = rule
                 .binaries
@@ -2524,46 +2778,8 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .flat_map(|b| {
                     let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
-                    match resolve_binary_in_container(&b.path, entrypoint_pid) {
-                        BinaryResolution::Resolved(resolved) => {
-                            tracing::info!(
-                                "Resolved policy binary symlink: original={} resolved={resolved} pid={entrypoint_pid}",
-                                b.path
-                            );
-                            entries.push(binary_entry(&resolved));
-                        }
-                        BinaryResolution::Absent => {
-                            tracing::debug!(
-                                "Policy binary candidate not present in container: path={} pid={entrypoint_pid}. Matched literally.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::Inaccessible(kind) => {
-                            tracing::warn!(
-                                "Cannot access container filesystem for symlink resolution: path={} pid={entrypoint_pid} \
-                                error_kind={kind:?}. Binary paths in policy will be matched literally. \
-                                If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                                use the canonical path instead, or run with CAP_SYS_PTRACE.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::CandidateInaccessible(kind) => {
-                            tracing::warn!(
-                                "Cannot access policy binary candidate path: path={} pid={entrypoint_pid} \
-                                error_kind={kind:?}. Binary path will be matched literally. \
-                                A parent component is permission-denied or the path forms a symlink loop; \
-                                the process root itself is reachable.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::ChainBroken(kind) => {
-                            tracing::warn!(
-                                "Symlink chain broken during resolution: path={} pid={entrypoint_pid} error_kind={kind:?}. \
-                                Matched by original path only.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::Literal => {},
+                    if let Some(resolved) = resolve_policy_binary(&b.path, entrypoint_pid) {
+                        entries.push(binary_entry(&resolved));
                     }
                     entries
                 })
@@ -3357,6 +3573,9 @@ mod tests {
             },
         );
         ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5714,6 +5933,9 @@ process:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6337,6 +6559,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6408,6 +6633,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6484,6 +6712,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8227,6 +8458,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8284,6 +8518,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8342,6 +8579,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8402,6 +8642,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8461,6 +8704,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8522,7 +8768,7 @@ network_policies:
             .unwrap();
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.engine.lock().unwrap();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -8564,7 +8810,7 @@ network_policies:
         let cloned = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.engine.lock().unwrap();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -9972,6 +10218,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10042,6 +10291,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10272,6 +10524,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -11252,6 +11507,9 @@ network_policies:
             process: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         let pid = std::process::id(); // accessible root, leaf paths absent
@@ -11935,6 +12193,9 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -12098,6 +12359,9 @@ process:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         // Initial load at pid=0 — no symlink expansion

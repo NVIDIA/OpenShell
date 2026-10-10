@@ -331,7 +331,9 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::ProviderReadinessReason;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_supervisor_network::cedar_only::CedarOnlyEngine;
 use openshell_supervisor_network::opa::{OpaEngine, PolicyGenerationGuard};
+use openshell_supervisor_network::policy_engine::PolicyEngine;
 use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::skills;
 use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracker};
@@ -526,7 +528,12 @@ pub async fn run_network_proxy(
     }
 
     let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
-    let (mut policy, opa_engine, _, _, _, initial_agent_proposals_enabled, _, _) = load_policy(
+    let LoadedPolicy {
+        mut policy,
+        opa_engine,
+        agent_proposals_enabled: initial_agent_proposals_enabled,
+        ..
+    } = load_policy(
         None,
         None,
         None,
@@ -571,6 +578,7 @@ pub async fn run_network_proxy(
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
+        None,
         None,
         None,
     )
@@ -800,16 +808,17 @@ async fn run_sandbox_with_backend(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (
+    let LoadedPolicy {
         policy,
         opa_engine,
-        retained_proto,
+        proto: retained_proto,
         middleware_registry_status,
-        loaded_policy_origin,
-        initial_agent_proposals_enabled,
-        initial_extension_authentication_enabled,
+        origin: loaded_policy_origin,
+        agent_proposals_enabled: initial_agent_proposals_enabled,
+        extension_authentication_enabled: initial_extension_authentication_enabled,
         captured_provider_environment,
-    ) = load_policy_with_gateway(
+        cedar_engine,
+    } = load_policy_with_gateway(
         sandbox_id.clone(),
         sandbox.clone(),
         openshell_endpoint.clone(),
@@ -1044,6 +1053,7 @@ async fn run_sandbox_with_backend(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            cedar_engine.as_ref(),
         )
         .await?,
     );
@@ -1160,6 +1170,7 @@ async fn run_sandbox_with_backend(
         let poll_sandbox = sandbox.to_string();
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
+        let poll_cedar_engine = cedar_engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
@@ -1178,6 +1189,7 @@ async fn run_sandbox_with_backend(
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
             opa_engine: poll_engine,
+            cedar_engine: poll_cedar_engine,
             loaded_policy_origin,
             vm_identity: vm_policy_identity,
             entrypoint_pid: poll_pid,
@@ -2199,6 +2211,22 @@ impl CapturedProviderEnvironment {
     }
 }
 
+/// Policy state produced by [`load_policy`] at supervisor startup.
+struct LoadedPolicy {
+    policy: SandboxPolicy,
+    opa_engine: Option<Arc<OpaEngine>>,
+    /// The gateway-delivered policy, retained for reload comparison.
+    proto: Option<openshell_core::proto::SandboxPolicy>,
+    middleware_registry_status: MiddlewareRegistryStatus,
+    origin: LoadedPolicyOrigin,
+    agent_proposals_enabled: bool,
+    extension_authentication_enabled: bool,
+    captured_provider_environment: Option<CapturedProviderEnvironment>,
+    /// The authoritative engine when the policy is Cedar-authored. The OPA
+    /// engine then only serves middleware and tunnel plumbing.
+    cedar_engine: Option<Arc<CedarOnlyEngine>>,
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -2207,16 +2235,7 @@ async fn load_policy(
     policy_data: Option<String>,
     extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
     local_policy_identity: LocalPolicyIdentity,
-) -> Result<(
-    SandboxPolicy,
-    Option<Arc<OpaEngine>>,
-    Option<openshell_core::proto::SandboxPolicy>,
-    MiddlewareRegistryStatus,
-    LoadedPolicyOrigin,
-    bool,
-    bool,
-    Option<CapturedProviderEnvironment>,
-)> {
+) -> Result<LoadedPolicy> {
     load_policy_with_gateway(
         sandbox_id,
         sandbox,
@@ -2249,16 +2268,7 @@ async fn load_policy_with_gateway(
     vm_identity: Option<VmPolicyIdentity>,
     image_discovery: Option<ImagePolicyDiscovery>,
     gateway: &impl StartupGateway,
-) -> Result<(
-    SandboxPolicy,
-    Option<Arc<OpaEngine>>,
-    Option<openshell_core::proto::SandboxPolicy>,
-    MiddlewareRegistryStatus,
-    LoadedPolicyOrigin,
-    bool,
-    bool,
-    Option<CapturedProviderEnvironment>,
-)> {
+) -> Result<LoadedPolicy> {
     use openshell_core::proto::ConfigurationAdmissionState;
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -2315,16 +2325,17 @@ async fn load_policy_with_gateway(
         };
         enrich_sandbox_baseline_paths(&mut policy);
         // File mode has no operator-registered middleware to connect.
-        return Ok((
+        return Ok(LoadedPolicy {
             policy,
-            Some(Arc::new(engine)),
-            None,
-            MiddlewareRegistryStatus::Synchronized,
-            LoadedPolicyOrigin::LocalOverride,
-            false,
-            false,
-            None,
-        ));
+            opa_engine: Some(Arc::new(engine)),
+            proto: None,
+            middleware_registry_status: MiddlewareRegistryStatus::Synchronized,
+            origin: LoadedPolicyOrigin::LocalOverride,
+            agent_proposals_enabled: false,
+            extension_authentication_enabled: false,
+            captured_provider_environment: None,
+            cedar_engine: None,
+        });
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -2465,7 +2476,11 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            // A Cedar-authored policy's Landlock grants come from the Cedar
+            // text, not `filesystem`, so its baseline paths are added after
+            // extraction in `prepare_startup_configuration` instead.
+            let enriched = proto_policy.cedar_policy_source.is_empty()
+                && enrich_proto_baseline_paths(&mut proto_policy);
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -2562,7 +2577,7 @@ async fn load_policy_with_gateway(
                 continue;
             }
             debug!("Creating OPA engine from proto policy data");
-            let (engine, policy, captured_provider_credentials) =
+            let (engine, cedar_engine, policy, captured_provider_credentials) =
                 match prepare_startup_configuration(&snapshot, &proto_policy, &provider) {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -2588,6 +2603,7 @@ async fn load_policy_with_gateway(
                     }
                 };
             let engine = Arc::new(engine);
+            let cedar_engine = cedar_engine.map(Arc::new);
 
             // Install the in-process catalog before any external connection can
             // fail. A newly started sandbox must always be able to resolve built-in
@@ -2684,22 +2700,23 @@ async fn load_policy_with_gateway(
                         .build()
                 );
             }
-            return Ok((
+            return Ok(LoadedPolicy {
                 policy,
                 opa_engine,
-                Some(proto_policy),
+                proto: Some(proto_policy),
                 middleware_registry_status,
-                LoadedPolicyOrigin::Gateway {
+                origin: LoadedPolicyOrigin::Gateway {
                     revision: loaded_policy_revision,
                     has_last_valid_policy,
                 },
-                agent_proposals_enabled_from_settings(&snapshot.settings),
-                snapshot.extension_authentication_enabled,
-                Some(CapturedProviderEnvironment::new(
+                agent_proposals_enabled: agent_proposals_enabled_from_settings(&snapshot.settings),
+                extension_authentication_enabled: snapshot.extension_authentication_enabled,
+                captured_provider_environment: Some(CapturedProviderEnvironment::new(
                     captured_provider_credentials,
                     &provider,
                 )),
-            ));
+                cedar_engine,
+            });
         }
     }
 
@@ -2748,7 +2765,12 @@ fn prepare_startup_configuration(
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
     policy: &openshell_core::proto::SandboxPolicy,
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
-) -> Result<(OpaEngine, SandboxPolicy, ProviderCredentialState)> {
+) -> Result<(
+    OpaEngine,
+    Option<CedarOnlyEngine>,
+    SandboxPolicy,
+    ProviderCredentialState,
+)> {
     if !snapshot.configuration_admitted {
         return Err(miette::miette!(
             "Effective configuration admission rejected"
@@ -2765,9 +2787,38 @@ fn prepare_startup_configuration(
         ));
     }
     let engine = OpaEngine::from_proto(policy)?;
-    let process_policy = SandboxPolicy::try_from(policy.clone())?;
+    // A non-empty `cedar_policy_source` makes Cedar the sole authoritative
+    // network, L7, and filesystem engine. The OPA engine built above has no
+    // network policies and only supplies middleware and tunnel plumbing (see
+    // `openshell_supervisor_network::policy_engine`).
+    let cedar_engine = if policy.cedar_policy_source.is_empty() {
+        None
+    } else {
+        Some(CedarOnlyEngine::from_proto(policy)?)
+    };
+    let mut process_policy = SandboxPolicy::try_from(policy.clone())?;
+    if let Some(cedar) = &cedar_engine {
+        let grants = cedar.filesystem_grants()?;
+        process_policy.filesystem = openshell_core::policy::FilesystemPolicy {
+            read_only: grants
+                .read_only
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            read_write: grants
+                .read_write
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            include_workdir: false,
+        };
+        // Same baseline YAML proxy-mode sandboxes get. Without it, a Cedar
+        // policy with no filesystem permits would yield an empty grant list,
+        // which applies no Landlock ruleset at all.
+        enrich_sandbox_baseline_paths(&mut process_policy);
+    }
     let credentials = prepare_provider_environment(provider)?;
-    Ok((engine, process_policy, credentials))
+    Ok((engine, cedar_engine, process_policy, credentials))
 }
 
 /// Whether the provider response contains a complete environment snapshot that
@@ -3004,6 +3055,7 @@ async fn reload_gateway_policy_runtime(
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
     reload_gateway_configuration_runtime(
         engine,
+        None,
         policy,
         entrypoint_pid,
         middleware,
@@ -3014,8 +3066,13 @@ async fn reload_gateway_policy_runtime(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Each input is a distinct part of one atomic runtime reload"
+)]
 async fn reload_gateway_configuration_runtime(
     engine: &OpaEngine,
+    cedar_engine: Option<&CedarOnlyEngine>,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
@@ -3048,7 +3105,46 @@ async fn reload_gateway_configuration_runtime(
             ));
         }
     }
-    match policy {
+    // The authoritative engine is chosen once at startup from the policy
+    // format, so a reload cannot switch formats. Accepting one would leave
+    // the previous engine enforcing a stale policy while reporting success.
+    // A Cedar policy is validated here, before the OPA plumbing reload, so a
+    // rejected Cedar policy leaves both engines on the previous revision.
+    let staged_cedar = match (cedar_engine, policy) {
+        (Some(_), Some(policy)) if policy.cedar_policy_source.is_empty() => {
+            return Err(GatewayRuntimeReloadError::PolicyValidation(
+                miette::miette!(
+                    "candidate policy is YAML, but this sandbox enforces a Cedar policy; \
+                     a sandbox cannot switch policy formats; previous policy remains active"
+                ),
+            ));
+        }
+        (None, Some(policy)) if !policy.cedar_policy_source.is_empty() => {
+            return Err(GatewayRuntimeReloadError::PolicyValidation(
+                miette::miette!(
+                    "candidate policy is Cedar, but this sandbox enforces a YAML policy; \
+                     a sandbox cannot switch policy formats; previous policy remains active"
+                ),
+            ));
+        }
+        (Some(cedar_engine), Some(policy)) => Some(
+            cedar_engine
+                .stage(policy, entrypoint_pid)
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?,
+        ),
+        _ => None,
+    };
+    // Activate the staged Cedar policy inside the OPA commit, after existing
+    // plumbing guards become stale and before credentials change, so the
+    // Cedar policy, middleware, and credentials publish as one generation.
+    let mut cedar_commit = Ok(());
+    let commit = || {
+        if let (Some(cedar_engine), Some(staged)) = (cedar_engine, staged_cedar) {
+            cedar_commit = cedar_engine.commit(staged);
+        }
+        commit_credentials();
+    };
+    let result = match policy {
         Some(policy) if middleware.registry_changed => {
             let registry = (middleware.connector)(
                 middleware.desired_services.to_vec(),
@@ -3061,7 +3157,7 @@ async fn reload_gateway_configuration_runtime(
                     policy,
                     entrypoint_pid,
                     Some(registry),
-                    commit_credentials,
+                    commit,
                 )
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
         }
@@ -3069,17 +3165,15 @@ async fn reload_gateway_configuration_runtime(
         // delivered service set, so swap the engine alone. This must not
         // require middleware reachability.
         Some(policy) => engine
-            .reload_configuration_from_proto_with_pid(
-                policy,
-                entrypoint_pid,
-                None,
-                commit_credentials,
-            )
+            .reload_configuration_from_proto_with_pid(policy, entrypoint_pid, None, commit)
             .map_err(GatewayRuntimeReloadError::PolicyValidation),
         None => Err(GatewayRuntimeReloadError::PolicyValidation(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
-    }
+    };
+    let guard = result?;
+    cedar_commit.map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+    Ok(guard)
 }
 
 fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
@@ -3691,6 +3785,12 @@ struct PolicyPollLoopContext {
     /// Canonical sandbox reference used by name-scoped configuration APIs.
     sandbox: String,
     opa_engine: Arc<OpaEngine>,
+    /// Authoritative Cedar engine for a Cedar-sourced sandbox, reloaded
+    /// alongside `opa_engine` on every successful reload. `None` when this
+    /// sandbox's policy was submitted as YAML (`opa_engine` stays
+    /// authoritative for the sandbox's whole lifetime; see
+    /// `openshell_supervisor_network::policy_engine`).
+    cedar_engine: Option<Arc<CedarOnlyEngine>>,
     /// Source of the policy currently loaded into OPA. This distinguishes an
     /// explicit local-file override from an unbound gateway revision so the
     /// former is never replaced by policy polling.
@@ -3720,6 +3820,17 @@ struct PolicyPollLoopContext {
     endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
     /// Session accepted by `ConnectSupervisor`; `None` suspends endpoint reports.
     supervisor_session_id: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+impl PolicyPollLoopContext {
+    /// The engine that makes this sandbox's network decisions: Cedar for a
+    /// Cedar-authored policy, otherwise OPA.
+    fn policy_engine(&self) -> PolicyEngine {
+        self.cedar_engine.as_ref().map_or_else(
+            || PolicyEngine::from(Arc::clone(&self.opa_engine)),
+            |cedar| PolicyEngine::from(Arc::clone(cedar)),
+        )
+    }
 }
 
 type MiddlewareConnector = Arc<
@@ -3913,7 +4024,7 @@ enum GatewayRuntimeFailureDisposition {
 }
 
 fn apply_gateway_runtime_reload_failure(
-    engine: &OpaEngine,
+    engine: &PolicyEngine,
     failure: GatewayRuntimeReloadError,
     configured_mode: PolicyValidationFailureMode,
     has_last_valid_policy: bool,
@@ -3969,8 +4080,11 @@ fn emit_transparent_tcp_expansion_rejection(
     );
 }
 
+/// Quarantines or retains the policy on `engine`, the sandbox's
+/// authoritative engine, so a rejected candidate never leaves network
+/// decisions on a policy the operator chose not to keep.
 fn apply_policy_validation_failure(
-    engine: &OpaEngine,
+    engine: &PolicyEngine,
     configured_mode: PolicyValidationFailureMode,
     has_last_valid_policy: bool,
     version: u32,
@@ -4335,7 +4449,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         if reloads_gateway_policy && !result.configuration_admitted {
             let disposition = apply_policy_validation_failure(
-                &ctx.opa_engine,
+                &ctx.policy_engine(),
                 result.policy_validation_failure_mode,
                 has_last_valid_policy,
                 result.version,
@@ -4450,7 +4564,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 let mode = result.policy_validation_failure_mode;
                 if mode != rejected.configured_mode {
                     let disposition = apply_policy_validation_failure(
-                        &ctx.opa_engine,
+                        &ctx.policy_engine(),
                         mode,
                         has_last_valid_policy,
                         rejected.version,
@@ -4593,6 +4707,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_configuration_runtime(
                 &ctx.opa_engine,
+                ctx.cedar_engine.as_deref(),
                 result.policy.as_ref(),
                 pid,
                 MiddlewareReloadContext {
@@ -4737,7 +4852,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
                         let failure_mode = result.policy_validation_failure_mode;
                         match apply_gateway_runtime_reload_failure(
-                            &ctx.opa_engine,
+                            &ctx.policy_engine(),
                             failure,
                             failure_mode,
                             has_last_valid_policy,
@@ -5830,6 +5945,7 @@ network_policies:
         let committed = AtomicBool::new(false);
         let result = reload_gateway_configuration_runtime(
             &engine,
+            None,
             Some(&policy),
             0,
             MiddlewareReloadContext {
@@ -6061,7 +6177,7 @@ network_policies:
             .unwrap()
             .expect("repair returns one launch bundle");
         assert!(
-            bundle.7.is_some(),
+            bundle.captured_provider_environment.is_some(),
             "launch bundle retains matching provider state"
         );
     }
@@ -6388,7 +6504,7 @@ network_policies:
                 .unwrap()
                 .expect("the repaired configuration returns one launch bundle");
             assert_eq!(
-                bundle.2,
+                bundle.proto,
                 Some(repaired),
                 "startup must install the repaired policy"
             );
@@ -6539,7 +6655,7 @@ network_policies:
             ],
             "startup must discard the obsolete rejection and validate the repair"
         );
-        assert_eq!(bundle.2, Some(repaired));
+        assert_eq!(bundle.proto, Some(repaired));
     }
 
     #[tokio::test(start_paused = true)]
@@ -6853,14 +6969,14 @@ network_policies:
             "startup must not write a global policy back as a sandbox policy"
         );
         assert_eq!(
-            bundle.2,
+            bundle.proto,
             Some(enriched),
             "startup installs the global policy with the baseline paths added"
         );
         let LoadedPolicyOrigin::Gateway {
             revision: Some(revision),
             ..
-        } = bundle.4
+        } = bundle.origin
         else {
             panic!("startup must bind the global policy to its gateway revision");
         };
@@ -6998,7 +7114,7 @@ network_policies:
         );
         snapshot.provider_env_revision = 10;
         assert!(prepare_startup_configuration(&snapshot, &policy, &startup_provider(11)).is_err());
-        let (_, _, credentials) =
+        let (_, _, _, credentials) =
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
@@ -7042,8 +7158,9 @@ network_policies:
             provider
                 .non_secret_environment_keys
                 .push("PROJECT_ID".to_string());
-            let (_, _, credentials) = prepare_startup_configuration(&snapshot, &policy, &provider)
-                .expect("withheld credentials preserve fail-closed startup");
+            let (_, _, _, credentials) =
+                prepare_startup_configuration(&snapshot, &policy, &provider)
+                    .expect("withheld credentials preserve fail-closed startup");
             assert_eq!(credentials.revision(), 10);
             assert!(credentials.snapshot().child_env.contains_key("PROJECT_ID"));
         }
@@ -7902,6 +8019,7 @@ network_policies:
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
             opa_engine,
+            cedar_engine: None,
             loaded_policy_origin,
             vm_identity: None,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
@@ -8446,6 +8564,7 @@ network_policies:
     async fn assert_gateway_reload_rejects_and_repairs(registry_changed: bool) {
         let policy = proto_provenance_policy_fixture();
         let engine = OpaEngine::from_proto(&policy).expect("build initial gateway policy");
+        let engine = Arc::new(engine);
         install_builtin_middleware_registry(&engine)
             .await
             .expect("install initial registry");
@@ -8487,7 +8606,7 @@ network_policies:
             GatewayRuntimeReloadError::PolicyValidation(_)
         ));
         let disposition = apply_gateway_runtime_reload_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             failure,
             PolicyValidationFailureMode::RetainLastValid,
             true,
@@ -8573,16 +8692,16 @@ network_policies:
                 LocalPolicyIdentity::Required,
             )
         };
-        let (
-            _,
-            engine,
+        let LoadedPolicy {
+            opa_engine: engine,
             proto,
-            registry,
+            middleware_registry_status: registry,
             origin,
-            proposals,
+            agent_proposals_enabled: proposals,
             extension_authentication_enabled,
-            provider_credentials,
-        ) = startup().await.expect("load valid local policy");
+            captured_provider_environment: provider_credentials,
+            ..
+        } = startup().await.expect("load valid local policy");
         assert!(provider_credentials.is_none());
         assert!(proto.is_none());
         assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
@@ -8663,6 +8782,7 @@ network_policies:
     #[tokio::test]
     async fn unavailable_middleware_reload_keeps_last_known_good_runtime_active() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let engine = Arc::new(engine);
         install_builtin_middleware_registry(&engine)
             .await
             .expect("install built-in middleware registry");
@@ -8689,7 +8809,7 @@ network_policies:
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
         let disposition = apply_gateway_runtime_reload_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             failure,
             PolicyValidationFailureMode::FailClosed,
             true,
@@ -8705,9 +8825,160 @@ network_policies:
         assert!(engine.fail_closed_reason().is_none());
     }
 
+    const CEDAR_RELOAD_POLICY: &str = r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");
+"#;
+
+    fn cedar_proto_policy(source: &str) -> openshell_core::proto::SandboxPolicy {
+        openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn cedar_engines() -> (OpaEngine, Arc<CedarOnlyEngine>) {
+        let engine = OpaEngine::from_proto(&cedar_proto_policy(CEDAR_RELOAD_POLICY))
+            .expect("build OPA engine");
+        let cedar = Arc::new(
+            CedarOnlyEngine::from_policy_str(CEDAR_RELOAD_POLICY).expect("build Cedar engine"),
+        );
+        (engine, cedar)
+    }
+
+    async fn reload_with_cedar(
+        engine: &OpaEngine,
+        cedar_engine: Option<&CedarOnlyEngine>,
+        policy: &openshell_core::proto::SandboxPolicy,
+    ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
+        reload_gateway_configuration_runtime(
+            engine,
+            cedar_engine,
+            Some(policy),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+            None,
+            || {},
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn yaml_reload_of_a_cedar_sandbox_is_rejected_and_keeps_previous_policy() {
+        let (engine, cedar) = cedar_engines();
+        let opa_generation = engine.current_generation();
+        let cedar_generation = cedar.current_generation();
+
+        let failure = reload_with_cedar(&engine, Some(&cedar), &proto_policy_fixture())
+            .await
+            .expect_err("format switch must be rejected");
+
+        assert!(
+            matches!(failure, GatewayRuntimeReloadError::PolicyValidation(_)),
+            "{failure:?}"
+        );
+        assert_eq!(engine.current_generation(), opa_generation);
+        assert_eq!(cedar.current_generation(), cedar_generation);
+    }
+
+    #[tokio::test]
+    async fn cedar_reload_of_a_yaml_sandbox_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let opa_generation = engine.current_generation();
+
+        let failure = reload_with_cedar(&engine, None, &cedar_proto_policy(CEDAR_RELOAD_POLICY))
+            .await
+            .expect_err("format switch must be rejected");
+
+        assert!(
+            matches!(failure, GatewayRuntimeReloadError::PolicyValidation(_)),
+            "{failure:?}"
+        );
+        assert_eq!(engine.current_generation(), opa_generation);
+    }
+
+    #[tokio::test]
+    async fn invalid_cedar_reload_leaves_both_engines_on_the_previous_policy() {
+        let (engine, cedar) = cedar_engines();
+        let opa_generation = engine.current_generation();
+        let cedar_generation = cedar.current_generation();
+
+        reload_with_cedar(&engine, Some(&cedar), &cedar_proto_policy("not cedar {{{"))
+            .await
+            .expect_err("invalid Cedar policy must be rejected");
+
+        assert_eq!(engine.current_generation(), opa_generation);
+        assert_eq!(cedar.current_generation(), cedar_generation);
+    }
+
+    #[tokio::test]
+    async fn valid_cedar_reload_commits_cedar_and_ends_its_quarantine() {
+        let (engine, cedar) = cedar_engines();
+        PolicyEngine::from(Arc::clone(&cedar))
+            .enter_fail_closed("invalid candidate")
+            .expect("quarantine");
+        let quarantined_generation = cedar.current_generation();
+
+        let widened = format!(
+            "{CEDAR_RELOAD_POLICY}\npermit (principal, action == Sandbox::Action::\"NetworkConnect\", \
+             resource == Sandbox::NetworkEndpoint::\"files.pythonhosted.org:443\");"
+        );
+        reload_with_cedar(&engine, Some(&cedar), &cedar_proto_policy(&widened))
+            .await
+            .expect("valid Cedar policy reloads");
+
+        assert!(cedar.fail_closed_reason().is_none());
+        assert!(cedar.current_generation() > quarantined_generation);
+    }
+
+    #[test]
+    fn policy_rejection_quarantines_the_cedar_engine_of_a_cedar_sandbox() {
+        let (_engine, cedar) = cedar_engines();
+        let input = openshell_supervisor_network::opa::NetworkInput {
+            host: "pypi.org".to_string(),
+            port: 443,
+            binary_path: std::path::PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        assert!(matches!(
+            cedar.authorize_egress(&input).unwrap().action,
+            openshell_supervisor_network::opa::NetworkAction::Allow { .. }
+        ));
+
+        let disposition = apply_gateway_runtime_reload_failure(
+            &PolicyEngine::from(Arc::clone(&cedar)),
+            GatewayRuntimeReloadError::PolicyValidation(miette::miette!("invalid candidate")),
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::PolicyRejected { .. }
+        ));
+        assert!(cedar.fail_closed_reason().is_some());
+        assert!(matches!(
+            cedar.authorize_egress(&input).unwrap().action,
+            openshell_supervisor_network::opa::NetworkAction::Deny { .. }
+        ));
+        assert!(cedar.policy_dns_eligibility_snapshot().unwrap().fail_closed);
+    }
+
     #[tokio::test]
     async fn tcp_policy_reload_without_startup_substrate_is_rejected_and_keeps_previous_policy() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let engine = Arc::new(engine);
         let active_generation = engine.current_generation();
 
         let failure = reload_gateway_policy_runtime(
@@ -8728,7 +8999,7 @@ network_policies:
         .await
         .expect_err("TCP expansion must require startup substrate");
         let disposition = apply_gateway_runtime_reload_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             failure,
             PolicyValidationFailureMode::FailClosed,
             true,
@@ -8780,12 +9051,13 @@ network_policies:
             "network_policies: {}\n",
         )
         .unwrap();
+        let engine = Arc::new(engine);
         let middleware_failure = GatewayRuntimeReloadError::MiddlewareRegistry(miette::miette!(
             "middleware service unavailable"
         ));
         let first_failure = FailedRuntimeRevision::new(42, "sha256:candidate", &middleware_failure);
         let middleware_disposition = apply_gateway_runtime_reload_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             middleware_failure,
             PolicyValidationFailureMode::FailClosed,
             true,
@@ -8809,7 +9081,7 @@ network_policies:
         );
 
         let policy_disposition = apply_gateway_runtime_reload_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             policy_failure,
             PolicyValidationFailureMode::FailClosed,
             true,
@@ -9235,10 +9507,11 @@ network_policies:
             "network_policies: {}\n",
         )
         .unwrap();
+        let engine = Arc::new(engine);
         let previous_generation = engine.current_generation();
 
         let disposition = apply_policy_validation_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             PolicyValidationFailureMode::FailClosed,
             true,
             7,
@@ -9263,10 +9536,11 @@ network_policies:
             "network_policies: {}\n",
         )
         .unwrap();
+        let engine = Arc::new(engine);
         let previous_generation = engine.current_generation();
 
         let quarantined = apply_policy_validation_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             PolicyValidationFailureMode::FailClosed,
             true,
             6,
@@ -9276,7 +9550,7 @@ network_policies:
         assert!(!quarantined.previous_policy_active);
 
         let disposition = apply_policy_validation_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             PolicyValidationFailureMode::RetainLastValid,
             true,
             7,
@@ -9297,9 +9571,10 @@ network_policies:
             "network_policies: {}\n",
         )
         .unwrap();
+        let engine = Arc::new(engine);
 
         let disposition = apply_policy_validation_failure(
-            &engine,
+            &PolicyEngine::from(Arc::clone(&engine)),
             PolicyValidationFailureMode::RetainLastValid,
             false,
             1,

@@ -166,12 +166,15 @@ func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 	handled := fieldSet{
-		"version":             true,
-		"filesystem":          true,
-		"network_policies":    true,
-		"process":             true,
-		"landlock":            true,
-		"network_middlewares": true,
+		"version":                   true,
+		"filesystem":                true,
+		"network_policies":          true,
+		"process":                   true,
+		"landlock":                  true,
+		"network_middlewares":       true,
+		"cedar_policy_source":       true,
+		"provider_credential_rules": true,
+		"endpoint_settings":         true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.SandboxPolicy{}).ProtoReflect().Descriptor(), handled, nil)

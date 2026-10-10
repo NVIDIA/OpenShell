@@ -24,6 +24,7 @@ mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
+pub(crate) use resolver::ResolveError as TrustedResolveError;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
@@ -32,7 +33,7 @@ pub(crate) use store::{
     SyntheticPools,
 };
 
-use crate::opa::OpaEngine;
+use crate::policy_engine::PolicyEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
 use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
@@ -84,7 +85,7 @@ pub(crate) enum PolicyDnsError {
 /// No socket is bound by this type. A later runtime adapter owns listener and
 /// namespace lifecycle and calls the bounded wire helpers in this module.
 pub(crate) struct PolicyDnsService<R> {
-    policy: Arc<OpaEngine>,
+    policy: PolicyEngine,
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
     trusted_host_gateway: Option<std::net::IpAddr>,
@@ -92,13 +93,13 @@ pub(crate) struct PolicyDnsService<R> {
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn new(
-        policy: Arc<OpaEngine>,
+        policy: impl Into<PolicyEngine>,
         resolver: R,
         store: Arc<ResolvedEndpointStore>,
         trusted_host_gateway: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
-            policy,
+            policy: policy.into(),
             resolver,
             store,
             trusted_host_gateway,
@@ -381,6 +382,7 @@ fn eligible_endpoints(
             None,
             &raw_allowed_ips,
             exact_declared_host,
+            None,
         )
         .map_err(|error| PolicyDnsError::Policy(error.reason))?;
         eligible.push(EligibleEndpoint {
@@ -658,6 +660,7 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;

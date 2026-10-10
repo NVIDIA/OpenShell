@@ -3069,14 +3069,14 @@ pub fn evaluate_l7_request(
         && !jsonrpc.calls.is_empty()
     {
         if jsonrpc.has_response {
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, request)?;
             if !allowed {
                 return Ok((false, reason));
             }
         }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
             if !allowed {
                 return Ok((false, reason));
             }
@@ -3084,7 +3084,7 @@ pub fn evaluate_l7_request(
         return Ok((true, String::new()));
     }
 
-    evaluate_l7_request_once(engine, ctx, request)
+    engine.evaluate_request(ctx, request)
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
@@ -3094,7 +3094,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+        let (allowed, reason) = engine.evaluate_request(ctx, request)?;
         if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
             return Ok(JsonRpcEvaluation {
                 allowed,
@@ -3109,7 +3109,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         let mut first_denied_reason = None;
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
             if !allowed {
                 if first_denied_reason.is_none() {
                     first_denied_reason = Some(reason);
@@ -3141,7 +3141,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         });
     }
 
-    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+    let (allowed, reason) = engine.evaluate_request(ctx, request)?;
     Ok(JsonRpcEvaluation {
         allowed,
         reason,
@@ -3300,7 +3300,9 @@ fn emit_transformed_body_decision(
     ocsf_emit!(event);
 }
 
-fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
+pub(crate) fn jsonrpc_policy_input(
+    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+) -> serde_json::Value {
     let call = if info.is_batch {
         None
     } else {
@@ -3325,7 +3327,7 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
 
 /// A batch may be allowed by several endpoints, but one credential owner must
 /// admit every member before its token can authenticate the combined request.
-fn admitted_token_grant_owners(
+pub(crate) fn admitted_token_grant_owners(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
@@ -3361,30 +3363,13 @@ fn admitted_token_grant_owners_once(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<HashSet<String>> {
-    if engine.is_stale() {
-        return Err(miette!("policy changed before token grant selection"));
-    }
-    let mut engine = engine
-        .engine()
-        .lock()
-        .map_err(|_| miette!("OPA engine lock poisoned"))?;
-    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
-    let owners = engine
-        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
-        .map_err(|error| miette!("{error}"))?;
-    let regorus::Value::Array(owners) = owners else {
-        return Err(miette!("invalid credential owner admission result"));
-    };
-    owners
-        .iter()
-        .map(|owner| match owner {
-            regorus::Value::String(owner) => Ok(owner.to_string()),
-            _ => Err(miette!("invalid credential owner identity")),
-        })
-        .collect()
+    engine.admitted_token_grant_owners(ctx, request)
 }
 
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+pub(crate) fn l7_request_policy_input(
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> serde_json::Value {
     serde_json::json!({
         "network": { "host": ctx.host, "port": ctx.port },
         "exec": {
@@ -3400,49 +3385,6 @@ fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serd
             "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
     })
-}
-
-fn evaluate_l7_request_once(
-    engine: &TunnelPolicyEngine,
-    ctx: &L7EvalContext,
-    request: &L7RequestInfo,
-) -> Result<(bool, String)> {
-    if engine.is_stale() {
-        return Err(miette!(
-            "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
-            engine.captured_generation(),
-            engine.current_generation(),
-        ));
-    }
-
-    let input = l7_request_policy_input(ctx, request);
-
-    let mut engine = engine
-        .engine()
-        .lock()
-        .map_err(|_| miette!("OPA engine lock poisoned"))?;
-
-    crate::opa::set_regorus_input(&mut engine, input)?;
-
-    let allowed = engine
-        .eval_rule("data.openshell.sandbox.allow_request".into())
-        .map_err(|e| miette!("{e}"))?;
-    let allowed = allowed == regorus::Value::from(true);
-
-    let reason = if allowed {
-        String::new()
-    } else {
-        let val = engine
-            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
-            .map_err(|e| miette!("{e}"))?;
-        match val {
-            regorus::Value::String(s) => s.to_string(),
-            regorus::Value::Undefined => "request denied by policy".to_string(),
-            other => other.to_string(),
-        }
-    };
-
-    Ok((allowed, reason))
 }
 
 /// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).
@@ -3532,7 +3474,11 @@ where
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
-            if generation != generation_guard.captured_generation() {
+            // `engine` supplies middleware and has its own generation, which
+            // for a Cedar sandbox is unrelated to `generation_guard` (pinned
+            // to Cedar). Stop if either the middleware chain just changed or
+            // the tunnel's policy is stale.
+            if generation != engine.current_generation() || generation_guard.is_stale() {
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;

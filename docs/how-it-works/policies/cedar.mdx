@@ -1,0 +1,458 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Write Sandbox Policies in Cedar"
+sidebar-title: "Cedar Policies"
+description: "Author an OpenShell sandbox policy in Cedar instead of YAML and understand which Cedar policy shapes OpenShell accepts."
+keywords: "Generative AI, Cybersecurity, Policy, Cedar, Network Policy, Landlock, Sandbox, Security"
+position: 8
+---
+
+A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead of YAML. Cedar then decides every network connection, every inspected HTTP or JSON-RPC request, and the filesystem paths Landlock allows. A sandbox uses one format for its whole lifetime: YAML policies are evaluated by the built-in Rego engine, and Cedar policies by Cedar.
+
+Cedar's restricted language makes policies easier to analyze, for example to check that a revision grants no more access than the one it replaces. OpenShell accepts only Cedar policy shapes it can enforce exactly as written, and rejects the rest when you submit the policy.
+
+## Apply a Cedar Policy
+
+OpenShell treats a policy file as Cedar when its extension is `.cedar`, in any case. Any other extension is parsed as YAML.
+
+Create a sandbox with a Cedar policy:
+
+```shell
+openshell sandbox create --policy ./policy.cedar -- claude
+```
+
+Replace the policy on a running sandbox:
+
+```shell
+openshell policy set <name> --policy ./policy.cedar --wait
+```
+
+The CLI validates the file before sending it, and the gateway validates it again. If the sandbox cannot load a revision, the `policy_validation_failure_mode` setting applies as it does for YAML policies. Refer to [Manage Policies](/how-it-works/policies/manage-policies).
+
+`openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
+
+## Add Middleware and Endpoint Settings
+
+Middleware and endpoint settings are configuration, not access control, so they are supplied separately from the Cedar file in a middleware file. The file has a `network_middlewares` section, in the same format as the section of a YAML policy, and an `endpoint_settings` section:
+
+```yaml
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["api.github.com"]
+
+endpoint_settings:
+  - host: gitlab.example.com
+    port: 443
+    path: /api/**
+    allow_encoded_slash: true
+  - host: mcp.example.com
+    port: 443
+    mcp:
+      versions: ["2025-06-18", "2025-11-25"]
+      strict_tool_names: false
+```
+
+Pass it with `--middleware` when you create the sandbox or set its policy:
+
+```shell
+openshell sandbox create --policy ./policy.cedar --middleware ./middleware.yaml -- claude
+openshell policy set <name> --policy ./policy.cedar --middleware ./middleware.yaml --wait
+```
+
+`openshell policy get <name>` prints both sections after the Cedar text. The Landlock compatibility mode and process identity of a Cedar sandbox use their defaults.
+
+Each `endpoint_settings` entry selects endpoints the way a YAML endpoint does: `host` is an exact host or a host glob, `port` or `ports` lists the ports, and the optional `path` uses the YAML endpoint path syntax. An entry can set these YAML endpoint fields:
+
+| Field | Applies to |
+|---|---|
+| `tls: skip` | Every connection to the endpoint, inspected or not. Cannot be combined with `path`. |
+| `allow_encoded_slash` | Inspected requests. |
+| `json_rpc.max_body_bytes`, `mcp.max_body_bytes` | JSON-RPC and MCP endpoints. |
+| `mcp.versions`, `mcp.strict_tool_names` | MCP endpoints. Without `mcp.versions`, an MCP endpoint uses the YAML default revision. |
+| `graphql_max_body_bytes`, `persisted_queries`, `graphql_persisted_queries` | GraphQL and GraphQL-over-WebSocket endpoints. |
+
+A setting takes effect only on connections the Cedar policy allows, and a protocol option only where the policy inspects that protocol. Fields that decide access, such as `protocol`, `enforcement`, `access`, `rules`, `deny_rules`, `allowed_ips`, and `binaries`, and credential fields, which providers supply, are rejected. A YAML policy rejects `endpoint_settings`, because its endpoints carry these fields directly.
+
+An entry with a `path` applies to requests whose path it matches, and an entry without one applies to every request. When several entries match, the most specific path wins, as for YAML endpoints sharing a host and port, and a later entry overrides an earlier one for the fields it sets. Two entries cannot select the same host, path, and port. An entry with a `path` takes the protocol and enforcement of the [inspected path](#paths) that matches it, and has no effect where no inspected path matches.
+
+## Policy Model
+
+Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`.
+
+| Action | Resource | Context fields | Decides |
+|---|---|---|---|
+| `ReadFile`, `WriteFile` | `FilesystemPath` | none | Landlock grants, fixed at sandbox start. |
+| `NetworkConnect` | `NetworkEndpoint` | `binary_path`, `ancestors`, `binary_aliases`, and optional `destination_ip` | Whether a process may open a connection, and to which resolved addresses. |
+| `HttpRequest` | `NetworkEndpoint` | `binary_path`, `ancestors`, `binary_aliases`, `method`, `path`, `query`, and the protocol fields below | Each request on an inspected connection. |
+
+A `NetworkEndpoint` id is `"host:port"`, with a lowercase host. `NetworkConnect` also declares `method`, `path`, and `command`, but they are always empty because no request has been read at connect time. Put method and path conditions on `HttpRequest`.
+
+This example grants filesystem access, allows `curl` to connect to the GitHub API, and inspects each request on that connection:
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action in [Sandbox::Action::"ReadFile", Sandbox::Action::"WriteFile"],
+    resource is Sandbox::FilesystemPath
+)
+when { resource in Sandbox::FilesystemPath::"/sandbox" || resource in Sandbox::FilesystemPath::"/tmp" };
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"ReadFile",
+    resource in Sandbox::FilesystemPath::"/usr"
+);
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.method == "GET" && context.path like("/repos/*/*", "/") };
+```
+
+## Filesystem Rules
+
+Landlock applies a flat allow-list of path subtrees when the sandbox starts, so OpenShell accepts only filesystem policies that mean exactly that. A policy that can apply to `ReadFile` or `WriteFile` must:
+
+- Be a `permit`. A `forbid` that can apply to files is rejected.
+- List only `ReadFile` and `WriteFile` in its action scope.
+- Use `principal` or `principal is Sandbox::Process`.
+- Name paths with `resource in Sandbox::FilesystemPath::"/path"`, either in the scope or in a single `when` clause that only joins such tests with `||`.
+
+`resource ==` is rejected because Landlock grants the whole subtree under a directory. Paths must be absolute, must not contain `..`, and `/` cannot be granted write access. A policy that lists `WriteFile` grants read-write access to its paths.
+
+The supervisor adds the same baseline runtime paths it adds for YAML policies. On a running sandbox, a policy update can add filesystem paths but cannot remove them, because Landlock cannot revoke access from a running process.
+
+## Network Rules
+
+Cedar evaluates `NetworkConnect` for every outbound connection, with the calling binary in `context.binary_path` and its ancestors in `context.ancestors`. Conditions on these actions are evaluated by Cedar as written.
+
+Cedar compares `context.binary_path` exactly, and the kernel reports the resolved executable, such as `/usr/bin/python3.12`, not a symlink such as `/usr/bin/python3`. To match a binary the way a YAML binary path matches it, symlink included, test all three fields:
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"pypi.org:443"
+)
+when {
+    context.binary_path == "/usr/bin/python3"
+    || context.ancestors.contains("/usr/bin/python3")
+    || context.binary_aliases.contains("/usr/bin/python3")
+};
+```
+
+`context.binary_aliases` holds each path your policies test with `.contains`, `.containsAny`, or `.containsAll` that is a symlink in the sandbox resolving to the calling binary or one of its ancestors. The supervisor resolves these paths inside the sandbox once the entrypoint process starts, and again on each policy update, as it resolves YAML binary paths. Until then the set is empty, so a policy that needs it matches only the literal path. Paths must be literal absolute paths without `*`: like YAML, OpenShell never resolves a glob such as `context.binary_path like("/usr/lib/postgresql/*/bin/psql", "/")`.
+
+## Globs
+
+Write globs with a delimiter, as `like("pattern", "delimiter")`. With a delimiter, `*` matches within one segment and `**` matches across segments, as in YAML policies. Use `"."` for hosts and `"/"` for paths. Without a delimiter, `like` treats every `*` as matching across segments, so `context.path like "/repos/*"` also matches `/repos/a/b/c`.
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource is Sandbox::NetworkEndpoint
+)
+when {
+    resource.host like("*.example.com", ".")
+    && resource.port == 443
+    && context.binary_path == "/usr/bin/curl"
+};
+```
+
+## Policy DNS
+
+Policy DNS resolves a host when a `NetworkConnect` permit names it in its scope, such as `resource == Sandbox::NetworkEndpoint::"pypi.org:443"`, or requires both the host and the port in its `when` conditions, as in the example above. The host condition can be an exact string or a host glob with a `.` delimiter that follows the YAML wildcard host rules: `*` or `**` as the whole first label, `*` within the first label, `*` as a whole later label, and no wildcard top-level domain such as `*.com`. Policy DNS does not resolve any other host, so the connection fails closed.
+
+A host named exactly may resolve to a private address. A host matched by a glob may not, unless an allowing permit names it exactly or [restricts its addresses](#destination-addresses).
+
+## Destination Addresses
+
+`context.destination_ip` is the Cedar form of YAML `allowed_ips`. A `NetworkConnect` permit can require each address the host resolves to to lie in fixed ranges:
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"my-service.corp.net:8080"
+)
+when {
+    context.binary_path == "/usr/bin/curl"
+    && context has destination_ip
+    && context.destination_ip.isInRange(ip("10.0.5.0/24"))
+};
+```
+
+Leave out the host to allow any host on the port whose addresses are in range, like a YAML endpoint with `allowed_ips` and no `host`. Such a permit does not make a host eligible for policy DNS.
+
+OpenShell decides a connection twice. Before the host resolves, `destination_ip` is absent, and a permit counts as if its address conditions held. After the host resolves, Cedar decides again for each address, and every address must pass. Policy DNS drops answers outside a permit's ranges.
+
+An address is admitted only when:
+
+- It is not loopback, link-local (including cloud metadata), or unspecified. These stay blocked regardless of policy.
+- Every allowing permit with a `destination_ip` condition includes it.
+- For a private address, an allowing permit names the host exactly, or every allowing permit has a `destination_ip` condition. A permit without one admits only public addresses unless it names the host.
+- Every attached provider endpoint for the host and port that sets `allowed_ips` includes it. Provider ranges only narrow; they never admit an address the Cedar policy rejects.
+
+Control-plane ports, such as 6443 and 2379, are blocked unless only public-only permits allow the connection and no matching provider endpoint sets `allowed_ips`, as in YAML.
+
+When the operator sets `proxy_connect_by_hostname`, the upstream proxy resolves the host again, so `destination_ip` checks do not bind the address it connects to. YAML `allowed_ips` has the same limitation.
+
+A permit must write its address condition as a top-level `when` conjunct: `context has destination_ip`, or `isInRange` tests joined with `||`. Conditions in that form intersect. OpenShell rejects a permit that reads `destination_ip` in any other form, a range that overlaps loopback, link-local, or unspecified addresses, and any policy that reads `destination_ip` without exactly the `NetworkConnect` action in its scope. A `forbid` may read `destination_ip` in any form; it applies once the host resolves.
+
+## Native TCP
+
+Add `@transport("tcp")` to a `NetworkConnect` permit to mark its endpoint as native TCP, like a YAML endpoint with `protocol: tcp`. The connection is allowed as plain L4 traffic and never inspected per request.
+
+```cedar
+@transport("tcp")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"db.example.com:5432"
+)
+when { context.binary_path == "/usr/bin/psql" };
+```
+
+As in YAML, OpenShell rejects a native TCP endpoint that:
+
+- Names an IP address or an invalid DNS host. Native TCP reaches hosts through policy DNS.
+- Names no host and port the way [Policy DNS](#policy-dns) requires.
+- Overlaps, on a host and port, an endpoint that an `HttpRequest` policy inspects or that another `NetworkConnect` permit names without `@transport("tcp")`. Host globs overlap when some host matches both.
+
+`@transport` applies only to `permit` policies whose action scope is exactly `NetworkConnect`.
+
+## Request Rules
+
+The proxy decides at connect time whether to inspect a connection request by request. It inspects every endpoint that an `HttpRequest` policy names in its scope, whether the policy is a `permit` or a `forbid`. An `HttpRequest` policy without an endpoint in its scope is rejected, because the proxy could not tell which connections it applies to.
+
+Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each request to that endpoint needs a matching `permit`.
+
+Only endpoints named exactly in an `HttpRequest` scope are inspected. A host that a `NetworkConnect` glob allows, such as `resource.host like("*.example.com", ".")`, connects without per-request checks unless an `HttpRequest` policy names that host exactly. YAML can inspect every host that matches a wildcard endpoint; Cedar cannot.
+
+Endpoints are parsed as REST by default. Add `@protocol("json-rpc")`, `@protocol("mcp")`, `@protocol("graphql")`, `@protocol("websocket")`, or `@protocol("websocket-graphql")` to an `HttpRequest` policy to inspect that protocol instead. All policies that declare a protocol for one endpoint path must agree. `@protocol("sql")` is rejected, because OpenShell does not inspect SQL traffic.
+
+Fields that do not apply to a request are empty strings, `false`, or empty sets.
+
+| Protocol | Context fields |
+|---|---|
+| REST | `method`, `path` |
+| JSON-RPC | `jsonrpc_method`, `jsonrpc_response` |
+| MCP | `jsonrpc_method`, `mcp_tool`, `mcp_method_class`, `jsonrpc_receive_stream`, `jsonrpc_response` |
+| GraphQL | `graphql_operation_type`, `graphql_operation_name`, `graphql_fields` |
+| WebSocket | `method`, `path` |
+| GraphQL over WebSocket | `method`, `path`, and the GraphQL fields |
+
+`context.method` is always uppercase. Unlike YAML, a `GET` condition does not also allow `HEAD`, so list `HEAD` when you want it allowed.
+
+For JSON-RPC and MCP, each call is evaluated on its own, and `method` is empty for a call. OpenShell denies a request that fails JSON-RPC inspection, and a call or response frame that is not sent with `POST`, before evaluating it.
+
+`resource.protocol` is the protocol a request is inspected with, such as `"graphql"` or `"websocket-graphql"`. On `NetworkConnect` it is the protocol of the policies without `@path`, or empty.
+
+### Paths
+
+Add `@path("pattern")` to `HttpRequest` policies to inspect one path of an endpoint with its own protocol and enforcement, as YAML endpoints that share a host and port do. The pattern uses the YAML endpoint `path` syntax: it starts with `/` or is `**`, `/prefix/**` matches `/prefix` and everything below it, and other patterns are globs. Each request is inspected as the most specific matching path declares, and policies without `@path` declare the inspection of every other path. When the policies name only paths, OpenShell denies a request that matches none of them.
+
+`@path` chooses how a request is parsed and enforced, not which policies apply to it. Every policy for the endpoint is evaluated for every request, so write the path in the policy's conditions:
+
+```cedar
+@path("/repos/**")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.method == "GET" && context.path like("/repos/**", "/") };
+
+@path("/graphql")
+@protocol("graphql")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.path == "/graphql" && context.graphql_operation_type == "query" };
+```
+
+A YAML GraphQL endpoint is authoritative for the requests it parses, so a broader REST rule never allows a GraphQL operation. A Cedar permit has no such limit: add `resource.protocol == "rest"` to a REST permit whose path conditions also cover a GraphQL path. Two equally specific paths that can match the same request must declare the same protocol and enforcement.
+
+### Query Parameters
+
+`context.query` holds the request's decoded query parameters as tags, one per key. Check that a key is present with `hasTag` before reading its value with `getTag`. YAML query globs treat `.` as a delimiter, so write the same globs with `like("pattern", ".")`:
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.example.com:443"
+)
+when {
+    context.method == "GET" && context.path == "/download"
+    && context.query.hasTag("tag") && context.query.getTag("tag") like("foo-*", ".")
+};
+
+forbid (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.example.com:443"
+)
+when { context.query.hasTag("force") && context.query.getTag("force") == "true" };
+```
+
+When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the request once for each combination of values. It allows the request only if no evaluation is denied and one `permit` allows every evaluation. This matches YAML: a permit must accept every value of each key it reads, and a `forbid` applies when each key it reads has one matching value. Write each YAML allow rule as its own `permit`, because two rules joined with `||` in one permit can together allow values that neither rule allows alone. OpenShell denies a request with more than 64 combinations of the keys that policies read.
+
+### MCP
+
+`mcp_tool` is the tool name of a `tools/call` request. `mcp_method_class` is `available` for a core method of the selected MCP revision, and `extension` for any other method. An MCP endpoint does not allow its receive stream or client response frames by itself, so permit them explicitly. The endpoint accepts the YAML default revision, `2025-11-25`, unless an [endpoint setting](#add-middleware-and-endpoint-settings) lists other revisions.
+
+```cedar
+@protocol("mcp")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"mcp.example.com:443"
+)
+when {
+    context.path == "/mcp"
+    && context.mcp_method_class == "available"
+    && (["initialize", "tools/list"].contains(context.jsonrpc_method)
+        || (context.jsonrpc_method == "tools/call" && context.mcp_tool like("github.*", ".")))
+};
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"mcp.example.com:443"
+)
+when {
+    context.path == "/mcp"
+    && ((context.method == "GET" && context.jsonrpc_receive_stream) || context.jsonrpc_response)
+};
+```
+
+### GraphQL
+
+OpenShell evaluates each operation in a request separately and denies the request if any operation is denied. `graphql_operation_type` is lowercase. A hash-only persisted query, which sends no operation text, is looked up in the endpoint's `graphql_persisted_queries` [endpoint setting](#add-middleware-and-endpoint-settings) by hash, then by saved-query id, and Cedar evaluates the registered operation. OpenShell denies a hash-only query that is not registered, or any hash-only query unless `persisted_queries` is `allow_registered`, as for YAML. Match exact field names with `containsAll` and `containsAny`:
+
+```cedar
+@protocol("graphql")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when {
+    context.path == "/graphql"
+    && (context.graphql_operation_type == "query"
+        || (context.graphql_operation_type == "mutation"
+            && context.graphql_fields.containsAny(["createIssue", "commentOnIssue"])
+            && ["createIssue", "commentOnIssue"].containsAll(context.graphql_fields)))
+};
+```
+
+Field globs, such as YAML `fields: ["create*"]`, cannot be written, because they need every field to match a pattern. Operation name globs work with `like`.
+
+### WebSocket
+
+On a `@protocol("websocket")` endpoint, the upgrade is a `GET` request, and each client text message is evaluated with `method` `WEBSOCKET_TEXT` and the `path` of the upgrade. A request that is not a WebSocket upgrade is denied. A message that Cedar denies closes the connection, or is logged and forwarded on an audit endpoint.
+
+`@protocol("websocket-graphql")` is a WebSocket endpoint whose client messages carry GraphQL operations, as a YAML WebSocket endpoint with GraphQL operation rules. Each operation message is evaluated with `method` `WEBSOCKET_TEXT`, the upgrade path, and the GraphQL fields. Control messages such as `connection_init` and `ping` pass without evaluation, and a message that is not a valid GraphQL-over-WebSocket client message is denied:
+
+```cedar
+@path("/graphql")
+@protocol("websocket-graphql")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"realtime.example.com:443"
+)
+when {
+    context.path == "/graphql"
+    && (context.method == "GET"
+        || (context.graphql_operation_type == "subscription"
+            && ["messageAdded"].containsAll(context.graphql_fields)))
+};
+```
+
+A permit that allows every `WEBSOCKET_TEXT` message on a `websocket-graphql` endpoint allows every GraphQL operation. YAML rejects such a rule; in Cedar, condition message permits on the GraphQL fields.
+
+## Audit Mode
+
+Add `@enforcement("audit")` to an `HttpRequest` policy to make it audit-only. The policy's action scope must be exactly `HttpRequest`.
+
+When every `HttpRequest` policy for an endpoint path is audit-only, that path runs in audit mode, like a YAML endpoint with `enforcement: audit`. OpenShell evaluates each request routed to it against every policy for the endpoint, logs a request they deny with decision `audit`, and forwards it. Policies with `@path` set the mode of their path, and policies without it set the mode of the path-less endpoint.
+
+An audit-only policy never blocks a request, even on an overlapping enforced path. A YAML audit endpoint's deny rules still block requests routed to a more specific enforced endpoint. To get that behavior in Cedar, repeat those rules as enforced policies with the enforced path's `@path` and a matching `context.path` condition.
+
+On a path that has other `HttpRequest` policies, audit-only policies are staged. They never change a decision. OpenShell logs each request whose decision they would change, with `cedar_audit:staged_deny` or `cedar_audit:staged_allow` and the policies that would decide it. Use a staged `forbid` to see what a new restriction would block before you enforce it:
+
+```cedar
+@enforcement("audit")
+@id("no-webhook-changes")
+forbid (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.path like("/repos/*/*/hooks/**", "/") };
+```
+
+Logs name policies by their `@id` annotation when they have one.
+
+## Providers and Credentials
+
+Providers attached to a Cedar sandbox supply credentials but never grant access. The Cedar policy alone decides which endpoints a process can reach and which addresses they may resolve to. A provider endpoint's `allowed_ips` can only narrow the addresses its connections reach (see [Destination Addresses](#destination-addresses)), and a provider endpoint without a host supplies no credentials. Attaching a provider makes its credentials available on connections that Cedar already allows to the provider's endpoints, with the provider's credential settings, such as request signing and body rewriting.
+
+A provider endpoint that carries credentials must be inspected per request, so write an `HttpRequest` policy for it. OpenShell refuses connections to a credentialed endpoint that Cedar does not inspect, unless the provider allows uninspected credentials.
+
+A provider's token grant applies to a request only when Cedar allows the request and the provider's own endpoint also allows it under the provider's rules, as in a YAML sandbox. Provider rules can only withhold a token; they never allow a request that Cedar denies. A request that an audit-only policy would deny gets no token.
+
+`openshell policy get <name> --full` shows the provider rules delivered to the sandbox in a separate section after the Cedar text and middleware, with a list of the endpoints that carry credentials. `--base` omits them.
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.binary_path == "/usr/bin/gh" };
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.method == "GET" };
+```
+
+## Limitations
+
+- A sandbox cannot switch between YAML and Cedar after creation. Recreate the sandbox to change formats.
+- Global policies must be YAML.
+- Incremental `openshell policy update` merges are not available for Cedar policies. Use `openshell policy set` with the full policy.
+- Policy templates are not supported.
+- Request rules cannot apply to a wildcard host. Name each host to inspect exactly.
+
+## Next Steps
+
+- [Policies Overview](/how-it-works/policies/overview) covers the YAML policy format.
+- [Policy Schema Reference](/how-it-works/policies/schema) lists every YAML field.
+- [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) describes middleware fields and failure behavior.
+- [Policy Schema Reference](/how-it-works/policies/schema) describes the endpoint fields that `endpoint_settings` reuses.

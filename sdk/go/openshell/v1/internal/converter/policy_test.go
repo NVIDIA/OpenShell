@@ -252,6 +252,28 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 	assert.Equal(t, "db", db.Name)
 }
 
+func TestSandboxPolicyEndpointSettingsRoundTrip(t *testing.T) {
+	original := &v1.SandboxPolicy{
+		CedarPolicySource: "permit (principal, action, resource);",
+		EndpointSettings: []v1.PolicyNetworkEndpoint{
+			{Host: "gitlab.example.com", Port: 443, Path: "/api/**", AllowEncodedSlash: true},
+		},
+	}
+
+	proto := SandboxPolicyToProto(original)
+	require.Len(t, proto.GetEndpointSettings(), 1)
+	assert.Equal(t, "/api/**", proto.GetEndpointSettings()[0].GetPath())
+
+	roundTrip := SandboxPolicyFromProto(proto)
+	require.Len(t, roundTrip.EndpointSettings, 1)
+	assert.Equal(t, original.EndpointSettings[0].Host, roundTrip.EndpointSettings[0].Host)
+	assert.True(t, roundTrip.EndpointSettings[0].AllowEncodedSlash)
+
+	// The SDK copy is isolated from the proto it came from.
+	proto.EndpointSettings[0].Host = "mutated.example.com"
+	assert.Equal(t, "gitlab.example.com", roundTrip.EndpointSettings[0].Host)
+}
+
 func TestSandboxPolicyDeepCopy(t *testing.T) {
 	// Build a proto, convert to SDK, mutate proto, verify SDK is isolated.
 	proto := &sbv1.SandboxPolicy{

@@ -131,6 +131,20 @@ type SandboxPolicy struct {
 	// NetworkMiddlewares contains named middleware pipeline configurations for
 	// network egress. Nil means no middleware is specified; an empty map is distinct from nil.
 	NetworkMiddlewares map[string]NetworkMiddlewareConfig
+	// CedarPolicySource is the policy written in Cedar. When non-empty, Cedar
+	// enforces network, per-request, and filesystem access, and NetworkPolicies
+	// must be empty. Filesystem and Landlock are ignored.
+	CedarPolicySource string
+	// ProviderCredentialRules is set by the gateway for Cedar policies: the
+	// network rules of attached providers, used only for credential injection
+	// settings. They never grant access. Do not set it when writing a policy.
+	ProviderCredentialRules map[string]NetworkPolicyRule
+	// EndpointSettings is set only for Cedar policies: endpoint configuration
+	// that is not access control (TLS skip, encoded slashes, body limits, MCP
+	// revisions, GraphQL persisted queries), selected by host, port, and
+	// optional path. The Cedar policy decides access and inspection. Nil means
+	// no endpoint settings are specified.
+	EndpointSettings []PolicyNetworkEndpoint
 }
 
 // NetworkMiddlewareConfig configures a supervisor middleware pipeline for

@@ -201,7 +201,18 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    cedar_network_engine: Option<&Arc<crate::cedar_only::CedarOnlyEngine>>,
 ) -> Result<Networking> {
+    // The authoritative engine: Cedar for a Cedar-authored policy,
+    // otherwise the OPA engine. The OPA engine is still passed separately
+    // for middleware and tunnel plumbing; see `crate::policy_engine`.
+    let network_engine: Option<crate::policy_engine::PolicyEngine> =
+        match (cedar_network_engine, opa_engine) {
+            (Some(cedar), _) => Some(Arc::clone(cedar).into()),
+            (None, Some(opa)) => Some(Arc::clone(opa).into()),
+            (None, None) => None,
+        };
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -235,6 +246,7 @@ pub async fn run_networking(
             let resolve_engine = engine.clone();
             let resolve_proto = proto.clone();
             let resolve_pid = entrypoint_pid.clone();
+            let resolve_cedar = cedar_network_engine.cloned();
             tokio::spawn(async move {
                 // Phase 1: wait for run_process to publish the entrypoint PID.
                 // 20 attempts * 250ms = 5s window.
@@ -285,6 +297,16 @@ pub async fn run_networking(
                                  (non-fatal, falling back to literal path matching): {e}"
                                 );
                             }
+                        }
+                        // A Cedar sandbox resolves the binary paths its
+                        // policies test in `context.binary_aliases`.
+                        if let Some(cedar) = &resolve_cedar
+                            && let Err(e) = cedar.resolve_binary_symlinks(pid)
+                        {
+                            warn!(
+                                "Failed to resolve Cedar policy binary symlinks \
+                             (non-fatal, binary_aliases stays empty): {e}"
+                            );
                         }
                         let _ = engine_ready_tx.send(true);
                         return;
@@ -435,9 +457,9 @@ pub async fn run_networking(
     };
 
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        let engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Mediated DNS requires a network policy engine (OPA or Cedar)")
+        })?;
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,
@@ -472,10 +494,15 @@ pub async fn run_networking(
             SocketAddr::new(ip, port)
         });
 
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires a network policy engine (OPA or Cedar)")
+        })?;
+
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
             engine,
+            active_network_engine,
             cache,
             entrypoint_pid.clone(),
             tls_state,
@@ -504,12 +531,15 @@ pub async fn run_networking(
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("transparent TCP requires an OPA policy engine"))?;
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("transparent TCP requires a network policy engine (OPA or Cedar)")
+        })?;
         let cache = identity_cache
             .clone()
             .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
         let trusted_gateway = crate::proxy::detect_trusted_host_gateway();
         let dns = crate::policy_dns::PolicyDnsRuntime::start(
-            engine.clone(),
+            active_network_engine.clone(),
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,
@@ -520,6 +550,7 @@ pub async fn run_networking(
             runtime.listeners,
             dns.store.clone(),
             engine,
+            active_network_engine,
             cache,
             entrypoint_pid,
             agent_proposals,

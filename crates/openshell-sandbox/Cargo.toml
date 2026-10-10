@@ -28,7 +28,7 @@ openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-ocsf = { path = "../openshell-ocsf" }
-openshell-policy = { path = "../openshell-policy" }
+openshell-policy = { path = "../openshell-policy", default-features = false }
 
 anyhow = { workspace = true }
 async-trait = "0.1"

@@ -92,7 +92,15 @@ pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyEr
         landlock,
         process,
         network_middlewares,
+        endpoint_settings,
     } = document;
+    if !endpoint_settings.is_empty() {
+        return Err(ParsePolicyError(
+            "invalid policy: endpoint_settings belongs in a middleware file used with a Cedar \
+             policy; set these fields on network_policies endpoints instead"
+                .to_string(),
+        ));
+    }
     Ok(ContainmentPolicy {
         filesystem_policy,
         network_policies,

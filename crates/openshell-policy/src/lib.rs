@@ -472,6 +472,85 @@ fn yaml_mcp_method(
     method.to_string()
 }
 
+/// Converts an authored endpoint to its protobuf form.
+///
+/// The caller has validated the endpoint's `tls`, `enforcement`, and `access`
+/// values with [`validate_endpoint_modes`].
+fn endpoint_def_to_proto(e: NetworkEndpointDef) -> NetworkEndpoint {
+    let protocol = e.protocol;
+    let allow_rules = e.rules;
+    let deny_rules = e.deny_rules;
+    // Normalize port/ports: ports takes precedence, else
+    // single port is promoted to ports array.
+    let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
+        e.ports.into_iter().map(u32::from).collect()
+    } else if e.port > 0 {
+        vec![u32::from(e.port)]
+    } else {
+        vec![]
+    };
+    NetworkEndpoint {
+        host: e.host,
+        path: e.path,
+        port: normalized_ports.first().copied().unwrap_or(0),
+        ports: normalized_ports,
+        protocol: protocol.clone(),
+        tls: network_tls_mode_from_str(&e.tls).expect("endpoint modes validated above") as i32,
+        enforcement: network_enforcement_mode_from_str(&e.enforcement)
+            .expect("endpoint modes validated above") as i32,
+        access: network_access_preset_from_str(&e.access).expect("endpoint modes validated above")
+            as i32,
+        rules: allow_rules
+            .into_iter()
+            .map(|r| L7Rule {
+                allow: Some(allow_def_to_proto(&protocol, r.allow)),
+            })
+            .collect(),
+        allowed_ips: e.allowed_ips,
+        deny_rules: deny_rules
+            .into_iter()
+            .map(|deny| deny_def_to_proto(&protocol, deny))
+            .collect(),
+        allow_encoded_slash: e.allow_encoded_slash,
+        websocket_credential_rewrite: e.websocket_credential_rewrite,
+        request_body_credential_rewrite: e.request_body_credential_rewrite,
+        allow_uninspected_credentials: e.allow_uninspected_credentials,
+        // Provider credential provenance is derived by the
+        // gateway and cannot be authored in policy YAML.
+        provider_credentialed: false,
+        token_grant_owner: String::new(),
+        // Advisor provenance is internal runtime state, not
+        // a user-authored policy schema field.
+        advisor_proposed: false,
+        persisted_queries: e.persisted_queries,
+        graphql_persisted_queries: e
+            .graphql_persisted_queries
+            .into_iter()
+            .map(|(key, op)| {
+                (
+                    key,
+                    GraphqlOperation {
+                        operation_type: op.operation_type,
+                        operation_name: op.operation_name,
+                        fields: op.fields,
+                    },
+                )
+            })
+            .collect(),
+        graphql_max_body_bytes: e.graphql_max_body_bytes,
+        credential_signing: e.credential_signing,
+        signing_service: e.signing_service,
+        signing_region: e.signing_region,
+        credential_binding: e.credential_binding.map(|binding| {
+            openshell_core::proto::NetworkCredentialBinding {
+                provider: binding.provider,
+            }
+        }),
+        json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
+        mcp: mcp_options(&protocol, &e.mcp),
+    }
+}
+
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
     for (policy_name, rule) in &raw.network_policies {
         for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
@@ -490,6 +569,13 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         .into_diagnostic()
         .wrap_err("failed to convert network middleware config")?;
 
+    let endpoint_settings = raw
+        .endpoint_settings
+        .into_iter()
+        .enumerate()
+        .map(|(index, setting)| endpoint_setting_def_to_proto(index, setting))
+        .collect::<Result<Vec<_>>>()?;
+
     let network_policies = raw
         .network_policies
         .into_iter()
@@ -503,84 +589,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                 endpoints: rule
                     .endpoints
                     .into_iter()
-                    .map(|e| {
-                        let protocol = e.protocol;
-                        let allow_rules = e.rules;
-                        let deny_rules = e.deny_rules;
-                        // Normalize port/ports: ports takes precedence, else
-                        // single port is promoted to ports array.
-                        let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
-                            e.ports.into_iter().map(u32::from).collect()
-                        } else if e.port > 0 {
-                            vec![u32::from(e.port)]
-                        } else {
-                            vec![]
-                        };
-                        NetworkEndpoint {
-                            host: e.host,
-                            path: e.path,
-                            port: normalized_ports.first().copied().unwrap_or(0),
-                            ports: normalized_ports,
-                            protocol: protocol.clone(),
-                            tls: network_tls_mode_from_str(&e.tls)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            enforcement: network_enforcement_mode_from_str(&e.enforcement)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            access: network_access_preset_from_str(&e.access)
-                                .expect("endpoint modes validated above")
-                                as i32,
-                            rules: allow_rules
-                                .into_iter()
-                                .map(|r| L7Rule {
-                                    allow: Some(allow_def_to_proto(&protocol, r.allow)),
-                                })
-                                .collect(),
-                            allowed_ips: e.allowed_ips,
-                            deny_rules: deny_rules
-                                .into_iter()
-                                .map(|deny| deny_def_to_proto(&protocol, deny))
-                                .collect(),
-                            allow_encoded_slash: e.allow_encoded_slash,
-                            websocket_credential_rewrite: e.websocket_credential_rewrite,
-                            request_body_credential_rewrite: e.request_body_credential_rewrite,
-                            allow_uninspected_credentials: e.allow_uninspected_credentials,
-                            // Provider credential provenance is derived by the
-                            // gateway and cannot be authored in policy YAML.
-                            provider_credentialed: false,
-                            token_grant_owner: String::new(),
-                            // Advisor provenance is internal runtime state, not
-                            // a user-authored policy schema field.
-                            advisor_proposed: false,
-                            persisted_queries: e.persisted_queries,
-                            graphql_persisted_queries: e
-                                .graphql_persisted_queries
-                                .into_iter()
-                                .map(|(key, op)| {
-                                    (
-                                        key,
-                                        GraphqlOperation {
-                                            operation_type: op.operation_type,
-                                            operation_name: op.operation_name,
-                                            fields: op.fields,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                            graphql_max_body_bytes: e.graphql_max_body_bytes,
-                            credential_signing: e.credential_signing,
-                            signing_service: e.signing_service,
-                            signing_region: e.signing_region,
-                            credential_binding: e.credential_binding.map(|binding| {
-                                openshell_core::proto::NetworkCredentialBinding {
-                                    provider: binding.provider,
-                                }
-                            }),
-                            json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
-                            mcp: mcp_options(&protocol, &e.mcp),
-                        }
-                    })
+                    .map(endpoint_def_to_proto)
                     .collect(),
                 binaries: rule
                     .binaries
@@ -611,12 +620,190 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         network_policies,
         network_middlewares,
+        // YAML-authored policies never set this; Cedar policies are authored
+        // as `.cedar` files (see `parse_cedar_sandbox_policy_file`).
+        cedar_policy_source: String::new(),
+        provider_credential_rules: HashMap::default(),
+        endpoint_settings,
     })
+}
+
+/// Converts one authored `endpoint_settings` entry to its protobuf form.
+///
+/// Entries carry no protocol, so MCP options are kept whatever the protocol
+/// field says; validation then rejects fields that are not settings (see
+/// [`validate_sandbox_policy`]). The JSON-RPC body limit may be set in
+/// `json_rpc` or `mcp`, but not both.
+fn endpoint_setting_def_to_proto(
+    index: usize,
+    setting: NetworkEndpointDef,
+) -> Result<NetworkEndpoint> {
+    let errors = validate_endpoint_modes(&setting.tls, &setting.enforcement, &setting.access);
+    if !errors.is_empty() {
+        return Err(miette::miette!(
+            "endpoint_settings[{index}]: {}",
+            errors.join("; ")
+        ));
+    }
+    let json_rpc_limit = setting
+        .json_rpc
+        .as_ref()
+        .map_or(0, |config| config.max_body_bytes);
+    let mcp_limit = setting
+        .mcp
+        .as_ref()
+        .map_or(0, |config| config.max_body_bytes);
+    if json_rpc_limit > 0 && mcp_limit > 0 {
+        return Err(miette::miette!(
+            "endpoint_settings[{index}]: set the JSON-RPC body limit in json_rpc or mcp, not both"
+        ));
+    }
+    let mcp = setting.mcp.as_ref().map(|config| {
+        let mut versions = config.versions.clone().unwrap_or_default();
+        canonicalize_mcp_versions(&mut versions);
+        McpOptions {
+            versions,
+            strict_tool_names: config.strict_tool_names,
+            allow_all_known_mcp_methods: config.allow_all_known_mcp_methods,
+        }
+    });
+    let mut endpoint = endpoint_def_to_proto(setting);
+    endpoint.json_rpc_max_body_bytes = json_rpc_limit.max(mcp_limit);
+    endpoint.mcp = mcp;
+    Ok(endpoint)
+}
+
+/// Converts one protobuf `endpoint_settings` entry to its authored form.
+///
+/// MCP options render in an `mcp` stanza, which then also carries the
+/// JSON-RPC body limit.
+fn endpoint_setting_proto_to_def(setting: &NetworkEndpoint) -> Result<NetworkEndpointDef> {
+    let mut def = endpoint_proto_to_def(setting)?;
+    if let Some(options) = &setting.mcp {
+        let mut versions = options.versions.clone();
+        canonicalize_mcp_versions(&mut versions);
+        def.json_rpc = None;
+        def.mcp = Some(McpConfigDef {
+            versions: (!versions.is_empty()).then_some(versions),
+            max_body_bytes: setting.json_rpc_max_body_bytes,
+            strict_tool_names: options.strict_tool_names,
+            allow_all_known_mcp_methods: options.allow_all_known_mcp_methods,
+        });
+    }
+    Ok(def)
 }
 
 // ---------------------------------------------------------------------------
 // Proto → YAML conversion
 // ---------------------------------------------------------------------------
+
+/// Converts a protobuf endpoint to its authored form.
+fn endpoint_proto_to_def(e: &NetworkEndpoint) -> Result<NetworkEndpointDef> {
+    // Use compact form: if ports has exactly 1 element,
+    // emit port (scalar). If >1, emit ports (array).
+    // Proto uses u32; authored ports are u16. Reject an
+    // invalid protobuf value instead of silently clamping.
+    let checked = |value: u32| {
+        u16::try_from(value).map_err(|_| {
+            miette::miette!(
+                "cannot serialize endpoint '{}': port {value} exceeds {}",
+                e.host,
+                u16::MAX
+            )
+        })
+    };
+    let (port, ports) = if e.ports.len() > 1 {
+        (
+            0,
+            e.ports
+                .iter()
+                .copied()
+                .map(checked)
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        (checked(e.ports.first().copied().unwrap_or(e.port))?, vec![])
+    };
+    let protocol = e.protocol.clone();
+    let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
+        || e.mcp
+            .as_ref()
+            .and_then(|options| options.allow_all_known_mcp_methods)
+            .unwrap_or(false);
+    let rules = e
+        .rules
+        .iter()
+        .map(|r| L7RuleDef {
+            allow: allow_proto_to_def(
+                &protocol,
+                r.allow.clone().unwrap_or_default(),
+                mcp_allow_all_known_mcp_methods,
+            ),
+        })
+        .collect();
+    let deny_rules: Vec<L7DenyRuleDef> = e
+        .deny_rules
+        .iter()
+        .map(|d| deny_proto_to_def(&protocol, d, mcp_allow_all_known_mcp_methods))
+        .collect();
+    let (json_rpc, mcp) = if is_mcp_protocol(&protocol) {
+        (
+            None,
+            mcp_config_from_proto(e.json_rpc_max_body_bytes, e.mcp.as_ref()),
+        )
+    } else {
+        (json_rpc_config_from_proto(e.json_rpc_max_body_bytes), None)
+    };
+    Ok(NetworkEndpointDef {
+        host: e.host.clone(),
+        path: e.path.clone(),
+        port,
+        ports,
+        protocol,
+        tls: network_tls_mode_to_str(e.tls)
+            .expect("policy enum values validated before serialization")
+            .to_string(),
+        enforcement: network_enforcement_mode_to_str(e.enforcement)
+            .expect("policy enum values validated before serialization")
+            .to_string(),
+        access: network_access_preset_to_str(e.access)
+            .expect("policy enum values validated before serialization")
+            .to_string(),
+        rules,
+        allowed_ips: e.allowed_ips.clone(),
+        deny_rules,
+        allow_encoded_slash: e.allow_encoded_slash,
+        websocket_credential_rewrite: e.websocket_credential_rewrite,
+        request_body_credential_rewrite: e.request_body_credential_rewrite,
+        allow_uninspected_credentials: e.allow_uninspected_credentials,
+        persisted_queries: e.persisted_queries.clone(),
+        graphql_persisted_queries: e
+            .graphql_persisted_queries
+            .iter()
+            .map(|(key, op)| {
+                (
+                    key.clone(),
+                    GraphqlOperationDef {
+                        operation_type: op.operation_type.clone(),
+                        operation_name: op.operation_name.clone(),
+                        fields: op.fields.clone(),
+                    },
+                )
+            })
+            .collect(),
+        graphql_max_body_bytes: e.graphql_max_body_bytes,
+        credential_signing: e.credential_signing.clone(),
+        signing_service: e.signing_service.clone(),
+        signing_region: e.signing_region.clone(),
+        credential_binding: e.credential_binding.as_ref().map(|binding| {
+            NetworkCredentialBindingDef {
+                provider: binding.provider.clone(),
+            }
+        }),
+        json_rpc,
+        mcp,
+    })
+}
 
 fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
     let filesystem_policy = policy.filesystem.as_ref().map(|fs| FilesystemDef {
@@ -661,114 +848,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                 endpoints: rule
                     .endpoints
                     .iter()
-                    .map(|e| -> Result<_> {
-                        // Use compact form: if ports has exactly 1 element,
-                        // emit port (scalar). If >1, emit ports (array).
-                        // Proto uses u32; authored ports are u16. Reject an
-                        // invalid protobuf value instead of silently clamping.
-                        let checked = |value: u32| {
-                            u16::try_from(value).map_err(|_| {
-                                miette::miette!(
-                                    "cannot serialize endpoint '{}': port {value} exceeds {}",
-                                    e.host,
-                                    u16::MAX
-                                )
-                            })
-                        };
-                        let (port, ports) = if e.ports.len() > 1 {
-                            (
-                                0,
-                                e.ports
-                                    .iter()
-                                    .copied()
-                                    .map(checked)
-                                    .collect::<Result<Vec<_>>>()?,
-                            )
-                        } else {
-                            (checked(e.ports.first().copied().unwrap_or(e.port))?, vec![])
-                        };
-                        let protocol = e.protocol.clone();
-                        let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
-                            || e.mcp
-                                .as_ref()
-                                .and_then(|options| options.allow_all_known_mcp_methods)
-                                .unwrap_or(false);
-                        let rules = e
-                            .rules
-                            .iter()
-                            .map(|r| L7RuleDef {
-                                allow: allow_proto_to_def(
-                                    &protocol,
-                                    r.allow.clone().unwrap_or_default(),
-                                    mcp_allow_all_known_mcp_methods,
-                                ),
-                            })
-                            .collect();
-                        let deny_rules: Vec<L7DenyRuleDef> = e
-                            .deny_rules
-                            .iter()
-                            .map(|d| {
-                                deny_proto_to_def(&protocol, d, mcp_allow_all_known_mcp_methods)
-                            })
-                            .collect();
-                        let (json_rpc, mcp) = if is_mcp_protocol(&protocol) {
-                            (
-                                None,
-                                mcp_config_from_proto(e.json_rpc_max_body_bytes, e.mcp.as_ref()),
-                            )
-                        } else {
-                            (json_rpc_config_from_proto(e.json_rpc_max_body_bytes), None)
-                        };
-                        Ok(NetworkEndpointDef {
-                            host: e.host.clone(),
-                            path: e.path.clone(),
-                            port,
-                            ports,
-                            protocol,
-                            tls: network_tls_mode_to_str(e.tls)
-                                .expect("policy enum values validated before serialization")
-                                .to_string(),
-                            enforcement: network_enforcement_mode_to_str(e.enforcement)
-                                .expect("policy enum values validated before serialization")
-                                .to_string(),
-                            access: network_access_preset_to_str(e.access)
-                                .expect("policy enum values validated before serialization")
-                                .to_string(),
-                            rules,
-                            allowed_ips: e.allowed_ips.clone(),
-                            deny_rules,
-                            allow_encoded_slash: e.allow_encoded_slash,
-                            websocket_credential_rewrite: e.websocket_credential_rewrite,
-                            request_body_credential_rewrite: e.request_body_credential_rewrite,
-                            allow_uninspected_credentials: e.allow_uninspected_credentials,
-                            persisted_queries: e.persisted_queries.clone(),
-                            graphql_persisted_queries: e
-                                .graphql_persisted_queries
-                                .iter()
-                                .map(|(key, op)| {
-                                    (
-                                        key.clone(),
-                                        GraphqlOperationDef {
-                                            operation_type: op.operation_type.clone(),
-                                            operation_name: op.operation_name.clone(),
-                                            fields: op.fields.clone(),
-                                        },
-                                    )
-                                })
-                                .collect(),
-                            graphql_max_body_bytes: e.graphql_max_body_bytes,
-                            credential_signing: e.credential_signing.clone(),
-                            signing_service: e.signing_service.clone(),
-                            signing_region: e.signing_region.clone(),
-                            credential_binding: e.credential_binding.as_ref().map(|binding| {
-                                NetworkCredentialBindingDef {
-                                    provider: binding.provider.clone(),
-                                }
-                            }),
-                            json_rpc,
-                            mcp,
-                        })
-                    })
+                    .map(endpoint_proto_to_def)
                     .collect::<Result<Vec<_>>>()?,
                 binaries: rule
                     .binaries
@@ -783,6 +863,11 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         .collect::<Result<BTreeMap<_, _>>>()?;
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
+    let endpoint_settings = policy
+        .endpoint_settings
+        .iter()
+        .map(endpoint_setting_proto_to_def)
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(PolicyFile {
         // Proto3 scalar fields do not preserve presence. Treat zero as an
@@ -798,6 +883,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         process,
         network_policies,
         network_middlewares,
+        endpoint_settings,
     })
 }
 
@@ -856,6 +942,7 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
     let raw = openshell_policy_schema::parse_policy(yaml)?;
+    reject_endpoint_settings_in_policy_file(&raw)?;
     to_proto(raw)
 }
 
@@ -865,7 +952,83 @@ pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
         path,
         openshell_policy_schema::ParseLimits::default(),
     )?;
+    reject_endpoint_settings_in_policy_file(&raw)?;
     to_proto(raw)
+}
+
+/// Rejects `endpoint_settings` in a YAML policy file.
+///
+/// The section belongs to a middleware file used with a Cedar policy; a YAML
+/// policy sets the same fields on its endpoints.
+fn reject_endpoint_settings_in_policy_file(raw: &PolicyFile) -> Result<()> {
+    if raw.endpoint_settings.is_empty() {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "endpoint_settings is not a policy section; it belongs in a middleware file \
+         (--middleware) used with a Cedar policy, and a YAML policy sets these fields on its \
+         network_policies endpoints"
+    ))
+}
+
+/// Parses a sandbox policy file, dispatching on extension.
+///
+/// `.cedar` (any case) builds a Cedar-sourced policy via
+/// [`parse_cedar_sandbox_policy_file`]; anything else (`.yaml`, `.yml`,
+/// extensionless) uses the existing YAML path via
+/// [`parse_sandbox_policy_file`], byte-for-byte unchanged.
+///
+/// # Errors
+///
+/// Returns an error if the selected parser fails.
+pub fn parse_sandbox_policy_file_auto(path: &Path) -> Result<SandboxPolicy> {
+    let is_cedar = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cedar"));
+    if is_cedar {
+        parse_cedar_sandbox_policy_file(path)
+    } else {
+        parse_sandbox_policy_file(path)
+    }
+}
+
+/// Reads and validates a `.cedar` policy file, building a [`SandboxPolicy`]
+/// with `cedar_policy_source` set and every other field at default.
+///
+/// Runs the same checks the gateway runs at submission time so a malformed
+/// Cedar policy is rejected locally with a fast, actionable error instead of
+/// a round trip to the gateway.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, contains no policy text, or
+/// fails validation (see [`validate_sandbox_policy`]).
+pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
+    let cedar_policy_source = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read Cedar policy file {}", path.display()))?;
+    // An empty `cedar_policy_source` selects the YAML path, so an empty file
+    // would silently become an empty YAML policy.
+    if cedar_policy_source.trim().is_empty() {
+        return Err(miette::miette!(
+            "Cedar policy file {} is empty",
+            path.display()
+        ));
+    }
+    let policy = SandboxPolicy {
+        version: 1,
+        cedar_policy_source,
+        provider_credential_rules: HashMap::default(),
+        ..Default::default()
+    };
+    validate_sandbox_policy(&policy)
+        .map_err(|violations| {
+            let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+            miette::miette!("policy contains unsafe content: {}", messages.join("; "))
+        })
+        .wrap_err_with(|| format!("invalid Cedar policy at {}", path.display()))?;
+    Ok(policy)
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -873,9 +1036,22 @@ pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// This is the inverse of [`parse_sandbox_policy`] — the output uses the
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
+///
+/// A Cedar-authored policy serializes to its Cedar text, which round-trips
+/// through [`parse_cedar_sandbox_policy_file`]. Its middleware and endpoint
+/// settings are not part of the policy text; see
+/// [`serialize_network_middlewares`].
+///
+/// # Errors
+///
+/// Returns an error if the policy version is unsupported or the policy is
+/// invalid.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     validate_proto_version_for_authored_serialization(policy)?;
     validate_policy_enum_values(policy)?;
+    if !policy.cedar_policy_source.is_empty() {
+        return Ok(policy.cedar_policy_source.clone());
+    }
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
@@ -886,13 +1062,243 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 ///
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
+///
+/// A Cedar-authored policy renders as its Cedar text in
+/// `cedar_policy_source`, plus `network_middlewares`, `endpoint_settings`, and
+/// the gateway-managed `provider_credential_rules` (with
+/// `provider_credentialed_endpoints`) when it has any.
+///
+/// # Errors
+///
+/// Returns an error if the policy version is unsupported or the policy is
+/// invalid.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
     validate_proto_version_for_authored_serialization(policy)?;
     validate_policy_enum_values(policy)?;
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
-    openshell_policy_schema::policy_to_json_value(&json_repr)
+    let json = openshell_policy_schema::policy_to_json_value(&json_repr)?;
+    if canonical.cedar_policy_source.is_empty() {
+        return Ok(json);
+    }
+    let mut cedar = serde_json::json!({
+        "version": 1,
+        "cedar_policy_source": canonical.cedar_policy_source,
+    });
+    if let Some(middlewares) = json.get("network_middlewares") {
+        cedar["network_middlewares"] = middlewares.clone();
+    }
+    if let Some(settings) = json.get("endpoint_settings") {
+        cedar["endpoint_settings"] = settings.clone();
+    }
+    if !canonical.provider_credential_rules.is_empty() {
+        let rules_only = SandboxPolicy {
+            version: 1,
+            network_policies: canonical.provider_credential_rules.clone(),
+            ..Default::default()
+        };
+        let rules_json = openshell_policy_schema::policy_to_json_value(&from_proto(&rules_only)?)?;
+        if let Some(rules) = rules_json.get("network_policies") {
+            cedar["provider_credential_rules"] = rules.clone();
+        }
+        cedar["provider_credentialed_endpoints"] =
+            provider_credentialed_endpoints(&canonical).into();
+    }
+    Ok(cedar)
+}
+
+/// Serializes a policy's middleware file sections.
+///
+/// The output has the policy's `network_middlewares` and `endpoint_settings`
+/// sections and round-trips through [`parse_middleware_file`]. Returns `None`
+/// when the policy has neither.
+///
+/// # Errors
+///
+/// Returns an error if the middleware configuration or endpoint settings are
+/// invalid.
+pub fn serialize_network_middlewares(policy: &SandboxPolicy) -> Result<Option<String>> {
+    if policy.network_middlewares.is_empty() && policy.endpoint_settings.is_empty() {
+        return Ok(None);
+    }
+    let middleware_only = SandboxPolicy {
+        version: 1,
+        network_middlewares: policy.network_middlewares.clone(),
+        endpoint_settings: policy.endpoint_settings.clone(),
+        ..Default::default()
+    };
+    let yaml = serialize_sandbox_policy(&middleware_only)?;
+    // The policy serializer always leads with the version line, which a
+    // middleware file does not carry.
+    Ok(Some(
+        yaml.strip_prefix("version: 1\n")
+            .unwrap_or(&yaml)
+            .to_string(),
+    ))
+}
+
+/// Lists the provider endpoints that carry credentials, as `host:port[path]`.
+///
+/// These are the endpoints the gateway marked `provider_credentialed` in a
+/// Cedar policy's `provider_credential_rules`, sorted. On a Cedar sandbox a
+/// connection to one is refused unless the Cedar policy inspects it with an
+/// `HttpRequest` policy or the provider allows uninspected credentials.
+#[must_use]
+pub fn provider_credentialed_endpoints(policy: &SandboxPolicy) -> Vec<String> {
+    let mut endpoints: Vec<String> = policy
+        .provider_credential_rules
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .filter(|endpoint| endpoint.provider_credentialed)
+        .flat_map(|endpoint| {
+            let ports = if endpoint.ports.is_empty() {
+                vec![endpoint.port]
+            } else {
+                endpoint.ports.clone()
+            };
+            ports
+                .into_iter()
+                .map(move |port| format!("{}:{port}{}", endpoint.host, endpoint.path))
+        })
+        .collect();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+/// Serializes the gateway-managed provider rules of a Cedar policy.
+///
+/// The output is a `provider_credential_rules` section in the same shape as
+/// `network_policies`, for display only: these rules supply credential
+/// settings for attached providers and grant no access. A comment lists the
+/// endpoints that carry credentials (see
+/// [`provider_credentialed_endpoints`]), which the authored YAML schema does
+/// not represent. Returns `None` when the policy has none.
+///
+/// # Errors
+///
+/// Returns an error if the rules are invalid.
+pub fn serialize_provider_credential_rules(policy: &SandboxPolicy) -> Result<Option<String>> {
+    if policy.provider_credential_rules.is_empty() {
+        return Ok(None);
+    }
+    let rules_only = SandboxPolicy {
+        version: 1,
+        network_policies: policy.provider_credential_rules.clone(),
+        ..Default::default()
+    };
+    let yaml = serialize_sandbox_policy(&rules_only)?;
+    let rules = yaml
+        .strip_prefix("version: 1\nnetwork_policies:\n")
+        .ok_or_else(|| miette::miette!("unexpected provider rule serialization"))?;
+    let credentialed = provider_credentialed_endpoints(policy);
+    let comment = if credentialed.is_empty() {
+        String::new()
+    } else {
+        format!("# Credentialed endpoints: {}\n", credentialed.join(", "))
+    };
+    Ok(Some(format!(
+        "{comment}provider_credential_rules:\n{rules}"
+    )))
+}
+
+/// The sections of a middleware file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MiddlewareFile {
+    /// Supervisor middleware configs, as in a YAML policy's
+    /// `network_middlewares` section.
+    pub network_middlewares: HashMap<String, openshell_core::proto::NetworkMiddlewareConfig>,
+    /// Endpoint settings for a Cedar policy (see
+    /// `SandboxPolicy.endpoint_settings`).
+    pub endpoint_settings: Vec<NetworkEndpoint>,
+}
+
+/// Parses middleware file text: YAML with only top-level
+/// `network_middlewares` and `endpoint_settings` sections.
+///
+/// Middleware and endpoint settings are configuration, not access control,
+/// so they are supplied separately from the policy file. `network_middlewares`
+/// uses the same format and validation as in a YAML policy and applies to
+/// YAML and Cedar policies alike. `endpoint_settings` applies only to Cedar
+/// policies; each entry uses YAML endpoint field names (see
+/// [`validate_sandbox_policy`] for the fields it accepts).
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid middleware configuration or
+/// endpoint settings, or contains any other section.
+pub fn parse_middleware_yaml(content: &str) -> Result<MiddlewareFile> {
+    // Parse with the policy parser so the format and validation match the
+    // corresponding sections of a YAML policy exactly.
+    let raw = openshell_policy_schema::parse_policy(&format!("version: 1\n{content}"))?;
+    let parsed = to_proto(raw)?;
+    let file = MiddlewareFile {
+        network_middlewares: parsed.network_middlewares.clone(),
+        endpoint_settings: parsed.endpoint_settings.clone(),
+    };
+    let only_file_sections = SandboxPolicy {
+        version: 1,
+        network_middlewares: file.network_middlewares.clone(),
+        endpoint_settings: file.endpoint_settings.clone(),
+        ..Default::default()
+    };
+    if parsed != only_file_sections {
+        return Err(miette::miette!(
+            "expected YAML with only top-level network_middlewares and endpoint_settings sections"
+        ));
+    }
+    let violations = validate_endpoint_settings(&file.endpoint_settings);
+    if !violations.is_empty() {
+        let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        return Err(miette::miette!("{}", messages.join("; ")));
+    }
+    Ok(file)
+}
+
+/// Reads a middleware file (see [`parse_middleware_yaml`]).
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or is invalid.
+pub fn parse_middleware_file(path: &Path) -> Result<MiddlewareFile> {
+    let content = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read middleware file {}", path.display()))?;
+    parse_middleware_yaml(&content)
+        .wrap_err_with(|| format!("invalid middleware file {}", path.display()))
+}
+
+/// Sets `policy`'s middleware and endpoint settings from a middleware file.
+///
+/// # Errors
+///
+/// Returns an error if the file is invalid (see [`parse_middleware_file`]),
+/// the policy already defines `network_middlewares` or `endpoint_settings`,
+/// or the file has `endpoint_settings` and the policy is not a Cedar policy.
+pub fn apply_middleware_file(policy: &mut SandboxPolicy, path: &Path) -> Result<()> {
+    if !policy.network_middlewares.is_empty() {
+        return Err(miette::miette!(
+            "the policy already defines network_middlewares; remove them from the policy or \
+             omit --middleware"
+        ));
+    }
+    if !policy.endpoint_settings.is_empty() {
+        return Err(miette::miette!(
+            "the policy already defines endpoint_settings; omit --middleware"
+        ));
+    }
+    let file = parse_middleware_file(path)?;
+    if !file.endpoint_settings.is_empty() && policy.cedar_policy_source.is_empty() {
+        return Err(miette::miette!(
+            "invalid middleware file {}: {}",
+            path.display(),
+            PolicyViolation::EndpointSettingsRequireCedar
+        ));
+    }
+    policy.network_middlewares = file.network_middlewares;
+    policy.endpoint_settings = file.endpoint_settings;
+    Ok(())
 }
 
 fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
@@ -918,6 +1324,16 @@ fn validate_policy_enum_values(policy: &SandboxPolicy) -> Result<()> {
             }
         }
     }
+    for (index, setting) in policy.endpoint_settings.iter().enumerate() {
+        let errors =
+            validate_endpoint_mode_values(setting.tls, setting.enforcement, setting.access);
+        if !errors.is_empty() {
+            return Err(miette::miette!(
+                "endpoint_settings[{index}]: {}",
+                errors.join("; ")
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -940,9 +1356,9 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     let policy = if let Some(p) = cli_path {
-        parse_sandbox_policy_file(Path::new(p))?
+        parse_sandbox_policy_file_auto(Path::new(p))?
     } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        parse_sandbox_policy_file(Path::new(&policy_path))?
+        parse_sandbox_policy_file_auto(Path::new(&policy_path))?
     } else {
         return Ok(None);
     };
@@ -991,6 +1407,9 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         process: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
+        cedar_policy_source: String::new(),
+        provider_credential_rules: HashMap::default(),
+        endpoint_settings: Vec::new(),
     }
 }
 
@@ -1113,6 +1532,20 @@ pub enum PolicyViolation {
         policy_name: String,
         host: String,
         version: String,
+    },
+    /// `cedar_policy_source` is set alongside `network_policies`. Exactly
+    /// one policy format may be authored per sandbox.
+    CedarMutuallyExclusiveWithNetworkPolicies,
+    /// `cedar_policy_source` failed to parse or validate, or uses a policy
+    /// shape Cedar cannot enforce exactly.
+    InvalidCedarPolicy { reason: String },
+    /// `endpoint_settings` is set on a policy that is not a Cedar policy.
+    EndpointSettingsRequireCedar,
+    /// An `endpoint_settings` entry is invalid.
+    InvalidEndpointSetting {
+        index: usize,
+        host: String,
+        reason: String,
     },
 }
 
@@ -1319,6 +1752,28 @@ impl fmt::Display for PolicyViolation {
                     "network policy '{policy_name}': MCP endpoint '{host}' repeats protocol version '{version}'"
                 )
             }
+            Self::CedarMutuallyExclusiveWithNetworkPolicies => {
+                write!(
+                    f,
+                    "cedar_policy_source cannot be combined with network_policies; \
+                     a sandbox uses exactly one policy format"
+                )
+            }
+            Self::InvalidCedarPolicy { reason } => {
+                write!(f, "cedar_policy_source is invalid: {reason}")
+            }
+            Self::EndpointSettingsRequireCedar => {
+                write!(
+                    f,
+                    "endpoint_settings applies only to Cedar policies; a YAML policy sets \
+                     these fields on its network_policies endpoints"
+                )
+            }
+            Self::InvalidEndpointSetting {
+                index,
+                host,
+                reason,
+            } => write!(f, "endpoint_settings[{index}] ('{host}'): {reason}"),
         }
     }
 }
@@ -1410,11 +1865,88 @@ enum McpVersionPresence {
     AllowDefaultable,
 }
 
+/// Validates `policy.cedar_policy_source`, when non-empty.
+///
+/// Checks mutual exclusivity with `network_policies`, that the Cedar engine
+/// accepts the policy (parse, strict schema validation, and supported
+/// shapes), and that the derived Landlock grants pass the same path checks
+/// as YAML `filesystem` paths. A no-op when `cedar_policy_source` is empty
+/// (the YAML-sourced path, unaffected).
+fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<PolicyViolation>) {
+    if policy.cedar_policy_source.is_empty() {
+        return;
+    }
+    if !policy.network_policies.is_empty() {
+        violations.push(PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies);
+    }
+    // Landlock grants come from the Cedar text; authored filesystem paths
+    // would be silently ignored.
+    if policy
+        .filesystem
+        .as_ref()
+        .is_some_and(|fs| !fs.read_only.is_empty() || !fs.read_write.is_empty())
+    {
+        violations.push(PolicyViolation::InvalidCedarPolicy {
+            reason: "filesystem_policy cannot be combined with cedar_policy; grant paths \
+                     with ReadFile/WriteFile policies instead"
+                .to_string(),
+        });
+    }
+    match load_cedar_grants(&policy.cedar_policy_source) {
+        Ok((read_only, read_write)) => {
+            if let Err(errors) = validate_filesystem_paths(&read_only, &read_write) {
+                violations.extend(errors);
+            }
+        }
+        Err(reason) => violations.push(PolicyViolation::InvalidCedarPolicy { reason }),
+    }
+}
+
+/// Returns the Landlock grants a Cedar policy source authorizes.
+///
+/// Grants are returned as a proto `FilesystemPolicy` so callers can compare
+/// them with the same rules that apply to YAML `filesystem` sections.
+/// Returns `None` if the source does not load; validation reports why.
+#[must_use]
+pub fn cedar_filesystem_grants(cedar_policy_source: &str) -> Option<FilesystemPolicy> {
+    let (read_only, read_write) = load_cedar_grants(cedar_policy_source).ok()?;
+    Some(FilesystemPolicy {
+        include_workdir: false,
+        read_only,
+        read_write,
+    })
+}
+
+/// Loads a Cedar policy and returns its `(read_only, read_write)` grants.
+#[cfg(feature = "cedar")]
+fn load_cedar_grants(
+    cedar_policy_source: &str,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let engine = openshell_policy_cedar::CedarEngine::from_policy_str(cedar_policy_source)
+        .map_err(|error| error.to_string())?;
+    let grants = engine.filesystem_grants();
+    Ok((grants.read_only.clone(), grants.read_write.clone()))
+}
+
+/// Rejects every Cedar policy in builds without the `cedar` feature.
+#[cfg(not(feature = "cedar"))]
+fn load_cedar_grants(
+    _cedar_policy_source: &str,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    Err("Cedar policy support is not enabled in this build".to_string())
+}
+
 fn validate_sandbox_policy_with_mcp_presence(
     policy: &SandboxPolicy,
     mcp_version_presence: McpVersionPresence,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
+
+    validate_cedar_policy_source(policy, &mut violations);
+    if !policy.endpoint_settings.is_empty() && policy.cedar_policy_source.is_empty() {
+        violations.push(PolicyViolation::EndpointSettingsRequireCedar);
+    }
+    violations.extend(validate_endpoint_settings(&policy.endpoint_settings));
 
     // Omitted process identity fields are resolved by the compute runtime.
     // Explicit fields must be "sandbox" or a numeric UID/GID within the
@@ -1684,6 +2216,192 @@ fn validate_sandbox_policy_with_mcp_presence(
     }
 }
 
+/// Endpoint fields that decide access or inspection, which the Cedar policy
+/// owns, paired with whether `setting` sets them.
+fn endpoint_setting_access_fields(setting: &NetworkEndpoint) -> [(&'static str, bool); 8] {
+    [
+        ("protocol", !setting.protocol.is_empty()),
+        ("enforcement", setting.enforcement != 0),
+        ("access", setting.access != 0),
+        ("rules", !setting.rules.is_empty()),
+        ("deny_rules", !setting.deny_rules.is_empty()),
+        ("allowed_ips", !setting.allowed_ips.is_empty()),
+        (
+            "mcp.allow_all_known_mcp_methods",
+            setting
+                .mcp
+                .as_ref()
+                .is_some_and(|mcp| mcp.allow_all_known_mcp_methods.is_some()),
+        ),
+        ("advisor_proposed", setting.advisor_proposed),
+    ]
+}
+
+/// Endpoint fields that carry credential settings, which attached providers
+/// supply, paired with whether `setting` sets them.
+fn endpoint_setting_credential_fields(setting: &NetworkEndpoint) -> [(&'static str, bool); 9] {
+    [
+        (
+            "websocket_credential_rewrite",
+            setting.websocket_credential_rewrite,
+        ),
+        (
+            "request_body_credential_rewrite",
+            setting.request_body_credential_rewrite,
+        ),
+        (
+            "allow_uninspected_credentials",
+            setting.allow_uninspected_credentials,
+        ),
+        ("credential_signing", !setting.credential_signing.is_empty()),
+        ("signing_service", !setting.signing_service.is_empty()),
+        ("signing_region", !setting.signing_region.is_empty()),
+        ("credential_binding", setting.credential_binding.is_some()),
+        ("provider_credentialed", setting.provider_credentialed),
+        ("token_grant_owner", !setting.token_grant_owner.is_empty()),
+    ]
+}
+
+/// Returns the ports an endpoint selector covers.
+fn effective_endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        (endpoint.port != 0)
+            .then_some(endpoint.port)
+            .into_iter()
+            .collect()
+    } else {
+        endpoint.ports.clone()
+    }
+}
+
+/// Validates `endpoint_settings` entries.
+///
+/// Each entry selects endpoints with the same host, port, and path rules as
+/// a YAML endpoint, and may set only configuration: `tls`,
+/// `allow_encoded_slash`, body limits, MCP `versions` and
+/// `strict_tool_names`, and the GraphQL persisted-query settings. Fields that
+/// decide access or carry credentials are rejected, `tls` applies to a whole
+/// connection so it cannot be scoped to a `path`, and no two entries may
+/// select the same host, path, and port.
+fn validate_endpoint_settings(settings: &[NetworkEndpoint]) -> Vec<PolicyViolation> {
+    let mut violations = Vec::new();
+    for (index, setting) in settings.iter().enumerate() {
+        let mut reasons = Vec::new();
+        if setting.host.trim().is_empty() {
+            reasons.push("host must not be empty".to_string());
+        }
+        if (setting.host.starts_with("*.") || setting.host.starts_with("**."))
+            && setting.host.split('.').count() <= 2
+        {
+            reasons.push(format!(
+                "TLD wildcard '{}' is not allowed; use subdomain wildcards like '*.example.com'",
+                setting.host
+            ));
+        }
+        if host_wildcard_shape_invalid(&setting.host) {
+            reasons.push(format!(
+                "invalid host wildcard '{}'; middle DNS label wildcards must be the entire \
+                 label '*' and recursive '**' is only allowed as the entire first label",
+                setting.host
+            ));
+        }
+        let ports = effective_endpoint_ports(setting);
+        if ports.is_empty() {
+            reasons.push("must declare at least one port".to_string());
+        }
+        for port in &ports {
+            if !(1..=u16::MAX.into()).contains(port) {
+                reasons.push(format!("invalid port {port}; expected 1..=65535"));
+            }
+        }
+        if !setting.path.is_empty() && !setting.path.starts_with('/') && setting.path != "**" {
+            reasons.push("path must start with '/' or be '**'".to_string());
+        }
+        reasons.extend(validate_endpoint_mode_values(
+            setting.tls,
+            setting.enforcement,
+            setting.access,
+        ));
+        if setting.tls != 0 && !setting.path.is_empty() {
+            reasons.push(
+                "tls applies to a whole connection and cannot be combined with path".to_string(),
+            );
+        }
+        for (field, set) in endpoint_setting_access_fields(setting) {
+            if set {
+                reasons.push(format!(
+                    "'{field}' is not an endpoint setting; the Cedar policy decides access and \
+                     inspection"
+                ));
+            }
+        }
+        for (field, set) in endpoint_setting_credential_fields(setting) {
+            if set {
+                reasons.push(format!(
+                    "'{field}' is not an endpoint setting; attached providers supply credential \
+                     settings"
+                ));
+            }
+        }
+        if !setting.persisted_queries.is_empty()
+            && !matches!(
+                setting.persisted_queries.as_str(),
+                "deny" | "allow_registered"
+            )
+        {
+            reasons.push(format!(
+                "persisted_queries must be 'deny' or 'allow_registered', got '{}'",
+                setting.persisted_queries
+            ));
+        }
+        let mut registry: Vec<_> = setting.graphql_persisted_queries.iter().collect();
+        registry.sort_by_key(|(key, _)| *key);
+        for (key, operation) in registry {
+            if !matches!(
+                operation.operation_type.as_str(),
+                "query" | "mutation" | "subscription"
+            ) {
+                reasons.push(format!(
+                    "graphql_persisted_queries[{key}].operation_type must be query, mutation, \
+                     or subscription"
+                ));
+            }
+        }
+        if let Some(mcp) = &setting.mcp {
+            let mut seen = BTreeSet::new();
+            for version in &mcp.versions {
+                if !seen.insert(version.as_str()) {
+                    reasons.push(format!("repeats MCP protocol version '{version}'"));
+                }
+                if version.parse::<McpProtocolVersion>().is_err() {
+                    reasons.push(format!(
+                        "unsupported MCP protocol version '{version}'; {MCP_VERSION_REMEDIATION}"
+                    ));
+                }
+            }
+        }
+        if let Some(earlier) = settings[..index].iter().position(|other| {
+            other.host.eq_ignore_ascii_case(&setting.host)
+                && other.path == setting.path
+                && effective_endpoint_ports(other)
+                    .iter()
+                    .any(|port| ports.contains(port))
+        }) {
+            reasons.push(format!(
+                "selects the same host, path, and port as endpoint_settings[{earlier}]"
+            ));
+        }
+        violations.extend(reasons.into_iter().map(|reason| {
+            PolicyViolation::InvalidEndpointSetting {
+                index,
+                host: setting.host.clone(),
+                reason,
+            }
+        }));
+    }
+    violations
+}
+
 fn host_wildcard_shape_invalid(host: &str) -> bool {
     if host == "*" || host == "**" {
         return true;
@@ -1907,11 +2625,14 @@ pub(crate) fn materialize_default_mcp_versions(policy: &mut SandboxPolicy) {
 /// [`validate_and_canonicalize_sandbox_policy`] and cannot safely normalize an
 /// unvalidated policy in place.
 pub(crate) fn canonicalize_mcp_version_allowlists(policy: &mut SandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
-        for endpoint in &mut rule.endpoints {
-            if let Some(options) = endpoint.mcp.as_mut() {
-                canonicalize_mcp_options(options);
-            }
+    let endpoints = policy
+        .network_policies
+        .values_mut()
+        .flat_map(|rule| &mut rule.endpoints)
+        .chain(&mut policy.endpoint_settings);
+    for endpoint in endpoints {
+        if let Some(options) = endpoint.mcp.as_mut() {
+            canonicalize_mcp_options(options);
         }
     }
 }
@@ -1949,6 +2670,94 @@ pub use openshell_policy_schema::normalize_path;
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn parse_sandbox_policy_file_auto_dispatches_cedar_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_auto_dispatch",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.cedar");
+        std::fs::write(
+            &path,
+            r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+"#,
+        )
+        .expect("write policy file");
+
+        let policy = parse_sandbox_policy_file_auto(&path).expect("Cedar policy must parse");
+        assert!(!policy.cedar_policy_source.is_empty());
+        assert_eq!(policy.version, 1);
+        assert!(policy.network_policies.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn parse_sandbox_policy_file_auto_dispatches_uppercase_cedar_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_uppercase_extension",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.CEDAR");
+        std::fs::write(
+            &path,
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        )
+        .expect("write policy file");
+
+        let policy = parse_sandbox_policy_file_auto(&path).expect("Cedar policy must parse");
+        assert!(!policy.cedar_policy_source.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_cedar_sandbox_policy_file_rejects_empty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_empty_file",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.cedar");
+        std::fs::write(&path, " \n\t\n").expect("write policy file");
+
+        let result = parse_cedar_sandbox_policy_file(&path);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_cedar_sandbox_policy_file_rejects_invalid_syntax() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_invalid_syntax",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.cedar");
+        std::fs::write(&path, "not valid cedar {{{").expect("write policy file");
+
+        let result = parse_cedar_sandbox_policy_file(&path);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn truncate_for_display_handles_multi_byte_utf8_without_panicking() {
         // Byte index 77 falls inside the multi-byte 'é'.
@@ -1962,6 +2771,533 @@ mod tests {
     fn truncate_for_display_leaves_short_strings_untouched() {
         let s = "short path";
         assert_eq!(truncate_for_display(s), s);
+    }
+
+    fn cedar_sourced_policy(cedar_policy_source: &str) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: None,
+            landlock: None,
+            process: None,
+            network_policies: HashMap::new(),
+            network_middlewares: HashMap::default(),
+            cedar_policy_source: cedar_policy_source.to_string(),
+            provider_credential_rules: HashMap::default(),
+            endpoint_settings: Vec::new(),
+        }
+    }
+
+    const MIDDLEWARE_FILE: &str = r#"network_middlewares:
+  guard:
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["pypi.org"]
+"#;
+
+    fn write_temp_file(name: &str, contents: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write file");
+        (dir, path)
+    }
+
+    #[test]
+    fn middleware_file_applies_to_a_cedar_policy_and_round_trips() {
+        let (dir, path) = write_temp_file("cedar-middleware.yaml", MIDDLEWARE_FILE);
+        let source = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#;
+        let mut policy = cedar_sourced_policy(source);
+
+        apply_middleware_file(&mut policy, &path).expect("middleware file must apply");
+        assert!(policy.network_middlewares.contains_key("guard"));
+        assert_eq!(
+            serialize_sandbox_policy(&policy).expect("serialize"),
+            source,
+            "a Cedar policy serializes to its Cedar text alone"
+        );
+
+        let middleware = serialize_network_middlewares(&policy)
+            .expect("serialize middleware")
+            .expect("policy has middleware");
+        assert!(
+            middleware.starts_with("network_middlewares:"),
+            "{middleware}"
+        );
+        let (roundtrip_dir, reserialized) = write_temp_file("roundtrip.yaml", &middleware);
+        assert_eq!(
+            parse_middleware_file(&reserialized)
+                .expect("serialized middleware must parse")
+                .network_middlewares,
+            policy.network_middlewares
+        );
+
+        let json = sandbox_policy_to_json_value(&policy).expect("json");
+        assert_eq!(json["cedar_policy_source"], source);
+        assert!(json["network_middlewares"].get("guard").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&roundtrip_dir).ok();
+    }
+
+    #[test]
+    fn provider_credential_rules_render_for_display_with_credentialed_endpoints() {
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#,
+        );
+        policy.provider_credential_rules.insert(
+            "_provider_work_github".to_string(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        request_body_credential_rewrite: true,
+                        provider_credentialed: true,
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "github.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            provider_credentialed_endpoints(&policy),
+            vec!["api.github.com:443".to_string()]
+        );
+        let rendered = serialize_provider_credential_rules(&policy)
+            .expect("serialize")
+            .expect("policy has provider rules");
+        assert!(
+            rendered.starts_with("# Credentialed endpoints: api.github.com:443\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("provider_credential_rules:\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("_provider_work_github"), "{rendered}");
+        assert!(
+            rendered.contains("request_body_credential_rewrite: true"),
+            "{rendered}"
+        );
+
+        let json = sandbox_policy_to_json_value(&policy).expect("json");
+        assert!(
+            json["provider_credential_rules"]
+                .get("_provider_work_github")
+                .is_some()
+        );
+        assert_eq!(
+            json["provider_credentialed_endpoints"],
+            serde_json::json!(["api.github.com:443"])
+        );
+    }
+
+    #[test]
+    fn middleware_file_rejects_other_sections() {
+        let (dir, path) = write_temp_file(
+            "with-policies.yaml",
+            &format!("{MIDDLEWARE_FILE}network_policies:\n  x: {{ endpoints: [] }}\n"),
+        );
+        assert!(parse_middleware_file(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn middleware_file_does_not_replace_policy_middleware() {
+        let (dir, path) = write_temp_file("existing-middleware.yaml", MIDDLEWARE_FILE);
+        let mut policy = restrictive_default_policy();
+        policy.network_middlewares = parse_middleware_file(&path)
+            .expect("middleware file must parse")
+            .network_middlewares;
+        assert!(apply_middleware_file(&mut policy, &path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every message in an error's chain, joined.
+    fn error_chain(error: &miette::Report) -> String {
+        error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+
+    const ENDPOINT_SETTINGS: &str = r#"endpoint_settings:
+  - host: gitlab.example.com
+    port: 443
+    path: /api/**
+    allow_encoded_slash: true
+  - host: "*.example.com"
+    ports: [443, 8443]
+    tls: skip
+  - host: mcp.example.com
+    port: 443
+    mcp:
+      versions: ["2025-11-25", "2025-06-18"]
+      strict_tool_names: false
+      max_body_bytes: 131072
+  - host: api.example.com
+    port: 443
+    graphql_max_body_bytes: 131072
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      abc123: { operation_type: query, operation_name: Viewer, fields: [viewer] }
+"#;
+
+    #[test]
+    fn endpoint_settings_apply_to_a_cedar_policy_and_round_trip() {
+        let (dir, path) = write_temp_file(
+            "endpoint-settings.yaml",
+            &format!("{MIDDLEWARE_FILE}{ENDPOINT_SETTINGS}"),
+        );
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        apply_middleware_file(&mut policy, &path).expect("middleware file must apply");
+        assert_eq!(policy.endpoint_settings.len(), 4);
+        assert!(policy.endpoint_settings[0].allow_encoded_slash);
+        assert_eq!(policy.endpoint_settings[1].ports, vec![443, 8443]);
+        let mcp = policy.endpoint_settings[2]
+            .mcp
+            .as_ref()
+            .expect("mcp options");
+        assert_eq!(mcp.versions, vec!["2025-06-18", "2025-11-25"]);
+        assert_eq!(mcp.strict_tool_names, Some(false));
+        assert_eq!(policy.endpoint_settings[2].json_rpc_max_body_bytes, 131_072);
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        let rendered = serialize_network_middlewares(&policy)
+            .expect("serialize")
+            .expect("policy has middleware");
+        assert!(rendered.contains("endpoint_settings:"), "{rendered}");
+        let reparsed = parse_middleware_yaml(&rendered).expect("rendered file parses");
+        assert_eq!(reparsed.endpoint_settings, policy.endpoint_settings);
+        assert_eq!(reparsed.network_middlewares, policy.network_middlewares);
+
+        let json = sandbox_policy_to_json_value(&policy).expect("json");
+        assert_eq!(json["endpoint_settings"][0]["host"], "gitlab.example.com");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_settings_require_a_cedar_policy() {
+        let (dir, path) = write_temp_file("yaml-endpoint-settings.yaml", ENDPOINT_SETTINGS);
+        let mut policy = restrictive_default_policy();
+        let error = apply_middleware_file(&mut policy, &path).expect_err("YAML policy");
+        assert!(
+            error.to_string().contains("invalid middleware file"),
+            "{error}"
+        );
+        assert!(error_chain(&error).contains("Cedar"), "{error:?}");
+
+        policy.endpoint_settings = parse_middleware_file(&path)
+            .expect("file parses")
+            .endpoint_settings;
+        let violations = validate_sandbox_policy(&policy).expect_err("YAML policy");
+        assert!(violations.contains(&PolicyViolation::EndpointSettingsRequireCedar));
+
+        let error = parse_sandbox_policy(&format!("version: 1\n{ENDPOINT_SETTINGS}"))
+            .expect_err("a policy file cannot carry endpoint settings");
+        assert!(error.to_string().contains("middleware file"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_settings_reject_access_and_credential_fields() {
+        for (field, yaml) in [
+            ("protocol", "protocol: rest"),
+            ("enforcement", "enforcement: enforce"),
+            ("access", "access: read-only"),
+            ("rules", "rules: [{ allow: { method: GET } }]"),
+            ("deny_rules", "deny_rules: [{ method: GET }]"),
+            ("allowed_ips", "allowed_ips: [10.0.0.0/8]"),
+            ("binaries", "binaries: [{ path: /usr/bin/curl }]"),
+            (
+                "mcp.allow_all_known_mcp_methods",
+                "mcp: { allow_all_known_mcp_methods: true }",
+            ),
+            (
+                "request_body_credential_rewrite",
+                "request_body_credential_rewrite: true",
+            ),
+            ("credential_signing", "credential_signing: sigv4"),
+            (
+                "credential_binding",
+                "credential_binding: { provider: work }",
+            ),
+        ] {
+            let error = parse_middleware_yaml(&format!(
+                "endpoint_settings:\n  - host: api.example.com\n    port: 443\n    {yaml}\n"
+            ))
+            .expect_err(field);
+            assert!(error_chain(&error).contains(field), "{field}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_settings_validate_selectors_and_values() {
+        for (case, yaml, expected) in [
+            ("no host", "  - port: 443\n", "host must not be empty"),
+            ("no port", "  - host: a.example.com\n", "at least one port"),
+            (
+                "TLD wildcard",
+                "  - host: \"*.com\"\n    port: 443\n",
+                "TLD wildcard",
+            ),
+            (
+                "bad path",
+                "  - host: a.example.com\n    port: 443\n    path: api\n",
+                "path must start",
+            ),
+            (
+                "tls with path",
+                "  - host: a.example.com\n    port: 443\n    path: /api\n    tls: skip\n",
+                "whole connection",
+            ),
+            (
+                "bad persisted_queries",
+                "  - host: a.example.com\n    port: 443\n    persisted_queries: yes-please\n",
+                "persisted_queries must be",
+            ),
+            (
+                "bad registry operation",
+                "  - host: a.example.com\n    port: 443\n    graphql_persisted_queries:\n      h: { operation_type: fetch }\n",
+                "operation_type must be",
+            ),
+            (
+                "unknown MCP version",
+                "  - host: a.example.com\n    port: 443\n    mcp: { versions: [\"1999-01-01\"] }\n",
+                "1999-01-01",
+            ),
+            (
+                "two body limits",
+                "  - host: a.example.com\n    port: 443\n    json_rpc: { max_body_bytes: 10 }\n    mcp: { max_body_bytes: 10 }\n",
+                "not both",
+            ),
+            (
+                "duplicate selector",
+                "  - host: a.example.com\n    ports: [443]\n  - host: A.example.com\n    ports: [8443, 443]\n",
+                "same host, path, and port",
+            ),
+        ] {
+            let error =
+                parse_middleware_yaml(&format!("endpoint_settings:\n{yaml}")).expect_err(case);
+            assert!(error_chain(&error).contains(expected), "{case}: {error:?}");
+        }
+        // Different paths on one host:port are separate selectors.
+        parse_middleware_yaml(
+            "endpoint_settings:\n  - host: a.example.com\n    port: 443\n  - host: a.example.com\n    port: 443\n    path: /api/**\n    allow_encoded_slash: true\n",
+        )
+        .expect("distinct paths are valid");
+    }
+
+    #[test]
+    fn middleware_selecting_a_tls_skip_endpoint_setting_is_rejected() {
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        let file = parse_middleware_yaml(&format!(
+            "{MIDDLEWARE_FILE}endpoint_settings:\n  - host: pypi.org\n    port: 443\n    tls: skip\n"
+        ))
+        .expect("file parses");
+        policy.network_middlewares = file.network_middlewares;
+        policy.endpoint_settings = file.endpoint_settings;
+        let violations = validate_sandbox_policy(&policy).expect_err("conflict");
+        assert!(
+            violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::MiddlewareTlsSkipConflict { .. }
+            )),
+            "{violations:?}"
+        );
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn cedar_policy_accepts_middleware_and_rejects_filesystem_paths() {
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        policy.network_middlewares.insert(
+            "audit".to_string(),
+            openshell_core::proto::NetworkMiddlewareConfig {
+                middleware: "openshell/regex".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !validate_sandbox_policy(&policy)
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "network_middlewares must be allowed with Cedar"
+        );
+
+        policy.filesystem = Some(FilesystemPolicy {
+            read_only: vec!["/usr".to_string()],
+            ..Default::default()
+        });
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[cfg(not(feature = "cedar"))]
+    #[test]
+    fn cedar_policy_source_is_rejected_without_the_cedar_feature() {
+        let policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn cedar_policy_source_passes_validation() {
+        let policy = cedar_sourced_policy(
+            r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+"#,
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn cedar_policy_source_rejects_unparsable_policy() {
+        let policy = cedar_sourced_policy("this is not valid cedar syntax {{{");
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn cedar_policy_source_rejects_forbid_on_filesystem_path() {
+        let policy = cedar_sourced_policy(
+            r#"
+forbid (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"ReadFile",
+    resource  is Sandbox::FilesystemPath
+)
+when { resource == Sandbox::FilesystemPath::"/etc/shadow" };
+"#,
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn cedar_policy_source_applies_filesystem_path_checks_to_grants() {
+        let policy = cedar_sourced_policy(
+            r#"
+permit (principal, action == Sandbox::Action::"WriteFile",
+        resource in Sandbox::FilesystemPath::"/");
+permit (principal, action == Sandbox::Action::"ReadFile",
+        resource in Sandbox::FilesystemPath::"/usr/../etc");
+permit (principal, action == Sandbox::Action::"ReadFile",
+        resource in Sandbox::FilesystemPath::"relative/dir");
+"#,
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::PathTraversal { .. })),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::RelativePath { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn cedar_policy_source_rejects_coexistence_with_network_policies() {
+        let mut policy = cedar_sourced_policy(
+            r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+"#,
+        );
+        policy
+            .network_policies
+            .insert("extra".to_string(), NetworkPolicyRule::default());
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations.iter().any(|v| matches!(
+                v,
+                PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies
+            )),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn empty_cedar_policy_source_is_a_no_op() {
+        // The YAML-sourced path (cedar_policy_source empty) must not trip
+        // any Cedar-specific check, even though it has no network_policies
+        // either.
+        let policy = restrictive_default_policy();
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     /// Verify that the serialized YAML uses `filesystem_policy` (not
@@ -3699,6 +5035,9 @@ network_policies:
     #[test]
     fn validate_accepts_empty_process() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             process: None,
             filesystem: None,
@@ -4154,6 +5493,9 @@ network_policies:
     #[test]
     fn validate_accepts_numeric_uid_in_range() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: "1000".into(),
@@ -4170,6 +5512,9 @@ network_policies:
     #[test]
     fn validate_accepts_boundary_uids() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: MIN_SANDBOX_UID.to_string(),
@@ -4242,6 +5587,9 @@ network_policies:
     fn validate_accepts_mixed_sandbox_name_and_uid() {
         // run_as_user as "sandbox" name, run_as_group as numeric UID
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: "sandbox".into(),

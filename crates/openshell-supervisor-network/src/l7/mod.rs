@@ -327,8 +327,12 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
     let endpoint_id = get_object_str(val, "endpoint_id").unwrap_or_default();
     let policy_hash = get_object_str(val, "policy_hash").unwrap_or_default();
-    let websocket_graphql_policy =
-        protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
+    // A YAML endpoint opts in through its GraphQL rules or persisted-query
+    // settings. A Cedar endpoint carries no rules, so the Cedar engine sets
+    // the flag for a `websocket-graphql` endpoint.
+    let websocket_graphql_policy = protocol == L7Protocol::Websocket
+        && (get_object_bool(val, "websocket_graphql_policy").unwrap_or(false)
+            || endpoint_has_graphql_policy(val));
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)

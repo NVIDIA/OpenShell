@@ -16,6 +16,7 @@ openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-policy-cedar = { path = "../openshell-policy-cedar" }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
@@ -31,6 +32,7 @@ bytes = { workspace = true }
 flate2 = "1"
 futures = { workspace = true }
 glob = { workspace = true }
+globset = { version = "0.4", default-features = false }
 hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"

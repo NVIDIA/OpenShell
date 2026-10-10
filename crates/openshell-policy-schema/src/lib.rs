@@ -199,6 +199,12 @@ pub struct PolicyDocument {
     pub network_policies: BTreeMap<String, NetworkPolicyRule>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub network_middlewares: BTreeMap<String, NetworkMiddleware>,
+    /// Endpoint settings for a Cedar policy, authored only in a middleware
+    /// file. Each entry selects endpoints by host, port, and optional path,
+    /// and sets configuration (TLS, parsing, and protocol options) rather
+    /// than access. Policy files reject this section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_settings: Vec<NetworkEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +627,11 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
             "network_policies.*.endpoints.*.deny_rules.*",
             "network_policies.*.endpoints.*.deny_rules.*.query",
             "network_policies.*.endpoints.*.deny_rules.*.params",
+            "endpoint_settings.*",
+            "endpoint_settings.*.json_rpc",
+            "endpoint_settings.*.mcp",
+            "endpoint_settings.*.graphql_persisted_queries",
+            "endpoint_settings.*.graphql_persisted_queries.*",
         ],
     )
     .into_diagnostic()
@@ -724,6 +735,13 @@ fn validate_policy(document: &PolicyDocument) -> Result<()> {
             }
         }
     }
+    // Endpoint settings carry no protocol: the Cedar policy selects it, and
+    // MCP options apply only where it selects MCP.
+    for (index, endpoint) in document.endpoint_settings.iter().enumerate() {
+        if let Some(config) = &endpoint.mcp {
+            validate_mcp_config(config, &format!("endpoint_settings[{index}]"))?;
+        }
+    }
     Ok(())
 }
 
@@ -742,6 +760,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
             "process",
             "network_policies",
             "network_middlewares",
+            "endpoint_settings",
         ],
     )?
     else {
@@ -797,6 +816,10 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
             )?;
             // `config` is deliberately an open user-data map.
         }
+    }
+
+    for (index, endpoint) in sequence(root.get("endpoint_settings")).iter().enumerate() {
+        inspect_endpoint(endpoint, &format!("endpoint_settings[{index}]"))?;
     }
     Ok(())
 }
