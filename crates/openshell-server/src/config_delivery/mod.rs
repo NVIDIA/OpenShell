@@ -3,6 +3,7 @@
 
 //! Build and deliver complete supervisor configuration snapshots.
 
+mod result_writer;
 pub mod session;
 mod session_slots;
 mod task;
@@ -209,6 +210,8 @@ pub struct ConfigDelivery {
     publications: AtomicU64,
     peer_notifies: Mutex<HashMap<PeerNotifyTarget, ConfigComponents>>,
     peer_notify_permits: Arc<Semaphore>,
+    /// Admission and policy-result writes for running workloads.
+    results: result_writer::ResultWriter,
 }
 
 /// Where a peer notification goes.
@@ -234,6 +237,7 @@ impl ConfigDelivery {
             publications: AtomicU64::new(0),
             peer_notifies: Mutex::new(HashMap::new()),
             peer_notify_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_NOTIFIES)),
+            results: result_writer::ResultWriter::default(),
         }
     }
 

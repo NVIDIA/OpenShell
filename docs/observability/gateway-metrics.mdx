@@ -253,6 +253,8 @@ empty in poll mode, where `GetSandboxConfig` and
 | `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
 | `openshell_supervisor_config_bootstrap_revision_mismatches_total` | Counter | None | Bootstrap builds retried because the two components disagreed on provider revision, provider attachments, or effective policy. |
 | `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
+| `openshell_supervisor_config_result_writes_total` | Counter | `kind`, `outcome` | Admission and policy-result writes for running workloads, which a single background writer persists after the supervisor is acknowledged. |
+| `openshell_supervisor_config_result_writes_pending` | Gauge | None | Sandboxes with result writes waiting for the background writer. |
 
 The labels take these values:
 
@@ -273,6 +275,10 @@ The labels take these values:
   `payload_too_large`, `owner_moved`, or `owner_lookup_failed`.
 - On peer notifications, `outcome` is `accepted`, `stale_owner`,
   `unsupported_peer`, `peer_error`, or `timeout`.
+- On result writes, `kind` is `admission` or `policy_result`, and `outcome`
+  is `written`, `coalesced` (a newer admission for the sandbox replaced a
+  queued one), `stale_session` (the session ended before its admission was
+  written), `retried`, or `dropped`.
 
 ## Gateway Interceptor Metrics
 

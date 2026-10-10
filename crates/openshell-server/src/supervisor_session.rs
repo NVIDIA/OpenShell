@@ -590,6 +590,11 @@ impl SupervisorSessionRegistry {
             .map(|s| s.tx.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_runtime_ready_for_test(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.mark_runtime_ready(sandbox_id, session_id)
+    }
+
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
     }
