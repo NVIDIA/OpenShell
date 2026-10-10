@@ -5,8 +5,9 @@
 //!
 //! Preflight runs every selected stage in chain order. Stages that inspect
 //! the body then run concurrently, linked by bounded channels. Each stage
-//! waits for its upstream `Start`, sends `Begin` with its current head, and
-//! forwards its own `Start` only after that. The outgoing head therefore
+//! waits for its upstream `Start`, sends `Begin` with the head after every
+//! preflight mutation and the late mutations of earlier stages, and forwards
+//! its own `Start` only after that. The outgoing head therefore
 //! commits only on the final `Start`, once every late header mutation is
 //! known: the original head, then every preflight mutation, then every late
 //! mutation, each in chain order.
@@ -329,8 +330,6 @@ pub struct Stage {
     entry: DescribedChainEntry,
     stream: StageStream,
     mode: StageMode,
-    /// Head after preflight mutations through this stage.
-    head: Vec<HttpHeader>,
 }
 
 /// Event sender and result stream of one open stage exchange.
@@ -652,7 +651,6 @@ pub async fn preflight(
                     entry: entry.clone(),
                     stream,
                     mode,
-                    head: state.headers.clone(),
                 });
             }
             http_result::Result::Reject(reject) => {
@@ -675,6 +673,7 @@ pub async fn preflight(
     } = state;
     let pipeline = (!stages.is_empty()).then(|| Pipeline {
         spec,
+        head: headers.clone(),
         stages,
         declared_input_bytes,
     });
@@ -723,6 +722,8 @@ impl PreflightState {
 /// Stages that selected a body mode, ready to run.
 pub struct Pipeline {
     spec: PipelineSpec,
+    /// Head after every preflight mutation.
+    head: Vec<HttpHeader>,
     stages: Vec<Stage>,
     declared_input_bytes: Option<u64>,
 }
@@ -805,6 +806,7 @@ impl Pipeline {
     ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
         let Self {
             spec,
+            head,
             stages,
             declared_input_bytes,
         } = self;
@@ -822,7 +824,7 @@ impl Pipeline {
             receivers.push(Some(receiver));
         }
         let (abort, aborted) = watch::channel(None::<MiddlewareSessionEndReason>);
-        let shared = Shared { spec };
+        let shared = Shared { spec, head };
 
         let checks = matches!(body_policy, TransformedBodyPolicy::Reevaluate(_));
         let (source_body, mut checked_body) = if checks {
@@ -975,6 +977,9 @@ enum Frame {
 
 struct Shared {
     spec: PipelineSpec,
+    /// Head after every preflight mutation. Each stage begins on it plus the
+    /// late mutations of earlier stages.
+    head: Vec<HttpHeader>,
 }
 
 struct StageDone {
@@ -1313,7 +1318,7 @@ async fn drive_stage(
     };
     let begin_head = headers::apply_accumulated(
         shared.spec.head_authority,
-        &stage.head,
+        &shared.head,
         &shared.spec.connection_nominated,
         &upstream.header_mutations,
     )

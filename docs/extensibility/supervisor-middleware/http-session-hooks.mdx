@@ -77,7 +77,7 @@ When no mode is permitted, your service can continue or reject. Use the reason t
 
 ## Headers and Delivery
 
-Header mutations follow the [header change rules](/extensibility/supervisor-middleware/operations#requests) of v1 HTTP hooks. OpenShell applies them in this order: the original head, then every stage's preflight mutations, then every stage's late mutations from `buffered_result` or `output_start`, each in chain order. `begin` carries the head as it stands for your stage, including the late mutations of earlier stages.
+Header mutations follow the [header change rules](/extensibility/supervisor-middleware/operations#requests) of v1 HTTP hooks. OpenShell applies them in this order: the original head, then every stage's preflight mutations, then every stage's late mutations from `buffered_result` or `output_start`, each in chain order. `begin` carries the head after every stage's preflight mutations and the late mutations of earlier stages.
 
 OpenShell commits the outgoing head when the last stage starts its output, so late mutations reach the external service or the sandbox. It injects provider credentials after all middleware mutations, so middleware never sees them.
 

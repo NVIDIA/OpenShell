@@ -621,8 +621,8 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
     );
     second.preflight_mutation = true;
     second.late_mutation = true;
-    let second = Arc::new(second);
-    let outcome = run(vec![Arc::new(first), Arc::clone(&second)], b"hello").await;
+    let (first, second) = (Arc::new(first), Arc::new(second));
+    let outcome = run(vec![Arc::clone(&first), Arc::clone(&second)], b"hello").await;
     assert!(outcome.allowed, "{}", outcome.reason);
     assert_eq!(
         outcome.preflight_mutations,
@@ -630,16 +630,23 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
     );
     assert_eq!(outcome.late_mutations, ["example/a-late", "example/b-late"]);
     assert_eq!(outcome.body, b"HELLO");
-    // The second stage begins on the original head, every preflight
-    // mutation, and the first stage's late mutation.
-    let begun = second.begun.lock().unwrap().clone();
-    let values: Vec<_> = begun[0]
-        .iter()
-        .filter(|header| header.name == "x-order")
-        .map(|header| header.value.as_str())
-        .collect();
+    let begun_order = |stage: &ScriptedStage| -> Vec<String> {
+        let begun = stage.begun.lock().unwrap();
+        assert_eq!(begun.len(), 1, "{} begins once", stage.name);
+        begun[0]
+            .iter()
+            .filter(|header| header.name == "x-order")
+            .map(|header| header.value.clone())
+            .collect()
+    };
+    // Every stage begins on the original head and every preflight mutation,
+    // including those of later stages, then earlier stages' late mutations.
     assert_eq!(
-        values,
+        begun_order(&first),
+        ["original", "example/a-pre", "example/b-pre"]
+    );
+    assert_eq!(
+        begun_order(&second),
         [
             "original",
             "example/a-pre",
