@@ -843,7 +843,7 @@ credentials, DNS, and mediated upstream connections.
 
 The supervisor opens `ConnectSupervisor` before attaching to the workload. When
 the gateway runs with `config_delivery_mode = "push"`, it accepts the session
-with `config_apply_enabled` and delivers configuration on that stream. On the
+with `config_push_enabled` and delivers configuration on that stream. On the
 first connection the supervisor offers the policy found in the workload image.
 The gateway selects its stored policy when present, otherwise the image policy,
 and sends that candidate back for image-specific filesystem preparation. It

@@ -2221,7 +2221,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         mut inbound,
         session_lifetime,
     } = setup;
-    let stream_applies_config = matches!(mode, SessionMode::Push(_));
+    let pushes_config = matches!(mode, SessionMode::Push(_));
     let ready_on_accept = matches!(
         mode,
         SessionMode::Poll {
@@ -2240,7 +2240,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
             bootstrap,
-            config_apply_enabled: stream_applies_config,
+            config_push_enabled: pushes_config,
             heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
                 u64::from(HEARTBEAT_INTERVAL_SECS),
             ))
@@ -2366,7 +2366,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         instance_id = %instance_id,
         connection_epoch,
         replica_id = %state.replica_id,
-        config_apply = stream_applies_config,
+        config_push = pushes_config,
         "supervisor session: accepted"
     );
 
@@ -2466,30 +2466,30 @@ pub async fn handle_connect_supervisor(
     }
     // Configuration is pushed only in push mode and only to supervisors that
     // apply it; the rest keep polling.
-    let stream_applies_config = state.config.config_delivery_mode
+    let pushes_config = state.config.config_delivery_mode
         == openshell_core::config::ConfigDeliveryMode::Push
-        && hello.supports_config_apply;
+        && hello.supports_config_push;
     // The stock supervisor includes discovery only on its first connection.
     // Reconnects from the same process omit it and proceed directly to the
     // current authoritative bootstrap.
-    let mode = if stream_applies_config {
+    let mode = if pushes_config {
         SessionMode::Push(Arc::new(ConfigSlots::default()))
     } else {
-        // Supervisors that predate streamed apply never set workload_pending:
+        // Supervisors that predate config push never set workload_pending:
         // they connect once their workload runs.
         SessionMode::Poll {
             ready_on_accept: !hello.workload_pending,
         }
     };
-    let prepares_startup_policy = stream_applies_config && hello.image_policy_discovery.is_some();
-    let image_policy_admission = if stream_applies_config {
+    let prepares_startup_policy = pushes_config && hello.image_policy_discovery.is_some();
+    let image_policy_admission = if pushes_config {
         config_session::image_policy_admission(&hello)?
     } else {
         ImagePolicyAdmission::Missing
     };
     // Captured before reading any bootstrap input, including the sandbox
     // record, so registration detects publications the bootstrap may miss.
-    let captured_seq = stream_applies_config.then(|| state.config_delivery.publications());
+    let captured_seq = pushes_config.then(|| state.config_delivery.publications());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
     // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
@@ -2545,7 +2545,7 @@ pub async fn handle_connect_supervisor(
             .map(|spec| spec.providers.iter().cloned().collect())
             .unwrap_or_default(),
     });
-    let bootstrap = if stream_applies_config {
+    let bootstrap = if pushes_config {
         Some(
             config_session::build_session_bootstrap(state, &sandbox_id, &image_policy_admission)
                 .await?,
@@ -3189,7 +3189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_without_config_apply_is_accepted() {
+    async fn supervisor_without_config_push_is_accepted() {
         let state = state_with_sandbox("sb-legacy").await;
         let mut harness = crate::grpc::test_support::connect_supervisor_stream(
             &state,

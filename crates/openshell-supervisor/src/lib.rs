@@ -1152,7 +1152,7 @@ async fn run_sandbox_with_backend(
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let (config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(16);
     let mut config_apply_rx = Some(config_apply_rx);
-    let (config_apply_updates, config_apply_enabled) = tokio::sync::watch::channel(true);
+    let (config_push_updates, config_push_enabled) = tokio::sync::watch::channel(true);
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
@@ -1352,7 +1352,7 @@ async fn run_sandbox_with_backend(
             },
             config_apply_rx: config_apply_rx.take(),
             initial_stream_snapshot,
-            config_apply_enabled: Some(config_apply_enabled),
+            config_push_enabled: Some(config_push_enabled),
             endpoint_observation_tx,
             endpoint_status_rx,
             endpoint_policy: poll_endpoint_policy,
@@ -1403,7 +1403,7 @@ async fn run_sandbox_with_backend(
                 ssh_socket_path.as_deref(),
                 config_apply_tx.clone(),
                 Some(supervisor_session_updates.clone()),
-                config_apply_updates,
+                config_push_updates,
             )
             .await?,
         ),
@@ -4053,7 +4053,7 @@ struct PolicyPollLoopContext {
     initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
     /// Whether the current supervisor session delivers configuration
     /// authoritatively. A stream-started runtime polls while it is false.
-    config_apply_enabled: Option<tokio::sync::watch::Receiver<bool>>,
+    config_push_enabled: Option<tokio::sync::watch::Receiver<bool>>,
     /// Producer shared with network enforcement and policy installation.
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
     /// Single FIFO consumed by the endpoint status reporter.

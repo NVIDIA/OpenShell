@@ -1395,10 +1395,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let stream_started = initial_stream_snapshot.is_some();
     // A stream-started runtime stays stream-authoritative only while its
     // current session applies configuration. A reconnect to a gateway that
-    // does not enable apply, such as after a rollback to poll mode, resumes
+    // does not enable config push, such as after a rollback to poll mode, resumes
     // polling. Keep the last value if the session task ends.
-    let mut config_apply_updates = ctx.config_apply_enabled.take();
-    let mut config_apply_enabled = config_apply_updates
+    let mut config_push_updates = ctx.config_push_enabled.take();
+    let mut config_push_enabled = config_push_updates
         .as_ref()
         .is_none_or(|updates| *updates.borrow());
     let mut runtime = ConfigRuntime::new(&ctx, initial_stream_snapshot.as_ref());
@@ -1537,20 +1537,20 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
     let interval = Duration::from_secs(ctx.interval_secs);
     loop {
-        if let Some(updates) = config_apply_updates.as_ref() {
-            config_apply_enabled = *updates.borrow();
+        if let Some(updates) = config_push_updates.as_ref() {
+            config_push_enabled = *updates.borrow();
         }
-        if stream_started && config_apply_enabled {
+        if stream_started && config_push_enabled {
             let delay = next_poll_delay(&ctx.extension_credentials, interval);
             tokio::select! {
                 changed = async {
-                    match config_apply_updates.as_mut() {
+                    match config_push_updates.as_mut() {
                         Some(updates) => updates.changed().await.is_ok(),
                         None => std::future::pending().await,
                     }
                 } => {
                     if !changed {
-                        config_apply_updates = None;
+                        config_push_updates = None;
                     }
                 }
                 request = receive_config_apply(&mut config_apply_rx) => {
@@ -2756,7 +2756,7 @@ mod tests {
             transparent_tcp: TransparentTcpReloadState::default(),
             config_apply_rx: None,
             initial_stream_snapshot: None,
-            config_apply_enabled: None,
+            config_push_enabled: None,
             endpoint_observation_tx: None,
             endpoint_status_rx: None,
             endpoint_policy: None,
@@ -3562,7 +3562,7 @@ mod tests {
         let (_config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(1);
         ctx.config_apply_rx = Some(config_apply_rx);
         let (apply_enabled_tx, apply_enabled_rx) = tokio::sync::watch::channel(true);
-        ctx.config_apply_enabled = Some(apply_enabled_rx);
+        ctx.config_push_enabled = Some(apply_enabled_rx);
         let (client, _polls, _reports) = scripted_policy_gateway();
         let poll_calls = Arc::clone(&client.poll_calls);
 

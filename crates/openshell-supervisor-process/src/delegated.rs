@@ -100,7 +100,7 @@ pub async fn start_prepared_supervisor_session(
     ssh_socket_path: Option<&str>,
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
-    config_apply_updates: tokio::sync::watch::Sender<bool>,
+    config_push_updates: tokio::sync::watch::Sender<bool>,
 ) -> Result<PrestartedSupervisorSession> {
     let terminating = Arc::new(AtomicBool::new(false));
     let loopback = Arc::new(DeferredLoopbackConnector::default());
@@ -117,7 +117,7 @@ pub async fn start_prepared_supervisor_session(
         terminating.clone(),
         config_apply_tx,
         supervisor_session_updates,
-        config_apply_updates,
+        config_push_updates,
     );
     let ready = tokio::time::timeout(
         crate::supervisor_session::SESSION_PREPARE_TIMEOUT,

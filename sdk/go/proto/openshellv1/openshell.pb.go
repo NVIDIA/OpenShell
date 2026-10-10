@@ -14007,13 +14007,14 @@ type SupervisorHello struct {
 	// first connection of a supervisor process. The gateway considers it when
 	// preparing the first authoritative bootstrap for this process.
 	ImagePolicyDiscovery *ImagePolicyDiscovery `protobuf:"bytes,8,opt,name=image_policy_discovery,json=imagePolicyDiscovery,proto3" json:"image_policy_discovery,omitempty"`
-	// The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
-	// stream, applies them, reports apply results and admission, and prepares
-	// its startup policy on this stream. Gateways send configuration payloads
-	// only when this is set.
-	SupportsConfigApply bool `protobuf:"varint,9,opt,name=supports_config_apply,json=supportsConfigApply,proto3" json:"supports_config_apply,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// The supervisor can receive its configuration over this stream instead of
+	// polling for it: it prepares its startup policy here, applies the
+	// ConfigBootstrap before starting the workload, applies and acknowledges
+	// ConfigUpdate payloads, and reports admission. Gateways push configuration
+	// only to supervisors that set this.
+	SupportsConfigPush bool `protobuf:"varint,9,opt,name=supports_config_push,json=supportsConfigPush,proto3" json:"supports_config_push,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SupervisorHello) Reset() {
@@ -14102,9 +14103,9 @@ func (x *SupervisorHello) GetImagePolicyDiscovery() *ImagePolicyDiscovery {
 	return nil
 }
 
-func (x *SupervisorHello) GetSupportsConfigApply() bool {
+func (x *SupervisorHello) GetSupportsConfigPush() bool {
 	if x != nil {
-		return x.SupportsConfigApply
+		return x.SupportsConfigPush
 	}
 	return false
 }
@@ -14403,13 +14404,13 @@ type SessionAccepted struct {
 	// Gateway-assigned session ID for this connection.
 	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	// Complete gateway-owned configuration. Present exactly when
-	// config_apply_enabled is set.
+	// config_push_enabled is set.
 	Bootstrap *ConfigBootstrap `protobuf:"bytes,3,opt,name=bootstrap,proto3" json:"bootstrap,omitempty"`
-	// The gateway delivers configuration authoritatively on this stream: the
-	// bootstrap is required, ConfigUpdate payloads are applied and
-	// acknowledged, and the supervisor may stop polling. Set only for
-	// supervisors that set SupervisorHello.supports_config_apply.
-	ConfigApplyEnabled bool `protobuf:"varint,4,opt,name=config_apply_enabled,json=configApplyEnabled,proto3" json:"config_apply_enabled,omitempty"`
+	// The gateway pushes configuration authoritatively on this stream instead
+	// of the supervisor polling for it: the bootstrap is required, ConfigUpdate
+	// payloads are applied and acknowledged, and the supervisor stops polling.
+	// Set only for supervisors that set SupervisorHello.supports_config_push.
+	ConfigPushEnabled bool `protobuf:"varint,4,opt,name=config_push_enabled,json=configPushEnabled,proto3" json:"config_push_enabled,omitempty"`
 	// Recommended heartbeat interval.
 	HeartbeatInterval *durationpb.Duration `protobuf:"bytes,102,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"`
 	unknownFields     protoimpl.UnknownFields
@@ -14460,9 +14461,9 @@ func (x *SessionAccepted) GetBootstrap() *ConfigBootstrap {
 	return nil
 }
 
-func (x *SessionAccepted) GetConfigApplyEnabled() bool {
+func (x *SessionAccepted) GetConfigPushEnabled() bool {
 	if x != nil {
-		return x.ConfigApplyEnabled
+		return x.ConfigPushEnabled
 	}
 	return false
 }
@@ -20647,7 +20648,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rconfig_update\x18\a \x01(\v2\x1a.openshell.v1.ConfigUpdateH\x00R\fconfigUpdate\x12`\n" +
 	"\x18startup_config_candidate\x18\b \x01(\v2$.openshell.v1.StartupConfigCandidateH\x00R\x16startupConfigCandidate\x12f\n" +
 	"\x17configuration_admission\x18\t \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionH\x00R\x16configurationAdmissionB\t\n" +
-	"\apayload\"\xd1\x03\n" +
+	"\apayload\"\xcf\x03\n" +
 	"\x0fSupervisorHello\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -20660,8 +20661,8 @@ const file_openshell_proto_rawDesc = "" +
 	"redirected\x12:\n" +
 	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x12)\n" +
 	"\x10workload_pending\x18\a \x01(\bR\x0fworkloadPending\x12X\n" +
-	"\x16image_policy_discovery\x18\b \x01(\v2\".openshell.v1.ImagePolicyDiscoveryR\x14imagePolicyDiscovery\x122\n" +
-	"\x15supports_config_apply\x18\t \x01(\bR\x13supportsConfigApply\"\xc7\x01\n" +
+	"\x16image_policy_discovery\x18\b \x01(\v2\".openshell.v1.ImagePolicyDiscoveryR\x14imagePolicyDiscovery\x120\n" +
+	"\x14supports_config_push\x18\t \x01(\bR\x12supportsConfigPush\"\xc7\x01\n" +
 	"\x14ImagePolicyDiscovery\x122\n" +
 	"\amissing\x18\x01 \x01(\v2\x16.google.protobuf.EmptyH\x00R\amissing\x122\n" +
 	"\ainvalid\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\ainvalid\x12=\n" +
@@ -20679,12 +20680,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\tunchanged\x18\x02 \x01(\v2\x16.google.protobuf.EmptyH\x00R\tunchanged\x12N\n" +
 	"\x0fprepared_policy\x18\x03 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyH\x00R\x0epreparedPolicy\x12<\n" +
 	"\afailure\x18\x04 \x01(\v2 .openshell.v1.ConfigApplyFailureH\x00R\afailureB\b\n" +
-	"\x06result\"\x88\x02\n" +
+	"\x06result\"\x86\x02\n" +
 	"\x0fSessionAccepted\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12;\n" +
-	"\tbootstrap\x18\x03 \x01(\v2\x1d.openshell.v1.ConfigBootstrapR\tbootstrap\x120\n" +
-	"\x14config_apply_enabled\x18\x04 \x01(\bR\x12configApplyEnabled\x12H\n" +
+	"\tbootstrap\x18\x03 \x01(\v2\x1d.openshell.v1.ConfigBootstrapR\tbootstrap\x12.\n" +
+	"\x13config_push_enabled\x18\x04 \x01(\bR\x11configPushEnabled\x12H\n" +
 	"\x12heartbeat_interval\x18f \x01(\v2\x19.google.protobuf.DurationR\x11heartbeatIntervalJ\x04\b\x02\x10\x03R\x17heartbeat_interval_secs\"\xc3\x01\n" +
 	"\x0fConfigBootstrap\x12R\n" +
 	"\x0esandbox_config\x18\x01 \x01(\v2+.openshell.sandbox.v1.SandboxConfigSnapshotR\rsandboxConfig\x12\\\n" +

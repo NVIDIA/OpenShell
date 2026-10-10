@@ -3134,11 +3134,12 @@ message SupervisorHello {
   // first connection of a supervisor process. The gateway considers it when
   // preparing the first authoritative bootstrap for this process.
   ImagePolicyDiscovery image_policy_discovery = 8;
-  // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
-  // stream, applies them, reports apply results and admission, and prepares
-  // its startup policy on this stream. Gateways send configuration payloads
-  // only when this is set.
-  bool supports_config_apply = 9;
+  // The supervisor can receive its configuration over this stream instead of
+  // polling for it: it prepares its startup policy here, applies the
+  // ConfigBootstrap before starting the workload, applies and acknowledges
+  // ConfigUpdate payloads, and reports admission. Gateways push configuration
+  // only to supervisors that set this.
+  bool supports_config_push = 9;
 }
 
 message ImagePolicyDiscovery {
@@ -3181,13 +3182,13 @@ message SessionAccepted {
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
   // Complete gateway-owned configuration. Present exactly when
-  // config_apply_enabled is set.
+  // config_push_enabled is set.
   ConfigBootstrap bootstrap = 3;
-  // The gateway delivers configuration authoritatively on this stream: the
-  // bootstrap is required, ConfigUpdate payloads are applied and
-  // acknowledged, and the supervisor may stop polling. Set only for
-  // supervisors that set SupervisorHello.supports_config_apply.
-  bool config_apply_enabled = 4;
+  // The gateway pushes configuration authoritatively on this stream instead
+  // of the supervisor polling for it: the bootstrap is required, ConfigUpdate
+  // payloads are applied and acknowledged, and the supervisor stops polling.
+  // Set only for supervisors that set SupervisorHello.supports_config_push.
+  bool config_push_enabled = 4;
   // Recommended heartbeat interval.
   google.protobuf.Duration heartbeat_interval = 102;
 }

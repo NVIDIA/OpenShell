@@ -86,7 +86,7 @@ pub struct PreparedSupervisorSession {
     heartbeat_secs: u32,
     session_id: String,
     /// The gateway committed to authoritative streamed configuration.
-    config_apply_enabled: bool,
+    config_push_enabled: bool,
     /// The hello reported the workload as not started, so a polling gateway
     /// waits for `SupervisorRuntimeReady`.
     workload_pending: bool,
@@ -99,7 +99,7 @@ impl PreparedSupervisorSession {
     }
 
     pub fn uses_stream_configuration(&self) -> bool {
-        self.config_apply_enabled
+        self.config_push_enabled
     }
 }
 
@@ -564,7 +564,7 @@ pub fn spawn_with_readiness(
         config_apply_tx: runtime.config_apply_tx,
         ready_tx,
         runtime_ready: Arc::new(AtomicBool::new(true)),
-        config_apply_updates: None,
+        config_push_updates: None,
     };
     (tokio::spawn(run_session_loop(config, None)), ready_rx)
 }
@@ -638,8 +638,8 @@ pub async fn prepare(
     })
     .await
     .map_err(|_| "timed out waiting for supervisor session bootstrap")??;
-    if prepared.config_apply_enabled && prepared.bootstrap.is_none() {
-        return Err("gateway enabled configuration apply without a bootstrap".into());
+    if prepared.config_push_enabled && prepared.bootstrap.is_none() {
+        return Err("gateway enabled config push without a bootstrap".into());
     }
     Ok(prepared)
 }
@@ -656,7 +656,7 @@ pub fn spawn_prepared(
     terminating: Arc<AtomicBool>,
     config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
     session_id_updates: Option<watch::Sender<Option<String>>>,
-    config_apply_updates: watch::Sender<bool>,
+    config_push_updates: watch::Sender<bool>,
 ) -> (
     tokio::task::JoinHandle<()>,
     watch::Receiver<bool>,
@@ -678,7 +678,7 @@ pub fn spawn_prepared(
         session_id_updates,
         ready_tx,
         runtime_ready: runtime_ready.clone(),
-        config_apply_updates: Some(config_apply_updates),
+        config_push_updates: Some(config_push_updates),
     };
     let task = tokio::spawn(run_session_loop(config, Some((prepared, bootstrap_result))));
     (task, ready_rx, outbound, runtime_ready)
@@ -699,8 +699,8 @@ struct SessionConfig {
     runtime_ready: Arc<AtomicBool>,
     /// Publishes whether the current session delivers configuration
     /// authoritatively, so a stream-started runtime resumes polling when a
-    /// reconnect lands on a gateway that does not enable apply.
-    config_apply_updates: Option<watch::Sender<bool>>,
+    /// reconnect lands on a gateway that does not enable config push.
+    config_push_updates: Option<watch::Sender<bool>>,
 }
 
 async fn run_session_loop(
@@ -965,7 +965,7 @@ async fn open_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.clone(),
             instance_id: instance_id.clone(),
-            supports_config_apply: true,
+            supports_config_push: true,
             workload_pending,
             connection_epoch,
             image_policy_discovery,
@@ -1061,7 +1061,7 @@ async fn open_session(
         .and_then(|value| openshell_core::time::duration_to_std(value).ok())
         .map_or(5, |value| value.as_secs().max(5));
     let heartbeat_secs = u32::try_from(heartbeat_secs).unwrap_or(u32::MAX);
-    if !accepted.config_apply_enabled {
+    if !accepted.config_push_enabled {
         debug!(
             sandbox_id = %sandbox_id,
             session_id = %accepted.session_id,
@@ -1076,7 +1076,7 @@ async fn open_session(
     );
     ocsf_emit!(event);
 
-    let config_apply_enabled = accepted.config_apply_enabled;
+    let config_push_enabled = accepted.config_push_enabled;
     Ok(OpenedSession::Accepted(Box::new(
         PreparedSupervisorSession {
             endpoint,
@@ -1090,9 +1090,9 @@ async fn open_session(
             inbound,
             heartbeat_secs,
             session_id: accepted.session_id,
-            config_apply_enabled,
+            config_push_enabled,
             workload_pending,
-            bootstrap: config_apply_enabled.then_some(accepted.bootstrap).flatten(),
+            bootstrap: config_push_enabled.then_some(accepted.bootstrap).flatten(),
         },
     )))
 }
@@ -1106,9 +1106,9 @@ async fn run_prepared_session(
         updates.send_replace(Some(prepared.session_id.clone()));
     }
     let heartbeat_secs = prepared.heartbeat_secs;
-    // Polling stays authoritative on a session without streamed apply.
+    // Polling stays authoritative on a session without config push.
     let config_apply_tx = prepared
-        .config_apply_enabled
+        .config_push_enabled
         .then_some(&config.config_apply_tx);
     let channel = prepared.channel;
     let tx = prepared.tx;
@@ -1128,10 +1128,10 @@ async fn run_prepared_session(
         .await
         .map_err(|_| "failed to queue configuration bootstrap result")?;
     }
-    if let Some(updates) = &config.config_apply_updates {
-        updates.send_replace(prepared.config_apply_enabled);
+    if let Some(updates) = &config.config_push_updates {
+        updates.send_replace(prepared.config_push_enabled);
     }
-    if !prepared.config_apply_enabled {
+    if !prepared.config_push_enabled {
         config.ready_tx.send_replace(true);
         // Without streamed admission the gateway learns readiness only from
         // this report. A hello that reported the workload running was already
@@ -1353,7 +1353,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let Some(apply_tx) = context.config_apply_tx.cloned() else {
                 warn!(
                     sandbox_id = %context.sandbox_id,
-                    "supervisor session: ignored configuration update on a session without streamed apply"
+                    "supervisor session: ignored configuration update on a session without config push"
                 );
                 return;
             };

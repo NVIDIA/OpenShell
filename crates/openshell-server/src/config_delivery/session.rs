@@ -1550,7 +1550,7 @@ mod tests {
                     sandbox_config: Some(SandboxConfigSnapshot::default()),
                     provider_environment: Some(ProviderEnvironmentSnapshot::default()),
                 }),
-                config_apply_enabled: true,
+                config_push_enabled: true,
             })),
         };
         let updates = [
@@ -3146,7 +3146,7 @@ mod tests {
         else {
             panic!("expected SessionAccepted without a startup candidate");
         };
-        assert!(!accepted.config_apply_enabled);
+        assert!(!accepted.config_push_enabled);
         assert!(accepted.bootstrap.is_none());
 
         // This supervisor connects before its workload starts, so acceptance
@@ -3186,7 +3186,7 @@ mod tests {
         else {
             panic!("expected SessionAccepted");
         };
-        assert!(!accepted.config_apply_enabled);
+        assert!(!accepted.config_push_enabled);
         // Its workload already runs, so it is ready like a supervisor that
         // predates streamed apply.
         assert!(
