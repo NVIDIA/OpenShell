@@ -1,0 +1,217 @@
+{
+    "attributes": [
+        {
+            "session": {
+                "type": "object_t",
+                "description": "The authenticated user or service session.",
+                "requirement": "optional",
+                "caption": "Session",
+                "object_name": "Session",
+                "object_type": "session",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the connection.",
+                "requirement": "recommended",
+                "caption": "Connection UID",
+                "type_name": "String",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "boundary": {
+                "type": "string_t",
+                "description": "The boundary of the connection, normalized to the caption of 'boundary_id'. In the case of 'Other', it is defined by the event source. <p> For cloud connections, this translates to the traffic-boundary(same VPC, through IGW, etc.). For traditional networks, this is described as Local, Internal, or External.</p>",
+                "requirement": "optional",
+                "caption": "Boundary",
+                "type_name": "String",
+                "_source": "network_connection_info",
+                "_sibling_of": "boundary_id"
+            }
+        },
+        {
+            "protocol_name": {
+                "type": "string_t",
+                "description": "The TCP/IP protocol name in lowercase, as defined by the Internet Assigned Numbers Authority (IANA). See <a target='_blank' href='https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml'>Protocol Numbers</a>. For example: <code>tcp</code> or <code>udp</code>.",
+                "requirement": "recommended",
+                "caption": "Protocol Name",
+                "type_name": "String",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "direction": {
+                "type": "string_t",
+                "description": "The direction of the initiated connection, traffic, or email, normalized to the caption of the direction_id value. In the case of 'Other', it is defined by the event source.",
+                "requirement": "optional",
+                "caption": "Direction",
+                "type_name": "String",
+                "_source": "network_connection_info",
+                "_sibling_of": "direction_id"
+            }
+        },
+        {
+            "boundary_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "description": "External network traffic between two endpoints on the Internet or outside the network.",
+                        "caption": "External"
+                    },
+                    "6": {
+                        "description": "Through a virtual private gateway",
+                        "caption": "Virtual Private Gateway"
+                    },
+                    "0": {
+                        "description": "The connection boundary is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "description": "Local network traffic on the same endpoint.",
+                        "caption": "Localhost"
+                    },
+                    "2": {
+                        "description": "Internal network traffic between two endpoints inside network.",
+                        "caption": "Internal"
+                    },
+                    "99": {
+                        "description": "The boundary is not mapped. See the <code>boundary</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "4": {
+                        "description": "Through another resource in the same VPC",
+                        "caption": "Same VPC"
+                    },
+                    "5": {
+                        "description": "Through an Internet gateway or a gateway VPC endpoint",
+                        "caption": "Internet/VPC Gateway"
+                    },
+                    "7": {
+                        "description": "Through an intra-region VPC peering connection",
+                        "caption": "Intra-region VPC"
+                    },
+                    "8": {
+                        "description": "Through an inter-region VPC peering connection",
+                        "caption": "Inter-region VPC"
+                    },
+                    "9": {
+                        "description": "Through a local gateway",
+                        "caption": "Local Gateway"
+                    },
+                    "10": {
+                        "description": "Through a gateway VPC endpoint (Nitro-based instances only)",
+                        "caption": "Gateway VPC"
+                    },
+                    "11": {
+                        "description": "Through an Internet gateway (Nitro-based instances only)",
+                        "caption": "Internet Gateway"
+                    }
+                },
+                "description": "<p>The normalized identifier of the boundary of the connection. </p><p> For cloud connections, this translates to the traffic-boundary (same VPC, through IGW, etc.). For traditional networks, this is described as Local, Internal, or External.</p>",
+                "requirement": "recommended",
+                "caption": "Boundary ID",
+                "type_name": "Integer",
+                "sibling": "boundary",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "direction_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "description": "Lateral network connection. The connection was originated from inside the network, destined for services on the inside network.",
+                        "caption": "Lateral"
+                    },
+                    "0": {
+                        "description": "The connection direction is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "description": "Inbound network connection. The connection was originated from the Internet or outside network, destined for services on the inside network.",
+                        "caption": "Inbound"
+                    },
+                    "2": {
+                        "description": "Outbound network connection. The connection was originated from inside the network, destined for services on the Internet or outside network.",
+                        "caption": "Outbound"
+                    },
+                    "99": {
+                        "description": "The direction is not mapped. See the <code>direction</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    }
+                },
+                "description": "The normalized identifier of the direction of the initiated connection, traffic, or email.",
+                "requirement": "required",
+                "caption": "Direction ID",
+                "type_name": "Integer",
+                "sibling": "direction",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "protocol_num": {
+                "type": "integer_t",
+                "description": "The TCP/IP protocol number, as defined by the Internet Assigned Numbers Authority (IANA). Use -1 if the protocol is not defined by IANA. See <a target='_blank' href='https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml'>Protocol Numbers</a>. For example: <code>6</code> for TCP and <code>17</code> for UDP.",
+                "requirement": "recommended",
+                "caption": "Protocol Number",
+                "type_name": "Integer",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "protocol_ver": {
+                "type": "string_t",
+                "description": "The Internet Protocol version.",
+                "requirement": "optional",
+                "caption": "IP Version",
+                "type_name": "String",
+                "_source": "network_connection_info",
+                "_sibling_of": "protocol_ver_id"
+            }
+        },
+        {
+            "protocol_ver_id": {
+                "type": "integer_t",
+                "enum": {
+                    "6": {
+                        "caption": "Internet Protocol version 6 (IPv6)"
+                    },
+                    "0": {
+                        "description": "The protocol version is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "99": {
+                        "description": "The protocol version is not mapped. See the <code>protocol_ver</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "4": {
+                        "caption": "Internet Protocol version 4 (IPv4)"
+                    }
+                },
+                "description": "The Internet Protocol version identifier.",
+                "requirement": "recommended",
+                "caption": "IP Version ID",
+                "type_name": "Integer",
+                "sibling": "protocol_ver",
+                "_source": "network_connection_info"
+            }
+        },
+        {
+            "tcp_flags": {
+                "type": "integer_t",
+                "description": "The network connection TCP header flags (i.e., control bits).",
+                "requirement": "optional",
+                "caption": "TCP Flags",
+                "type_name": "Integer",
+                "_source": "network_connection_info"
+            }
+        }
+    ],
+    "name": "network_connection_info",
+    "description": "The Network Connection Information object describes characteristics of a network connection. Defined by D3FEND <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:NetworkSession/'>d3f:NetworkSession</a>.",
+    "extends": "object",
+    "caption": "Network Connection Information"
+}

@@ -4,5 +4,6 @@
 //! OCSF event formatters: shorthand (human-readable) and JSONL.
 
 pub mod downgrade;
+mod downgrade_defs;
 pub mod jsonl;
 pub mod shorthand;

@@ -44,7 +44,7 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     /// it can be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, NetworkActivityBuilder};
+    /// use openshell_ocsf::{EventContext, EventOrigin, NetworkActivityBuilder};
     ///
     /// let ctx = EventContext {
     ///     sandbox_id: String::new(),
@@ -54,6 +54,7 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     ///     product_version: String::new(),
     ///     proxy_ip: "127.0.0.1".parse().unwrap(),
     ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
     /// };
     /// NetworkActivityBuilder::new(&ctx).build();
     /// ```

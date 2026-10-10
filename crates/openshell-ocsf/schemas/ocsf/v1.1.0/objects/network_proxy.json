@@ -1,0 +1,330 @@
+{
+    "attributes": [
+        {
+            "name": {
+                "type": "string_t",
+                "description": "The short name of the endpoint.",
+                "requirement": "recommended",
+                "caption": "Name",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "port": {
+                "type": "port_t",
+                "description": "The port used for communication within the network connection.",
+                "requirement": "recommended",
+                "caption": "Port",
+                "type_name": "Port",
+                "_source": "network_endpoint"
+            }
+        },
+        {
+            "type": {
+                "type": "string_t",
+                "description": "The network endpoint type. For example: <code>unknown</code>, <code>server</code>, <code>desktop</code>, <code>laptop</code>, <code>tablet</code>, <code>mobile</code>, <code>virtual</code>, <code>browser</code>, or <code>other</code>.",
+                "requirement": "optional",
+                "caption": "Type",
+                "type_name": "String",
+                "_source": "network_endpoint",
+                "_sibling_of": "type_id"
+            }
+        },
+        {
+            "os": {
+                "type": "object_t",
+                "description": "The endpoint operating system.",
+                "requirement": "optional",
+                "caption": "OS",
+                "object_name": "Operating System (OS)",
+                "object_type": "os",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "domain": {
+                "type": "string_t",
+                "description": "The name of the domain.",
+                "requirement": "optional",
+                "caption": "Domain",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "ip": {
+                "type": "ip_t",
+                "description": "The IP address of the endpoint, in either IPv4 or IPv6 format.",
+                "requirement": "recommended",
+                "caption": "IP Address",
+                "type_name": "IP Address",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "location": {
+                "type": "object_t",
+                "description": "The geographical location of the endpoint.",
+                "requirement": "optional",
+                "caption": "Geo Location",
+                "object_name": "Geo Location",
+                "object_type": "location",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "hostname": {
+                "type": "hostname_t",
+                "description": "The fully qualified name of the endpoint.",
+                "requirement": "recommended",
+                "caption": "Hostname",
+                "type_name": "Hostname",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the endpoint.",
+                "requirement": "recommended",
+                "caption": "Unique ID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "mac": {
+                "type": "mac_t",
+                "description": "The Media Access Control (MAC) address of the endpoint.",
+                "requirement": "optional",
+                "caption": "MAC Address",
+                "type_name": "MAC Address",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "type_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:LaptopComputer/'>laptop computer</a>.",
+                        "caption": "Laptop"
+                    },
+                    "6": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:VirtualizationSoftware/'>virtual machine</a>.",
+                        "caption": "Virtual"
+                    },
+                    "99": {
+                        "description": "The type is not mapped. See the <code>type</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "0": {
+                        "description": "The type is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Server/'>server</a>.",
+                        "caption": "Server"
+                    },
+                    "2": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:DesktopComputer/'>desktop computer</a>.",
+                        "caption": "Desktop"
+                    },
+                    "10": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Switch/'>networking switch</a>.",
+                        "caption": "Switch"
+                    },
+                    "4": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:TabletComputer/'>tablet computer</a>.",
+                        "caption": "Tablet"
+                    },
+                    "5": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:MobilePhone/'>mobile phone</a>.",
+                        "caption": "Mobile"
+                    },
+                    "7": {
+                        "description": "A <a target='_blank' href='https://www.techtarget.com/iotagenda/definition/IoT-device'>IOT (Internet of Things) device</a>.",
+                        "caption": "IOT"
+                    },
+                    "8": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Browser/'>web browser</a>.",
+                        "caption": "Browser"
+                    },
+                    "9": {
+                        "description": "A <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:Firewall/'>networking firewall</a>.",
+                        "caption": "Firewall"
+                    },
+                    "11": {
+                        "description": "A <a target='_blank' href='https://en.wikipedia.org/wiki/Ethernet_hub'>networking hub</a>.",
+                        "caption": "Hub"
+                    }
+                },
+                "description": "The network endpoint type ID.",
+                "requirement": "recommended",
+                "caption": "Type ID",
+                "type_name": "Integer",
+                "sibling": "type",
+                "_source": "network_endpoint"
+            }
+        },
+        {
+            "container": {
+                "profile": "container",
+                "type": "object_t",
+                "description": "The information describing an instance of a container. A container is a prepackaged, portable system image that runs isolated on an existing system using a container runtime like containerd.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Container",
+                "object_name": "Container",
+                "object_type": "container",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "hw_info": {
+                "type": "object_t",
+                "description": "The endpoint hardware information.",
+                "requirement": "optional",
+                "caption": "Hardware Info",
+                "object_name": "Device Hardware Info",
+                "object_type": "device_hw_info",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "instance_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of a VM instance.",
+                "requirement": "recommended",
+                "caption": "Instance ID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "interface_name": {
+                "type": "string_t",
+                "description": "The name of the network interface (e.g. eth2).",
+                "requirement": "recommended",
+                "caption": "Network Interface Name",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "interface_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the network interface.",
+                "requirement": "recommended",
+                "caption": "Network Interface ID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "intermediate_ips": {
+                "type": "ip_t",
+                "description": "The intermediate IP Addresses. For example, the IP addresses in the HTTP X-Forwarded-For header.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Intermediate IP Addresses",
+                "type_name": "IP Address",
+                "_source": "network_endpoint"
+            }
+        },
+        {
+            "namespace_pid": {
+                "profile": "container",
+                "type": "integer_t",
+                "description": "If running under a process namespace (such as in a container), the process identifier within that process namespace.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Namespace PID",
+                "type_name": "Integer",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "proxy_endpoint": {
+                "type": "object_t",
+                "description": "The network proxy information pertaining to a specific endpoint. This can be used to describe information pertaining to network address translation (NAT).",
+                "requirement": "optional",
+                "caption": "Proxy Endpoint",
+                "object_name": "Network Proxy Endpoint",
+                "object_type": "network_proxy",
+                "_source": "network_endpoint"
+            }
+        },
+        {
+            "subnet_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of a virtual subnet.",
+                "requirement": "optional",
+                "caption": "Subnet UID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "svc_name": {
+                "type": "string_t",
+                "description": "The service name in service-to-service connections. For example, AWS VPC logs the pkt-src-aws-service and pkt-dst-aws-service fields identify the connection is coming from or going to an AWS service.",
+                "requirement": "recommended",
+                "caption": "Service Name",
+                "type_name": "String",
+                "_source": "network_endpoint"
+            }
+        },
+        {
+            "vlan_uid": {
+                "type": "string_t",
+                "description": "The Virtual LAN identifier.",
+                "requirement": "optional",
+                "caption": "VLAN",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "vpc_uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the Virtual Private Cloud (VPC).",
+                "requirement": "optional",
+                "caption": "VPC UID",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        },
+        {
+            "zone": {
+                "type": "string_t",
+                "description": "The network zone or LAN segment.",
+                "requirement": "optional",
+                "caption": "Network Zone",
+                "type_name": "String",
+                "_source": "endpoint"
+            }
+        }
+    ],
+    "name": "network_proxy",
+    "description": "The network proxy endpoint object describes a proxy server, which acts as an intermediary between a client requesting a resource and the server providing that resource.  Defined by D3FEND <a target='_blank' href='https://d3fend.mitre.org/dao/artifact/d3f:ProxyServer/'>d3f:ProxyServer</a>.",
+    "extends": "network_endpoint",
+    "constraints": {
+        "at_least_one": [
+            "ip",
+            "uid",
+            "name",
+            "hostname",
+            "svc_name",
+            "instance_uid",
+            "interface_uid",
+            "interface_name"
+        ]
+    },
+    "profiles": [
+        "container"
+    ],
+    "caption": "Network Proxy Endpoint",
+    "observable": 20
+}

@@ -1,0 +1,86 @@
+{
+    "attributes": [
+        {
+            "process": {
+                "type": "object_t",
+                "description": "The process that initiated the activity.",
+                "requirement": "recommended",
+                "caption": "Process",
+                "object_name": "Process",
+                "object_type": "process",
+                "_source": "actor"
+            }
+        },
+        {
+            "session": {
+                "type": "object_t",
+                "description": "The user session from which the activity was initiated.",
+                "requirement": "optional",
+                "caption": "Session",
+                "object_name": "Session",
+                "object_type": "session",
+                "_source": "actor"
+            }
+        },
+        {
+            "user": {
+                "type": "object_t",
+                "description": "The user that initiated the activity or the user context from which the activity was initiated.",
+                "requirement": "recommended",
+                "caption": "User",
+                "object_name": "User",
+                "object_type": "user",
+                "_source": "actor"
+            }
+        },
+        {
+            "authorizations": {
+                "type": "object_t",
+                "description": "Provides details about an authorization, such as authorization outcome, and any associated policies related to the activity/event.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Authorization Information",
+                "object_name": "Authorization Result",
+                "object_type": "authorization",
+                "_source": "actor"
+            }
+        },
+        {
+            "idp": {
+                "type": "object_t",
+                "description": "This object describes details about the Identity Provider used.",
+                "requirement": "optional",
+                "caption": "Identity Provider",
+                "object_name": "Identity Provider",
+                "object_type": "idp",
+                "_source": "actor"
+            }
+        },
+        {
+            "invoked_by": {
+                "type": "string_t",
+                "description": "The name of the service that invoked the activity as described in the event.",
+                "requirement": "optional",
+                "caption": "Invoked by",
+                "type_name": "String",
+                "_source": "actor"
+            }
+        }
+    ],
+    "name": "actor",
+    "description": "The Actor object contains details about the user, role, or process that initiated or performed a specific activity.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "process",
+            "user",
+            "invoked_by",
+            "session"
+        ]
+    },
+    "profiles": [
+        "container",
+        "linux/linux_users"
+    ],
+    "caption": "Actor"
+}

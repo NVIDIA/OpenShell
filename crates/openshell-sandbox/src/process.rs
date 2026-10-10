@@ -66,6 +66,11 @@ impl ResolvedWorkspace {
     }
 }
 
+/// The sandbox launcher as the acting process of the Process Activity events it emits.
+pub(crate) fn ocsf_launcher_process() -> openshell_ocsf::Process {
+    openshell_ocsf::Process::new("openshell-sandbox", i64::from(std::process::id()))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -835,6 +840,7 @@ impl ProcessHandle {
                     .activity(openshell_ocsf::ActivityId::Close)
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Failure)
+                    .actor_process(ocsf_launcher_process())
                     .message(format!("Failed to send SIGTERM: {e}"))
                     .build()
             );

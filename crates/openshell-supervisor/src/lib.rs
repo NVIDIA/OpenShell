@@ -4290,6 +4290,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     }
 
     let interval = Duration::from_secs(ctx.interval_secs);
+    let mut reported_kept_native = openshell_ocsf::format::downgrade::kept_native_tally().0;
     loop {
         let result = if let Some(result) = pending_result.take() {
             result
@@ -4315,6 +4316,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
             }
         };
+        // Every poll, even when no configuration changed and the loop skips ahead.
+        report_ocsf_kept_native(&mut reported_kept_native, &ctx.ocsf_schema_version);
 
         // Reuse installed per-service credentials, rotating only when one is
         // missing or due. Rotation happens on the existing gateway channel and
@@ -4948,6 +4951,28 @@ fn apply_ocsf_schema_version_setting(
     }
 }
 
+/// Warn when OCSF events stayed at the native schema version since the last
+/// report because they cannot conform to the downgrade target. Returns whether
+/// it warned.
+fn report_ocsf_kept_native(reported: &mut u64, version: &std::sync::Mutex<String>) -> bool {
+    let (total, latest) = openshell_ocsf::format::downgrade::kept_native_tally();
+    if total <= *reported {
+        return false;
+    }
+    let target = version.lock().map(|v| v.clone()).unwrap_or_default();
+    let count = total - *reported;
+    let reason = latest.unwrap_or_default();
+    warn!(
+        count,
+        total,
+        ocsf_schema_version = %target,
+        "{count} OCSF events kept at native schema version {} for target {target}; latest reason: {reason}",
+        openshell_ocsf::OCSF_VERSION
+    );
+    *reported = total;
+    true
+}
+
 /// Extract a string value from an effective setting, if present.
 fn extract_string_setting(
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -5430,6 +5455,24 @@ mod tests {
         apply_ocsf_schema_version_setting(&version, &settings);
 
         assert_eq!(*version.lock().unwrap(), "1.3");
+    }
+
+    #[test]
+    fn ocsf_kept_native_report_advances_only_when_the_tally_grows() {
+        let version = std::sync::Mutex::new("1.1".to_string());
+        let mut reported = openshell_ocsf::format::downgrade::kept_native_tally().0;
+        let start = reported;
+        assert!(!report_ocsf_kept_native(&mut reported, &version));
+        assert_eq!(reported, start);
+
+        openshell_ocsf::format::downgrade::record_kept_native(
+            "http_response is required by OCSF 1.1.0",
+        );
+        assert!(report_ocsf_kept_native(&mut reported, &version));
+        assert!(reported > start);
+        let after = reported;
+        assert!(!report_ocsf_kept_native(&mut reported, &version));
+        assert_eq!(reported, after);
     }
 
     #[test]

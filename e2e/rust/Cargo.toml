@@ -115,6 +115,11 @@ path = "tests/podman_host_gateway.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "ocsf_jsonl_conformance"
+path = "tests/ocsf_jsonl_conformance.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "podman_corporate_proxy"
 path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
@@ -264,6 +269,7 @@ url = "2"
 nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
+openshell-ocsf = { path = "../../crates/openshell-ocsf", features = ["test-support"] }
 serial_test = "3"
 
 [lints.rust]

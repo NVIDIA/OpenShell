@@ -256,6 +256,7 @@ record its queue and writer:
 | `openshell_ocsf_log_queued_total` | Counter | None | Records queued for the file. |
 | `openshell_ocsf_log_written_total` | Counter | None | Records written to the file. |
 | `openshell_ocsf_log_dropped_total` | Counter | `reason` | Records discarded, by bounded reason. |
+| `openshell_ocsf_log_kept_native_total` | Counter | `class_uid`, `target` | Records written at the native OCSF version because they cannot conform to the configured `schema_version`. |
 | `openshell_ocsf_log_writer_errors_total` | Counter | None | Failed writes, reopens, and retention cleanups. |
 | `openshell_ocsf_log_recovery_discarded_bytes_total` | Counter | None | Bytes of an incomplete trailing line removed when the writer opens the file. |
 | `openshell_ocsf_log_queue_records` | Gauge | None | Records waiting to be written. |

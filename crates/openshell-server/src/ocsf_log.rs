@@ -9,7 +9,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use openshell_ocsf::{OcsfEvent, format::downgrade::downgrade_event};
+use openshell_ocsf::OcsfEvent;
+use openshell_ocsf::format::downgrade::{DowngradeOutcome, downgrade_event};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -166,7 +167,21 @@ fn serialize_event(
         return event.to_json_line().map(String::into_bytes);
     };
     let mut event = serde_json::to_value(event)?;
-    downgrade_event(&mut event, schema_version.as_str());
+    if let DowngradeOutcome::KeptNative { .. } =
+        downgrade_event(&mut event, schema_version.as_str())
+    {
+        let class_uid = event
+            .get("class_uid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .to_string();
+        metrics::counter!(
+            "openshell_ocsf_log_kept_native_total",
+            "class_uid" => class_uid,
+            "target" => schema_version.as_str()
+        )
+        .increment(1);
+    }
     let mut line = serde_json::to_vec(&event)?;
     line.push(b'\n');
     Ok(line)
@@ -498,11 +513,35 @@ mod tests {
 
         let event: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(event["metadata"]["version"], "1.3");
+        assert_eq!(event["metadata"]["version"], "1.3.0");
         assert_eq!(
             event["unmapped"]["downgraded_from"],
             openshell_ocsf::OCSF_VERSION
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_events_that_cannot_conform_stay_native() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let mut settings = config(&path);
+        settings.schema_version = Some(OcsfSchemaVersion::V1_1);
+        let log = OcsfLog::start(settings).unwrap();
+        // 1.1 requires an HTTP response; a request-only event cannot conform.
+        let event = openshell_ocsf::HttpActivityBuilder::new(&crate::gateway_ocsf::context("", ""))
+            .http_request(openshell_ocsf::HttpRequest::new(
+                "GET",
+                openshell_ocsf::Url::new("https", "api.example.com", "/", 443),
+            ))
+            .build();
+        let subscriber = tracing_subscriber::registry().with(log.layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        log.shutdown().await;
+
+        let event: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(event["metadata"]["version"], openshell_ocsf::OCSF_VERSION);
+        assert!(event.pointer("/unmapped/downgraded_from").is_none());
     }
 
     #[tokio::test]

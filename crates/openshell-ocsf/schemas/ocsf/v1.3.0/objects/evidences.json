@@ -1,0 +1,264 @@
+{
+    "attributes": [
+        {
+            "data": {
+                "type": "json_t",
+                "description": "Additional evidence data that is not accounted for in the specific evidence attributes.<code> Use only when absolutely necessary.</code>",
+                "requirement": "optional",
+                "caption": "Data",
+                "type_name": "JSON",
+                "_source": "evidences"
+            }
+        },
+        {
+            "process": {
+                "type": "object_t",
+                "description": "Describes details about the process associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Process",
+                "object_name": "Process",
+                "object_type": "process",
+                "_source": "evidences"
+            }
+        },
+        {
+            "file": {
+                "type": "object_t",
+                "description": "Describes details about the file associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "File",
+                "object_name": "File",
+                "object_type": "file",
+                "_source": "evidences"
+            }
+        },
+        {
+            "user": {
+                "type": "object_t",
+                "description": "Describes details about the user that was the target or somehow else associated with the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "User",
+                "object_name": "User",
+                "object_type": "user",
+                "_source": "evidences"
+            }
+        },
+        {
+            "device": {
+                "type": "object_t",
+                "description": "An addressable device, computer system or host associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Device",
+                "object_name": "Device",
+                "object_type": "device",
+                "_source": "evidences"
+            }
+        },
+        {
+            "query": {
+                "type": "object_t",
+                "description": "Describes details about the DNS query associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "DNS Query",
+                "object_name": "DNS Query",
+                "object_type": "dns_query",
+                "_source": "evidences"
+            }
+        },
+        {
+            "connection_info": {
+                "type": "object_t",
+                "description": "Describes details about the network connection associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Connection Info",
+                "object_name": "Network Connection Information",
+                "object_type": "network_connection_info",
+                "_source": "evidences"
+            }
+        },
+        {
+            "url": {
+                "type": "object_t",
+                "description": "The URL object that pertains to the event or object associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "URL",
+                "object_name": "Uniform Resource Locator",
+                "object_type": "url",
+                "_source": "evidences"
+            }
+        },
+        {
+            "email": {
+                "type": "object_t",
+                "description": "The email object associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Email",
+                "object_name": "Email",
+                "object_type": "email",
+                "_source": "evidences"
+            }
+        },
+        {
+            "api": {
+                "type": "object_t",
+                "description": "Describes details about the API call associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "API Details",
+                "object_name": "API",
+                "object_type": "api",
+                "_source": "evidences"
+            }
+        },
+        {
+            "actor": {
+                "type": "object_t",
+                "description": "Describes details about the user/role/process that was the source of the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Actor",
+                "object_name": "Actor",
+                "object_type": "actor",
+                "_source": "evidences"
+            }
+        },
+        {
+            "container": {
+                "type": "object_t",
+                "description": "Describes details about the container associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Container",
+                "object_name": "Container",
+                "object_type": "container",
+                "_source": "evidences"
+            }
+        },
+        {
+            "database": {
+                "type": "object_t",
+                "description": "Describes details about the database associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Database",
+                "object_name": "Database",
+                "object_type": "database",
+                "_source": "evidences"
+            }
+        },
+        {
+            "databucket": {
+                "type": "object_t",
+                "description": "Describes details about the databucket associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Databucket",
+                "object_name": "Databucket",
+                "object_type": "databucket",
+                "_source": "evidences"
+            }
+        },
+        {
+            "dst_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the destination of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Destination Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "job": {
+                "type": "object_t",
+                "description": "Describes details about the scheduled job that was associated with the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Job",
+                "object_name": "Job",
+                "object_type": "job",
+                "_source": "evidences"
+            }
+        },
+        {
+            "src_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the source of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Source Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "reg_key": {
+                "type": "object_t",
+                "description": "Describes details about the registry key that triggered the detection.",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Registry Key",
+                "object_name": "Registry Key",
+                "object_type": "win/reg_key",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        },
+        {
+            "reg_value": {
+                "type": "object_t",
+                "description": "Describes details about the registry value that triggered the detection.",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Registry Value",
+                "object_name": "Registry Value",
+                "object_type": "win/reg_value",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        },
+        {
+            "win_service": {
+                "type": "object_t",
+                "description": "Describes details about the Windows service that triggered the detection.",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Windows Service",
+                "object_name": "Windows Service",
+                "object_type": "win/win_service",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        }
+    ],
+    "name": "evidences",
+    "description": "A collection of evidence artifacts associated to the activity/activities that triggered a security detection.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "actor",
+            "api",
+            "connection_info",
+            "data",
+            "database",
+            "databucket",
+            "device",
+            "dst_endpoint",
+            "email",
+            "file",
+            "process",
+            "query",
+            "src_endpoint",
+            "url",
+            "user",
+            "job",
+            "reg_key",
+            "reg_value",
+            "win_service"
+        ]
+    },
+    "caption": "Evidence Artifacts",
+    "profiles": [
+        "data_classification",
+        "container",
+        "linux/linux_users"
+    ]
+}

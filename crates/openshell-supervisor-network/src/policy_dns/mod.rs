@@ -482,8 +482,11 @@ fn clamp_mapping_ttl(ttl: Duration) -> Duration {
 fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
     Endpoint {
         domain: Some(name.as_str().to_string()),
+        hostname: Some(name.as_str().to_string()),
         ip: None,
         port: None,
+        name: None,
+        svc_name: None,
     }
 }
 
@@ -984,7 +987,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         assert_eq!(
             serde_json::to_value(event).unwrap()["dst_endpoint"],
-            serde_json::json!({"domain": "blocked.invalid"})
+            serde_json::json!({"domain": "blocked.invalid", "hostname": "blocked.invalid"})
         );
     }
 
@@ -1364,7 +1367,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         assert_eq!(json["status_detail"], "policy_dns_upstream_nxdomain");
         assert_eq!(
             json["dst_endpoint"],
-            serde_json::json!({"domain": "db.example"})
+            serde_json::json!({"domain": "db.example", "hostname": "db.example"})
         );
         assert_eq!(json["unmapped"]["normalized_name"], "db.example");
         assert_eq!(json["unmapped"]["address_family"], "ipv4");
