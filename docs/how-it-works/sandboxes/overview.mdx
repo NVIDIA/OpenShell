@@ -933,6 +933,10 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
+
+For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

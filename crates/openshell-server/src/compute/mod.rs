@@ -1580,9 +1580,24 @@ impl ComputeRuntime {
             return Ok(current);
         }
         let automatic_restart = is_automatic_restart_transition(&current);
-        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) && !automatic_restart {
+        // Timeout cleanup owns reclamation while the record remains Error.
+        // Its later start may recreate missing compute; an ordinary stop must
+        // not replace that recovery state with Stopping or Stopped.
+        if phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current) {
+            return Err(Status::failed_precondition(
+                "sandbox provisioning timed out; retry start after timeout cleanup completes",
+            ));
+        }
+        // Error does not prove compute has stopped. Use the normal driver stop
+        // and session cleanup before a subsequent start renews authentication
+        // and repeats configuration admission for the retained sandbox.
+        if !matches!(
+            phase,
+            SandboxPhase::Ready | SandboxPhase::Stopping | SandboxPhase::Error
+        ) && !automatic_restart
+        {
             return Err(Status::failed_precondition(format!(
-                "sandbox must be Ready or in an automatic restart to stop (current phase: {phase:?})"
+                "sandbox must be Ready, Error, or in an automatic restart to stop (current phase: {phase:?})"
             )));
         }
 
@@ -1787,8 +1802,13 @@ impl ComputeRuntime {
             ) && !is_failed_main_process_result(&current)
                 && !provisioning_timeout
             {
+                let recovery_hint = if phase == SandboxPhase::Error {
+                    "; stop the sandbox before retrying start"
+                } else {
+                    ""
+                };
                 return Err(Status::failed_precondition(format!(
-                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
+                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?}){recovery_hint}"
                 )));
             }
             if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
@@ -7354,6 +7374,8 @@ pub fn new_test_runtime_with_driver(
 
 #[cfg(test)]
 mod tests {
+    mod error_recovery;
+
     use super::*;
     use futures::stream;
     use openshell_core::proto::compute::v1::{

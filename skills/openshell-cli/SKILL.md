@@ -509,6 +509,8 @@ sandbox, even under the same name, creates a different identity. See the
 [sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for verification behavior and release compatibility.
 
+For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop
