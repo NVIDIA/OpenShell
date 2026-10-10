@@ -76,8 +76,7 @@ fn format_path_line(query: &str, p: &crate::finding::ExfilPath) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render compact output (one-line-per-finding-line for demos and CI).
-/// Returns exit code: 0 = pass, 1 = any findings present.
-pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_path: &str) -> i32 {
+pub fn render_compact(findings: &[Finding]) {
     let active: Vec<&Finding> = findings.iter().filter(|f| !f.accepted).collect();
     let accepted: Vec<&Finding> = findings.iter().filter(|f| f.accepted).collect();
 
@@ -108,19 +107,17 @@ pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_pat
         format!(", {} accepted", accepted.len())
     };
 
-    let path_count: usize = active.iter().map(|f| f.paths.len()).sum();
-    if path_count > 0 {
-        println!(
-            "   {}  {path_count} finding path(s) require review{accepted_note}",
-            " REVIEW ".black().bold().on_yellow()
-        );
-        1
-    } else {
+    if active.is_empty() {
         println!(
             "   {}  no findings{accepted_note}",
             " PASS ".white().bold().on_green()
         );
-        0
+    } else {
+        println!(
+            "   {}  {} finding(s) require review{accepted_note}",
+            " REVIEW ".black().bold().on_yellow(),
+            active.len()
+        );
     }
 }
 
@@ -129,8 +126,7 @@ pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_pat
 // ---------------------------------------------------------------------------
 
 /// Render a full terminal report with finding panels.
-/// Returns exit code: 0 = pass, 1 = any findings present.
-pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: &str) -> i32 {
+pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: &str) {
     let policy_name = Path::new(policy_path)
         .file_name()
         .map_or("policy.yaml", |n| n.to_str().unwrap_or("policy.yaml"));
@@ -160,7 +156,7 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
 
     if active.is_empty() && accepted.is_empty() {
         println!("{}", "No findings. Policy posture is clean.".green().bold());
-        return 0;
+        return;
     }
 
     println!("{}", "Finding Summary".bold().underline());
@@ -207,26 +203,23 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
         }
     }
 
-    let path_count: usize = active.iter().map(|f| f.paths.len()).sum();
     let accepted_note = if accepted.is_empty() {
         String::new()
     } else {
         format!(" ({} accepted)", accepted.len())
     };
-    if path_count > 0 {
+    if active.is_empty() {
+        println!(
+            "{}{accepted_note}",
+            "PASS \u{2014} All findings accepted.".bold().green()
+        );
+    } else {
         println!(
             "{}{accepted_note}",
             "REVIEW \u{2014} prover findings require human attention."
                 .bold()
                 .yellow()
         );
-        1
-    } else {
-        println!(
-            "{}{accepted_note}",
-            "PASS \u{2014} All findings accepted.".bold().green()
-        );
-        0
     }
 }
 
