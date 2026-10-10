@@ -154,6 +154,14 @@ be reflected in later sandbox creates. On WSL2 all-only runtimes, the default
 can fall back to `nvidia.com/gpu=all`; that fallback counts as one selectable
 device.
 
+Podman uses the server's `host.discoveredDevices` CDI inventory and reports its
+`host.cdiSpecDirs` in gateway connection logs. An empty server inventory remains
+empty, including when Podman omits `discoveredDevices` but returns `cdiSpecDirs`.
+Servers that omit both fields use legacy discovery from local `/dev/nvidia<N>`
+and `/dev/dxg` paths. Inventory query failures fail the default GPU request;
+OpenShell retries discovery on subsequent requests. Automatic selection retains
+the NVIDIA GPU policy.
+
 Exact GPU device selection is driver-specific and still requires `--gpu`. For
 Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
 match the active driver; replace `docker` with `podman` when using Podman. CDI

@@ -3,7 +3,7 @@
 
 //! Podman compute driver.
 
-use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
+use crate::client::{ContainerListEntry, HostInfo, PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
@@ -141,7 +141,8 @@ pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
-    gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
+    #[cfg(test)]
+    gpu_inventory_refresh: Option<Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>>,
     lifecycle_event_fences: LifecycleEventFences,
 }
 
@@ -408,6 +409,26 @@ fn local_podman_gpu_selector_state() -> (CdiGpuInventory, bool) {
     )
 }
 
+fn podman_gpu_selector_state(
+    host: &HostInfo,
+    legacy_discovery: impl FnOnce() -> (CdiGpuInventory, bool),
+    allow_all_default_gpu: bool,
+) -> (CdiGpuInventory, bool) {
+    if host.cdi_spec_dirs.is_none() && host.discovered_devices.is_none() {
+        return legacy_discovery();
+    }
+    // New servers omit discoveredDevices when no devices were found. Never
+    // replace that authoritative empty inventory with guessed local devices.
+    let inventory = CdiGpuInventory::new(
+        host.discovered_devices
+            .iter()
+            .flatten()
+            .filter(|device| device.source == "cdi")
+            .map(|device| &device.id),
+    );
+    (inventory, allow_all_default_gpu)
+}
+
 fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
@@ -497,7 +518,7 @@ impl PodmanComputeDriver {
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        match client.system_info().await {
+        let (gpu_inventory, allow_all_default_gpu) = match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -517,15 +538,22 @@ impl PodmanComputeDriver {
                     rootless = info.host.security.rootless,
                     rootless_network_cmd = %info.host.rootless_network_cmd,
                     apparmor_enabled = info.host.security.apparmor_enabled,
+                    cdi_spec_dirs = ?info.host.cdi_spec_dirs,
                     "Connected to Podman"
                 );
+                let (inventory, allow_all) = podman_gpu_selector_state(
+                    &info.host,
+                    local_podman_gpu_selector_state,
+                    local_podman_all_gpu_default_supported(),
+                );
+                (inventory, allow_all)
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        }
+        };
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
@@ -552,11 +580,10 @@ impl PodmanComputeDriver {
         client.ensure_network(&config.network_name).await?;
         info!(network = %config.network_name, "Podman network ready");
 
-        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
         if !gpu_inventory.is_empty() {
             info!(
                 device_count = gpu_inventory.as_slice().len(),
-                "Discovered local Podman NVIDIA CDI GPU devices"
+                "Discovered Podman NVIDIA CDI GPU devices"
             );
         }
 
@@ -567,7 +594,8 @@ impl PodmanComputeDriver {
                 gpu_inventory,
                 allow_all_default_gpu,
             )),
-            gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
+            #[cfg(test)]
+            gpu_inventory_refresh: None,
             lifecycle_event_fences: LifecycleEventFences::default(),
         };
         let reconciler = driver.clone();
@@ -649,11 +677,13 @@ impl PodmanComputeDriver {
         driver_config.admit_mount_types(&self.config.resource_admission)?;
         Self::validate_gpu_request(gpu_requirements, &driver_config)?;
         self.validate_user_volume_mounts_available(sandbox).await?;
-        let _ = self.resolve_gpu_cdi_devices(
-            gpu_requirements,
-            &driver_config,
-            CdiGpuDefaultSelector::peek_device_ids,
-        )?;
+        let _ = self
+            .resolve_gpu_cdi_devices(
+                gpu_requirements,
+                &driver_config,
+                CdiGpuDefaultSelector::peek_device_ids,
+            )
+            .await?;
         Ok(ValidatedPodmanSandbox {
             driver_config,
             gpu_requirements,
@@ -678,12 +708,26 @@ impl PodmanComputeDriver {
         Ok(())
     }
 
-    fn refresh_gpu_inventory(&self) {
-        let (inventory, allow_all_default_gpu) = (self.gpu_inventory_refresh)();
+    async fn refresh_gpu_inventory(&self) -> Result<(), ComputeDriverError> {
+        #[cfg(test)]
+        if let Some(refresh) = &self.gpu_inventory_refresh {
+            let (inventory, allow_all) = refresh();
+            self.gpu_selector.refresh(inventory, allow_all);
+            return Ok(());
+        }
+        let info = self.client.system_info().await.map_err(|error| {
+            ComputeDriverError::Message(format!("failed to refresh Podman CDI inventory: {error}"))
+        })?;
+        let (inventory, allow_all_default_gpu) = podman_gpu_selector_state(
+            &info.host,
+            local_podman_gpu_selector_state,
+            local_podman_all_gpu_default_supported(),
+        );
         self.gpu_selector.refresh(inventory, allow_all_default_gpu);
+        Ok(())
     }
 
-    fn resolve_gpu_cdi_devices(
+    async fn resolve_gpu_cdi_devices(
         &self,
         gpu_requirements: Option<&GpuResourceRequirements>,
         driver_config: &PodmanSandboxDriverConfig,
@@ -708,7 +752,7 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
 
-        self.refresh_gpu_inventory();
+        self.refresh_gpu_inventory().await?;
         select_default_devices(&self.gpu_selector, count)
             .map(Some)
             .map_err(podman_gpu_selection_error)
@@ -1152,11 +1196,14 @@ impl PodmanComputeDriver {
         async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                let gpu_devices = match self.resolve_gpu_cdi_devices(
-                    validated.gpu_requirements,
-                    &validated.driver_config,
-                    CdiGpuDefaultSelector::next_device_ids,
-                ) {
+                let gpu_devices = match self
+                    .resolve_gpu_cdi_devices(
+                        validated.gpu_requirements,
+                        &validated.driver_config,
+                        CdiGpuDefaultSelector::next_device_ids,
+                    )
+                    .await
+                {
                     Ok(devices) => devices,
                     Err(e) => {
                         cleanup_created().await;
@@ -1854,9 +1901,9 @@ impl PodmanComputeDriver {
                 gpu_inventory,
                 allow_all_default_gpu,
             )),
-            gpu_inventory_refresh: Arc::new(move || {
+            gpu_inventory_refresh: Some(Arc::new(move || {
                 (refresh_inventory.clone(), allow_all_default_gpu)
-            }),
+            })),
             lifecycle_event_fences: LifecycleEventFences::default(),
         }
     }
@@ -2838,6 +2885,148 @@ mod tests {
             .expect("Unconfined does not require AppArmor support");
         validate_apparmor_support(None, false)
             .expect("an omitted profile preserves Podman's runtime behavior");
+    }
+
+    #[test]
+    fn podman_cdi_presence_controls_legacy_fallback() {
+        for (json, legacy) in [
+            ("{}", true),
+            (r#"{"cdiSpecDirs":[]}"#, false),
+            (r#"{"cdiSpecDirs":["/etc/cdi"]}"#, false),
+            (r#"{"discoveredDevices":[]}"#, false),
+        ] {
+            let host: HostInfo = serde_json::from_str(json).unwrap();
+            let (inventory, allow_all) = podman_gpu_selector_state(
+                &host,
+                || {
+                    assert!(legacy, "supported empty inventory must not scan /dev");
+                    (CdiGpuInventory::new([CDI_GPU_DEVICE_ALL]), true)
+                },
+                false,
+            );
+            assert_eq!(inventory.is_empty(), !legacy);
+            assert_eq!(allow_all, legacy);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_podman_info_refresh_uses_local_inventory() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "cdi-legacy",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"host":{"cgroupVersion":"v2"}}"#,
+            )],
+        );
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            socket_path: Some(socket),
+            ..PodmanComputeConfig::default()
+        });
+        driver.gpu_inventory_refresh = None;
+        driver.refresh_gpu_inventory().await.unwrap();
+        let (inventory, allow_all) = local_podman_gpu_selector_state();
+        assert_eq!(
+            driver.gpu_selector.peek_device_ids(1),
+            CdiGpuDefaultSelector::new(inventory, allow_all).peek_device_ids(1)
+        );
+        handle.await.unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec!["GET /v5.0.0/libpod/info"]);
+    }
+
+    #[test]
+    fn server_all_only_inventory_preserves_platform_selection_policy() {
+        let host: HostInfo = serde_json::from_str(r#"{"cdiSpecDirs":["/etc/cdi"],"discoveredDevices":[{"source":"cdi","id":"nvidia.com/gpu=all"}]}"#).unwrap();
+        for allow_all in [false, true] {
+            let (inventory, allowed) = podman_gpu_selector_state(
+                &host,
+                || panic!("unexpected legacy fallback"),
+                allow_all,
+            );
+            let selected = CdiGpuDefaultSelector::new(inventory, allowed).peek_device_ids(1);
+            assert_eq!(selected.is_ok(), allow_all);
+        }
+    }
+
+    #[tokio::test]
+    async fn podman_info_refreshes_default_gpu_selection_and_propagates_errors() {
+        let bodies = [
+            r#"{"host":{"cdiSpecDirs":["/etc/cdi"],"discoveredDevices":[{"source":"cdi","id":"nvidia.com/gpu=0"},{"source":"other","id":"nvidia.com/gpu=9"},{"source":"cdi","id":"example.com/gpu=test0"}]}}"#,
+            r#"{"host":{"cdiSpecDirs":["/var/run/cdi"],"discoveredDevices":[{"source":"cdi","id":"nvidia.com/gpu=2"}]}}"#,
+            r#"{"host":{"cdiSpecDirs":["/etc/cdi"]}}"#,
+            r#"{"host":{"cdiSpecDirs":[],"discoveredDevices":[]}}"#,
+        ];
+        let mut responses = bodies
+            .into_iter()
+            .map(|body| StubResponse::new(StatusCode::OK, body))
+            .collect::<Vec<_>>();
+        responses.push(StubResponse::new(
+            StatusCode::OK,
+            r#"{"host":{"discoveredDevices":[{"source":"cdi","id":"nvidia.com/gpu=3"}]}}"#,
+        ));
+        responses.push(StubResponse::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "info unavailable",
+        ));
+        responses.push(StubResponse::new(StatusCode::OK, "invalid json"));
+        let (socket, requests, handle) = spawn_podman_stub("cdi-info", responses);
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            socket_path: Some(socket),
+            ..PodmanComputeConfig::default()
+        });
+        driver.gpu_inventory_refresh = None;
+        let gpu = GpuResourceRequirements { count: Some(1) };
+        let config = PodmanSandboxDriverConfig::default();
+        // Preflight peeks at inventory; create refreshes and consumes selection.
+        let peek: fn(&CdiGpuDefaultSelector, u32) -> Result<Vec<String>, CdiGpuSelectionError> =
+            CdiGpuDefaultSelector::peek_device_ids;
+        for (selector, expected) in [
+            (peek, "nvidia.com/gpu=0"),
+            (CdiGpuDefaultSelector::next_device_ids, "nvidia.com/gpu=2"),
+        ] {
+            let selected = driver
+                .resolve_gpu_cdi_devices(Some(&gpu), &config, selector)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected, vec![expected.to_string()]);
+        }
+        for _ in 0..2 {
+            let error = driver
+                .resolve_gpu_cdi_devices(
+                    Some(&gpu),
+                    &config,
+                    CdiGpuDefaultSelector::peek_device_ids,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ComputeDriverError::Precondition(_)));
+        }
+        driver.refresh_gpu_inventory().await.unwrap();
+        for _ in 0..2 {
+            let error = driver
+                .resolve_gpu_cdi_devices(
+                    Some(&gpu),
+                    &config,
+                    CdiGpuDefaultSelector::peek_device_ids,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("failed to refresh Podman CDI inventory")
+            );
+            // A failed query does not mutate inventory or permit stale selection.
+            assert_eq!(
+                driver.gpu_selector.peek_device_ids(1).unwrap(),
+                vec!["nvidia.com/gpu=3"]
+            );
+        }
+        handle.await.unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["GET /v5.0.0/libpod/info"; 7]
+        );
     }
 
     #[test]

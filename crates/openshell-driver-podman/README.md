@@ -149,3 +149,21 @@ authenticated health signal.
 
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.
+
+## CDI GPU discovery
+
+The driver reads `host.cdiSpecDirs` and `host.discoveredDevices` from
+`GET /v5.0.0/libpod/info` during initialization and before each default GPU
+preflight or create selection. Only devices with `source: "cdi"` enter the CDI
+inventory. The shared GPU selector retains its NVIDIA class and count policy;
+collecting other CDI IDs does not add GPU workload support for other vendors.
+
+Presence of either CDI field means server discovery is authoritative. Podman
+can omit `discoveredDevices` when its inventory is empty while still reporting
+`cdiSpecDirs`; this yields an empty inventory rather than probing local devices.
+When both fields are absent, legacy discovery scans local `/dev/nvidia<N>`
+paths and retains the `/dev/dxg` all-device fallback. Spec directories are
+server paths for diagnostics, not directories to scan on the gateway host.
+Refresh API or decoding failures fail the default GPU request without updating
+the selector or selecting from stale inventory. Explicit CDI selectors continue
+to be validated and passed to Podman without inventory lookup.

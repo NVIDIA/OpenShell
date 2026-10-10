@@ -381,6 +381,7 @@ openshell status
 
 Common findings:
 
+- For default GPU discovery, inspect the server inventory with `podman info --format '{{json .Host}}'`. Check `cdiSpecDirs` and devices whose `source` is `cdi` in `discoveredDevices`; the directories belong to the Podman server. An omitted device list with present spec directories means no discovered devices. OpenShell refreshes info before default GPU validation and creation and fails that request if info cannot be queried. Only servers omitting both CDI fields use legacy local `/dev/nvidia<N>` and `/dev/dxg` discovery. Automatic GPU selection retains the NVIDIA class policy. Check generated specs in the reported server directories when devices are missing; later requests pick up spec changes.
 - Podman socket unavailable: start or expose the user socket.
 - Rootless networking unavailable: inspect Podman network configuration.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.

@@ -311,6 +311,11 @@ pub struct SystemInfo {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostInfo {
+    /// Presence marks servers that expose CDI discovery, including empty inventories.
+    #[serde(default)]
+    pub cdi_spec_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    pub discovered_devices: Option<Vec<DiscoveredDevice>>,
     #[serde(default)]
     pub cgroup_version: String,
     #[serde(default)]
@@ -319,6 +324,13 @@ pub struct HostInfo {
     pub rootless_network_cmd: String,
     #[serde(default)]
     pub security: SecurityInfo,
+}
+
+/// A device discovered by the Podman server, independent of GPU selection policy.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DiscoveredDevice {
+    pub source: String,
+    pub id: String,
 }
 
 /// Security-related fields from the Podman system info response.
@@ -1156,6 +1168,41 @@ mod tests {
         // Exactly at the limit should be accepted.
         let exact_name = "a".repeat(MAX_NAME_LEN);
         assert!(validate_name(&exact_name).is_ok());
+    }
+
+    #[tokio::test]
+    async fn system_info_retains_cdi_inventory_and_spec_directories() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "info-cdi",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"host":{"cdiSpecDirs":["/etc/cdi","/var/run/cdi"],"discoveredDevices":[{"source":"cdi","id":"example.com/gpu=test0"}]}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, r#"{"host":{"cdiSpecDirs":["/etc/cdi"]}}"#),
+                StubResponse::new(StatusCode::OK, r#"{"host":{}}"#),
+            ],
+        );
+        let client = PodmanClient::new(socket);
+        let host = client.system_info().await.unwrap().host;
+        assert_eq!(
+            host.cdi_spec_dirs.unwrap(),
+            vec!["/etc/cdi", "/var/run/cdi"]
+        );
+        let devices = host.discovered_devices.unwrap();
+        assert_eq!(devices[0].source, "cdi");
+        assert_eq!(devices[0].id, "example.com/gpu=test0");
+        let empty = client.system_info().await.unwrap().host;
+        assert!(empty.cdi_spec_dirs.is_some());
+        assert!(empty.discovered_devices.is_none());
+        let legacy = client.system_info().await.unwrap().host;
+        assert!(legacy.cdi_spec_dirs.is_none());
+        assert!(legacy.discovered_devices.is_none());
+        handle.await.unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["GET /v5.0.0/libpod/info"; 3]
+        );
     }
 
     #[test]
