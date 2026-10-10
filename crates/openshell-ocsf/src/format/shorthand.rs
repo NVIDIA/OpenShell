@@ -22,43 +22,6 @@ pub fn format_ts(time_ms: i64) -> String {
     }
 }
 
-/// Map a severity ID byte to its single-character shorthand.
-#[must_use]
-pub fn severity_char(severity_id: u8) -> char {
-    // Safe: we match on the raw u8 value
-    match severity_id {
-        1 => 'I',
-        2 => 'L',
-        3 => 'M',
-        4 => 'H',
-        5 => 'C',
-        6 => 'F',
-        _ => ' ',
-    }
-}
-
-/// Format the severity as a bracketed tag placed after the `CLASS:ACTIVITY`.
-///
-/// Placed as a suffix so the class name always starts at column 0, keeping
-/// logs vertically scannable:
-///
-/// ```text
-/// NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443
-/// NET:OPEN [MED] DENIED python3(42) -> blocked.com:443
-/// FINDING:BLOCKED [HIGH] "NSSH1 Nonce Replay Attack"
-/// ```
-#[must_use]
-pub fn severity_tag(severity_id: u8) -> &'static str {
-    match severity_id {
-        2 => "[LOW]",
-        3 => "[MED]",
-        4 => "[HIGH]",
-        5 => "[CRIT]",
-        6 => "[FATAL]",
-        _ => "[INFO]",
-    }
-}
-
 /// Max length for the reason text in `[reason:...]` before truncation. A
 /// denial reason carries the full destination endpoint plus the rejecting
 /// policy name (e.g. `endpoint host.example:443 not in policy <name>`), so the
@@ -195,11 +158,20 @@ fn message_tag(base: &BaseEventData) -> String {
 impl OcsfEvent {
     /// Produce the single-line shorthand for `openshell.log` and gRPC log push.
     ///
+    /// The severity tag follows `CLASS:ACTIVITY` so the class name always starts
+    /// at column 0, keeping logs vertically scannable:
+    ///
+    /// ```text
+    /// NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443
+    /// NET:OPEN [MED] DENIED python3(42) -> blocked.com:443
+    /// FINDING:BLOCKED [HIGH] "NSSH1 Nonce Replay Attack"
+    /// ```
+    ///
     /// This is a display-only projection — the full OCSF JSON is the source of truth.
     #[must_use]
     pub fn format_shorthand(&self) -> String {
         let base = self.base();
-        let sev = severity_tag(base.severity.as_u8());
+        let sev = base.severity.shorthand_tag();
 
         match self {
             Self::NetworkActivity(e) => {
@@ -589,17 +561,6 @@ mod tests {
 
         let ts = format_ts(i64::MIN);
         assert_eq!(ts, "??:??:??.???");
-    }
-
-    #[test]
-    fn test_severity_char_mapping() {
-        assert_eq!(severity_char(0), ' ');
-        assert_eq!(severity_char(1), 'I');
-        assert_eq!(severity_char(2), 'L');
-        assert_eq!(severity_char(3), 'M');
-        assert_eq!(severity_char(4), 'H');
-        assert_eq!(severity_char(5), 'C');
-        assert_eq!(severity_char(6), 'F');
     }
 
     #[test]
@@ -1257,6 +1218,28 @@ mod tests {
             shorthand,
             "EVENT [INFO] Network namespace created [ns:openshell-sandbox-abc123]"
         );
+    }
+
+    #[test]
+    fn test_shorthand_severity_tags() {
+        use crate::enums::SeverityId;
+
+        for (severity, tag) in [
+            (SeverityId::Unknown, "[UNKN]"),
+            (SeverityId::Informational, "[INFO]"),
+            (SeverityId::Low, "[LOW]"),
+            (SeverityId::Medium, "[MED]"),
+            (SeverityId::High, "[HIGH]"),
+            (SeverityId::Critical, "[CRIT]"),
+            (SeverityId::Fatal, "[FATAL]"),
+            (SeverityId::Other, "[UNKN]"),
+        ] {
+            let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+            b.severity = severity;
+            b.set_message("msg");
+            let event = OcsfEvent::Base(BaseEvent { base: b });
+            assert_eq!(event.format_shorthand(), format!("EVENT {tag} msg"));
+        }
     }
 
     #[test]
