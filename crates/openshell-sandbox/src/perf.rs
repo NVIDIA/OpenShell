@@ -10,9 +10,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::linux::workload_launcher;
 use anyhow::{Context as _, bail};
 use clap::ValueEnum;
-use openshell_isolation_interface::linux::workload_launcher;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
 
