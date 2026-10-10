@@ -8,15 +8,19 @@
 //! `Content-Length` when the output declares its length, chunked framing
 //! otherwise, or close-delimited framing where the client cannot use chunked
 //! framing. STREAM is offered only where the client can receive chunked
-//! framing, so a streamed body's truncation stays detectable. Every write
+//! framing, so a streamed body's truncation stays detectable.
+//!
+//! Until every stage has returned its terminal result, the relay holds back
+//! what would complete the response: the terminating chunk, the final byte of
+//! a declared length, or the whole head of a declared empty body. Every write
 //! first checks the policy generation.
 //!
 //! A failure before commit returns the canonical 403 or 502 response. After
-//! commit, delivery aborts: no terminating chunk, trailers, or error body,
-//! and the connection closes. STREAM has no total deadline, and upstream
-//! silence never fails a response. As for an uninspected response, an
-//! upstream body without framing ends when the upstream closes, or, except for
-//! server-sent events, after the relay's idle timeout.
+//! commit, delivery aborts: no terminating chunk, final byte, trailers, or
+//! error body, and the connection closes. STREAM has no total deadline, and
+//! upstream silence never fails a response. As for an uninspected response,
+//! an upstream body without framing ends when the upstream closes, or, except
+//! for server-sent events, after the relay's idle timeout.
 
 use openshell_core::proto::MiddlewareSessionEndReason;
 use openshell_supervisor_middleware::{
@@ -256,6 +260,7 @@ where
         generation_guard: middleware.generation_guard,
         framing: None,
         committed: false,
+        withheld: Vec::new(),
     };
     let relay = async {
         let feed = feed_response_body(
@@ -553,6 +558,8 @@ struct ResponseWriter<'c, 'a, C> {
     /// True once any byte reached the client: no canonical error response may
     /// follow.
     committed: bool,
+    /// Bytes that complete a declared-length response, held until `End`.
+    withheld: Vec<u8>,
 }
 
 impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
@@ -571,9 +578,11 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
             }
             (HttpBodyOutput::Chunk(data), Some(framing)) => self.chunk(framing, &data).await,
             (HttpBodyOutput::End { trailers }, Some(framing)) => match framing {
-                OutputFraming::ContentLength { remaining: 0 } | OutputFraming::CloseDelimited => {
-                    Ok(())
+                OutputFraming::ContentLength { remaining: 0 } => {
+                    let withheld = std::mem::take(&mut self.withheld);
+                    self.send(&withheld).await
                 }
+                OutputFraming::CloseDelimited => Ok(()),
                 OutputFraming::ContentLength { .. } => Err(BodyRelayError::Output(miette!(
                     "HTTP response middleware output is shorter than its declared length"
                 ))),
@@ -641,6 +650,11 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
             },
         );
         self.framing = Some(framing);
+        // The head alone completes an empty declared body.
+        if framing == (OutputFraming::ContentLength { remaining: 0 }) {
+            self.withheld = head;
+            return Ok(());
+        }
         self.send(&head).await?;
         self.flush().await
     }
@@ -658,6 +672,13 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
                     )));
                 };
                 self.framing = Some(OutputFraming::ContentLength { remaining });
+                // The final byte completes the body.
+                if remaining == 0
+                    && let Some((last, data)) = data.split_last()
+                {
+                    self.withheld = vec![*last];
+                    return self.send(data).await;
+                }
                 self.send(data).await
             }
             // An empty chunk would terminate the body.
@@ -673,6 +694,9 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
     }
 
     async fn send(&mut self, bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if let Some(guard) = self.generation_guard {
             guard
                 .ensure_current()

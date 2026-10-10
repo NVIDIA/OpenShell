@@ -406,13 +406,15 @@ message HttpInputEnd {
 }
 
 // Starts STREAM output. OpenShell commits the outgoing head when the last
-// stage in the chain starts output.
+// stage in the chain starts output, unless that output declares an empty body.
 message HttpOutputStart {
   // Late head mutations, applied after every preflight mutation.
   repeated HeaderMutation header_mutations = 1;
   // When present, the output is exactly this many bytes, and OpenShell frames
   // the outgoing message with Content-Length. Otherwise a streamed message is
-  // chunked.
+  // chunked. Until every stage finishes, OpenShell holds back what would
+  // complete the message: the terminating chunk, the final byte of a declared
+  // length, or the whole head of a declared empty body.
   optional uint64 output_body_bytes = 2;
 }
 
@@ -427,12 +429,12 @@ message HttpFinish {
   MiddlewareDiagnostics diagnostics = 2;
 }
 
-// Terminal denial at preflight or during body processing. Before a request
-// reaches the upstream or a response head reaches the sandbox, OpenShell
-// returns the canonical 403 middleware denial with the validated reason_code.
-// After a response head is committed, OpenShell aborts delivery without a
-// terminating chunk, trailers, or an error body. For uninspectable traffic,
-// OpenShell refuses the connection.
+// Terminal denial at preflight or during body processing. Until a response
+// head reaches the sandbox, OpenShell answers the sandbox with the canonical
+// 403 middleware denial with the validated reason_code. A message already
+// partly delivered stays incomplete: OpenShell withholds its terminating chunk
+// or final byte, trailers, and any error body, and closes that connection.
+// For uninspectable traffic, OpenShell refuses the connection.
 message HttpReject {
   MiddlewareDiagnostics diagnostics = 1;
 }

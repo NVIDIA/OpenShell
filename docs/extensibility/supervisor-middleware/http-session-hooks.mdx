@@ -85,6 +85,8 @@ Request output streams to the external service while the sandbox uploads, except
 
 A response uses `Content-Length` framing when its output declares a length, and chunked framing otherwise. OpenShell flushes every chunk of a server-sent events response.
 
+Until every stage returns its terminal result, OpenShell holds back what would complete the outgoing request or response: the terminating chunk, the final byte of a declared length, or the whole head of a declared empty body. A stage that rejects after its output started therefore never leaves the external service or the sandbox with a message that looks complete.
+
 ## Limits and Deadlines
 
 | Limit | Value |
@@ -109,8 +111,8 @@ Because HTTP session hook request middleware decides for itself, a policy can at
 
 The HTTP session hooks always fail closed, and `on_error` does not apply to them. A stage error, timeout, unknown or undecodable result, `UNIMPLEMENTED` status, invalid header mutation, oversized body, or lifecycle violation fails the message:
 
-- A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection.
-- A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without a terminating chunk or error body and records a high-severity finding.
+- A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection before the request body completes.
+- A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without completing the response or sending an error body, and records a high-severity finding.
 - An uninspectable connection is refused.
 
 The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP session hooks, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP session hooks still loads. Supervisors run its HTTP traffic fail-closed once they reach the service, and follow its `on_error` while they cannot.

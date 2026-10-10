@@ -798,6 +798,12 @@ where
             .deny_uninspected_credentials
             .then(|| ReservedMarkerStreamGuard::new(options.body_classifier));
         let mut fixed_length = None;
+        // Declared body bytes not yet written, and what would complete the
+        // request: its final byte, or the whole head of an empty body. They
+        // wait until every stage finishes, so the upstream never sees a
+        // complete request that a stage could still reject.
+        let mut remaining = 0u64;
+        let mut withheld = Vec::new();
         while let Some(event) = receiver.recv().await {
             match event {
                 HttpBodyOutput::Start {
@@ -814,6 +820,12 @@ where
                     let head = rewrite_http_header_block(&head, options.resolver)
                         .map_err(|error| LiveWriteError::Failed(miette::Report::new(error)))?
                         .rewritten;
+                    fixed_length = Some(output_body_bytes.is_some());
+                    remaining = output_body_bytes.unwrap_or_default();
+                    if output_body_bytes == Some(0) {
+                        withheld = head;
+                        continue;
+                    }
                     ensure_body_generation_current(options).map_err(LiveWriteError::Failed)?;
                     upstream_for_write
                         .write_all(&head)
@@ -825,21 +837,30 @@ where
                         .await
                         .into_diagnostic()
                         .map_err(LiveWriteError::Failed)?;
-                    fixed_length = Some(output_body_bytes.is_some());
                 }
                 HttpBodyOutput::Chunk(data) if fixed_length.is_some() => {
-                    let data = match scanner.as_mut() {
+                    let mut data = match scanner.as_mut() {
                         Some(scanner) => scanner
                             .push(&data)
                             .map_err(|error| LiveWriteError::Failed(error.into()))?,
                         None => data,
                     };
+                    if fixed_length == Some(true) && !data.is_empty() {
+                        remaining = remaining.checked_sub(data.len() as u64).ok_or_else(|| {
+                            LiveWriteError::Failed(miette!(
+                                "request middleware output exceeds its declared length"
+                            ))
+                        })?;
+                        if remaining == 0 {
+                            withheld = data.split_off(data.len() - 1);
+                        }
+                    }
                     write_live_bytes(upstream_for_write, &data, fixed_length, options)
                         .await
                         .map_err(LiveWriteError::Failed)?;
                 }
                 HttpBodyOutput::End { .. } if fixed_length.is_some() => {
-                    return Ok((scanner, fixed_length));
+                    return Ok((scanner, fixed_length, withheld));
                 }
                 _ => {
                     return Err(LiveWriteError::Failed(miette!(
@@ -851,13 +872,14 @@ where
         Err(LiveWriteError::OutputEnded)
     };
     let (finish, written): (Result<HttpPipelineFinish>, _) = tokio::join!(run, write);
-    let (finish, (scanner, fixed_length)) = match (finish, written) {
+    let (finish, (scanner, fixed_length, withheld)) = match (finish, written) {
         (_, Err(LiveWriteError::Failed(error))) | (Err(error), _) => return Err(error),
         (Ok(_), Err(LiveWriteError::OutputEnded)) => {
             return Err(miette!("request middleware output ended early"));
         }
         (Ok(finish), Ok(written)) => (finish, written),
     };
+    write_body_bytes(upstream, &withheld, options).await?;
     if let Some(scanner) = scanner {
         write_live_bytes(upstream, &scanner.finish()?, fixed_length, options).await?;
     }

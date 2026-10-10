@@ -7366,6 +7366,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_response_holds_back_completion_until_the_stage_finishes() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for (name, declared, reject, expected_end) in [
+            ("declared length, finished", Some(5), false, "\r\n\r\nhello"),
+            // The client sees a body one byte short of its declared length.
+            ("declared length, rejected", Some(5), true, "\r\n\r\nhell"),
+            ("chunked, finished", None, false, "4\r\nello\r\n0\r\n\r\n"),
+            // No terminating chunk follows a rejection.
+            ("chunked, rejected", None, true, "1\r\nh\r\n4\r\nello\r\n"),
+        ] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared,
+                reject,
+                gate: None,
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), !reject, "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{name}: {delivered}"
+            );
+            assert!(delivered.ends_with(expected_end), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_response_holds_the_head_of_an_empty_declared_body() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for reject in [false, true] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared: Some(0),
+                reject,
+                gate: None,
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            if reject {
+                // Nothing was committed, so the client gets the canonical
+                // denial.
+                assert!(
+                    delivered.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                    "{delivered}"
+                );
+                assert!(delivered.contains("middleware_denied"), "{delivered}");
+            } else {
+                assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
+                assert!(delivered.contains("Content-Length: 0\r\n"), "{delivered}");
+                assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn session_response_checks_the_policy_generation_before_every_write() {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
