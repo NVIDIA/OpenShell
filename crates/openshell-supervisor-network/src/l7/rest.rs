@@ -7191,6 +7191,244 @@ mod tests {
         assert!(delivered.is_empty());
     }
 
+    /// HTTP session hook response stage that streams its input back and
+    /// declares `declared` output bytes. A stage that declares an empty output
+    /// emits nothing. With `gate`, it waits after the first byte of each input
+    /// chunk. It rejects at `input_end` when `reject` is set.
+    struct SessionEchoStage {
+        declared: Option<u64>,
+        reject: bool,
+        gate: Option<ResponseBodyGate>,
+    }
+
+    async fn emit_session_result(
+        sender: &mpsc::Sender<
+            std::result::Result<openshell_core::proto::HttpResult, tonic::Status>,
+        >,
+        result: openshell_core::proto::http_result::Result,
+    ) -> bool {
+        sender
+            .send(Ok(openshell_core::proto::HttpResult {
+                result: Some(result),
+            }))
+            .await
+            .is_ok()
+    }
+
+    #[tonic::async_trait]
+    impl openshell_supervisor_middleware::InProcessMiddleware for SessionEchoStage {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/session-echo".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                }],
+                expected_audience: String::new(),
+                extension: Some(
+                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                        "openshell/test-session-echo",
+                        "test",
+                    ),
+                ),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_supervisor_middleware::HttpRequestView<'_>,
+        ) -> Result<HttpRequestResult> {
+            Err(miette!("HTTP session hook test stage"))
+        }
+
+        async fn open_http_response_session(
+            &self,
+            mut events: mpsc::Receiver<openshell_core::proto::HttpEvent>,
+        ) -> std::result::Result<openshell_supervisor_middleware::HttpResultStream, tonic::Status>
+        {
+            use openshell_core::proto::{
+                HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+                HttpReject, HttpStreamMode, MiddlewareDiagnostics, http_event, http_inspect,
+                http_preflight_result, http_result,
+            };
+            let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
+            let (sender, receiver) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    let sent = match event.event {
+                        Some(http_event::Event::Preflight(_)) => {
+                            emit_session_result(
+                                &sender,
+                                http_result::Result::PreflightResult(HttpPreflightResult {
+                                    decision: Some(http_preflight_result::Decision::Inspect(
+                                        HttpInspect {
+                                            mode: Some(http_inspect::Mode::Stream(
+                                                HttpStreamMode {},
+                                            )),
+                                        },
+                                    )),
+                                    ..Default::default()
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_event::Event::Begin(_)) => {
+                            emit_session_result(
+                                &sender,
+                                http_result::Result::OutputStart(HttpOutputStart {
+                                    header_mutations: Vec::new(),
+                                    output_body_bytes: declared,
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_event::Event::InputChunk(_)) if declared == Some(0) => true,
+                        Some(http_event::Event::InputChunk(chunk)) => {
+                            let (first, rest) = chunk.data.split_at(1);
+                            let mut sent = emit_session_result(
+                                &sender,
+                                http_result::Result::OutputChunk(HttpOutputChunk {
+                                    data: first.to_vec(),
+                                }),
+                            )
+                            .await;
+                            if let Some(gate) = &gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
+                            if sent && !rest.is_empty() {
+                                sent = emit_session_result(
+                                    &sender,
+                                    http_result::Result::OutputChunk(HttpOutputChunk {
+                                        data: rest.to_vec(),
+                                    }),
+                                )
+                                .await;
+                            }
+                            sent
+                        }
+                        Some(http_event::Event::InputEnd(_)) if reject => {
+                            emit_session_result(
+                                &sender,
+                                http_result::Result::Reject(HttpReject {
+                                    diagnostics: Some(MiddlewareDiagnostics {
+                                        reason_code: "late_match".into(),
+                                        ..Default::default()
+                                    }),
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_event::Event::InputEnd(_)) => {
+                            emit_session_result(
+                                &sender,
+                                http_result::Result::Finish(HttpFinish::default()),
+                            )
+                            .await
+                        }
+                        _ => break,
+                    };
+                    if !sent {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(ReceiverStream::new(receiver)))
+        }
+    }
+
+    fn session_echo_fixture(
+        stage: SessionEchoStage,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(stage));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/session-echo".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        (runner, chain)
+    }
+
+    #[tokio::test]
+    async fn session_response_checks_the_policy_generation_before_every_write() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            declared: None,
+            reject: false,
+            gate: Some(ResponseBodyGate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        });
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("initial generation guard");
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.generation_guard = Some(&guard);
+        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nAB".as_slice();
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let relay = async move {
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut client_write,
+                RelayResponseOptions::default(),
+                Some(middleware),
+            )
+            .await;
+            drop(client_write);
+            outcome
+        };
+        let client = async {
+            // The stage consumed the whole input, emitted `A`, and waits.
+            entered.notified().await;
+            let mut delivered = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !delivered.windows(6).any(|window| window == b"1\r\nA\r\n") {
+                let count = client_read.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "client closed before the first output chunk");
+                delivered.extend_from_slice(&buffer[..count]);
+            }
+            engine
+                .reload(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy reload");
+            release.notify_one();
+            client_read.read_to_end(&mut delivered).await.unwrap();
+            delivered
+        };
+        let (outcome, delivered) = tokio::join!(relay, client);
+
+        let error = outcome.expect_err("output after a policy reload must not be delivered");
+        assert!(
+            error.to_string().contains("policy generation is stale"),
+            "{error}"
+        );
+        assert!(
+            !delivered.windows(6).any(|window| window == b"1\r\nB\r\n"),
+            "{}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert!(!delivered.ends_with(b"0\r\n\r\n"));
+    }
+
     #[tokio::test]
     async fn response_middleware_whole_body_timeout_obeys_failure_policy() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";

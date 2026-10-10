@@ -8,7 +8,8 @@
 //! `Content-Length` when the output declares its length, chunked framing
 //! otherwise, or close-delimited framing where the client cannot use chunked
 //! framing. STREAM is offered only where the client can receive chunked
-//! framing, so a streamed body's truncation stays detectable.
+//! framing, so a streamed body's truncation stays detectable. Every write
+//! first checks the policy generation.
 //!
 //! A failure before commit returns the canonical 403 or 502 response. After
 //! commit, delivery aborts: no terminating chunk, trailers, or error body,
@@ -254,6 +255,7 @@ where
         connection_close: server_wants_close,
         generation_guard: middleware.generation_guard,
         framing: None,
+        committed: false,
     };
     let relay = async {
         let feed = feed_response_body(
@@ -330,7 +332,7 @@ where
             Err(error)
         }
     };
-    let committed = framing.is_some();
+    let committed = writer.committed;
     match failure {
         Err(error @ BodyRelayError::Downstream(_)) => Err(error.into_report()),
         Err(error) if committed => {
@@ -546,8 +548,11 @@ struct ResponseWriter<'c, 'a, C> {
     chunked: bool,
     connection_close: bool,
     generation_guard: Option<&'a PolicyGenerationGuard>,
-    /// Set once the head is committed.
+    /// Set on the output `Start`.
     framing: Option<OutputFraming>,
+    /// True once any byte reached the client: no canonical error response may
+    /// follow.
+    committed: bool,
 }
 
 impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
@@ -595,11 +600,6 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         output_body_bytes: Option<u64>,
         body_transformed: bool,
     ) -> std::result::Result<(), BodyRelayError> {
-        if let Some(guard) = self.generation_guard {
-            guard
-                .ensure_current()
-                .map_err(BodyRelayError::PolicyReload)?;
-        }
         // A changed body makes the upstream's representation validators
         // stale.
         let mut headers = self.headers.to_vec();
@@ -640,8 +640,6 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
                 &[]
             },
         );
-        // A partial write commits the response too: no canonical error
-        // response may follow any byte of this head.
         self.framing = Some(framing);
         self.send(&head).await?;
         self.flush().await
@@ -675,6 +673,13 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
     }
 
     async fn send(&mut self, bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
+        if let Some(guard) = self.generation_guard {
+            guard
+                .ensure_current()
+                .map_err(BodyRelayError::PolicyReload)?;
+        }
+        // A partial write commits the response too.
+        self.committed = true;
         self.client
             .write_all(bytes)
             .await
