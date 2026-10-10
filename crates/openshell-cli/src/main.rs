@@ -10,7 +10,6 @@ use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use openshell_cli::color::{self, ColorChoice, Colorize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -1581,6 +1580,11 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Attach non-secret annotations to the sandbox (key=value format,
+        /// repeatable). Values may contain `/`, spaces, and `=`.
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
 
         /// Set a non-secret environment variable in the sandbox.
         /// Do not use this option for API keys, tokens, or other secrets; create
@@ -3361,6 +3365,7 @@ async fn run_async() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    annotations,
                     envs,
                     no_credential_warnings,
                     approval_mode,
@@ -3385,18 +3390,9 @@ async fn run_async() -> Result<()> {
                         None // prompt or auto-detect
                     };
 
-                    // Parse --label flags into a HashMap<String, String>.
-                    let mut labels_map = HashMap::new();
-                    for label_str in &labels {
-                        let parts: Vec<&str> = label_str.splitn(2, '=').collect();
-                        if parts.len() != 2 {
-                            return Err(miette::miette!(
-                                "invalid label format '{}', expected key=value",
-                                label_str
-                            ));
-                        }
-                        labels_map.insert(parts[0].to_string(), parts[1].to_string());
-                    }
+                    // Parse --label and --annotation flags into maps.
+                    let labels_map = run::parse_key_value_pairs(&labels, "--label")?;
+                    let annotations_map = run::parse_key_value_pairs(&annotations, "--annotation")?;
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
@@ -3448,6 +3444,7 @@ async fn run_async() -> Result<()> {
                             tty_override,
                             auto_providers_override,
                             labels: labels_map,
+                            annotations: annotations_map,
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
@@ -6109,6 +6106,33 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_annotation_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--annotation",
+            "policy-source-file=/home/you/my policy.yaml",
+            "--annotation",
+            "owner=platform",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { annotations, .. }),
+                ..
+            }) => assert_eq!(
+                annotations,
+                vec![
+                    "policy-source-file=/home/you/my policy.yaml".to_string(),
+                    "owner=platform".to_string(),
+                ]
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }
 

@@ -416,6 +416,12 @@ openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
 ```
 
+Use `--annotation KEY=VALUE` for non-secret metadata that does not fit label limits, such as a file path. Annotation values can contain `/`, spaces, and `=`, and appear in the `annotations` field of `sandbox get -o json` and `sandbox list -o json`.
+
+```shell
+openshell sandbox create --annotation "policy-source-file=/home/you/policies/research policy.yaml" -- claude
+```
+
 The Python SDK accepts the same gateway labels and selectors. Labels passed to
 `create` are stored on the gateway sandbox object and are returned on
 `SandboxRef.labels`, so selector-based listing finds Python-created sandboxes:

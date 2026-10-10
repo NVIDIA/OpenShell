@@ -285,6 +285,7 @@ Key flags:
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--annotation KEY=VALUE`: Add non-secret metadata such as file paths (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default

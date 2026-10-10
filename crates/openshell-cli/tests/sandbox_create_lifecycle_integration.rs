@@ -2036,6 +2036,86 @@ async fn detached_ephemeral_command_delegates_cleanup_to_gateway() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_annotations() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let source = "/home/you/my policy.yaml=1".to_string();
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("annotated"),
+            keep: true,
+            command: &["echo".into(), "OK".into()],
+            annotations: HashMap::from([("policy-source-file".to_string(), source.clone())]),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    assert_eq!(
+        requests[0]
+            .annotations
+            .get("policy-source-file")
+            .map(String::as_str),
+        Some(source.as_str())
+    );
+    assert!(
+        !requests[0]
+            .annotations
+            .contains_key("openshell.nvidia.com/retention"),
+        "a kept sandbox must not be marked ephemeral"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_sandbox_create_keeps_annotations_and_retention() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("annotated-ephemeral"),
+            keep: false,
+            command: &["echo".into(), "OK".into()],
+            annotations: HashMap::from([("owner".to_string(), "platform".to_string())]),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let annotations = &create_requests(&server).await[0].annotations;
+    assert_eq!(
+        annotations.get("owner").map(String::as_str),
+        Some("platform")
+    );
+    assert_eq!(
+        annotations
+            .get("openshell.nvidia.com/retention")
+            .map(String::as_str),
+        Some("ephemeral")
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_sends_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();

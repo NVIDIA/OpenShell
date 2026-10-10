@@ -1073,6 +1073,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_key_value_pairs_keeps_slashes_spaces_and_equals() {
+        let items = vec!["source=/home/you/my policy.yaml?a=b".to_string()];
+        let map = parse_key_value_pairs(&items, "--annotation").expect("annotation should parse");
+        assert_eq!(
+            map.get("source").map(String::as_str),
+            Some("/home/you/my policy.yaml?a=b")
+        );
+    }
+
+    #[test]
+    fn parse_key_value_pairs_rejects_malformed_and_empty_keys() {
+        let err =
+            parse_key_value_pairs(&["nokey".to_string()], "--annotation").expect_err("missing '='");
+        assert!(err.to_string().contains("--annotation expects KEY=VALUE"));
+
+        let err =
+            parse_key_value_pairs(&["=value".to_string()], "--annotation").expect_err("empty key");
+        assert!(err.to_string().contains("--annotation key cannot be empty"));
+    }
+
+    #[test]
     fn parse_duration_to_ms_parses_supported_units() {
         assert_eq!(parse_duration_to_ms("30s").expect("parse"), 30_000);
         assert_eq!(parse_duration_to_ms("5m").expect("parse"), 300_000);
