@@ -49,6 +49,11 @@ function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefin
   return millis === 0n ? undefined : millis.toString();
 }
 
+function timestampEpochMs(timestamp: { seconds: bigint; nanos: number } | undefined): number | undefined {
+  const millis = timestampMillis(timestamp);
+  return millis ? Number(millis) : undefined;
+}
+
 // Generated protobuf message shapes that callers need to populate or round-trip
 // directly. Re-export these rather than re-curating parallel surfaces.
 export type {
@@ -225,6 +230,8 @@ export interface SandboxRef {
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
   restartCount: number;
+  /** Creation time in epoch milliseconds; absent when the gateway omits it. */
+  createdAtMs?: number;
   nextRestartAtMs?: number;
   mainProcessStartedAtMs?: number;
 }
@@ -529,8 +536,6 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
-  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
-  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -549,8 +554,9 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
       : undefined,
     serviceUrls,
     restartCount: sandbox.status?.restartCount ?? 0,
-    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
-    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
+    createdAtMs: timestampEpochMs(meta.createdTime),
+    nextRestartAtMs: timestampEpochMs(sandbox.status?.nextRestartTime),
+    mainProcessStartedAtMs: timestampEpochMs(sandbox.status?.mainProcessStartedTime),
   };
 }
 

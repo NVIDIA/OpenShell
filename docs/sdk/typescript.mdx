@@ -130,6 +130,9 @@ if (deletion.outcome === 'accepted') {
 }
 ```
 
+Sandbox refs returned by `create`, `get`, and `list` include `createdAtMs`, the
+creation time in epoch milliseconds. It is absent when the gateway omits it.
+
 `client.sandbox` also supports streaming and interactive exec, TCP forwarding,
 SSH sessions, sandbox provider attachment, configuration, and policy. Close
 operation-scoped streams and forwarding handles when finished. The root client

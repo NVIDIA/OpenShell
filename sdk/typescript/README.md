@@ -64,6 +64,8 @@ resolves to a different ID. Without that option, it waits for name absence,
 including any same-name replacement. Pass the same `workspace` to deletion and
 its wait when using a non-default workspace.
 
+Sandbox refs from `create`, `get`, and `list` carry `createdAtMs` (epoch milliseconds), absent when the gateway omits it.
+
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
 the client's lifetime. For long-running service automation, use the renewable
