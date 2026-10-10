@@ -29,7 +29,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
@@ -133,18 +133,16 @@ echo "==> Building libkrunfw with custom kernel config..."
 ensure_python3_with_pyelftools_for_libkrunfw
 
 if [ ! -d libkrunfw ]; then
-  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF:-HEAD})..."
+  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF})..."
   git clone https://github.com/libkrun/libkrunfw.git
 fi
 
 cd libkrunfw
 
 # Ensure we're on the pinned commit for reproducible builds
-if [ -n "${LIBKRUNFW_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
-  git fetch origin
-  git checkout "${LIBKRUNFW_REF}"
-fi
+echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
+git fetch origin
+git checkout "${LIBKRUNFW_REF}"
 
 # Copy custom kernel config fragment
 if [ -f "$KERNEL_CONFIG" ]; then
@@ -415,9 +413,6 @@ echo "==> Building libkrun..."
 ensure_cargo_for_libkrun
 ensure_libclang_for_libkrun
 
-# LIBKRUN_REF is sourced from pins.env (line 32); env-var override still works.
-LIBKRUN_REF="${LIBKRUN_REF:-227b2de6ed323fe180e02f871c5f325a90c13cc2}"
-
 if [ ! -d libkrun ]; then
   echo "    Cloning libkrun..."
   git clone https://github.com/libkrun/libkrun.git
@@ -425,11 +420,12 @@ fi
 
 cd libkrun
 
-if [ -n "${LIBKRUN_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUN_REF}"
-  git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
-  git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || true
-fi
+echo "    Checking out pinned ref: ${LIBKRUN_REF}"
+git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
+git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || {
+  echo "Error: could not check out LIBKRUN_REF=${LIBKRUN_REF} in $(pwd) (dirty tree or unknown ref?)" >&2
+  exit 1
+}
 
 echo "    Building libkrun with NET=1 BLK=1..."
 cargo build --release --features blk --features net --target-dir="$(pwd)/target"
