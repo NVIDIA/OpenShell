@@ -3074,14 +3074,84 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
 
 #[test]
 fn docker_supervisor_defaults_to_the_primary_loopback_endpoint() {
+    let network = DockerSupervisorNetwork::GatewayLoopback;
     assert_eq!(
-        default_docker_supervisor_grpc_endpoint(17_670, false),
+        default_docker_supervisor_grpc_endpoint(17_670, false, network),
         "http://127.0.0.1:17670"
     );
     assert_eq!(
-        default_docker_supervisor_grpc_endpoint(17_670, true),
+        default_docker_supervisor_grpc_endpoint(17_670, true, network),
         "https://127.0.0.1:17670"
     );
+}
+
+#[test]
+fn docker_supervisor_reaches_wsl_gateway_through_docker_desktop_host_alias() {
+    let network = DockerSupervisorNetwork::WslDockerDesktop;
+    assert_eq!(
+        default_docker_supervisor_grpc_endpoint(17_670, true, network),
+        "https://host.docker.internal:17670"
+    );
+    // A named endpoint is resolved by Docker Desktop, not pinned by the driver.
+    assert_eq!(
+        docker_supervisor_host_aliases("https://host.docker.internal:17670"),
+        None
+    );
+}
+
+fn docker_desktop_wsl2_info() -> SystemInfo {
+    SystemInfo {
+        kernel_version: Some("6.6.87.2-microsoft-standard-WSL2".to_string()),
+        operating_system: Some("Docker Desktop".to_string()),
+        name: Some("docker-desktop".to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn docker_supervisor_network_uses_host_alias_for_wsl_gateway_on_docker_desktop() {
+    assert_eq!(
+        DockerSupervisorNetwork::detect(&docker_desktop_wsl2_info(), true),
+        DockerSupervisorNetwork::WslDockerDesktop
+    );
+    // Docker Desktop 4.71 on WSL 2 reports a variant suffix.
+    let containerized = SystemInfo {
+        operating_system: Some("Docker Desktop (containerized)".to_string()),
+        ..docker_desktop_wsl2_info()
+    };
+    assert_eq!(
+        DockerSupervisorNetwork::detect(&containerized, true),
+        DockerSupervisorNetwork::WslDockerDesktop
+    );
+}
+
+#[test]
+fn docker_supervisor_network_keeps_loopback_for_docker_desktop_outside_wsl() {
+    // macOS and Windows-native gateways share Docker Desktop's host network.
+    assert_eq!(
+        DockerSupervisorNetwork::detect(&docker_desktop_wsl2_info(), false),
+        DockerSupervisorNetwork::GatewayLoopback
+    );
+}
+
+#[test]
+fn docker_supervisor_network_keeps_loopback_for_docker_engine_inside_wsl() {
+    let info = SystemInfo {
+        kernel_version: Some("6.6.87.2-microsoft-standard-WSL2".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        DockerSupervisorNetwork::detect(&info, true),
+        DockerSupervisorNetwork::GatewayLoopback
+    );
+}
+
+#[test]
+fn kernel_release_detects_wsl() {
+    assert!(kernel_release_is_wsl("6.18.40.1-microsoft-standard-WSL2\n"));
+    assert!(kernel_release_is_wsl("4.4.0-19041-Microsoft"));
+    assert!(!kernel_release_is_wsl("6.8.0-60-generic"));
 }
 
 #[test]

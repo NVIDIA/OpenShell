@@ -891,9 +891,16 @@ impl DockerComputeDriver {
         let gateway_port = gateway_bind_address.port();
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
+            let network = DockerSupervisorNetwork::detect(&info, gateway_host_is_wsl());
             docker_config.grpc_endpoint = default_docker_supervisor_grpc_endpoint(
                 gateway_port,
                 docker_guest_tls_configured(&docker_config),
+                network,
+            );
+            info!(
+                grpc_endpoint = %docker_config.grpc_endpoint,
+                ?network,
+                "Auto-detected Docker supervisor gRPC endpoint"
             );
         }
         Url::parse(&docker_config.grpc_endpoint).map_err(|error| {
@@ -6551,9 +6558,67 @@ fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
     docker_config.guest_tls_ca.is_some()
 }
 
-fn default_docker_supervisor_grpc_endpoint(gateway_port: u16, tls: bool) -> String {
+/// Where the host-networked supervisor container can reach a gateway that
+/// listens on loopback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockerSupervisorNetwork {
+    /// The container host network shares the gateway's loopback: Docker
+    /// Engine on the gateway host, or Docker Desktop with host networking
+    /// on the machine that runs the gateway.
+    GatewayLoopback,
+    /// The gateway runs inside a WSL 2 distribution and the daemon is Docker
+    /// Desktop. Docker Desktop's host network is its own VM, not the
+    /// distribution, so loopback does not reach the gateway. WSL forwards
+    /// the gateway's loopback listener to Windows, which Docker Desktop
+    /// exposes to containers as `host.docker.internal`.
+    WslDockerDesktop,
+}
+
+impl DockerSupervisorNetwork {
+    fn detect(info: &SystemInfo, gateway_in_wsl: bool) -> Self {
+        if gateway_in_wsl && docker_info_reports_docker_desktop(info) {
+            Self::WslDockerDesktop
+        } else {
+            Self::GatewayLoopback
+        }
+    }
+
+    fn gateway_host(self) -> &'static str {
+        match self {
+            Self::GatewayLoopback => "127.0.0.1",
+            Self::WslDockerDesktop => HOST_DOCKER_INTERNAL,
+        }
+    }
+}
+
+fn default_docker_supervisor_grpc_endpoint(
+    gateway_port: u16,
+    tls: bool,
+    network: DockerSupervisorNetwork,
+) -> String {
     let scheme = if tls { "https" } else { "http" };
-    format!("{scheme}://127.0.0.1:{gateway_port}")
+    let host = network.gateway_host();
+    format!("{scheme}://{host}:{gateway_port}")
+}
+
+/// Docker Desktop reports `OperatingSystem` as `Docker Desktop`, or with a
+/// variant suffix such as `Docker Desktop (containerized)` (4.71, WSL 2).
+fn docker_info_reports_docker_desktop(info: &SystemInfo) -> bool {
+    info.operating_system
+        .as_deref()
+        .is_some_and(|os| os.trim().to_ascii_lowercase().starts_with("docker desktop"))
+}
+
+/// Whether the gateway process itself runs inside WSL. This is about the
+/// gateway host, not the daemon: Docker Engine installed inside a WSL
+/// distribution shares the gateway's loopback and needs no alias.
+fn gateway_host_is_wsl() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|release| kernel_release_is_wsl(&release))
+}
+
+fn kernel_release_is_wsl(release: &str) -> bool {
+    release.to_ascii_lowercase().contains("microsoft")
 }
 
 pub(crate) fn docker_guest_tls_paths(
