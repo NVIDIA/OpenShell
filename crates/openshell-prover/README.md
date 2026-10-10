@@ -189,8 +189,9 @@ See `src/model.rs`. Briefly:
 - Bool sorts per `(binary, endpoint)` pair encode policy reachability,
   filtered by binary capability flags (`can_exfiltrate`,
   `bypasses_l7`).
-- Bool sorts per `(binary, host)` encode credential-in-scope (one
-  credential set per sandbox).
+- Credential scope is not encoded in the solver;
+  `queries::check_credential_safety` checks it against the
+  `CredentialSet` directly.
 - The reachability formula composes these into the SAT query the
   `queries::check_credential_safety` loop iterates over.
 
