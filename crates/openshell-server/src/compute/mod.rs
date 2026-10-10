@@ -2322,7 +2322,7 @@ impl ComputeRuntime {
             .await
             .unwrap_or_else(|error| {
                 warn!(sandbox_id, %error, "Failed to resolve supervisor owner during lifecycle reconciliation");
-                self.supervisor_sessions.has_session(&sandbox_id)
+                self.supervisor_sessions.is_runtime_ready(&sandbox_id)
             });
         match self
             .store
@@ -2861,7 +2861,7 @@ impl ComputeRuntime {
                     .await
                     .unwrap_or_else(|error| {
                         warn!(sandbox_id, %error, "Failed to resolve supervisor owner during delete recovery");
-                        self.supervisor_sessions.has_session(sandbox_id)
+                        self.supervisor_sessions.is_runtime_ready(sandbox_id)
                     });
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
@@ -4813,7 +4813,8 @@ impl ComputeRuntime {
 
         // Ownership can move while the CAS above is in flight. Restore Ready
         // from the new owner's supervisor instance before releasing the local
-        // synchronization boundary.
+        // synchronization boundary, but only once that instance has reported
+        // runtime readiness.
         if let Some(instance_id) = self
             .supervisor_session_owner_instance_id(sandbox_id)
             .await?
@@ -4823,6 +4824,12 @@ impl ComputeRuntime {
                 .get_message::<Sandbox>(sandbox_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            if !existing
+                .as_ref()
+                .is_some_and(|sandbox| runtime_ready_instance(sandbox, &instance_id))
+            {
+                return Ok(());
+            }
             self.set_supervisor_session_state_from_snapshot(
                 sandbox_id,
                 SupervisorSessionStateUpdate::Connected {
@@ -4841,10 +4848,21 @@ impl ComputeRuntime {
         if self.supervisor_sessions.has_session(sandbox_id) {
             return Ok(self.supervisor_sessions.is_runtime_ready(sandbox_id));
         }
-        Ok(self
+        // A replica publishes ownership when it accepts a session, before
+        // admission and workload start. The owner's instance is ready only
+        // once it has durably reported runtime readiness.
+        let Some(instance_id) = self
             .supervisor_session_owner_instance_id(sandbox_id)
             .await?
-            .is_some())
+        else {
+            return Ok(false);
+        };
+        let sandbox = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(sandbox.is_some_and(|sandbox| runtime_ready_instance(&sandbox, &instance_id)))
     }
 
     async fn supervisor_session_owner_instance_id(
@@ -5989,6 +6007,16 @@ fn set_next_restart_at_ms(status: &mut SandboxStatus, millis: i64) {
     status.next_restart_time = (millis > 0)
         .then(|| openshell_core::time::timestamp_from_millis(millis).ok())
         .flatten();
+}
+
+/// Whether supervisor `instance_id` durably reported runtime readiness, which
+/// records it as the main process instance.
+fn runtime_ready_instance(sandbox: &Sandbox, instance_id: &str) -> bool {
+    !instance_id.is_empty()
+        && sandbox
+            .status
+            .as_ref()
+            .is_some_and(|status| status.main_process_instance_id == instance_id)
 }
 
 fn main_process_started_at_ms(status: &SandboxStatus) -> i64 {
@@ -14483,30 +14511,127 @@ mod tests {
         assert_eq!(ready.message, "Supervisor session disconnected");
     }
 
-    #[tokio::test]
-    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        runtime.store.put_message(&sandbox).await.unwrap();
-
+    async fn publish_remote_owner(runtime: &ComputeRuntime, supervisor_instance_id: &str) {
         SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
             .publish(
                 "sb-1",
                 "replacement-session",
-                "supervisor-instance",
+                supervisor_instance_id,
                 2,
                 "gateway-b",
                 "http://gateway-b:8080",
             )
             .await
             .unwrap();
+    }
+
+    fn with_main_process_instance(mut sandbox: Sandbox, instance_id: &str) -> Sandbox {
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .main_process_instance_id = instance_id.to_string();
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = with_main_process_instance(
+            sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready),
+            "supervisor-instance",
+        );
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        publish_remote_owner(&runtime, "supervisor-instance").await;
 
         runtime
             .supervisor_session_disconnected("sb-1", false)
             .await
             .unwrap();
 
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_does_not_restore_ready_for_a_remote_owner_still_starting() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = with_main_process_instance(
+            sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready),
+            "previous-instance",
+        );
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        // The replacement supervisor owns a session on another replica but
+        // has not reported runtime readiness.
+        publish_remote_owner(&runtime, "starting-instance").await;
+        assert!(!runtime.supervisor_session_ready("sb-1").await.unwrap());
+
+        runtime
+            .supervisor_session_disconnected("sb-1", false)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert_eq!(
+            stored.status.unwrap().main_process_instance_id,
+            "previous-instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_owner_is_ready_only_after_its_instance_reports_readiness() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        publish_remote_owner(&runtime, "supervisor-instance").await;
+        let driver_update = || DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "sandbox-a".to_string(),
+            namespace: "default".to_string(),
+            workspace: String::new(),
+            spec: None,
+            status: Some(make_ready_driver_status()),
+        };
+
+        runtime.apply_sandbox_update(driver_update()).await.unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning,
+            "a fresh owner record alone is not runtime readiness"
+        );
+
+        runtime
+            .store
+            .put_message(&with_main_process_instance(stored, "supervisor-instance"))
+            .await
+            .unwrap();
+        runtime.apply_sandbox_update(driver_update()).await.unwrap();
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")

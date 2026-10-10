@@ -563,7 +563,7 @@ pub fn spawn_with_readiness(
         session_id_updates: runtime.session_id_updates,
         config_apply_tx: runtime.config_apply_tx,
         ready_tx,
-        runtime_ready: Arc::new(AtomicBool::new(true)),
+        runtime_ready: watch::channel(true).0,
         config_push_updates: None,
     };
     (tokio::spawn(run_session_loop(config, None)), ready_rx)
@@ -660,12 +660,10 @@ pub fn spawn_prepared(
 ) -> (
     tokio::task::JoinHandle<()>,
     watch::Receiver<bool>,
-    mpsc::Sender<SupervisorMessage>,
-    Arc<AtomicBool>,
+    watch::Sender<bool>,
 ) {
     let (ready_tx, ready_rx) = watch::channel(false);
-    let outbound = prepared.tx.clone();
-    let runtime_ready = Arc::new(AtomicBool::new(false));
+    let runtime_ready = watch::channel(false).0;
     let config = SessionConfig {
         endpoint: prepared.endpoint.clone(),
         sandbox_id: prepared.sandbox_id.clone(),
@@ -681,7 +679,7 @@ pub fn spawn_prepared(
         config_push_updates: Some(config_push_updates),
     };
     let task = tokio::spawn(run_session_loop(config, Some((prepared, bootstrap_result))));
-    (task, ready_rx, outbound, runtime_ready)
+    (task, ready_rx, runtime_ready)
 }
 
 struct SessionConfig {
@@ -696,7 +694,9 @@ struct SessionConfig {
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
     ready_tx: watch::Sender<bool>,
-    runtime_ready: Arc<AtomicBool>,
+    /// Becomes true once the workload and relay plane are usable. Whichever
+    /// session is current reports it, so readiness survives a reconnect.
+    runtime_ready: watch::Sender<bool>,
     /// Publishes whether the current session delivers configuration
     /// authoritatively, so a stream-started runtime resumes polling when a
     /// reconnect lands on a gateway that does not enable config push.
@@ -870,6 +870,7 @@ async fn run_single_session(
     redirected: bool,
     connection_epoch: u64,
 ) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let workload_pending = !*config.runtime_ready.borrow();
     let opened = open_session(
         config.endpoint.clone(),
         target.to_string(),
@@ -877,7 +878,7 @@ async fn run_single_session(
         config.sandbox_id.clone(),
         config.instance_id.clone(),
         connection_epoch,
-        !config.runtime_ready.load(Ordering::Acquire),
+        workload_pending,
         None,
         None,
     )
@@ -1131,20 +1132,15 @@ async fn run_prepared_session(
     if let Some(updates) = &config.config_push_updates {
         updates.send_replace(prepared.config_push_enabled);
     }
+    let mut readiness = SessionReadiness::new(
+        &config.runtime_ready,
+        prepared.config_push_enabled,
+        prepared.workload_pending,
+    );
     if !prepared.config_push_enabled {
         config.ready_tx.send_replace(true);
-        // Without streamed admission the gateway learns readiness only from
-        // this report. A hello that reported the workload running was already
-        // ready on accept; one sent while it was pending needs the report if
-        // the workload started before the session was accepted.
-        if prepared.workload_pending && config.runtime_ready.load(Ordering::Acquire) {
-            tx.send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::RuntimeReady(
-                    openshell_core::proto::SupervisorRuntimeReady {},
-                )),
-            })
-            .await
-            .map_err(|_| "failed to queue runtime readiness")?;
+        if readiness.due() {
+            send_runtime_ready(&tx).await?;
         }
     }
 
@@ -1185,12 +1181,15 @@ async fn run_prepared_session(
                     terminating: &config.terminating,
                     config_apply_tx,
                     ready_tx: &config.ready_tx,
-                    runtime_ready: &config.runtime_ready,
                 };
-                handle_gateway_message(
-                    &msg,
-                    &context,
-                );
+                if handle_gateway_message(&msg, &context) && readiness.admit() {
+                    send_runtime_ready(&tx).await?;
+                }
+            }
+            Ok(()) = readiness.runtime_ready.changed() => {
+                if readiness.due() {
+                    send_runtime_ready(&tx).await?;
+                }
             }
             _ = heartbeat_interval.tick() => {
                 let hb = SupervisorMessage {
@@ -1319,7 +1318,6 @@ struct GatewayMessageContext<'a> {
     terminating: &'a Arc<AtomicBool>,
     config_apply_tx: Option<&'a mpsc::Sender<ConfigApplyRequest>>,
     ready_tx: &'a watch::Sender<bool>,
-    runtime_ready: &'a Arc<AtomicBool>,
 }
 
 fn update_session_readiness(accepted: bool, ready_tx: &watch::Sender<bool>) {
@@ -1328,7 +1326,57 @@ fn update_session_readiness(accepted: bool, ready_tx: &watch::Sender<bool>) {
     }
 }
 
-fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
+/// When one session reports workload readiness to the gateway.
+///
+/// A push session reports it after the gateway accepts its configuration
+/// admission. A polling session is admitted on accept, and reports only if
+/// its hello saw the workload pending; one that saw it running was ready on
+/// accept.
+struct SessionReadiness {
+    runtime_ready: watch::Receiver<bool>,
+    reports: bool,
+    admitted: bool,
+}
+
+impl SessionReadiness {
+    fn new(
+        runtime_ready: &watch::Sender<bool>,
+        config_push_enabled: bool,
+        workload_pending: bool,
+    ) -> Self {
+        Self {
+            runtime_ready: runtime_ready.subscribe(),
+            reports: config_push_enabled || workload_pending,
+            admitted: !config_push_enabled,
+        }
+    }
+
+    /// The gateway accepted this session's admission. Returns whether to
+    /// report readiness now.
+    fn admit(&mut self) -> bool {
+        self.admitted = true;
+        self.due()
+    }
+
+    /// Whether this session should report readiness now.
+    fn due(&mut self) -> bool {
+        self.admitted && self.reports && *self.runtime_ready.borrow_and_update()
+    }
+}
+
+async fn send_runtime_ready(tx: &mpsc::Sender<SupervisorMessage>) -> Result<(), SessionError> {
+    tx.send(SupervisorMessage {
+        payload: Some(supervisor_message::Payload::RuntimeReady(
+            openshell_core::proto::SupervisorRuntimeReady {},
+        )),
+    })
+    .await
+    .map_err(|_| "failed to queue runtime readiness".into())
+}
+
+/// Handle one gateway message. Returns true when it accepted this session's
+/// configuration admission.
+fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) -> bool {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
@@ -1336,18 +1384,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         Some(gateway_message::Payload::ConfigurationAdmission(admission)) => {
             let accepted = admission.state == i32::from(ConfigurationAdmissionState::Accepted);
             update_session_readiness(accepted, context.ready_tx);
-            if accepted && context.runtime_ready.load(Ordering::Acquire) {
-                let tx = context.tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(SupervisorMessage {
-                            payload: Some(supervisor_message::Payload::RuntimeReady(
-                                openshell_core::proto::SupervisorRuntimeReady {},
-                            )),
-                        })
-                        .await;
-                });
-            }
+            return accepted;
         }
         Some(gateway_message::Payload::ConfigUpdate(update)) => {
             let Some(apply_tx) = context.config_apply_tx.cloned() else {
@@ -1355,7 +1392,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                     sandbox_id = %context.sandbox_id,
                     "supervisor session: ignored configuration update on a session without config push"
                 );
-                return;
+                return false;
             };
             let update = update.clone();
             let tx = context.tx.clone();
@@ -1453,6 +1490,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             warn!(sandbox_id = %context.sandbox_id, "supervisor session: unexpected gateway message");
         }
     }
+    false
 }
 
 /// Handle a `RelayOpen` by initiating a `RelayStream` RPC on the gateway and
@@ -1803,6 +1841,37 @@ mod target_tests {
 
         update_session_readiness(false, &ready_tx);
         assert!(*ready_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_reaches_the_session_current_when_it_is_reported() {
+        let runtime_ready = watch::channel(false).0;
+        let mut first = SessionReadiness::new(&runtime_ready, true, true);
+        assert!(!first.admit(), "admission alone does not report readiness");
+        drop(first);
+
+        // The reconnected session is admitted before the workload is ready,
+        // then observes readiness itself.
+        let mut reconnect = SessionReadiness::new(&runtime_ready, true, true);
+        assert!(!reconnect.admit());
+        runtime_ready.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), reconnect.runtime_ready.changed())
+            .await
+            .expect("readiness change before timeout")
+            .unwrap();
+        assert!(reconnect.due());
+
+        // A session opened after readiness reports once it is admitted.
+        let mut later = SessionReadiness::new(&runtime_ready, true, false);
+        assert!(!later.due());
+        assert!(later.admit());
+    }
+
+    #[test]
+    fn polling_session_reports_readiness_only_for_a_pending_workload() {
+        let runtime_ready = watch::channel(true).0;
+        assert!(SessionReadiness::new(&runtime_ready, false, true).due());
+        assert!(!SessionReadiness::new(&runtime_ready, false, false).due());
     }
 
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {

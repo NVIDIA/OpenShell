@@ -35,8 +35,8 @@ use super::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::grpc::policy::{
-    build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    load_sandbox_config_inputs,
+    build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot,
+    build_sandbox_config_snapshot_from_inputs, load_sandbox_config_inputs,
 };
 use crate::supervisor_session::{AcceptedSession, SupervisorSessionRegistry};
 
@@ -892,7 +892,7 @@ pub async fn handle_bootstrap_result(
             fingerprint,
         );
     }
-    persist_and_ack_admission(session, &admission).await
+    persist_and_ack_admission(session, &admission).await != AdmissionAck::Failed
 }
 
 pub async fn handle_config_update_result(session: &AcceptedSession, result: &ConfigUpdateResult) {
@@ -947,7 +947,10 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
             completed.outcome,
         ) {
             Ok(admission) => {
-                let acknowledged = persist_and_ack_admission(session, &admission).await;
+                // A superseded admission was still applied; only its startup
+                // unlock waits for the newer generation.
+                let acknowledged =
+                    persist_and_ack_admission(session, &admission).await != AdmissionAck::Failed;
                 registry.finalize_config_update(sandbox_id, session_id, &completed, acknowledged)
             }
             Err(error) => {
@@ -963,10 +966,22 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AdmissionAck {
+    /// Persisted and sent to the supervisor.
+    Acknowledged,
+    /// Withheld because a newer generation was committed before the workload
+    /// started. That generation's own admission unlocks startup.
+    Superseded,
+    Failed,
+}
+
 async fn persist_and_ack_admission(
     session: &AcceptedSession,
     admission: &SandboxConfigurationAdmission,
-) -> bool {
+) -> AdmissionAck {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
     let AcceptedSession {
         state,
         sandbox_id,
@@ -979,14 +994,38 @@ async fn persist_and_ack_admission(
         .supervisor_sessions
         .is_current_session(sandbox_id, session_id)
     {
-        return false;
+        return AdmissionAck::Failed;
     }
     #[cfg(test)]
     {
         let mut failure_target = FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX.lock().unwrap();
         if failure_target.as_deref() == Some(sandbox_id.as_str()) {
             failure_target.take();
-            return false;
+            return AdmissionAck::Failed;
+        }
+    }
+    // Accepted admission lets a pending workload start, so it must name the
+    // current generation, as a polling startup report must. A running
+    // workload already has a configuration, and later updates follow it.
+    if admission.state == i32::from(ConfigurationAdmissionState::Accepted)
+        && !state.supervisor_sessions.is_runtime_ready(sandbox_id)
+    {
+        match admission_is_current(state, sandbox_id, admission).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    sandbox_id,
+                    session_id,
+                    config_revision = admission.config_revision,
+                    "withheld startup admission for a superseded configuration"
+                );
+                super::publish_sandbox_components(state, sandbox_id, ConfigComponents::ALL);
+                return AdmissionAck::Superseded;
+            }
+            Err(error) => {
+                warn!(sandbox_id, session_id, error = %error, "failed to verify supervisor configuration admission");
+                return AdmissionAck::Failed;
+            }
         }
     }
     if let Err(error) = state
@@ -995,7 +1034,7 @@ async fn persist_and_ack_admission(
         .await
     {
         warn!(sandbox_id, session_id, error = %error, "failed to persist supervisor configuration admission");
-        return false;
+        return AdmissionAck::Failed;
     }
     if tx
         .send(GatewayMessage {
@@ -1006,10 +1045,42 @@ async fn persist_and_ack_admission(
         .await
         .is_err()
     {
-        return false;
+        return AdmissionAck::Failed;
     }
     state.telemetry.sandbox_session_connected(sandbox_id);
-    true
+    AdmissionAck::Acknowledged
+}
+
+/// Whether `admission` names the generation the gateway would deliver now.
+async fn admission_is_current(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    admission: &SandboxConfigurationAdmission,
+) -> Result<bool, Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let snapshot = tokio::time::timeout(
+        CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+        build_sandbox_config_snapshot(state, &sandbox),
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("configuration admission check timed out"))??;
+    Ok(snapshot.configuration_admitted
+        && (
+            admission.policy_version,
+            &admission.policy_hash,
+            admission.config_revision,
+            admission.provider_env_revision,
+        ) == (
+            snapshot.version,
+            &snapshot.policy_hash,
+            snapshot.config_revision,
+            snapshot.provider_env_revision,
+        ))
 }
 
 async fn record_component_apply_result(
@@ -2803,11 +2874,21 @@ mod tests {
         }
     }
 
+    async fn current_bootstrap(state: &Arc<ServerState>, sandbox_id: &str) -> ConfigBootstrap {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        build_config_bootstrap(state, &sandbox).await.unwrap()
+    }
+
     #[tokio::test]
     async fn persisted_bootstrap_result_suppresses_unchanged_reconciliation() {
-        let state = push_state_with_sandbox("sb-bootstrap-ack").await;
+        let state = state_with_startup_policy("sb-bootstrap-ack", None).await;
         let (tx, mut rx, slots) = register_apply_session_in_state(&state, "sb-bootstrap-ack");
-        let bootstrap = admitted_bootstrap();
+        let bootstrap = current_bootstrap(&state, "sb-bootstrap-ack").await;
 
         assert!(
             handle_bootstrap_result(
@@ -2832,6 +2913,128 @@ mod tests {
             DeliveryDisposition::SuppressedUnchanged
         );
         assert!(slots.take_for_test().ok_or(()).is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_admission_waits_for_configuration_committed_after_the_bootstrap() {
+        use crate::policy_store::PolicyStoreExt as _;
+        use openshell_core::proto::ConfigurationAdmissionState;
+
+        let sandbox_id = "sb-bootstrap-superseded";
+        let state = state_with_startup_policy(sandbox_id, None).await;
+        let put_policy = |version: u32, policy: SandboxPolicy| {
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .store
+                    .put_policy_revision(
+                        &format!("policy-{version}"),
+                        sandbox_id,
+                        "default",
+                        i64::from(version),
+                        &policy.encode_to_vec(),
+                        &format!("hash-{version}"),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        let policy = openshell_policy::restrictive_default_policy();
+        put_policy(1, policy.clone()).await;
+        let (tx, mut rx, slots) = register_apply_session_in_state(&state, sandbox_id);
+        let session = accepted_session(&state, sandbox_id, tx);
+        let bootstrap = current_bootstrap(&state, sandbox_id).await;
+        state
+            .supervisor_sessions
+            .await_config_bootstrap(sandbox_id, "session-1");
+
+        // A newer policy commits while the supervisor applies the bootstrap,
+        // and its build is held behind the bootstrap.
+        let mut newer_policy = policy;
+        newer_policy
+            .filesystem
+            .get_or_insert_default()
+            .read_only
+            .push("/opt".into());
+        put_policy(2, newer_policy).await;
+        let newer = current_bootstrap(&state, sandbox_id)
+            .await
+            .sandbox_config
+            .unwrap();
+        assert_ne!(
+            newer.config_revision,
+            bootstrap.sandbox_config.as_ref().unwrap().config_revision
+        );
+        let newer_message = SupervisorConfigMessage::SandboxConfig(Box::new(newer.clone()));
+        assert_eq!(
+            state.supervisor_sessions.deliver_config(
+                sandbox_id,
+                "session-1",
+                newer_message.clone()
+            ),
+            DeliveryDisposition::Coalesced
+        );
+
+        assert!(
+            handle_bootstrap_result(
+                &session,
+                &ExpectedBootstrap::new(&bootstrap),
+                &applied_bootstrap_result(&bootstrap),
+            )
+            .await,
+            "a superseded bootstrap keeps the session open"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a superseded bootstrap must not unlock startup"
+        );
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            stored
+                .status
+                .and_then(|status| status.configuration_activated),
+            Some(true)
+        );
+
+        // The held configuration is released, and its admission unlocks
+        // startup.
+        let update = sent_update(slots.take_for_test().expect("released newer configuration"));
+        let revision = config_message_revision(&newer_message);
+        let mut admission = expected_configuration_admission(&newer);
+        admission.state = ConfigurationAdmissionState::Accepted.into();
+        handle_config_update_result(
+            &session,
+            &ConfigUpdateResult {
+                update_id: update.update_id,
+                component_sequence: update.component_sequence,
+                result: Some(ConfigComponentApplyResult {
+                    component: ConfigComponent::SandboxConfig.into(),
+                    requested_revision: Some(revision.clone()),
+                    applied_revision: Some(revision),
+                    outcome: ConfigApplyOutcome::Applied.into(),
+                    ..Default::default()
+                }),
+                admission: Some(admission),
+            },
+        )
+        .await;
+        let Some(gateway_message::Payload::ConfigurationAdmission(admitted)) = rx
+            .try_recv()
+            .expect("the newer configuration's admission is sent")
+            .payload
+        else {
+            panic!("expected configuration admission");
+        };
+        assert_eq!(admitted.config_revision, newer.config_revision);
+        assert_eq!(
+            admitted.state,
+            i32::from(ConfigurationAdmissionState::Accepted)
+        );
     }
 
     #[tokio::test]

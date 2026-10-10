@@ -62,23 +62,14 @@ pub struct PrestartedSupervisorSession {
     task: Option<tokio::task::JoinHandle<()>>,
     readiness: tokio::sync::watch::Receiver<bool>,
     loopback: Arc<DeferredLoopbackConnector>,
-    outbound: tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
-    runtime_ready: Arc<AtomicBool>,
+    /// Observed by whichever session is current, which reports readiness
+    /// through its own stream, including after a reconnect.
+    runtime_ready: tokio::sync::watch::Sender<bool>,
 }
 
 impl PrestartedSupervisorSession {
-    async fn report_runtime_ready(&self) -> Result<()> {
-        self.runtime_ready.store(true, Ordering::Release);
-        self.outbound
-            .send(openshell_core::proto::SupervisorMessage {
-                payload: Some(
-                    openshell_core::proto::supervisor_message::Payload::RuntimeReady(
-                        openshell_core::proto::SupervisorRuntimeReady {},
-                    ),
-                ),
-            })
-            .await
-            .map_err(|_| miette::miette!("supervisor session ended before runtime readiness"))
+    fn report_runtime_ready(&self) {
+        self.runtime_ready.send_replace(true);
     }
 }
 
@@ -108,7 +99,7 @@ pub async fn start_prepared_supervisor_session(
         || std::path::PathBuf::from(openshell_core::container_paths::SSH_SOCKET_PATH),
         std::path::PathBuf::from,
     );
-    let (task, mut readiness, outbound, runtime_ready) = crate::supervisor_session::spawn_prepared(
+    let (task, mut readiness, runtime_ready) = crate::supervisor_session::spawn_prepared(
         prepared,
         bootstrap_result,
         target,
@@ -131,7 +122,6 @@ pub async fn start_prepared_supervisor_session(
             task: Some(task),
             readiness,
             loopback,
-            outbound,
             runtime_ready,
         }),
         Ok(Err(_)) => {
@@ -223,7 +213,7 @@ pub async fn start_boundary_access(
     );
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
         if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
-            prestarted.report_runtime_ready().await?;
+            prestarted.report_runtime_ready();
         }
         let (session_task, session_readiness) = match prestarted_supervisor_session.as_mut() {
             Some(prestarted) => (prestarted.task.take(), Some(prestarted.readiness.clone())),
@@ -321,7 +311,7 @@ pub async fn start_boundary_access(
     };
 
     if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
-        prestarted.report_runtime_ready().await?;
+        prestarted.report_runtime_ready();
     }
 
     Ok(BoundaryAccess {

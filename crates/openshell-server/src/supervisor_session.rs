@@ -2607,7 +2607,7 @@ pub async fn handle_connect_supervisor(
             let bootstrap = candidate
                 .finish(&state, principal, &sandbox, &mut inbound)
                 .await?;
-            accept_supervisor_session(SessionSetup {
+            Box::pin(accept_supervisor_session(SessionSetup {
                 state: Arc::clone(&state),
                 sandbox_id: sandbox_id.clone(),
                 instance_id: hello.instance_id,
@@ -2620,7 +2620,7 @@ pub async fn handle_connect_supervisor(
                 outbound_tx: tx,
                 inbound,
                 session_lifetime,
-            })
+            }))
             .await
         })
         .await;
@@ -3233,6 +3233,11 @@ mod tests {
     ) -> OwnerGuard {
         let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
         sandbox.set_phase(SandboxPhase::Ready as i32);
+        // Runtime readiness records the supervisor instance durably.
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .main_process_instance_id = "old-instance".into();
         state.store.put_message(&sandbox).await.unwrap();
         let (tx, _rx) = mpsc::channel(1);
         state.supervisor_sessions.register(
