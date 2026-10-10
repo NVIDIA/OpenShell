@@ -381,6 +381,8 @@ service_name = "openshell-gateway"
 
 The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point `endpoint` at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
 
+Use an `https://` endpoint for TLS. The gateway verifies the collector certificate against the system trust roots.
+
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
 `service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`, `openshell.gateway.name` from the gateway's configured `name`, and `openshell.gateway.compute_driver`.
@@ -426,7 +428,8 @@ This table decides whether and where to export. How the SDK exports is controlle
 | `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
 | `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
-| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | Set to `gzip` to compress exports. `zstd` is not supported. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | No effect. The gateway is built with the gRPC exporter only. |
 
 To sample 10% of traces:

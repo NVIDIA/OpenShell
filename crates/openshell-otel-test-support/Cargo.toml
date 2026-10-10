@@ -15,9 +15,13 @@ openshell-otel = { path = "../openshell-otel" }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["gzip", "tls-aws-lc"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

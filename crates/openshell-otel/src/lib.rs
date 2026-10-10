@@ -25,7 +25,8 @@ pub use propagation::{
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -189,17 +190,19 @@ pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider,
     if endpoint.is_empty() {
         return Err(SetupError::EmptyEndpoint);
     }
-    endpoint
+    let uri = endpoint
         .parse::<http::Uri>()
         .map_err(|source| SetupError::InvalidEndpoint {
             endpoint: endpoint.to_string(),
             source,
         })?;
 
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()?;
+    let mut builder = SpanExporter::builder().with_tonic().with_endpoint(endpoint);
+    if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+        // Tonic trusts nothing by default, so enable the platform roots.
+        builder = builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots());
+    }
+    let exporter = builder.build()?;
 
     Ok(SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
