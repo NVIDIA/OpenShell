@@ -3548,6 +3548,25 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
+        type EvaluateHttpRequestSessionStream = openshell_core::middleware::HttpResultStream;
+
+        async fn evaluate_http_request_session(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> std::result::Result<Response<Self::EvaluateHttpRequestSessionStream>, Status> {
+            Err(Status::unimplemented("v1 HTTP hook test service"))
+        }
+
+        type EvaluateHttpResponseSessionStream = openshell_core::middleware::HttpResultStream;
+
+        async fn evaluate_http_response_session(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+        ) -> std::result::Result<Response<Self::EvaluateHttpResponseSessionStream>, Status>
+        {
+            Err(Status::unimplemented("v1 HTTP hook test service"))
+        }
+
         async fn describe(
             &self,
             _request: Request<openshell_core::proto::MiddlewareDescribeRequest>,

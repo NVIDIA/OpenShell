@@ -542,13 +542,15 @@ network rules allow, in ascending `order`.
 | `endpoints.exclude` | list of strings | No | Host patterns to skip. Takes precedence over `include`. |
 | `order` | integer | No | Run order. Lower values run first. Values must be unique. Defaults to `0`. |
 | `config` | object | No | Configuration for the middleware. |
-| `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. |
+| `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. Services that use HTTP session hooks accept only `fail_closed`. |
 | `name` | string | No | Display name. Defaults to the key. |
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per
 configuration. A `fail_closed` configuration cannot apply to an endpoint with
-`tls: skip`. Refer to [Supervisor
-Middleware](/extensibility/supervisor-middleware).
+`tls: skip` unless its service uses HTTP session hooks. Two configurations whose
+host patterns may overlap must use the same HTTP hook version for the operations
+both handle. Refer to [Supervisor Middleware
+Configuration](/extensibility/supervisor-middleware/configure#mix-http-hook-versions).
 
 ```yaml showLineNumbers={false}
 network_middlewares:

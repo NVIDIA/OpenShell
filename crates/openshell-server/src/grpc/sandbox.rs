@@ -563,7 +563,7 @@ async fn handle_create_sandbox_inner(
     validate_sandbox_spec(&request.name, &spec)?;
 
     if let Some(ref policy) = spec.policy {
-        validate_policy_safety(policy)?;
+        validate_policy_safety(policy, &state.middleware_registry)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
     super::policy::validate_candidate_sandbox_credential_policy(

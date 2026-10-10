@@ -11,12 +11,19 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent, WebSocketSessionEventResult,
+    HttpEvent, HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget,
+    HttpResponseEvent, HttpResponseEventResult, HttpResult, MiddlewareDescribeRequest,
+    MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
+/// Transport-neutral result stream for one HTTP session hook exchange
+/// (`EvaluateHttpRequestSession` or `EvaluateHttpResponseSession`).
+pub type HttpResultStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
+
+/// v1 HTTP hooks. Removed in 0.2.0.
+///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
@@ -63,6 +70,26 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     ) -> Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`).
+    async fn open_http_request_session(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP session hook requests",
+        ))
+    }
+
+    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
+    async fn open_http_response_session(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP session hook responses",
         ))
     }
 }
@@ -193,7 +220,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
-///                 request_timeout: None,
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -276,6 +303,33 @@ pub trait InProcessMiddleware: Send + Sync {
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`),
+    /// for a request or for traffic `OpenShell` cannot inspect.
+    ///
+    /// Implementations that do not require the HTTP session hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_request_session(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP session hook requests",
+        ))
+    }
+
+    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
+    ///
+    /// Implementations that do not require the HTTP session hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_response_session(
+        &self,
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP session hook responses",
         ))
     }
 }

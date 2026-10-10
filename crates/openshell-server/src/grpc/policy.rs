@@ -89,6 +89,7 @@ use openshell_prover::{
     registry::load_embedded_binary_registry,
     report::finding_shorthand,
 };
+use openshell_supervisor_middleware::MiddlewareRegistry;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -581,7 +582,7 @@ fn validation_result_for_agent_proposal(
         Ok(result) => result.policy,
         Err(error) => return format!("merge failed: {}", one_line(&error.to_string())),
     };
-    if let Err(error) = validate_policy_safety(&merged) {
+    if let Err(error) = validate_policy_safety(&merged, &MiddlewareRegistry::default()) {
         return format!("policy invalid: {}", one_line(&error.to_string()));
     }
 
@@ -837,7 +838,7 @@ fn evaluate_proposal_candidate(
 
     clear_provider_credentialed_markers(&mut candidate_base);
     let validation = (|| -> Result<ProtoSandboxPolicy, Status> {
-        validate_policy_safety(&candidate_base)?;
+        validate_policy_safety(&candidate_base, validation_context.middleware_registry)?;
         validate_candidate_effective_policy(&candidate_base, validation_context.provider_layers)?;
         let mut effective = if validation_context.provider_layers.is_empty() {
             candidate_base.clone()
@@ -1601,6 +1602,7 @@ async fn evaluate_stored_chunk_against_live_inputs(
         PolicyMergeValidationContext {
             provider_layers: &merge_validation.provider_layers,
             credential_binding: Some(&credential_binding_context),
+            middleware_registry: &state.middleware_registry,
         },
         reuse_validation_result,
     ))
@@ -1838,6 +1840,7 @@ async fn auto_approve_chunk(
         PolicyMergeValidationContext {
             provider_layers: &merge_validation.provider_layers,
             credential_binding: Some(&credential_binding_context),
+            middleware_registry: &state.middleware_registry,
         },
     )
     .await;
@@ -2926,7 +2929,7 @@ pub(super) async fn load_sandbox_config(
                     error.message()
                 ))
             })?;
-        validate_policy_safety(&effective_policy).map_err(|error| {
+        validate_policy_safety(&effective_policy, &state.middleware_registry).map_err(|error| {
             Status::failed_precondition(format!(
                 "provider composition produced an invalid effective policy: {}",
                 error.message()
@@ -3828,7 +3831,7 @@ async fn handle_update_config_inner(
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
-            validate_policy_safety(&new_policy)?;
+            validate_policy_safety(&new_policy, &state.middleware_registry)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
             validate_candidate_effective_policy(&new_policy, &[])?;
@@ -4130,6 +4133,7 @@ async fn handle_update_config_inner(
             PolicyMergeValidationContext {
                 provider_layers: &merge_validation.provider_layers,
                 credential_binding: Some(&credential_binding_context),
+                middleware_registry: &state.middleware_registry,
             },
             None,
             Some(&atomic_context),
@@ -4236,7 +4240,7 @@ async fn handle_update_config_inner(
 
     new_policy = validate_and_canonicalize_policy(new_policy)?;
     let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
-    validate_policy_safety(&new_policy)?;
+    validate_policy_safety(&new_policy, &state.middleware_registry)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
     let provider_layers =
         provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
@@ -5149,6 +5153,7 @@ pub(super) async fn handle_submit_policy_analysis(
     let proposal_validation_context = PolicyMergeValidationContext {
         provider_layers: &merge_validation.provider_layers,
         credential_binding: Some(&credential_binding_context),
+        middleware_registry: &state.middleware_registry,
     };
 
     let current_version = state
@@ -5629,6 +5634,7 @@ async fn handle_approve_draft_chunk_inner(
         PolicyMergeValidationContext {
             provider_layers: &merge_validation.provider_layers,
             credential_binding: Some(&credential_binding_context),
+            middleware_registry: &state.middleware_registry,
         },
     )
     .await;
@@ -5880,6 +5886,7 @@ async fn handle_approve_all_draft_chunks_inner(
     let merge_validation_context = PolicyMergeValidationContext {
         provider_layers: &merge_validation.provider_layers,
         credential_binding: Some(&credential_binding_context),
+        middleware_registry: &state.middleware_registry,
     };
     let mut staged_policy = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     let mut expected_effective_hash: Option<String> = None;
@@ -5995,6 +6002,7 @@ async fn handle_approve_all_draft_chunks_inner(
         let final_validation_context = PolicyMergeValidationContext {
             provider_layers: &final_merge_validation.provider_layers,
             credential_binding: Some(&final_credential_binding_context),
+            middleware_registry: &state.middleware_registry,
         };
         let final_base = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
         let mut rebuilt_policy = final_base.clone();
@@ -7099,6 +7107,7 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
 struct PolicyMergeValidationContext<'a> {
     provider_layers: &'a [ProviderPolicyLayer],
     credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
+    middleware_registry: &'a MiddlewareRegistry,
 }
 
 fn validate_operator_merged_credential_policy(
@@ -7134,7 +7143,7 @@ fn stage_validated_merge_operation(
         .map_err(map_policy_merge_error)?;
     let mut candidate = merged.policy;
     clear_provider_credentialed_markers(&mut candidate);
-    validate_policy_safety(&candidate)?;
+    validate_policy_safety(&candidate, validation_context.middleware_registry)?;
     validate_candidate_effective_policy(&candidate, validation_context.provider_layers)?;
     let mut effective = if validation_context.provider_layers.is_empty() {
         candidate.clone()
@@ -7203,7 +7212,7 @@ async fn apply_merge_operations_with_retry(
         if let Some(baseline_policy) = baseline_policy {
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
-        validate_policy_safety(&new_policy)?;
+        validate_policy_safety(&new_policy, validation_context.middleware_registry)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
         let mut effective_policy = if provider_layers.is_empty() {
             new_policy.clone()
@@ -7359,6 +7368,7 @@ async fn merge_chunk_into_policy(
         PolicyMergeValidationContext {
             provider_layers,
             credential_binding: None,
+            middleware_registry: &MiddlewareRegistry::default(),
         },
     )
     .await
@@ -7382,6 +7392,7 @@ async fn remove_chunk_from_policy(
         PolicyMergeValidationContext {
             provider_layers: &[],
             credential_binding: None,
+            middleware_registry: &state.middleware_registry,
         },
         None,
         None,
@@ -7930,6 +7941,7 @@ mod tests {
             PolicyMergeValidationContext {
                 provider_layers: &[],
                 credential_binding: None,
+                middleware_registry: &MiddlewareRegistry::default(),
             },
             None,
         );
@@ -9383,6 +9395,7 @@ mod tests {
                 PolicyMergeValidationContext {
                     provider_layers: &[],
                     credential_binding: None,
+                    middleware_registry: &MiddlewareRegistry::default(),
                 },
                 None,
                 None,
@@ -12706,6 +12719,7 @@ mod tests {
             PolicyMergeValidationContext {
                 provider_layers: &[],
                 credential_binding: None,
+                middleware_registry: &MiddlewareRegistry::default(),
             },
             None,
             None,
@@ -15258,6 +15272,7 @@ mod tests {
             PolicyMergeValidationContext {
                 provider_layers: &[],
                 credential_binding: None,
+                middleware_registry: &MiddlewareRegistry::default(),
             },
             Some(&reviewed_hash),
             None,
@@ -20535,6 +20550,7 @@ mod tests {
             }],
         }];
 
+        let middleware_registry = MiddlewareRegistry::default();
         let (left, right) = tokio::join!(
             apply_merge_operations_with_retry(
                 &store,
@@ -20545,6 +20561,7 @@ mod tests {
                 PolicyMergeValidationContext {
                     provider_layers: &[],
                     credential_binding: None,
+                    middleware_registry: &middleware_registry,
                 },
                 None,
                 None
@@ -20558,6 +20575,7 @@ mod tests {
                 PolicyMergeValidationContext {
                     provider_layers: &[],
                     credential_binding: None,
+                    middleware_registry: &middleware_registry,
                 },
                 None,
                 None

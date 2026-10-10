@@ -8,10 +8,12 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This configured-literal guard applies the same case-sensitive terms to UTF-8 HTTP request bodies, complete HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
+This configured-literal guard applies the same case-sensitive terms to HTTP request bodies, HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
+
+The guard implements [HTTP session hooks](../../docs/extensibility/supervisor-middleware/http-session-hooks.mdx) (`EvaluateHttpRequestSession` and `EvaluateHttpResponseSession`) only. Its manifest requires the `openshell.supervisor-middleware.http-session` capability. Gateways and supervisors that predate HTTP session hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the v1 HTTP hook reference.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request and response bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It matches case-sensitive literal bytes in HTTP bodies and WebSocket text messages, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client WebSocket messages, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
@@ -95,7 +97,18 @@ curl -sS https://httpbin.org/anything \
 
 The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
-## HTTP response behavior
+## HTTP behavior
+
+At preflight, the guard selects its configured `body_mode`, BUFFERED by default, and falls back to the other mode when OpenShell offers only that one. BUFFERED inspects one complete body of at most 256 KiB. STREAM has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing. Redaction can make the output longer than the input, so the guard splits it into chunks within the limit OpenShell offers.
+
+- A request whose path or query contains a configured term is rejected at preflight with reason code `content_match`, before its body is read or the upstream is contacted.
+- A message with an empty or absent body continues without inspection.
+- When OpenShell offers no body mode, such as for an encoded, partial, or `no-transform` response, the guard ends the exchange with `FAILED_PRECONDITION`. OpenShell reports `middleware_cannot_inspect` and fails closed.
+- Connections OpenShell cannot inspect, such as `tls: skip` tunnels, are rejected with reason code `uninspectable_traffic` unless the config sets `uninspectable: allow`.
+
+Redact mode replaces matching spans. Deny mode rejects the message with reason code `content_match`. In STREAM mode, a response whose head has already reached the sandbox is aborted instead.
+
+### HTTP responses
 
 The smoke launcher starts the local fixture. To start it manually:
 
@@ -106,22 +119,17 @@ uv run --no-project python examples/supervisor-middleware-content-guard/upstream
 The policy permits `GET /clean` and `GET /sensitive` on
 `http://host.openshell.internal:18081`. The first returns ordinary public text.
 The second contains both configured terms. Redact mode returns
-`contains [FILTERED] and [FILTERED]`. Deny mode returns typed `BlockDelivery`
-with reason code `content_match`, which produces the canonical 403 response
-before delivery. The smoke suite recreates the sandbox in deny mode and checks
-both clean and matching responses through the external gRPC service.
+`contains [FILTERED] and [FILTERED]`. Deny mode rejects the response with
+reason code `content_match`, which produces the canonical 403 response before
+delivery. The smoke suite recreates the sandbox in deny mode and checks both
+clean and matching responses through the external gRPC service.
 
-Every selected response requires `WHOLE_BODY_BYTES`. If that mode is unavailable,
-the service returns a middleware failure and the policy's `on_error` decides
-whether delivery fails open or closed. This includes encoded, partial,
-no-transform, bodyless, and known oversized responses. Unknown-length bodies can
-also exceed the runtime limit during collection. Invalid UTF-8 fails the same way.
-The example policy uses `fail_closed`.
-
-Clean bodies pass unchanged. Matching spans are merged and replaced in the
-complete body, so transport chunk boundaries do not affect matching. Trailers
-are accepted without mutation. The guard does not decode compressed bodies,
-normalize Unicode, scan response headers, retain stream units, or spool bodies.
+Bodyless responses, such as `HEAD`, `204`, and `304`, continue. Clean bodies
+pass unchanged, and transport chunk boundaries do not affect matching.
+Trailers pass without mutation. HTTP session hook middleware always fails
+closed, so the example policy's `on_error: fail_closed` is the only accepted
+value. The guard does not decode compressed bodies, normalize Unicode, scan
+headers, or spool bodies.
 
 ## WebSocket behavior
 
@@ -136,6 +144,8 @@ The service advertises a 256 KiB limit for complete WebSocket text messages. Ope
 | `mode` | No | `redact` (default) replaces matches; `deny` rejects the request. |
 | `terms` | Yes | Non-empty list of non-empty, case-sensitive literal strings. Overlapping match ranges are merged before redaction. |
 | `replacement` | No | Replacement text for `redact`; defaults to `[REDACTED]` and is invalid with `deny`. |
+| `body_mode` | No | `buffered` (default) or `stream`: the HTTP body mode the guard prefers when OpenShell offers both. |
+| `uninspectable` | No | `deny` (default) rejects connections OpenShell cannot inspect; `allow` lets them continue. |
 
 To exercise denial, change the policy config to:
 
@@ -146,4 +156,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `HTTP_RESPONSE/PRE_RETURN` through HTTP session hooks, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

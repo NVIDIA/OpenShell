@@ -3,6 +3,8 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod http_session;
+
 use super::*;
 
 /// Default wall-clock bound shared by whole-body stages in one response.
@@ -18,6 +20,9 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
+    /// The client request used HTTP/1.1, so an HTTP session hook response may
+    /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
+    pub(crate) client_accepts_chunked: bool,
 }
 
 #[derive(Clone)]
@@ -267,7 +272,7 @@ where
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
 /// deadlocks clients that are themselves waiting for EOF.
-async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+pub(super) async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
 where
     C: AsyncWrite + Unpin,
 {
@@ -340,6 +345,46 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    match openshell_supervisor_middleware::chain_http_hook_version(&described) {
+        openshell_supervisor_middleware::ChainHttpHookVersion::V1 => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::Session => {
+            return Box::pin(http_session::relay_response_through_pipeline(
+                request_method,
+                upstream,
+                client,
+                middleware,
+                described,
+                parsed,
+                buffered,
+                header_end,
+                status_code,
+                body_length,
+                server_wants_close,
+                event_stream,
+            ))
+            .await;
+        }
+        openshell_supervisor_middleware::ChainHttpHookVersion::Mixed => {
+            debug!(
+                reason = openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED,
+                "HTTP response middleware chain mixes HTTP hook versions"
+            );
+            emit_http_response_middleware_failure(
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                false,
+            );
+            send_response_delivery_failure(
+                client,
+                request_method,
+                middleware.policy_name,
+                &middleware.target,
+            )
+            .await?;
+            return Ok(Some(RelayOutcome::Consumed));
+        }
+    }
     let original_headers = parsed.headers.clone();
     let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();

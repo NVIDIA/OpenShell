@@ -12402,9 +12402,26 @@ network_middlewares:
 "#,
                 "invalid middleware configuration",
             ),
-            (
-                "tls skip selector",
-                r#"
+        ];
+
+        for (name, data, expected) in cases {
+            let err = match OpaEngine::from_strings(TEST_POLICY, data) {
+                Ok(_) => panic!("{name}: expected policy validation failure"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(expected),
+                "{name}: expected {expected:?} in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn middleware_tls_skip_conflict_is_left_to_the_gateway() {
+        // The rule depends on the middleware's HTTP hook version, which only the
+        // gateway's registry knows. At runtime a fail-closed entry that
+        // cannot inspect a tls: skip tunnel denies it.
+        let data = r#"
 network_middlewares:
   redactor:
     middleware: openshell/regex
@@ -12418,40 +12435,9 @@ network_policies:
         tls: skip
     binaries:
       - { path: /usr/bin/curl }
-"#,
-                "middleware conflicts with TLS inspection",
-            ),
-            (
-                "tls skip wildcard overlap",
-                r#"
-network_middlewares:
-  redactor:
-    middleware: openshell/regex
-    endpoints:
-      include: ["api.example.com"]
-network_policies:
-  api:
-    endpoints:
-      - host: "*.example.com"
-        port: 443
-        tls: skip
-    binaries:
-      - { path: /usr/bin/curl }
-"#,
-                "middleware conflicts with TLS inspection",
-            ),
-        ];
-
-        for (name, data, expected) in cases {
-            let err = match OpaEngine::from_strings(TEST_POLICY, data) {
-                Ok(_) => panic!("{name}: expected policy validation failure"),
-                Err(err) => err.to_string(),
-            };
-            assert!(
-                err.contains(expected),
-                "{name}: expected {expected:?} in {err:?}"
-            );
-        }
+"#;
+        OpaEngine::from_strings(TEST_POLICY, data)
+            .expect("supervisors load policies the gateway validated");
     }
 
     #[test]

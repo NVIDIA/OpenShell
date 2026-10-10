@@ -1315,7 +1315,7 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
     // Supply the rebuilt body at the exact pre-grant helper boundary. This
     // does not claim a middleware service performed the rewrite.
     let transformed = body_request("/api/rpc", final_body);
-    let (injected, _) = timeout(
+    let (injected, _, _) = timeout(
         WAIT,
         prepare_inspected_request(transformed, &ctx, &engine, &config, &info),
     )
