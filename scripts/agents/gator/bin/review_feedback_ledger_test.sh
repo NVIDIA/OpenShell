@@ -406,7 +406,7 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
   "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-   abort unless manifest.fetch("payload_version") == 11
+   abort unless manifest.fetch("payload_version") == 12
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
@@ -421,6 +421,14 @@ rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \
 rg -q 'Every prior Gator finding is a durable review disposition' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'review feedback ledger' "$GATOR_DIR/prompts/gator.md"
+# Keep security routing consistent across the gate, top-level prompt, and
+# independent reviewer; PR-owned regressions must remain actionable reviews.
+rg -Fq 'PR in that PR' "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq 'private_security_review_required' "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq 'Do not initiate external disclosure' "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq 'not a generic private-security blocker' "$GATOR_DIR/prompts/gator.md"
+rg -Fq 'Security classification alone is not a private-triage gate' \
+    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
 rg -q '### Pragmatic review calibration' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'A new commit permits a delta review' \
