@@ -67,9 +67,10 @@ where
 
 enum Stage {
     Preflight,
-    Begin(GuardConfig, BodyMode),
+    Begin(GuardConfig, Selected),
     Buffered(GuardConfig),
-    Stream(GuardConfig, StreamScanner),
+    /// STREAM, with the largest output chunk OpenShell accepts.
+    Stream(GuardConfig, StreamScanner, usize),
     Done,
 }
 
@@ -92,23 +93,18 @@ impl Stage {
                             diagnostics: Some(diagnostics),
                         }))])
                     }
-                    Decision::Inspect(config, mode) => {
-                        let selected = match mode {
+                    Decision::Inspect(config, selected) => {
+                        let mode = match selected {
                             Selected::Buffered(max_body_bytes) => {
-                                *self = Self::Begin(config, BodyMode::Buffered);
                                 http_inspect::Mode::Buffered(HttpBufferedMode { max_body_bytes })
                             }
-                            Selected::Stream => {
-                                *self = Self::Begin(config, BodyMode::Stream);
-                                http_inspect::Mode::Stream(HttpStreamMode {})
-                            }
+                            Selected::Stream(_) => http_inspect::Mode::Stream(HttpStreamMode {}),
                         };
+                        *self = Self::Begin(config, selected);
                         Ok(vec![result(http_result::Result::PreflightResult(
                             HttpPreflightResult {
                                 decision: Some(http_preflight_result::Decision::Inspect(
-                                    HttpInspect {
-                                        mode: Some(selected),
-                                    },
+                                    HttpInspect { mode: Some(mode) },
                                 )),
                                 ..Default::default()
                             },
@@ -116,13 +112,16 @@ impl Stage {
                     }
                 }
             }
-            (Self::Begin(config, BodyMode::Buffered), Some(http_event::Event::Begin(_))) => {
+            (Self::Begin(config, Selected::Buffered(_)), Some(http_event::Event::Begin(_))) => {
                 *self = Self::Buffered(config);
                 Ok(Vec::new())
             }
-            (Self::Begin(config, BodyMode::Stream), Some(http_event::Event::Begin(_))) => {
+            (
+                Self::Begin(config, Selected::Stream(max_chunk_bytes)),
+                Some(http_event::Event::Begin(_)),
+            ) => {
                 let scanner = StreamScanner::new(&config);
-                *self = Self::Stream(config, scanner);
+                *self = Self::Stream(config, scanner, max_chunk_bytes);
                 Ok(vec![result(http_result::Result::OutputStart(
                     HttpOutputStart::default(),
                 ))])
@@ -130,32 +129,33 @@ impl Stage {
             (Self::Buffered(config), Some(http_event::Event::BufferedBody(body))) => {
                 Ok(vec![buffered_result(inspect(&config, &body.data))])
             }
-            (Self::Stream(config, mut scanner), Some(http_event::Event::InputChunk(chunk))) => {
-                match scanner.push(&chunk.data, config.mode == Mode::Deny) {
-                    Ok(output) => {
-                        *self = Self::Stream(config, scanner);
-                        Ok(output_chunk(output).into_iter().collect())
-                    }
-                    Err(_) => Ok(vec![reject(&config, &scanner)]),
+            (
+                Self::Stream(config, mut scanner, max_chunk_bytes),
+                Some(http_event::Event::InputChunk(chunk)),
+            ) => match scanner.push(&chunk.data, config.mode == Mode::Deny) {
+                Ok(output) => {
+                    *self = Self::Stream(config, scanner, max_chunk_bytes);
+                    Ok(output_chunks(&output, max_chunk_bytes))
                 }
-            }
-            (Self::Stream(config, mut scanner), Some(http_event::Event::InputEnd(_))) => {
-                match scanner.finish(config.mode == Mode::Deny) {
-                    Ok(output) => {
-                        let (match_count, matched_term_count) = scanner.counts();
-                        let diagnostics = (match_count > 0).then(|| {
-                            diagnostics(outcome(&config, match_count, matched_term_count))
-                        });
-                        let mut results: Vec<_> = output_chunk(output).into_iter().collect();
-                        results.push(result(http_result::Result::Finish(HttpFinish {
-                            trailer_mutations: Vec::new(),
-                            diagnostics,
-                        })));
-                        Ok(results)
-                    }
-                    Err(_) => Ok(vec![reject(&config, &scanner)]),
+                Err(_) => Ok(vec![reject(&config, &scanner)]),
+            },
+            (
+                Self::Stream(config, mut scanner, max_chunk_bytes),
+                Some(http_event::Event::InputEnd(_)),
+            ) => match scanner.finish(config.mode == Mode::Deny) {
+                Ok(output) => {
+                    let (match_count, matched_term_count) = scanner.counts();
+                    let diagnostics = (match_count > 0)
+                        .then(|| diagnostics(outcome(&config, match_count, matched_term_count)));
+                    let mut results = output_chunks(&output, max_chunk_bytes);
+                    results.push(result(http_result::Result::Finish(HttpFinish {
+                        trailer_mutations: Vec::new(),
+                        diagnostics,
+                    })));
+                    Ok(results)
                 }
-            }
+                Err(_) => Ok(vec![reject(&config, &scanner)]),
+            },
             (_, None) => Err(Status::invalid_argument("HTTP event is required")),
             // Not FAILED_PRECONDITION, which OpenShell reads as "cannot
             // inspect".
@@ -166,9 +166,11 @@ impl Stage {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Selected {
     Buffered(u64),
-    Stream,
+    /// The largest output chunk OpenShell accepts.
+    Stream(usize),
 }
 
 enum Decision {
@@ -223,7 +225,10 @@ fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
             .map_or(0, |limits| limits.max_buffered_body_bytes);
         Selected::Buffered(offered.min(MAX_PAYLOAD_BYTES))
     });
-    let stream = permitted(HttpBodyMode::Stream).then_some(Selected::Stream);
+    let stream = permitted(HttpBodyMode::Stream).then(|| {
+        let max_chunk_bytes = preflight.limits.map_or(0, |limits| limits.max_chunk_bytes);
+        Selected::Stream(usize::try_from(max_chunk_bytes).unwrap_or(usize::MAX))
+    });
     let selected = match config.body_mode {
         BodyMode::Buffered => buffered.or(stream),
         BodyMode::Stream => stream.or(buffered),
@@ -231,6 +236,9 @@ fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
     match selected {
         Some(Selected::Buffered(0)) => Err(Status::invalid_argument(
             "BUFFERED requires a positive max_buffered_body_bytes",
+        )),
+        Some(Selected::Stream(0)) => Err(Status::invalid_argument(
+            "STREAM requires a positive max_chunk_bytes",
         )),
         Some(selected) => Ok(Decision::Inspect(config, selected)),
         // A message without a body has nothing to guard. The guard never
@@ -283,8 +291,16 @@ fn buffered_result(outcome: GuardOutcome) -> HttpResult {
     }))
 }
 
-fn output_chunk(data: Vec<u8>) -> Option<HttpResult> {
-    (!data.is_empty()).then(|| result(http_result::Result::OutputChunk(HttpOutputChunk { data })))
+/// Output results for `data`, each within OpenShell's chunk limit: redacting
+/// a short term makes the output longer than the input.
+fn output_chunks(data: &[u8], max_chunk_bytes: usize) -> Vec<HttpResult> {
+    data.chunks(max_chunk_bytes)
+        .map(|data| {
+            result(http_result::Result::OutputChunk(HttpOutputChunk {
+                data: data.to_vec(),
+            }))
+        })
+        .collect()
 }
 
 fn reject(config: &GuardConfig, scanner: &StreamScanner) -> HttpResult {
@@ -320,6 +336,7 @@ mod tests {
                 config: Some(config(mode, &["prototype-secret", "秘密"], extra)),
                 permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
                 limits: Some(HttpBodyLimits {
+                    max_chunk_bytes: 64 * 1024,
                     max_buffered_body_bytes: 1024 * 1024,
                     ..Default::default()
                 }),
@@ -469,6 +486,51 @@ mod tests {
             panic!("finish")
         };
         assert_eq!(finish.diagnostics.unwrap().findings[0].count, 1);
+    }
+
+    #[test]
+    fn stream_stage_splits_expanded_output_within_the_chunk_limit() {
+        let mut selected = preflight(
+            response(),
+            "redact",
+            &[("body_mode", "stream")],
+            &[HttpBodyMode::Stream],
+        );
+        let Some(http_event::Event::Preflight(preflight_event)) = selected.event.as_mut() else {
+            unreachable!()
+        };
+        preflight_event.limits = Some(HttpBodyLimits {
+            max_chunk_bytes: 16,
+            ..Default::default()
+        });
+        let mut stage = Stage::Preflight;
+        stage.handle(selected).unwrap();
+        stage
+            .handle(event(http_event::Event::Begin(HttpBegin::default())))
+            .unwrap();
+        // Each 6-byte term becomes the 10-byte marker.
+        let mut results = stage
+            .handle(event(http_event::Event::InputChunk(HttpInputChunk {
+                data: "秘密".repeat(8).into_bytes(),
+            })))
+            .unwrap();
+        results.extend(
+            stage
+                .handle(event(http_event::Event::InputEnd(HttpInputEnd::default())))
+                .unwrap(),
+        );
+        let mut output = Vec::new();
+        for result in results {
+            match result.result {
+                Some(http_result::Result::OutputChunk(chunk)) => {
+                    assert!((1..=16).contains(&chunk.data.len()), "{chunk:?}");
+                    output.extend(chunk.data);
+                }
+                Some(http_result::Result::Finish(_)) => {}
+                result => panic!("unexpected result: {result:?}"),
+            }
+        }
+        assert_eq!(output, "[REDACTED]".repeat(8).as_bytes());
     }
 
     #[test]

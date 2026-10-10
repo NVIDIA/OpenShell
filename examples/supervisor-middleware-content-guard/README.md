@@ -99,7 +99,7 @@ The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
 ## HTTP behavior
 
-At preflight, the guard selects its configured `body_mode`, BUFFERED by default, and falls back to the other mode when OpenShell offers only that one. BUFFERED inspects one complete body of at most 256 KiB. STREAM has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing.
+At preflight, the guard selects its configured `body_mode`, BUFFERED by default, and falls back to the other mode when OpenShell offers only that one. BUFFERED inspects one complete body of at most 256 KiB. STREAM has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing. Redaction can make the output longer than the input, so the guard splits it into chunks within the limit OpenShell offers.
 
 - A request whose path or query contains a configured term is rejected at preflight with reason code `content_match`, before its body is read or the upstream is contacted.
 - A message with an empty or absent body continues without inspection.
