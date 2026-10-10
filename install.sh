@@ -609,6 +609,19 @@ user_home() {
   echo "/home/${_user}"
 }
 
+# Config dir the openshell CLI will use, resolved in the same environment the CLI
+# runs in. The CLI takes $XDG_CONFIG_HOME when set and $HOME/.config otherwise,
+# so asking through as_target_user covers both cases: the same-user branch
+# inherits the caller's XDG_CONFIG_HOME, while the sudo and runuser branches
+# reset the environment and fall back to the target user's home.
+#
+# An empty XDG_CONFIG_HOME falls back to $HOME/.config, per the XDG base
+# directory spec. The CLI instead joins onto an empty base and yields a relative
+# "openshell", which no installer path can usefully match.
+target_openshell_config_dir() {
+  as_target_user sh -c 'printf "%s\n" "${XDG_CONFIG_HOME:-$HOME/.config}/openshell"'
+}
+
 as_target_user() {
   if [ "${PLATFORM:-}" = "darwin" ]; then
     if [ "$(id -u)" -eq "$TARGET_UID" ]; then
@@ -1040,7 +1053,7 @@ wait_for_local_gateway_listener() {
   _last_output=""
   _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
-  _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
+  _mtls_dir="$(target_openshell_config_dir)/gateways/openshell/mtls"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
@@ -1116,7 +1129,7 @@ remove_local_gateway_registration_from() {
 }
 
 remove_local_gateway_registration() {
-  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+  remove_local_gateway_registration_from "$(target_openshell_config_dir)"
 }
 
 remove_snap_gateway_registration() {
