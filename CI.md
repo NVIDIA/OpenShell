@@ -149,6 +149,12 @@ compatibility baseline for the v1beta1 Sandbox API. It does not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
+The `ubuntu-k3s` lane registers the gateway's ClusterIP Service directly, so
+recreating the Service requires reprovisioning the fixture. Before conformance,
+every installer waits up to five minutes for a connected gateway; interactive
+shells skip the wait. K3s failures upload diagnostics as `tmachine-diagnostics-*`
+artifacts.
+
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an
@@ -487,7 +493,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs. `Required CI Gates` publishes successful not-applicable statuses for both E2E contexts on merge-group events and subsequent merge-group workflow completions.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -543,7 +549,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
 | `.github/workflows/snap-package.yml` | Builds Snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing Snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after Snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 

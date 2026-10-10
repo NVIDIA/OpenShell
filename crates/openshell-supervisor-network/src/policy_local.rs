@@ -689,30 +689,44 @@ fn sanitize_reason_for_audit(raw: &str) -> String {
 }
 
 /// One-line audit description of a chunk's target: binary, host, port, and
-/// L7 method/path if present. Used by both the propose and approve/reject
-/// audit events so the trace can be grepped by endpoint without parsing
-/// JSON.
+/// L7 method/path allows for every endpoint. Used by both the propose and
+/// approve/reject audit events so the trace can be grepped by endpoint
+/// without parsing JSON.
 fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
     let Some(rule) = chunk.proposed_rule.as_ref() else {
         return format!("rule_name:{}", chunk.rule_name);
     };
-    let endpoint = rule.endpoints.first().map_or_else(
-        || "unknown".to_string(),
-        |ep| format!("{}:{}", ep.host, ep.port),
-    );
-    let l7 = rule
-        .endpoints
-        .first()
-        .and_then(|ep| ep.rules.first())
-        .and_then(|r| r.allow.as_ref())
-        .map(|a| format!(" {} {}", a.method, a.path))
-        .unwrap_or_default();
+    let endpoints = if rule.endpoints.is_empty() {
+        "unknown".to_string()
+    } else {
+        rule.endpoints
+            .iter()
+            .map(summarize_endpoint_for_audit)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let binary = if chunk.binary.is_empty() {
         String::new()
     } else {
         format!(" by {}", chunk.binary)
     };
-    format!("on {endpoint}{l7}{binary}")
+    format!("on {endpoints}{binary}")
+}
+
+fn summarize_endpoint_for_audit(endpoint: &NetworkEndpoint) -> String {
+    let allows = endpoint
+        .rules
+        .iter()
+        .filter_map(|r| r.allow.as_ref())
+        .map(|a| format!("{} {}", a.method, a.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = format!("{}:{}", endpoint.host, endpoint.port);
+    if allows.is_empty() {
+        target
+    } else {
+        format!("{target} [{allows}]")
+    }
 }
 
 /// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
@@ -2051,6 +2065,42 @@ mod tests {
         assert!(summary.contains("api.github.com:443"));
         assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
         assert!(summary.contains("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_lists_every_endpoint_and_allow() {
+        let allow = |method: &str, path: &str| L7Rule {
+            allow: Some(L7Allow {
+                method: method.to_string(),
+                path: path.to_string(),
+                ..Default::default()
+            }),
+        };
+        let chunk = PolicyChunk {
+            binary: "/usr/bin/perl".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: "two".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "ports.ubuntu.com".to_string(),
+                        port: 80,
+                        rules: vec![allow("GET", "/ubuntu-ports/**"), allow("HEAD", "/x")],
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "169.254.169.254".to_string(),
+                        port: 80,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_chunk_for_audit(&chunk),
+            "on ports.ubuntu.com:80 [GET /ubuntu-ports/**, HEAD /x], 169.254.169.254:80 by /usr/bin/perl"
+        );
     }
 
     // Helpers — synthetic proposed rule + policy with that rule already

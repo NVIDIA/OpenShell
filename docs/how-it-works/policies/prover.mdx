@@ -237,3 +237,7 @@ and port that has both a REST endpoint and an endpoint without request rules
 also returns `unsupported`, as do REST rules that match query parameters or use
 `?` or bracket expressions in paths. Other request protocols, such as WebSocket,
 GraphQL, MCP, and JSON-RPC, return `unsupported`.
+
+The check also applies each endpoint's `path` selector to its allow and deny
+rules, following the [endpoint matcher semantics](/how-it-works/policies/schema#matcher-semantics).
+Endpoint selectors and REST rule paths use different wildcard behavior.

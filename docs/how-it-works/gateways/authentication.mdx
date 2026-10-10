@@ -69,9 +69,35 @@ The connection flow:
 5. When mTLS user authentication is enabled, the gateway maps the verified certificate subject to a user principal.
 6. The gateway authorizes the gRPC method.
 
+### mTLS Operators
+
+Enable `[openshell.gateway.mtls_auth] operator_enabled = true` to recognize a
+trusted client certificate whose organizational unit is exactly `operator`
+(`OU=operator`). This creates a distinct operator principal with user and
+platform-admin capabilities across all workspaces, plus permission to call
+`GetProviderCredentials`. Ordinary mTLS users and OIDC admins do not have that
+permission, even with an `operator` claim or `openshell:all`.
+
+Operator authentication requires TLS and a configured client CA. It works
+alongside OIDC and does not require ordinary mTLS user authentication. Connect
+directly to the gateway with the certificate and its private key; do not send an
+`Authorization` header on the same connection. Forwarded certificate headers
+and edge-tunnel authentication cannot establish an operator identity.
+
+Anyone who can issue certificates under the trusted client CA can issue an
+operator certificate. Restrict CA issuance and operator private-key access.
+Normal gateway certificate generation does not grant the operator role.
+Certificate validity and CA changes apply to new TLS handshakes, not requests on
+already-established connections; close existing connections when removing
+trust. The gateway does not provide per-certificate revocation through this
+setting.
+
+See [Providers](/how-it-works/providers/overview#retrieve-runtime-credentials)
+for the credential retrieval contract.
+
 ### OIDC
 
-Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
+Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
 
 OIDC is application-layer authentication. TLS authenticates the gateway and protects the transport; OIDC clients do not need a TLS client certificate. The gateway validates any client certificate they present against the configured client CA.
 

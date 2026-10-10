@@ -25,6 +25,14 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Name of the Gateway API Gateway referenced by the GRPCRoute. Preserve explicit
+names unchanged because Gateway names may be longer than label values.
+*/}}
+{{- define "openshell.grpcRouteGatewayName" -}}
+{{- default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name -}}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "openshell.chart" -}}

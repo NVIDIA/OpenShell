@@ -82,6 +82,11 @@ mod linux {
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
+    // Three stdio pipes require six descriptors before fork, and Rust's
+    // process launcher may briefly need additional bookkeeping descriptors.
+    // Reclaim closed mediated sockets before each serialized spawn so stale
+    // socket sources cannot consume that bounded launch budget.
+    const EXEC_SPAWN_DESCRIPTOR_HEADROOM: usize = 16;
 
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
@@ -1398,6 +1403,29 @@ mod linux {
         status: Arc<Mutex<Option<ExitStatusWire>>>,
     }
 
+    async fn retain_exec_completion(
+        process: Arc<dyn BoundaryProcess>,
+        session: Arc<MainSession>,
+        status: Arc<Mutex<Option<ExitStatusWire>>>,
+    ) {
+        let exit_status = match process.wait().await {
+            Ok(exit_status) => ExitStatusWire::from(exit_status),
+            Err(error) => {
+                // A process wait error is terminal per the BoundaryProcess
+                // contract. Retaining `None` here makes this handle look live
+                // forever and can permanently exhaust exec admission.
+                tracing::warn!(%error, "Exec process wait failed; recording terminal status");
+                ExitStatusWire::Exited(74)
+            }
+        };
+        *lock(&status) = Some(exit_status);
+        let exit_code = match exit_status {
+            ExitStatusWire::Exited(code) => code,
+            ExitStatusWire::Signaled(signal) => 128 + signal,
+        };
+        let _ = session.finish_remote(exit_code, false).await;
+    }
+
     #[derive(Default)]
     struct ExecRequestLedger {
         requests: std::collections::HashSet<String>,
@@ -2162,6 +2190,14 @@ mod linux {
             }
             requests.reserve(request_id, expires_at)?;
             drop(requests);
+            self.network_broker
+                .ensure_descriptor_headroom(EXEC_SPAWN_DESCRIPTOR_HEADROOM)
+                .map_err(|error| {
+                    guest_error(
+                        BoundaryErrorKind::Unavailable,
+                        format!("exec descriptor headroom unavailable: {error}"),
+                    )
+                })?;
             let session = self
                 .process_runtime
                 .block_on(executor.exec(spec.into()))
@@ -2202,18 +2238,7 @@ mod linux {
             let wait_session = retained.clone();
             let wait_status = status.clone();
             self.process_runtime.spawn(async move {
-                if let Ok(exit_status) = wait_process.wait().await {
-                    *lock(&wait_status) = Some(ExitStatusWire::from(exit_status));
-                    let exit_code = match exit_status {
-                        openshell_isolation_interface::contract::BoundaryExitStatus::Exited(
-                            code,
-                        ) => code,
-                        openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
-                            signal,
-                        ) => 128 + signal,
-                    };
-                    let _ = wait_session.finish_remote(exit_code, false).await;
-                }
+                retain_exec_completion(wait_process, wait_session, wait_status).await;
             });
             let handle = ExecHandle {
                 request_id: request_id.to_string(),
@@ -3819,6 +3844,52 @@ mod linux {
             generate_sandbox_tls_material,
         };
         use rcgen::{KeyPair, PKCS_ED25519};
+
+        struct FailedWaitProcess;
+
+        #[async_trait::async_trait]
+        impl BoundaryProcess for FailedWaitProcess {
+            async fn wait(
+                &self,
+            ) -> Result<
+                openshell_isolation_interface::contract::BoundaryExitStatus,
+                openshell_isolation_interface::contract::BackendError,
+            > {
+                Err(
+                    openshell_isolation_interface::contract::BackendError::Terminated(
+                        "test boundary loss".to_string(),
+                    ),
+                )
+            }
+
+            async fn signal(
+                &self,
+                _signal: openshell_isolation_interface::contract::BoundarySignal,
+            ) -> Result<(), openshell_isolation_interface::contract::BackendError> {
+                Ok(())
+            }
+
+            async fn terminate(
+                &self,
+            ) -> Result<(), openshell_isolation_interface::contract::BackendError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn exec_wait_failure_records_reclaimable_terminal_status() {
+            let session = MainSession::inert();
+            let mut output = session.subscribe();
+            let status = Arc::new(Mutex::new(None));
+
+            retain_exec_completion(Arc::new(FailedWaitProcess), session, status.clone()).await;
+
+            assert_eq!(*lock(&status), Some(ExitStatusWire::Exited(74)));
+            assert!(matches!(
+                output.recv().await.expect("terminal exec output"),
+                MainOutput::Exit(74)
+            ));
+        }
 
         #[test]
         fn exec_tombstones_expire_without_a_lifetime_limit() {

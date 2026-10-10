@@ -192,6 +192,10 @@ struct RunArgs {
     )]
     enable_mtls_auth: bool,
 
+    /// Enable gateway-wide mTLS operators (trusted certificate OU=operator).
+    #[arg(long, env = "OPENSHELL_ENABLE_OPERATOR_AUTH", default_value_t = false, action = ArgAction::Set)]
+    enable_operator_auth: bool,
+
     /// Expected OIDC audience claim (typically the client ID).
     #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
     oidc_audience: String,
@@ -388,6 +392,11 @@ fn prepare_server_config_with_drivers(
             "--disable-tls and --tls-client-ca are mutually exclusive. Client certificate verification requires that TLS be enabled."
         ));
     }
+    if args.enable_operator_auth && (args.disable_tls || !has_client_ca) {
+        return Err(miette::miette!(
+            "operator authentication requires TLS and --tls-client-ca"
+        ));
+    }
     if mtls_auth_enabled && args.disable_tls {
         return Err(miette::miette!(
             "mTLS user authentication requires TLS. Remove --disable-tls or disable --enable-mtls-auth."
@@ -455,6 +464,7 @@ fn prepare_server_config_with_drivers(
         config.auth = auth;
     }
     config.mtls_auth.enabled = mtls_auth_enabled;
+    config.mtls_auth.operator_enabled = args.enable_operator_auth;
 
     // Listener addresses for the health and metrics endpoints. The file may
     // pin a different interface than the main listener (e.g. health on
@@ -676,6 +686,11 @@ async fn run_from_args(
     if prepared.config.mtls_auth.enabled {
         info!("mTLS user authentication enabled");
     }
+    if prepared.config.mtls_auth.operator_enabled {
+        info!(
+            "mTLS operator authentication enabled (OU=operator grants gateway-wide administration)"
+        );
+    }
     if has_oidc {
         info!("OIDC authentication enabled");
     }
@@ -699,6 +714,7 @@ async fn run_from_args(
 
     if !prepared.config.auth.allow_unauthenticated_users
         && !prepared.config.mtls_auth.enabled
+        && !prepared.config.mtls_auth.operator_enabled
         && !has_oidc
         && prepared.config.gateway_jwt.is_none()
     {
@@ -971,6 +987,11 @@ fn validate_preflight_semantics(
             "--disable-tls and --tls-client-ca are mutually exclusive"
         ));
     }
+    if args.enable_operator_auth && (args.disable_tls || !has_client_ca) {
+        return Err(miette::miette!(
+            "operator authentication requires TLS and --tls-client-ca"
+        ));
+    }
     if mtls_auth_enabled && args.disable_tls {
         return Err(miette::miette!("mTLS user authentication requires TLS"));
     }
@@ -1178,6 +1199,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_mtls_auth")
     {
         args.enable_mtls_auth = mtls_auth.enabled;
+    }
+    if let Some(mtls_auth) = &file.mtls_auth
+        && arg_defaulted(matches, "enable_operator_auth")
+    {
+        args.enable_operator_auth = mtls_auth.operator_enabled;
     }
     if let Some(disabled) = file.disable_tls
         && arg_defaulted(matches, "disable_tls")
@@ -2823,6 +2849,86 @@ enabled = false
             &matches,
             Some(&file)
         ));
+    }
+
+    #[test]
+    fn operator_auth_is_opt_in_and_file_flag_precedence_is_explicit() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::remove("OPENSHELL_ENABLE_OPERATOR_AUTH");
+        let file = config_file_from_toml(
+            "[openshell.gateway.mtls_auth]\noperator_enabled = true\nenabled = false\n",
+        );
+        let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+        assert!(!args.enable_operator_auth);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(args.enable_operator_auth);
+        assert!(!args.enable_mtls_auth);
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--enable-operator-auth", "false"]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(!args.enable_operator_auth);
+    }
+
+    #[test]
+    fn operator_preflight_requires_tls_and_ca_independently_of_user_auth() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let _env = EnvVarGuard::remove("OPENSHELL_ENABLE_OPERATOR_AUTH");
+        let registry = test_registry("shared", false);
+        for tls_args in [vec!["--disable-tls"], vec![]] {
+            let mut argv = vec![
+                "openshell-gateway",
+                "--compute-driver",
+                "shared",
+                "--enable-operator-auth",
+                "true",
+                "--enable-mtls-auth",
+                "false",
+            ];
+            argv.extend(tls_args);
+            let (run, matches) = parse_with_args(&argv);
+            let error = super::run_config_preflight_with_drivers(
+                super::ConfigPreflightArgs::default(),
+                run,
+                &matches,
+                &registry,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("operator authentication requires TLS")
+            );
+        }
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "shared",
+            "--enable-operator-auth",
+            "true",
+            "--enable-mtls-auth",
+            "false",
+            "--tls-cert",
+            "/tls/server.pem",
+            "--tls-key",
+            "/tls/key.pem",
+            "--tls-client-ca",
+            "/tls/ca.pem",
+        ]);
+        super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .unwrap();
     }
 
     #[test]

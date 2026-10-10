@@ -115,6 +115,36 @@ const sandbox = await SandboxClient.connect({ gateway, oidcToken })
 await sandbox.create({ image })
 ```
 
+## Provider credential retrieval
+
+`client.providers.getCredentials(name, keys, options)` exports selected runtime
+credentials using direct gateway mTLS with a trusted `OU=operator` certificate.
+Enable operator authentication at the gateway and omit OIDC and edge tokens.
+No sandbox or provider attachment is required.
+
+```ts
+import { ProviderClient } from '@nvidia/openshell-sdk'
+
+const providers = await ProviderClient.connect({ gateway, caCert, clientCert, clientKey })
+const credentials = await providers.getCredentials(
+  'my-graph',
+  ['MS_GRAPH_ACCESS_TOKEN'],
+  { workspace: 'production', minimumRemainingLifetimeSecs: 300 },
+)
+const token = credentials.MS_GRAPH_ACCESS_TOKEN!.value
+```
+
+The workspace and a nonempty selection are required. The result maps keys to
+`ProviderCredentialValue` objects with `value` and optional `expirationTime`
+(`Date`, truncating sub-millisecond precision). Lifetime is in seconds, including
+fractions; omission or zero uses the gateway's five-minute margin, up to a
+24-hour requested maximum. `signal` and `timeoutMs` bound the RPC, but canceling
+delivery does not roll back an already-started refresh. The helper does not
+retry or cache exports. Do not log the result: the values can be used outside
+sandbox policy enforcement. See the published
+[SDK example](https://docs.nvidia.com/openshell/latest/sdk/typescript#retrieve-provider-credentials)
+and [provider reference](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview#retrieve-runtime-credentials).
+
 ## Streaming and interactive exec
 
 `execStream` yields stdout/stderr chunks as they arrive, so long or chatty commands surface output incrementally instead of buffering until exit. The stream ends with a terminal `{ type: 'exit', exitCode }` event, yielded in-band so a failing command cannot look successful under `for await`. Discriminate it with `'type' in event`. If the gateway closes the stream without an exit event, `execStream` throws. `exec` drains `execStream` internally, so its buffered `ExecResult` is unchanged.
@@ -245,7 +275,7 @@ The SDK's goal is agent parity: anything the OpenShell gateway can do should be 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
 - `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
-- `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
+- `client.providers` (`ProviderClient`) is available today for operator-only credential retrieval. Provider CRUD and profile helpers remain planned.
 
 `health()` lives at the root today and will move under `client.gateway` (with a root alias) when that lands.
 

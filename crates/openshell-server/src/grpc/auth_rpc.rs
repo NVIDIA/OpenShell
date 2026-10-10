@@ -34,13 +34,12 @@ pub async fn handle_get_current_user(
     request: Request<GetCurrentUserRequest>,
 ) -> Result<Response<GetCurrentUserResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let Principal::User(user) = principal else {
+    let Some(identity) = principal.user_identity().cloned() else {
         return Err(Status::permission_denied(
             "GetCurrentUser requires a user principal",
         ));
     };
 
-    let identity = user.identity;
     Ok(Response::new(GetCurrentUserResponse {
         subject: identity.subject,
         display_name: identity.display_name.unwrap_or_default(),

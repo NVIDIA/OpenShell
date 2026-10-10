@@ -6,6 +6,9 @@
 //! Wraps [`regorus::Engine`] to evaluate Rego policies for sandbox network
 //! access decisions. The engine is loaded once at sandbox startup and queried
 //! on every proxy CONNECT request.
+//!
+//! The baked policy uses the `openshell.endpoint_path_matches` native builtin
+//! registered here to share endpoint selector semantics with Rust route selection.
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
@@ -35,6 +38,24 @@ mod raw_schema;
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
 const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
+
+fn new_regorus_engine() -> Result<regorus::Engine> {
+    let mut engine = regorus::Engine::new();
+    engine
+        .add_extension(
+            "openshell.endpoint_path_matches".into(),
+            2,
+            Box::new(|params: Vec<regorus::Value>| {
+                let pattern = params[0].as_string()?;
+                let path = params[1].as_string()?;
+                Ok(regorus::Value::from(
+                    openshell_core::endpoint_path::matches(pattern, path),
+                ))
+            }),
+        )
+        .map_err(|_| miette::miette!("failed to register endpoint path matcher"))?;
+    Ok(engine)
+}
 
 /// Maximum number of fixed categories in one policy-load error.
 const POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS: usize = 8;
@@ -358,7 +379,7 @@ impl OpaEngine {
         // original error, including its source chain, at the load boundary.
         let yaml_str = std::fs::read_to_string(data_path)
             .map_err(|_| miette::miette!("failed to read YAML policy data file"))?;
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy_from_file(policy_path)
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -405,7 +426,7 @@ impl OpaEngine {
         require_binary_identity: bool,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -499,7 +520,7 @@ impl OpaEngine {
         emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -5440,7 +5461,7 @@ process:
     }
 
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine().unwrap();
         engine
             .add_policy("policy.rego".into(), TEST_POLICY.into())
             .unwrap();
@@ -5457,7 +5478,7 @@ process:
     fn token_grant_owner_engine(policies: serde_json::Value) -> OpaEngine {
         // Owner identities are trusted runtime metadata, so these Rego tests
         // load the already-normalized data that follows policy conversion.
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine().expect("register runtime builtins");
         engine
             .add_policy("policy.rego".into(), TEST_POLICY.into())
             .expect("load owner admission policy");
@@ -6024,7 +6045,7 @@ network_policies:
 "#;
         let data_json: serde_json::Value =
             serde_yml::from_str(data).expect("fixture should parse as YAML");
-        let mut rego = regorus::Engine::new();
+        let mut rego = new_regorus_engine().unwrap();
         rego.add_policy("policy.rego".into(), TEST_POLICY.into())
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
@@ -6095,6 +6116,91 @@ network_policies:
             !eval_l7(&engine, &graphql_mutation),
             "REST rules on the same host must not allow a GraphQL mutation"
         );
+    }
+
+    #[test]
+    fn endpoint_path_matching_uses_canonical_rust_semantics() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("", "/p", true),
+            ("**", "/p/a", true),
+            ("/**", "/p/a", true),
+            ("/p", "/p", true),
+            ("/p", "/p/a", false),
+            ("/p/**", "/p", true),
+            ("/p/**", "/p/", true),
+            ("/p/**", "/p/a/b", true),
+            ("/p/**", "/prefix", false),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", true),
+            ("/v1/*", "/v1/a.json", true),
+            ("/v1/*", "/v1/a.b/c.d", true),
+            ("/v1/*", "/v2/a", false),
+            ("/v?/items", "/v1/items", true),
+            ("/v[12]/*", "/v2/a/b", true),
+            // A trailing /** treats its prefix literally, including glob syntax.
+            ("/v*/**", "/v1/a", false),
+            ("/v*/**", "/v*/a", true),
+            // Rust glob treats braces literally and invalid patterns as exact paths.
+            ("/a{b,c}", "/ab", false),
+            ("/a{b,c}", "/a{b,c}", true),
+            ("/[", "/[", true),
+            ("/[", "/p", false),
+        ] {
+            assert_eq!(
+                openshell_core::endpoint_path::matches(pattern, path),
+                expected
+            );
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({
+                    "endpoint": { "path": pattern },
+                    "request": { "path": path },
+                }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.endpoint_path_matches_request(input.endpoint, input.request)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "endpoint selector {pattern:?}, request path {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_path_matching_preserves_rule_path_globs() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("/p/**", "/p", false),
+            ("/p/**", "/p/a/b", true),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", false),
+        ] {
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({ "pattern": pattern, "path": path }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.path_matches(input.path, input.pattern)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "rule pattern {pattern:?}, request path {path:?}",
+            );
+        }
     }
 
     #[test]

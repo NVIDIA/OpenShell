@@ -132,30 +132,103 @@ The snap installs the standalone policy prover as `openshell.prover`. The
 The prover reads local policy files through the `home` interface and does not
 connect to the gateway.
 
-The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
+The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
 
 ```shell
-d=~/snap/openshell/common/.local/state/openshell/tls
-mkdir -p -m 700 "$d" "$d/client"
-sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
-sudo install -o "$USER" -m 600 -t "$d/client" \
-  /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
+snap services openshell.user-gateway
 openshell gateway add https://127.0.0.1:17670 --local --name openshell
 openshell status
 ```
 
-Keep the client key private.
+Existing installations upgraded from the former `openshell.gateway` service retain their state under `/var/snap/openshell/common` through `openshell.system-gateway`. Existing HTTPS registrations continue to work because the endpoint and TLS identity do not change.
 
-To install a locally built snap, connect its interfaces manually. The gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart the gateway after connecting the interfaces:
+If this user still has an old HTTP registration, or has not previously been enrolled, wait for the system gateway to be active, copy its client credentials into the user's Snap state, and register its HTTPS endpoint:
+
+```shell
+snap services openshell.system-gateway
+d=~/snap/openshell/common/.local/state/openshell/tls
+mkdir -p -m 700 "$d" "$d/client"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/ca.crt "$d/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.crt "$d/client/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.key "$d/client/"
+openshell gateway list
+old_registration="NAME_FROM_GATEWAY_LIST"
+openshell gateway remove "$old_registration"
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
+```
+
+Set `old_registration` to the name shown by `openshell gateway list`, and omit the variable assignment and `openshell gateway remove` when no registration exists. Older direct Snap instructions may have used `openshell-gateway`, while the install script uses `openshell`.
+
+### Change the Snap gateway mode
+
+The user and system gateways have separate configuration, databases, and cryptographic identities. Changing modes does not migrate gateway or sandbox state and interrupts active sandbox sessions. Back up any state you need and delete active sandboxes before changing modes.
+
+First disable both services and move the current user TLS directory to a timestamped backup. The directory can contain CA, server, client, and sandbox JWT private keys, so keep every `tls-backup-*` directory private:
+
+```shell
+sudo snap set openshell gateway-mode=disable
+state="$HOME/snap/openshell/common/.local/state/openshell"
+tls="$state/tls"
+if test -e "$tls" || test -L "$tls"; then
+  backup="$state/tls-backup-$(date +%s%N)"
+  while test -e "$backup" || test -L "$backup"; do
+    backup="$state/tls-backup-$(date +%s%N)"
+  done
+  mv -- "$tls" "$backup"
+  printf 'Previous gateway TLS state saved to: %s\n' "$backup"
+fi
+```
+
+To use the user gateway, start it and replace the previous CLI registration after it generates new credentials:
+
+```shell
+sudo snap set openshell gateway-mode=user
+systemctl --user is-active snap.openshell.user-gateway.service
+openshell gateway list
+old_registration="NAME_FROM_GATEWAY_LIST"
+openshell gateway remove "$old_registration"
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
+```
+
+To use the system gateway, start it, wait for it to generate its root-owned credentials, then copy its client bundle and replace the previous CLI registration:
+
+```shell
+sudo snap set openshell gateway-mode=system
+sudo snap services openshell.system-gateway
+tls="$HOME/snap/openshell/common/.local/state/openshell/tls"
+mkdir -p -m 700 "$tls" "$tls/client"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/ca.crt "$tls/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.crt "$tls/client/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.key "$tls/client/"
+openshell gateway list
+old_registration="NAME_FROM_GATEWAY_LIST"
+openshell gateway remove "$old_registration"
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
+```
+
+Set `old_registration` to the name shown by `openshell gateway list`, and omit the variable assignment and remove command when no registration exists. If a transition is interrupted while both services are disabled, select `gateway-mode=user` or `gateway-mode=system` to resume it. Keep the TLS backup until the selected gateway works and can create a sandbox.
+
+To install a locally built snap, connect its interfaces manually. The user gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart it from the affected user session after connecting the interfaces:
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
-sudo systemctl reset-failed snap.openshell.gateway.service
-sudo snap restart openshell.gateway
+systemctl --user reset-failed snap.openshell.user-gateway.service
+snap start --user openshell.user-gateway
 ```
+
+For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
 
 ## Kubernetes
 

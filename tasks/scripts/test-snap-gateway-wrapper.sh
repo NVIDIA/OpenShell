@@ -4,9 +4,7 @@
 
 set -euo pipefail
 
-wrapper_input=${1:?Usage: test-snap-gateway-wrapper.sh <wrapper>}
-wrapper_dir=$(cd "$(dirname "$wrapper_input")" && pwd)
-wrapper="${wrapper_dir}/$(basename "$wrapper_input")"
+wrapper=${1:?Usage: test-snap-gateway-wrapper.sh <wrapper>}
 work=$(mktemp -d "${TMPDIR:-/tmp}/openshell snap wrapper.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -18,57 +16,30 @@ mkdir -p "$snap/bin" "$common"
 
 cat >"$snap/bin/openshell-gateway" <<'EOF'
 #!/bin/sh
-printf '%s\n' "$*" >>"$FAKE_GATEWAY_LOG"
-if [ "${1:-}" = generate-certs ]; then
-  exit 0
-fi
-printf 'env:%s|%s|%s\n' \
+printf '%s|config=%s|db=%s|tls=%s\n' \
+  "$*" \
   "${OPENSHELL_GATEWAY_CONFIG:-}" \
   "${OPENSHELL_DB_URL:-}" \
-  "${OPENSHELL_DISABLE_TLS:-}" >>"$FAKE_GATEWAY_LOG"
-if [ "${1:-}" = config ] && [ "${2:-}" = preflight ]; then
-  if [ "${FAKE_PREFLIGHT_FAIL:-}" = 1 ]; then
-    exit 42
-  fi
-  if [ "${FAKE_REJECT_UNPAIRED_RATE:-}" = 1 ]; then
-    case " $* " in
-      *" --grpc-rate-limit-requests "*)
-        case " $* " in
-          *" --grpc-rate-limit-window-seconds "*) ;;
-          *) exit 43 ;;
-        esac
-        ;;
-    esac
-  fi
+  "${OPENSHELL_LOCAL_TLS_DIR:-}" >>"$FAKE_GATEWAY_LOG"
+if [ "${1:-}:${2:-}" = config:preflight ] && [ "${FAKE_PREFLIGHT_FAIL:-}" = 1 ]; then
+  exit 42
 fi
 EOF
 chmod +x "$snap/bin/openshell-gateway"
 
-run_wrapper() {
-  local config=$1
-  local fail=${2:-}
-  if [ "$config" = unset ]; then
-    env -u OPENSHELL_GATEWAY_CONFIG \
-      SNAP="$snap" \
-      SNAP_COMMON="$common" \
-      FAKE_GATEWAY_LOG="$log" \
-      FAKE_PREFLIGHT_FAIL="$fail" \
-      "$wrapper" --trace
-  else
-    env \
-      SNAP="$snap" \
-      SNAP_COMMON="$common" \
-      OPENSHELL_GATEWAY_CONFIG="$config" \
-      FAKE_GATEWAY_LOG="$log" \
-      FAKE_PREFLIGHT_FAIL="$fail" \
-      "$wrapper" --trace
-  fi
+run_system_wrapper() {
+  env -u OPENSHELL_GATEWAY_CONFIG \
+    SNAP="$snap" \
+    SNAP_COMMON="$common" \
+    OPENSHELL_SNAP_CONFIG_FILE="$common/gateway.toml" \
+    OPENSHELL_DB_URL="sqlite:$common/gateway.db?mode=rwc" \
+    OPENSHELL_LOCAL_TLS_DIR="$common/tls" \
+    FAKE_GATEWAY_LOG="$log" \
+    "$wrapper" "$@"
 }
 
 assert_log() {
-  printf '%s\n' \
-    "generate-certs --output-dir $common/tls --server-san host.openshell.internal" \
-    "$1" >"$expected"
+  printf '%s\n' "$1" >"$expected"
   if ! cmp -s "$expected" "$log"; then
     echo "FAIL: unexpected call sequence" >&2
     diff -u "$expected" "$log" >&2
@@ -76,148 +47,86 @@ assert_log() {
   fi
 }
 
+# A missing compatibility config remains optional and OpenShell performs its
+# normal config discovery.
+: >"$log"
+run_system_wrapper --trace
+assert_log "config preflight -- --trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+--trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
+
+# An existing compatibility config is exposed through the standard gateway
+# config environment variable for both preflight and startup.
+printf 'valid schema-v2\n' >"$common/gateway.toml"
+: >"$log"
+run_system_wrapper --trace
+assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+--trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
+
+# An operator-provided environment path takes precedence over the Snap
+# compatibility path, while CLI arguments are replayed unchanged.
 override="$work/override.toml"
 printf 'operator override\n' >"$override"
-cp "$override" "$work/override-before"
-: >"$log"
-run_wrapper "$override"
-assert_log "config preflight -- --trace
-env:$override|sqlite:$common/gateway.db?mode=rwc|
---trace
-env:$override|sqlite:$common/gateway.db?mode=rwc|"
-cmp -s "$work/override-before" "$override"
-
-cli_config="$work/cli.toml"
-printf 'CLI override\n' >"$cli_config"
-cp "$cli_config" "$work/cli-before"
 : >"$log"
 env \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
+  OPENSHELL_SNAP_CONFIG_FILE="$common/gateway.toml" \
   OPENSHELL_GATEWAY_CONFIG="$override" \
+  OPENSHELL_DB_URL="sqlite:$common/gateway.db?mode=rwc" \
+  OPENSHELL_LOCAL_TLS_DIR="$common/tls" \
   FAKE_GATEWAY_LOG="$log" \
-  "$wrapper" --trace --config "$cli_config"
-assert_log "config preflight -- --trace --config $cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|
---trace --config $cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|"
-cmp -s "$work/cli-before" "$cli_config"
+  "$wrapper" --config "$work/cli.toml" --trace
+assert_log "config preflight -- --config $work/cli.toml --trace|config=$override|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$override|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls
+--config $work/cli.toml --trace|config=$override|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
 
+# Broken compatibility symlinks are selected so preflight fails closed rather
+# than silently falling back to defaults.
+rm "$common/gateway.toml"
+ln -s "$work/missing.toml" "$common/gateway.toml"
 : >"$log"
-if env \
-  SNAP="$snap" \
-  SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
-  FAKE_GATEWAY_LOG="$log" \
-  FAKE_PREFLIGHT_FAIL=1 \
-  "$wrapper" --config="$cli_config"; then
-  echo "FAIL: CLI-selected config preflight failure reached gateway start" >&2
+if FAKE_PREFLIGHT_FAIL=1 run_system_wrapper --trace; then
+  echo "FAIL: broken compatibility symlink reached certificate generation" >&2
   exit 1
 fi
-assert_log "config preflight -- --config=$cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|"
-cmp -s "$work/cli-before" "$cli_config"
+assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
 
+# Preflight failure prevents certificate generation and gateway startup.
 : >"$log"
-if env \
-  SNAP="$snap" \
-  SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
-  FAKE_GATEWAY_LOG="$log" \
-  FAKE_REJECT_UNPAIRED_RATE=1 \
-  "$wrapper" --grpc-rate-limit-requests 10; then
-  echo "FAIL: invalid daemon overrides reached gateway start" >&2
+if FAKE_PREFLIGHT_FAIL=1 run_system_wrapper --config --; then
+  echo "FAIL: preflight failure reached certificate generation" >&2
   exit 1
 fi
-assert_log "config preflight -- --grpc-rate-limit-requests 10
-env:$override|sqlite:$common/gateway.db?mode=rwc|"
+assert_log "config preflight -- --config --|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls"
 
-for invalid_selector in terminator nested-config; do
-  : >"$log"
-  if [ "$invalid_selector" = terminator ]; then
-    invalid_args=(--config --)
-  else
-    invalid_args=(--config "--config=$cli_config")
-  fi
-  if env \
-    SNAP="$snap" \
-    SNAP_COMMON="$common" \
-    OPENSHELL_GATEWAY_CONFIG="$override" \
-    FAKE_GATEWAY_LOG="$log" \
-    "$wrapper" "${invalid_args[@]}"; then
-    echo "FAIL: invalid $invalid_selector selector reached gateway execution" >&2
-    exit 1
-  fi
-  if [ -s "$log" ]; then
-    echo "FAIL: invalid $invalid_selector selector reached preflight" >&2
-    exit 1
-  fi
-done
-
+# User mode supplies only XDG roots. The wrapper derives TLS state, leaves the
+# database unset for OpenShell's native default, and lets OpenShell discover
+# the XDG config itself.
+user_common="$work/user-common"
+user_tls="$user_common/.local/state/openshell/tls"
 : >"$log"
-env \
+env -u OPENSHELL_GATEWAY_CONFIG \
+  -u OPENSHELL_SNAP_CONFIG_FILE \
+  -u OPENSHELL_DB_URL \
+  -u OPENSHELL_LOCAL_TLS_DIR \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
+  XDG_CONFIG_HOME="$user_common/.config" \
+  XDG_STATE_HOME="$user_common/.local/state" \
   FAKE_GATEWAY_LOG="$log" \
-  "$wrapper" --config=--dash-leading
-assert_log "config preflight -- --config=--dash-leading
-env:$override|sqlite:$common/gateway.db?mode=rwc|
---config=--dash-leading
-env:$override|sqlite:$common/gateway.db?mode=rwc|"
+  "$wrapper" --trace
+assert_log "config preflight -- --trace|config=|db=|tls=$user_tls
+generate-certs --output-dir $user_tls --server-san host.openshell.internal|config=|db=|tls=$user_tls
+--trace|config=|db=|tls=$user_tls"
 
-canonical="$common/gateway.toml"
-printf 'valid schema-v2\n' >"$canonical"
-cp "$canonical" "$work/canonical-before"
-: >"$log"
-run_wrapper unset
-assert_log "config preflight -- --config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|
---config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|"
-cmp -s "$work/canonical-before" "$canonical"
-
-rm "$canonical"
-: >"$log"
-run_wrapper unset
-assert_log "config preflight -- --trace
-env:|sqlite:$common/gateway.db?mode=rwc|
---trace
-env:|sqlite:$common/gateway.db?mode=rwc|"
-
-assert_preflight_failure() {
-  local name=$1
-  : >"$log"
-  if run_wrapper unset 1; then
-    echo "FAIL: $name reached gateway start" >&2
-    exit 1
-  fi
-  assert_log "config preflight -- --config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|"
-}
-
-printf 'legacy version = 1\n' >"$canonical"
-cp "$canonical" "$work/legacy-before"
-assert_preflight_failure legacy
-cmp -s "$work/legacy-before" "$canonical"
-
-printf 'not valid TOML = [\n' >"$canonical"
-cp "$canonical" "$work/malformed-before"
-assert_preflight_failure malformed
-cmp -s "$work/malformed-before" "$canonical"
-
-rm "$canonical"
-ln -s "$work/missing-target" "$canonical"
-readlink "$canonical" >"$work/link-before"
-assert_preflight_failure broken-symlink
-readlink "$canonical" >"$work/link-after"
-cmp -s "$work/link-before" "$work/link-after"
-
-rm "$canonical"
-mkdir "$canonical"
-printf 'nonregular marker\n' >"$canonical/marker"
-cp "$canonical/marker" "$work/marker-before"
-assert_preflight_failure nonregular
-cmp -s "$work/marker-before" "$canonical/marker"
+if env -u OPENSHELL_LOCAL_TLS_DIR -u XDG_STATE_HOME \
+  SNAP="$snap" FAKE_GATEWAY_LOG="$log" "$wrapper" --trace \
+  >"$work/out" 2>"$work/err"; then
+  echo "FAIL: wrapper accepted missing TLS roots" >&2
+  exit 1
+fi
+grep -Fq 'OPENSHELL_LOCAL_TLS_DIR or XDG_STATE_HOME is required' "$work/err"
 
 echo "Snap gateway wrapper tests passed"

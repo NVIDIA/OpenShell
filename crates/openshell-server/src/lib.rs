@@ -1152,8 +1152,14 @@ fn spawn_gateway_connection(
                     match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            let certificate_sha256 =
+                                multiplex::extract_peer_certificate_sha256(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_verified_certificate(
+                                    tls_stream,
+                                    peer_identity,
+                                    certificate_sha256,
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {

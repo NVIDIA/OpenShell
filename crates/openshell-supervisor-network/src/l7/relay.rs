@@ -8848,6 +8848,136 @@ network_policies:
             .unwrap();
     }
 
+    async fn assert_endpoint_path_deny(selector: &str, method: &str, path: &str, denied: bool) {
+        let data = format!(
+            r#"
+network_policies:
+  route_api:
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: "{selector}"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: "*", path: "**" }}
+        deny_rules:
+          - {{ method: POST, path: "**" }}
+      - host: gateway.example.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: "*", path: "**" }}
+    binaries:
+      - {{ path: /usr/bin/node }}
+"#,
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data)
+            .expect("compatible overlapping endpoints must be accepted");
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoints, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| crate::l7::parse_l7_config(endpoint).unwrap())
+            .collect();
+        assert_eq!(configs.len(), 2);
+        if denied {
+            assert_eq!(
+                select_l7_config_for_path(&configs, path).unwrap().path,
+                selector
+            );
+        }
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        // Respond to any forwarded request so a bypass produces an observable
+        // 200, rather than a timeout that could hide the authorization result.
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 8192];
+            let n = upstream.read(&mut request).await.unwrap();
+            if n != 0 {
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            n
+        });
+        app.write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: gateway.example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_http_headers(&mut app),
+        )
+        .await
+        .expect("relay must answer the request");
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("relay must finish")
+            .unwrap()
+            .unwrap();
+        let forwarded_bytes = server.await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let status = if denied { "403 Forbidden" } else { "200 OK" };
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "selector={selector}, request={method} {path}: {response}"
+        );
+        assert_eq!(forwarded_bytes == 0, denied);
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_covers_subtree_root() {
+        assert_endpoint_path_deny("/p/**", "POST", "/p", true).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_covers_multisegment_star() {
+        assert_endpoint_path_deny("/v1/*", "POST", "/v1/a/b", true).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_preserves_matching_and_nonmatching_controls() {
+        assert_endpoint_path_deny("/p/**", "POST", "/p/child", true).await;
+        assert_endpoint_path_deny("/v1/*", "POST", "/v1/a", true).await;
+        assert_endpoint_path_deny("/p/**", "GET", "/p", false).await;
+        assert_endpoint_path_deny("/p/**", "POST", "/public", false).await;
+        assert_endpoint_path_deny("/p/**", "POST", "/prefix", false).await;
+    }
+
     /// Policy allowing GET on both `/repos/**` and `/admin/**` for the same
     /// host:port, so an encoded-slash denial can only come from the
     /// per-endpoint `allow_encoded_slash` scoping.

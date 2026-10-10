@@ -243,6 +243,7 @@ mock_gateway! {
         delete_service(proto::DeleteServiceRequest) -> proto::DeleteServiceResponse;
         revoke_ssh_session(proto::RevokeSshSessionRequest) -> proto::RevokeSshSessionResponse;
         create_provider(proto::CreateProviderRequest) -> proto::ProviderResponse;
+        get_provider_credentials(proto::GetProviderCredentialsRequest) -> proto::GetProviderCredentialsResponse;
         get_provider(proto::GetProviderRequest) -> proto::ProviderResponse;
         list_providers(proto::ListProvidersRequest) -> proto::ListProvidersResponse;
         list_provider_profiles(proto::ListProviderProfilesRequest) -> proto::ListProviderProfilesResponse;

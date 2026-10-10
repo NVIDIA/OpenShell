@@ -93,6 +93,14 @@ TLS.
     the Kubernetes compute driver.
     Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
 
+**--enable-operator-auth** *BOOL*
+:   Enable direct mTLS operators with a trusted client certificate containing
+    **OU=operator**. Grants user/platform-admin capabilities across all
+    workspaces and access to runtime credential retrieval. Defaults off.
+    Requires TLS and a client CA, independently of ordinary mTLS user auth
+    and OIDC. Do not combine an operator certificate with bearer headers.
+    Environment: **OPENSHELL_ENABLE_OPERATOR_AUTH**.
+
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
     address is **0.0.0.0** (the RPM default), disabling TLS exposes the
@@ -142,7 +150,9 @@ The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
 Snap wrapper replays its effective daemon arguments through preflight. It first
 uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
-SNAP_COMMON/gateway.toml path whenever it exists or is a symlink. A broken symlink
+service-specific gateway.toml path whenever it exists or is a symlink. The legacy
+system service uses SNAP_COMMON/gateway.toml; the user service uses
+SNAP_USER_COMMON/.config/openshell/gateway.toml. A broken symlink
 fails preflight before the gateway is started. Correct or manually migrate an
 operator-owned v1 file, then run preflight again before restarting the service.
 

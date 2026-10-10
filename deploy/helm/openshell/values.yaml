@@ -689,9 +689,10 @@ certManager:
   serverIpAddresses:
     - 127.0.0.1
 
-# Kubernetes Gateway API - HTTPRoute and Gateway resources.
-# Requires a Gateway API controller in the cluster. Install Envoy Gateway via
-# the skaffold.yaml releases or independently:
+# Kubernetes Gateway API - GRPCRoute and Gateway resources.
+# Requires a Gateway API controller in the cluster. OpenShell tests the
+# examples with Envoy Gateway, which can be installed via skaffold.yaml or
+# independently:
 #   helm install eg oci://docker.io/envoyproxy/gateway-helm \
 #     --version v1.4.1 -n envoy-gateway-system --create-namespace
 grpcRoute:
@@ -701,23 +702,34 @@ grpcRoute:
   hostnames: []
   gateway:
     # -- When true, a Gateway resource is created in the release namespace.
-    # Set to false and provide name/namespace to attach to a pre-existing Gateway.
+    # Set to false and provide name/namespace to attach to a pre-existing
+    # Gateway. Use sectionName to select a specific listener when needed.
     create: false
-    # -- GatewayClass to reference. Envoy Gateway installs one named "eg".
+    # -- GatewayClass for a chart-created Gateway. Set this to the name exposed
+    # by your Gateway API implementation. Envoy Gateway uses "eg" in the
+    # OpenShell examples. Ignored when gateway.create is false.
     className: "eg"
-    # -- Name of the Gateway resource. Defaults to the chart fullname.
+    # -- Name of the Gateway resource. Defaults to `<fullname>`. Set a distinct
+    # name when the selected controller creates a proxy Service with the
+    # Gateway name. When gateway.create is false, set this to the name of the
+    # existing Gateway.
     name: ""
     # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
-    # Defaults to the release namespace.
+    # Defaults to the release namespace. A chart-created Gateway always resides
+    # in the release namespace.
     namespace: ""
+    # -- Listener name on an existing Gateway. Leave empty to let Gateway API
+    # listener matching select compatible listeners.
+    sectionName: ""
     # Listener settings (only used when gateway.create is true).
     listener:
       # -- Listener port for the generated Gateway resource. Use 443 with protocol HTTPS.
       port: 80
       # -- Listener protocol for the generated Gateway resource: HTTP or HTTPS.
-      # HTTPS terminates TLS at the Envoy Gateway listener; pair it with
-      # server.disableTls=true so Envoy forwards plaintext to the gateway pod,
-      # and use OIDC for client identity (the gateway never sees the client cert).
+      # HTTPS terminates TLS at the Gateway listener; pair it with
+      # server.disableTls=true so the proxy forwards plaintext to the gateway
+      # pod, and use OIDC for client identity (the gateway never sees the client
+      # certificate).
       protocol: HTTP
       # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same
