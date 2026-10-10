@@ -90,8 +90,8 @@ navigation:
       path: extensibility/supervisor-middleware/configure.mdx
     - page: "Supported Operations"
       path: extensibility/supervisor-middleware/operations.mdx
-    - page: "V2 HTTP Hooks"
-      path: extensibility/supervisor-middleware/http-hooks-v2.mdx
+    - page: "HTTP Session Hooks"
+      path: extensibility/supervisor-middleware/http-session-hooks.mdx
   - page: "Gateway Interceptors"
     path: extensibility/gateway-interceptors.mdx
   - page: "Drivers"

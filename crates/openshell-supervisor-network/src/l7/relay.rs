@@ -4745,23 +4745,27 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpRequestSessionStream = openshell_core::middleware::HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status>
-        {
+        ) -> std::result::Result<
+            tonic::Response<Self::EvaluateHttpRequestSessionStream>,
+            tonic::Status,
+        > {
             Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpResponseSessionStream = openshell_core::middleware::HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status>
-        {
+        ) -> std::result::Result<
+            tonic::Response<Self::EvaluateHttpResponseSessionStream>,
+            tonic::Status,
+        > {
             Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
@@ -11485,11 +11489,11 @@ network_policies:
         Missing,
     }
 
-    /// v2 HTTP hook counterpart of [`McpToolReplacingService`]: a BUFFERED stage
+    /// HTTP session hook counterpart of [`McpToolReplacingService`]: a BUFFERED stage
     /// that replaces the tool call and writes the sessionless `Mcp-Name`
     /// mirror as a late mutation in its body result, at preflight, or not at
     /// all.
-    struct McpToolReplacingV2Service {
+    struct McpToolReplacingSessionService {
         replacement: Vec<u8>,
         tool_name: &'static str,
         mirror: McpNameMirror,
@@ -11497,15 +11501,19 @@ network_policies:
     }
 
     #[tonic::async_trait]
-    impl openshell_core::middleware::InProcessMiddleware for McpToolReplacingV2Service {
+    impl openshell_core::middleware::InProcessMiddleware for McpToolReplacingSessionService {
         async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
             let mut manifest =
                 openshell_core::middleware::InProcessMiddleware::describe(&BodyReplacingService {
                     replacement: b"",
                 })
                 .await;
-            manifest.bindings[0].operation =
-                openshell_core::proto::SupervisorMiddlewareOperation::HttpRequestV2 as i32;
+            manifest.extension = Some(
+                openshell_core::extension_protocol::http_session_middleware_metadata(
+                    manifest.name.clone(),
+                    "test",
+                ),
+            );
             manifest
         }
 
@@ -11524,7 +11532,7 @@ network_policies:
             Err(miette!("version 2 test middleware"))
         }
 
-        async fn open_http_request_v2(
+        async fn open_http_request_session(
             &self,
             mut requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpEvent>,
         ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
@@ -11669,7 +11677,7 @@ network_policies:
                     let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
                     engine.set_middleware_runner_for_tests(
                         openshell_supervisor_middleware::ChainRunner::new(Arc::new(
-                            McpToolReplacingV2Service {
+                            McpToolReplacingSessionService {
                                 replacement: replacement.as_bytes().to_vec(),
                                 tool_name,
                                 mirror,

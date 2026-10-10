@@ -4,11 +4,11 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through v2 HTTP hooks
-//! (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`), and in WebSocket
-//! text messages. Its `HTTP_REQUEST_V2` and `HTTP_RESPONSE_V2` bindings are
-//! unknown to gateways and supervisors that predate v2 HTTP hooks, so they
-//! refuse it at Describe.
+//! response bodies through HTTP session hooks (`EvaluateHttpRequestSession`
+//! and `EvaluateHttpResponseSession`), and in WebSocket text messages. Its
+//! manifest requires the `openshell.supervisor-middleware.http-session`
+//! capability, which gateways and supervisors that predate HTTP session hooks
+//! do not support, so they refuse it at Describe.
 
 mod guard;
 mod http;
@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use openshell_core::extension_protocol::{
-    ExtensionFamily, extension_metadata, validate_gateway_metadata,
+    ExtensionFamily, http_session_middleware_metadata, validate_gateway_metadata,
 };
 use openshell_core::middleware::{HttpResultStream, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
@@ -63,8 +63,8 @@ fn http_binding(
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
     type EvaluateWebSocketSessionStream = WebSocketResponseStream;
-    type EvaluateHttpRequestV2Stream = HttpResultStream;
-    type EvaluateHttpResponseV2Stream = HttpResultStream;
+    type EvaluateHttpRequestSessionStream = HttpResultStream;
+    type EvaluateHttpResponseSessionStream = HttpResultStream;
 
     async fn describe(
         &self,
@@ -75,11 +75,11 @@ impl SupervisorMiddleware for ContentGuard {
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![
                 http_binding(
-                    SupervisorMiddlewareOperation::HttpRequestV2,
+                    SupervisorMiddlewareOperation::HttpRequest,
                     SupervisorMiddlewarePhase::PreCredentials,
                 ),
                 http_binding(
-                    SupervisorMiddlewareOperation::HttpResponseV2,
+                    SupervisorMiddlewareOperation::HttpResponse,
                     SupervisorMiddlewarePhase::PreReturn,
                 ),
                 MiddlewareBinding {
@@ -90,11 +90,9 @@ impl SupervisorMiddleware for ContentGuard {
                 },
             ],
             expected_audience: String::new(),
-            extension: Some(extension_metadata(
-                ExtensionFamily::SupervisorMiddleware,
+            extension: Some(http_session_middleware_metadata(
                 MANIFEST_NAME,
                 openshell_core::VERSION,
-                [],
             )),
         };
         validate_gateway_metadata(
@@ -130,23 +128,23 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         _request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
-        // v1 HTTP hooks. This service implements v2 HTTP hooks only.
+        // v1 HTTP hooks. This service implements HTTP session hooks only.
         Err(Status::unimplemented(
-            "content guard implements v2 HTTP hooks only",
+            "content guard implements HTTP session hooks only",
         ))
     }
 
-    async fn evaluate_http_request_v2(
+    async fn evaluate_http_request_session(
         &self,
         request: Request<tonic::Streaming<HttpEvent>>,
-    ) -> Result<Response<Self::EvaluateHttpRequestV2Stream>, Status> {
+    ) -> Result<Response<Self::EvaluateHttpRequestSessionStream>, Status> {
         Ok(Response::new(http::stage_stream(request.into_inner())))
     }
 
-    async fn evaluate_http_response_v2(
+    async fn evaluate_http_response_session(
         &self,
         request: Request<tonic::Streaming<HttpEvent>>,
-    ) -> Result<Response<Self::EvaluateHttpResponseV2Stream>, Status> {
+    ) -> Result<Response<Self::EvaluateHttpResponseSessionStream>, Status> {
         Ok(Response::new(http::stage_stream(request.into_inner())))
     }
 
@@ -173,12 +171,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use openshell_core::extension_protocol::gateway_metadata;
+    use openshell_core::extension_protocol::{
+        SUPERVISOR_MIDDLEWARE_HTTP_SESSION, gateway_metadata,
+    };
 
     use super::*;
 
     #[tokio::test]
-    async fn manifest_advertises_v2_http_hook_and_websocket_bindings() {
+    async fn manifest_advertises_http_session_hook_and_websocket_bindings() {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest {
@@ -197,10 +197,17 @@ mod tests {
         assert_eq!(
             operations,
             [
-                SupervisorMiddlewareOperation::HttpRequestV2 as i32,
-                SupervisorMiddlewareOperation::HttpResponseV2 as i32,
+                SupervisorMiddlewareOperation::HttpRequest as i32,
+                SupervisorMiddlewareOperation::HttpResponse as i32,
                 SupervisorMiddlewareOperation::WebsocketMessage as i32,
             ]
+        );
+        let extension = manifest.extension.expect("extension metadata");
+        assert!(
+            extension
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
         );
     }
 

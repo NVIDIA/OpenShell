@@ -3,11 +3,11 @@
 
 #![cfg(feature = "e2e-docker")]
 
-//! v2 HTTP hooks end to end.
+//! HTTP session hooks end to end.
 //!
 //! Runs the `supervisor-middleware-content-guard` example from this checkout
 //! as an operator-registered middleware service for the current gateway and
-//! Docker sandbox supervisor. `mise run e2e:middleware-http-v2` builds the
+//! Docker sandbox supervisor. `mise run e2e:middleware-http-session` builds the
 //! example and exports `OPENSHELL_E2E_CONTENT_GUARD_BIN`; without it the test
 //! skips, unless `OPENSHELL_E2E_REQUIRE_MIDDLEWARE=1` makes the binary
 //! mandatory.
@@ -647,7 +647,7 @@ fn should_run() -> Option<String> {
     let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
     let skip = |reason: &str| {
         assert!(!required, "{REQUIRE_ENV}=1 but {reason}");
-        eprintln!("Skipping v2 HTTP hook middleware e2e: {reason}");
+        eprintln!("Skipping HTTP session hook middleware e2e: {reason}");
         None
     };
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
@@ -664,14 +664,14 @@ fn should_run() -> Option<String> {
     match std::env::var(BIN_ENV) {
         Ok(binary) if !binary.is_empty() => Some(binary),
         _ => skip(&format!(
-            "{BIN_ENV} is not set; run `mise run e2e:middleware-http-v2`"
+            "{BIN_ENV} is not set; run `mise run e2e:middleware-http-session`"
         )),
     }
 }
 
 #[tokio::test]
 #[serial(supervisor_middleware)]
-async fn v2_http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
+async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor() {
     let Some(binary) = should_run() else {
         return;
     };

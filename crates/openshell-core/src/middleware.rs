@@ -17,8 +17,8 @@ use crate::proto::{
     ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one v2 HTTP hook exchange
-/// (`EvaluateHttpRequestV2` or `EvaluateHttpResponseV2`).
+/// Transport-neutral result stream for one HTTP session hook exchange
+/// (`EvaluateHttpRequestSession` or `EvaluateHttpResponseSession`).
 pub type HttpResultStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
 
@@ -73,23 +73,23 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one v2 HTTP hook request exchange (`EvaluateHttpRequestV2`).
-    async fn open_http_request_v2(
+    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`).
+    async fn open_http_request_session(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement v2 HTTP hook requests",
+            "middleware does not implement HTTP session hook requests",
         ))
     }
 
-    /// Open one v2 HTTP hook response exchange (`EvaluateHttpResponseV2`).
-    async fn open_http_response_v2(
+    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
+    async fn open_http_response_session(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement v2 HTTP hook responses",
+            "middleware does not implement HTTP session hook responses",
         ))
     }
 }
@@ -306,30 +306,30 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one v2 HTTP hook request exchange (`EvaluateHttpRequestV2`),
+    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`),
     /// for a request or for traffic `OpenShell` cannot inspect.
     ///
-    /// Implementations without an `HTTP_REQUEST_V2` binding may keep the
-    /// default unsupported response.
-    async fn open_http_request_v2(
+    /// Implementations that do not require the HTTP session hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_request_session(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement v2 HTTP hook requests",
+            "middleware does not implement HTTP session hook requests",
         ))
     }
 
-    /// Open one v2 HTTP hook response exchange (`EvaluateHttpResponseV2`).
+    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
     ///
-    /// Implementations without an `HTTP_RESPONSE_V2` binding may keep the
-    /// default unsupported response.
-    async fn open_http_response_v2(
+    /// Implementations that do not require the HTTP session hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_response_session(
         &self,
         _requests: mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement v2 HTTP hook responses",
+            "middleware does not implement HTTP session hook responses",
         ))
     }
 }

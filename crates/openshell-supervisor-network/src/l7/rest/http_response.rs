@@ -3,7 +3,7 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
-mod http_v2;
+mod http_session;
 
 use super::*;
 
@@ -20,7 +20,7 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
-    /// The client request used HTTP/1.1, so a v2 HTTP hook response may
+    /// The client request used HTTP/1.1, so an HTTP session hook response may
     /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
     pub(crate) client_accepts_chunked: bool,
 }
@@ -347,8 +347,8 @@ where
     };
     match openshell_supervisor_middleware::chain_http_hook_version(&described) {
         openshell_supervisor_middleware::ChainHttpHookVersion::V1 => {}
-        openshell_supervisor_middleware::ChainHttpHookVersion::V2 => {
-            return Box::pin(http_v2::relay_response_through_pipeline(
+        openshell_supervisor_middleware::ChainHttpHookVersion::Session => {
+            return Box::pin(http_session::relay_response_through_pipeline(
                 request_method,
                 upstream,
                 client,

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! v2 HTTP hooks (`EvaluateHttpRequestV2` and `EvaluateHttpResponseV2`).
+//! HTTP session hooks (`EvaluateHttpRequestSession` and `EvaluateHttpResponseSession`).
 //!
 //! v1 HTTP hooks keep their own engines. A chain runs on exactly one hook
 //! version: every selected entry for one HTTP message must use the same
@@ -44,9 +44,10 @@ pub enum ChainHttpHookVersion {
     /// Every resolved entry uses v1 HTTP hooks, or the chain is empty. The
     /// chain runs on the v1 HTTP hook engines, unchanged.
     V1,
-    /// At least one entry uses v2 HTTP hooks and none uses v1 HTTP hooks.
-    V2,
-    /// Resolved v1 and v2 HTTP hook entries select the same
+    /// At least one entry uses HTTP session hooks and none uses v1 HTTP
+    /// hooks.
+    Session,
+    /// Resolved v1 HTTP hook and HTTP session hook entries select the same
     /// message. The message fails closed with [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
     Mixed,
 }
@@ -55,15 +56,15 @@ pub enum ChainHttpHookVersion {
 /// entries. An unresolved entry follows its `on_error` on either path.
 #[must_use]
 pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHookVersion {
-    let v2 = entries
+    let session = entries
         .iter()
-        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::V2));
+        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Session));
     let v1 = entries
         .iter()
         .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::V1));
-    match (v1, v2) {
+    match (v1, session) {
         (true, true) => ChainHttpHookVersion::Mixed,
-        (false, true) => ChainHttpHookVersion::V2,
+        (false, true) => ChainHttpHookVersion::Session,
         _ => ChainHttpHookVersion::V1,
     }
 }

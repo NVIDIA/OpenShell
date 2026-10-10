@@ -3384,7 +3384,7 @@ network_policies:
         assert!(
             middleware_tls_skip_conflicts(&policy, |middleware| middleware == "example/guard")
                 .is_empty(),
-            "v2 HTTP hook middleware decides about tls: skip tunnels at runtime"
+            "HTTP session hook middleware decides about tls: skip tunnels at runtime"
         );
     }
 

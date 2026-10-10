@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! v2 HTTP hook stage pipeline, shared by request and response evaluation.
+//! HTTP session hook stage pipeline, shared by request and response evaluation.
 //!
 //! Preflight runs every selected stage in chain order. Stages that inspect
 //! the body then run concurrently, linked by bounded channels. Each stage
@@ -64,10 +64,10 @@ pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
-/// Failure reason for a v2 HTTP hook stage that ends its stream with
+/// Failure reason for an HTTP session hook stage that ends its stream with
 /// `FAILED_PRECONDITION`: it cannot inspect the message.
 pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
-/// Failure reason for a chain that selects v1 and v2 HTTP hook stages for the
+/// Failure reason for a chain that selects v1 and HTTP session hook stages for the
 /// same HTTP message.
 pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed";
 
@@ -118,7 +118,7 @@ pub enum HttpStageOutcome {
     FailClosed,
     /// The entry did not resolve to a registered binding, and its
     /// `on_error: fail_open` let the message continue without it. Never an
-    /// v2 HTTP hook entry.
+    /// HTTP session hook entry.
     FailOpen,
 }
 
@@ -457,12 +457,12 @@ pub(super) async fn open_stage(
             .send(event)
             .await
             .map_err(|_| tonic::Status::unavailable("middleware stage stream closed"))?;
-        // A response preflight uses EvaluateHttpResponseV2; a request or an
-        // uninspectable connection uses EvaluateHttpRequestV2.
+        // A response preflight uses EvaluateHttpResponseSession; a request or an
+        // uninspectable connection uses EvaluateHttpRequestSession.
         let mut results = if is_response {
-            service.service.open_http_response_v2(receiver).await?
+            service.service.open_http_response_session(receiver).await?
         } else {
-            service.service.open_http_request_v2(receiver).await?
+            service.service.open_http_request_session(receiver).await?
         };
         let first = results.next().await;
         Ok::<_, tonic::Status>((results, first))
@@ -538,7 +538,7 @@ pub async fn preflight(
     for entry in entries {
         if !entry.is_resolved() {
             // An unresolved entry follows its on_error, as with v1 HTTP
-            // hooks. The gateway rejects fail_open for v2 HTTP hook services.
+            // hooks. The gateway rejects fail_open for HTTP session hook services.
             if entry.on_error() == OnError::FailOpen {
                 state
                     .diagnostics
@@ -550,7 +550,7 @@ pub async fn preflight(
                 .fail(entry_failure(entry, "binding_not_described"))
                 .await;
         }
-        if entry.http_hook_version() != Some(HttpHookVersion::V2) {
+        if entry.http_hook_version() != Some(HttpHookVersion::Session) {
             return state
                 .fail(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED))
                 .await;
@@ -1854,7 +1854,7 @@ fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMi
         // The stage says it cannot inspect this message. The reason never
         // carries the service's status text.
         tonic::Code::FailedPrecondition => entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT),
-        // The service does not implement the v2 HTTP hook RPC its binding
+        // The service does not implement the HTTP session hook RPC its binding
         // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
         _ => entry_failure(entry, &diagnostic_policy(entry).error_reason(status)),

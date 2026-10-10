@@ -19,21 +19,29 @@ service SupervisorMiddleware {
   // ValidateConfig checks service-specific configuration for one binding.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
-  // v1 HTTP hooks. Deprecated: removed in 0.2.0; use EvaluateHttpRequestV2.
+  // Deprecated: v1 HTTP hooks, removed in 0.2.0. Use
+  // EvaluateHttpRequestSession.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
-  // buffered HTTP request. OpenShell calls it for HTTP_REQUEST bindings.
-  rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+  // buffered HTTP request. OpenShell calls it for the HTTP_REQUEST bindings of
+  // a service that does not require the HTTP session hooks capability.
+  rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult) {
+    option deprecated = true;
+  }
 
-  // v2 HTTP hooks for HTTP_REQUEST_V2 bindings. One stream per request and
-  // middleware stage, or per connection OpenShell cannot inspect. The first
-  // event is a preflight whose subject is a request or uninspectable
-  // traffic.
-  rpc EvaluateHttpRequestV2(stream HttpEvent) returns (stream HttpResult);
+  // HTTP session hooks for requests. OpenShell calls it for the HTTP_REQUEST
+  // bindings of a service whose manifest lists
+  // openshell.supervisor-middleware.http-session in
+  // extension.required_capabilities. Peers that predate HTTP session hooks
+  // reject such a service at Describe. One stream per request and middleware
+  // stage, or per connection OpenShell cannot inspect. The first event is a
+  // preflight whose subject is a request or uninspectable traffic.
+  rpc EvaluateHttpRequestSession(stream HttpEvent) returns (stream HttpResult);
 
-  // v2 HTTP hooks for HTTP_RESPONSE_V2 bindings. One stream per response
-  // and middleware stage. The first event is a preflight whose subject is a
-  // response.
-  rpc EvaluateHttpResponseV2(stream HttpEvent) returns (stream HttpResult);
+  // HTTP session hooks for responses, for the HTTP_RESPONSE bindings of a
+  // service that requires the HTTP session hooks capability. One stream per
+  // response and middleware stage. The first event is a preflight whose
+  // subject is a response.
+  rpc EvaluateHttpResponseSession(stream HttpEvent) returns (stream HttpResult);
 
   // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
   // single middleware stage and WebSocket upgrade attempt. The current
@@ -52,16 +60,23 @@ message MiddlewareDescribeRequest {
   openshell.extension.v1.PeerMetadata gateway = 1;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0. Use
+// SupervisorMiddleware.EvaluateHttpResponseSession.
 // HttpResponsePreReturn evaluates one response for one middleware stage before
-// OpenShell returns it to the sandbox.
+// OpenShell returns it to the sandbox. OpenShell calls it for the HTTP_RESPONSE
+// bindings of a service that does not require the HTTP session hooks
+// capability.
 service HttpResponsePreReturn {
-  // v1 HTTP hooks. Deprecated: removed in 0.2.0; use
-  // SupervisorMiddleware.EvaluateHttpResponseV2.
+  option deprecated = true;
+
+  // Deprecated: v1 HTTP hooks, removed in 0.2.0.
   // Evaluate starts with preflight and may continue with selected body units
   // and trailers. A body unit marked end_of_stream ends body inspection, not
   // the event stream. Trailers and one best-effort session_end may follow.
   rpc Evaluate(stream HttpResponseEvent)
-      returns (stream HttpResponseEventResult);
+      returns (stream HttpResponseEventResult) {
+    option deprecated = true;
+  }
 }
 
 // MiddlewareManifest describes one middleware service and its bindings.
@@ -93,9 +108,10 @@ message MiddlewareBinding {
   // Supported phase.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum request body, WebSocket message, or response body unit/replacement.
-  // Required for payload-bearing operations. An HTTP_REQUEST_V2 or
-  // HTTP_RESPONSE_V2 binding may leave this zero: OpenShell then offers it no
-  // body modes, so it can only continue or reject at preflight.
+  // Required for payload-bearing operations. An HTTP binding of a service that
+  // requires the HTTP session hooks capability may leave this zero: OpenShell
+  // then offers it no body modes, so it can only continue or reject at
+  // preflight.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
@@ -120,10 +136,10 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// v2 HTTP hooks. One ordered event in an EvaluateHttpRequestV2 or
-// EvaluateHttpResponseV2 stream. Preflight is always first. An inspect result
-// is followed by begin and exactly one body lifecycle: buffered_body for
-// BUFFERED, or input_chunk events ending with input_end for STREAM.
+// HTTP session hooks. One ordered event in an EvaluateHttpRequestSession or
+// EvaluateHttpResponseSession stream. Preflight is always first. An inspect
+// result is followed by begin and exactly one body lifecycle: buffered_body
+// for BUFFERED, or input_chunk events ending with input_end for STREAM.
 // session_end is best effort and has no result.
 message HttpEvent {
   oneof event {
@@ -136,8 +152,8 @@ message HttpEvent {
   }
 }
 
-// v2 HTTP hooks. One ordered result in an EvaluateHttpRequestV2 or
-// EvaluateHttpResponseV2 stream. Preflight requires preflight_result or
+// HTTP session hooks. One ordered result in an EvaluateHttpRequestSession or
+// EvaluateHttpResponseSession stream. Preflight requires preflight_result or
 // reject. BUFFERED ends with buffered_result or reject. STREAM sends
 // output_start before any output_chunk and ends with finish or reject. An
 // unset or unknown result fails the exchange closed.
@@ -161,7 +177,7 @@ message HttpResult {
   }
 }
 
-// v2 HTTP hooks body lifecycle a stage selects at preflight.
+// HTTP session hooks body lifecycle a stage selects at preflight.
 enum HttpBodyMode {
   HTTP_BODY_MODE_UNSPECIFIED = 0;
   // One complete body and one terminal result. OpenShell holds the body in
@@ -231,7 +247,7 @@ message UninspectableTraffic {
   UninspectableTrafficReason reason = 4;
 }
 
-// v2 HTTP hook preflight for one stage: what is evaluated, the body modes
+// HTTP session hook preflight for one stage: what is evaluated, the body modes
 // offered, and limits.
 message HttpPreflight {
   oneof subject {
@@ -435,9 +451,10 @@ message MiddlewareDiagnostics {
   map<string, string> metadata = 4;
 }
 
-// v1 HTTP hooks. Deprecated: removed in 0.2.0.
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
+  option deprecated = true;
   // Evaluation phase selected for this request.
   SupervisorMiddlewarePhase phase = 1;
   // Sandbox and request identity available to the supervisor.
@@ -468,11 +485,12 @@ message HttpHeader {
   string value = 2;
 }
 
-// v1 HTTP hooks. Deprecated: removed in 0.2.0.
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // One ordered response event. A stream starts with preflight, may continue with
 // body units ending in end_of_stream, may then include trailers, and may end
 // with one best-effort session_end.
 message HttpResponseEvent {
+  option deprecated = true;
   oneof event {
     // Initial response head and request context.
     HttpResponsePreflight preflight = 1;
@@ -485,10 +503,11 @@ message HttpResponseEvent {
   }
 }
 
-// v1 HTTP hooks. Deprecated: removed in 0.2.0.
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Each preflight, body, and trailers event requires one ordered result.
 // session_end has no result.
 message HttpResponseEventResult {
+  option deprecated = true;
   oneof result {
     // Result for preflight.
     HttpResponsePreflightResult preflight_result = 1;
@@ -499,8 +518,10 @@ message HttpResponseEventResult {
   }
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // HttpResponsePreflight exposes the current final response head to one stage.
 message HttpResponsePreflight {
+  option deprecated = true;
   // Request identity. request_id links request and response evaluations.
   // Limited to 4 KiB encoded.
   RequestContext context = 1;
@@ -536,10 +557,12 @@ message HttpResponsePreflight {
   repeated HttpResponseBodyMode permitted_body_modes = 8;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Selects skip, inspect, or block. Diagnostic fields apply to every action.
 // Invalid diagnostics make the entire result a middleware failure handled
 // according to on_error.
 message HttpResponsePreflightResult {
+  option deprecated = true;
   oneof action {
     // Deliver unchanged without invoking on_error.
     HttpResponsePreflightSkip skip = 1;
@@ -560,9 +583,13 @@ message HttpResponsePreflightResult {
   map<string, string> metadata = 6;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Ends this stage successfully without body inspection.
-message HttpResponsePreflightSkip {}
+message HttpResponsePreflightSkip {
+  option deprecated = true;
+}
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Blocks delivery as a successful decision regardless of on_error. OpenShell
 // evaluates results in policy order. Once it accepts a valid block, it stops
 // later middleware evaluation and ends every still-writable opened stage with
@@ -584,10 +611,14 @@ message HttpResponsePreflightSkip {}
 // After response commitment, including during STREAM_BYTES, OpenShell aborts
 // downstream delivery. It does not inject an error body, a terminating chunk,
 // or an error trailer. OpenShell does not reuse the upstream connection.
-message HttpResponseBlockDelivery {}
+message HttpResponseBlockDelivery {
+  option deprecated = true;
+}
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Selects body inspection and response-header mutations.
 message HttpResponsePreflightInspect {
+  option deprecated = true;
   // Required mode from permitted_body_modes. Invalid values fail according to
   // on_error.
   HttpResponseBodyMode body_mode = 1;
@@ -598,8 +629,10 @@ message HttpResponsePreflightInspect {
   repeated HeaderMutation header_mutations = 2;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Controls which response-body units a stage receives.
 enum HttpResponseBodyMode {
+  option deprecated = true;
   // Invalid value handled according to on_error.
   HTTP_RESPONSE_BODY_MODE_UNSPECIFIED = 0;
   // Inspect only the response head.
@@ -616,9 +649,11 @@ enum HttpResponseBodyMode {
   HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // One normalized body unit. Boundaries have no transport or application
 // meaning.
 message HttpResponseBodyUnit {
+  option deprecated = true;
   // Contiguous and stage-local, starting at 1.
   uint64 sequence = 1;
   oneof payload {
@@ -637,6 +672,7 @@ message HttpResponseBodyUnit {
   bool end_of_stream = 3;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Result for one body unit. Units are processed in lockstep; V1 does not
 // support ownership transfer or cross-unit retention. Diagnostic fields apply
 // to every action. Invalid diagnostics make the entire result a middleware
@@ -644,6 +680,7 @@ message HttpResponseBodyUnit {
 // until it validates the result, so fail-open can continue from the last input
 // OpenShell still owns.
 message HttpResponseBodyResult {
+  option deprecated = true;
   // Must match the next unit. Zero, gaps, duplicates, and regressions fail.
   uint64 sequence = 1;
   // Exactly one explicit action is required.
@@ -671,13 +708,18 @@ message HttpResponseBodyResult {
   map<string, string> metadata = 7;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Preserves the input unit.
-message HttpResponseBodyPassThrough {}
+message HttpResponseBodyPassThrough {
+  option deprecated = true;
+}
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Finalizes this unit and ends the stage. This stage receives no later body or
 // trailer events. The current and later units continue through other stages.
 // For WHOLE_BODY_BYTES, this equals its nested action.
 message HttpResponseBodySkipRemaining {
+  option deprecated = true;
   // Exactly one action for the current unit.
   oneof current {
     // Forward the current unit unchanged.
@@ -687,8 +729,10 @@ message HttpResponseBodySkipRemaining {
   }
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Replaces the complete input unit.
 message HttpResponseBodyTransform {
+  option deprecated = true;
   // Required replacement, limited to max_payload_bytes. Present empty data
   // deletes the input unit. The replacement fully accounts for this input unit;
   // middleware must not retain input bytes for a later unit in V1.
@@ -698,15 +742,18 @@ message HttpResponseBodyTransform {
   }
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // The current normalized response trailers in wire order. Repeated names stay
 // as separate fields. A stage that completes WHOLE_BODY_BYTES or STREAM_BYTES
 // receives exactly one trailers event after its final body result, including
 // when this set is empty. SKIP, HEADERS_ONLY, semantically bodyless responses,
 // and stages ended by block, failure, or skip_remaining receive no trailers.
 message HttpResponseTrailers {
+  option deprecated = true;
   repeated HttpHeader headers = 1;
 }
 
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // Applies ordered trailer mutations atomically. An empty mutation list
 // preserves the current trailers. A write may target only a case-insensitive
 // name present in the trailers event; V1 cannot create a trailer name. Removal
@@ -716,6 +763,7 @@ message HttpResponseTrailers {
 // mutations make the entire result a middleware failure handled according to
 // on_error.
 message HttpResponseTrailersResult {
+  option deprecated = true;
   // At most 64 operations, 32 KiB of validated name/value data, and 64 KiB
   // encoded are accepted.
   repeated HeaderMutation trailer_mutations = 1;
@@ -788,20 +836,17 @@ message MiddlewareExchangeProtocolError {}
 // Supervisor operation selected for middleware evaluation.
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
-  // v1 HTTP hooks (EvaluateHttpRequest). Deprecated: removed in 0.2.0; use
-  // HTTP_REQUEST_V2.
+  // An HTTP request at PRE_CREDENTIALS. OpenShell calls
+  // EvaluateHttpRequestSession when the service requires the
+  // openshell.supervisor-middleware.http-session capability, and the
+  // deprecated v1 EvaluateHttpRequest otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
-  // v1 HTTP hooks (HttpResponsePreReturn.Evaluate). Deprecated: removed in
-  // 0.2.0; use HTTP_RESPONSE_V2.
+  // A final HTTP response at PRE_RETURN. OpenShell calls
+  // EvaluateHttpResponseSession when the service requires the HTTP session
+  // hooks capability, and the deprecated v1 HttpResponsePreReturn.Evaluate
+  // otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;
-  // v2 HTTP hooks (EvaluateHttpRequestV2) for requests, at PRE_CREDENTIALS. Peers
-  // that predate v2 HTTP hooks reject this operation at Describe. A service
-  // implements one HTTP hook version, so it cannot also bind HTTP_REQUEST or
-  // HTTP_RESPONSE.
-  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST_V2 = 4;
-  // v2 HTTP hooks (EvaluateHttpResponseV2) for responses, at PRE_RETURN.
-  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE_V2 = 5;
 }
 
 // Ordered phase within a supervisor operation.
@@ -1028,9 +1073,10 @@ message HeaderMutation {
   }
 }
 
-// v1 HTTP hooks. Deprecated: removed in 0.2.0.
+// Deprecated: v1 HTTP hooks, removed in 0.2.0.
 // HttpRequestResult contains the decision and optional request mutations.
 message HttpRequestResult {
+  option deprecated = true;
   // Allow or deny decision for this request.
   Decision decision = 1;
   // Free-form service diagnostic. OpenShell does not relay this text into

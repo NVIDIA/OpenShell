@@ -29,7 +29,7 @@ pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
-    /// v2 HTTP hook request middleware streams the body. `request` holds
+    /// HTTP session hook request middleware streams the body. `request` holds
     /// only the head; the relay commits it on the middleware's final `Start`.
     Streamed {
         request: crate::l7::provider::L7Request,
@@ -48,7 +48,7 @@ pub enum MiddlewareApplyResult {
     RequestTimeout,
 }
 
-/// Whether v2 HTTP hook request middleware output may stream to the
+/// Whether HTTP session hook request middleware output may stream to the
 /// upstream while the client uploads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RequestBodyDelivery {
@@ -173,8 +173,8 @@ impl HttpMiddlewareExchange {
 /// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
 /// protocols without an L7 relay) must be handled for a matching chain.
 ///
-/// v1 HTTP hook entries derive this from their `on_error`. v2 HTTP request
-/// hook middleware decides itself at an uninspectable preflight; see
+/// v1 HTTP hook entries derive this from their `on_error`. HTTP session hook
+/// request middleware decides itself at an uninspectable preflight; see
 /// [`uninspectable_traffic_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninspectableTrafficGate {
@@ -183,10 +183,10 @@ pub enum UninspectableTrafficGate {
     /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
     /// detection finding.
     BypassWithFinding,
-    /// At least one matching entry is `fail_closed`, or a v2 HTTP hook
+    /// At least one matching entry is `fail_closed`, or an HTTP session hook
     /// stage rejected or failed: deny.
     Deny,
-    /// Every v2 HTTP hook stage let the connection continue, and no other
+    /// Every HTTP session hook stage let the connection continue, and no other
     /// entry requires inspection.
     Allowed,
 }
@@ -209,7 +209,7 @@ pub fn uninspectable_traffic_gate(
 
 /// Decide about traffic a matching middleware chain cannot inspect.
 ///
-/// A chain without an entry whose service binds `HTTP_REQUEST_V2` keeps the
+/// A chain without an HTTP session hook entry that binds `HTTP_REQUEST` keeps the
 /// v1 HTTP hook rule of [`uninspectable_traffic_gate`]. Otherwise each such
 /// entry decides at an uninspectable preflight, in chain order, and other
 /// entries follow their `on_error`. Any failure of a deciding stage denies.
@@ -784,7 +784,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
 }
 
 /// Describe the request chain and run it on the engine of its HTTP hook version.
-/// A chain that mixes v1 and v2 HTTP hook entries fails
+/// A chain that mixes v1 HTTP hook and HTTP session hook entries fails
 /// closed.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
@@ -824,7 +824,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
             emit_mixed_protocol_denial(ctx, &req, &chain);
             Ok(MiddlewareApplyResult::Denied { denial: None })
         }
-        ChainHttpHookVersion::V2 => {
+        ChainHttpHookVersion::Session => {
             // A body-aware policy re-checks every replaced body, so the
             // upstream must not see any of it before the last stage's output
             // is checked.
@@ -969,7 +969,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
-/// Run a v2 HTTP hook request chain on the stage pipeline.
+/// Run an HTTP session hook request chain on the stage pipeline.
 #[allow(clippy::too_many_arguments)]
 async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -1529,7 +1529,7 @@ pub(super) fn request_client_timeout_event(
         .build()
 }
 
-/// A request chain selected v1 and v2 HTTP hook entries for
+/// A request chain selected v1 HTTP hook and HTTP session hook entries for
 /// the same message, so it failed closed.
 fn emit_mixed_protocol_denial(
     ctx: &L7EvalContext,
@@ -1549,7 +1549,7 @@ pub(super) fn mixed_protocol_events(
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut diagnostics = HttpStageDiagnostics::default();
     if let Some(entry) = chain.iter().find(|entry| {
-        entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::V2)
+        entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::Session)
     }) {
         diagnostics
             .invocations

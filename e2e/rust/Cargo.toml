@@ -215,8 +215,8 @@ path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]
 
 [[test]]
-name = "supervisor_middleware_http_v2"
-path = "tests/supervisor_middleware_http_v2.rs"
+name = "supervisor_middleware_http_session"
+path = "tests/supervisor_middleware_http_session.rs"
 required-features = ["e2e-docker"]
 
 [[test]]

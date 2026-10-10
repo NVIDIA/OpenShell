@@ -19,6 +19,14 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Capability for supervisor middleware that implements HTTP session hooks.
+///
+/// A service selects HTTP session hooks for all of its HTTP bindings by
+/// listing this capability in `required_capabilities`. Peers that predate
+/// HTTP session hooks do not support it, so they reject the service at
+/// `Describe` instead of calling the deprecated v1 HTTP hooks.
+pub const SUPERVISOR_MIDDLEWARE_HTTP_SESSION: &str = "openshell.supervisor-middleware.http-session";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -111,8 +119,14 @@ pub enum NegotiationError {
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let contract = family.contract_capability();
     let mut supported_capabilities = vec![contract.clone()];
-    if family == ExtensionFamily::Compute {
-        supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+    match family {
+        ExtensionFamily::Compute => {
+            supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        }
+        ExtensionFamily::SupervisorMiddleware => {
+            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string());
+        }
+        ExtensionFamily::Credentials | ExtensionFamily::GatewayInterceptor => {}
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
@@ -146,6 +160,27 @@ pub fn extension_metadata(
         supported_capabilities,
         required_capabilities: vec![contract],
     }
+}
+
+/// Extension metadata for supervisor middleware that implements HTTP session hooks.
+///
+/// It supports and requires [`SUPERVISOR_MIDDLEWARE_HTTP_SESSION`], so peers
+/// without HTTP session hooks reject the service at `Describe`.
+#[must_use]
+pub fn http_session_middleware_metadata(
+    implementation_name: impl Into<String>,
+    implementation_version: impl Into<String>,
+) -> PeerMetadata {
+    let mut metadata = extension_metadata(
+        ExtensionFamily::SupervisorMiddleware,
+        implementation_name,
+        implementation_version,
+        [SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string()],
+    );
+    metadata
+        .required_capabilities
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string());
+    metadata
 }
 
 pub fn negotiate(
@@ -415,6 +450,49 @@ mod tests {
             ),
             Err(NegotiationError::IncompatibleProtocol { .. })
         ));
+    }
+
+    #[test]
+    fn http_session_middleware_requires_a_peer_with_http_session_hooks() {
+        let middleware = http_session_middleware_metadata("example/guard", "test");
+        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        let negotiated = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &gateway,
+            Some(middleware.clone()),
+        )
+        .expect("a peer with HTTP session hooks accepts the service");
+        assert!(
+            negotiated
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+        );
+
+        // A peer that predates HTTP session hooks advertises only the
+        // contract capability.
+        let mut older = gateway;
+        older
+            .supported_capabilities
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_SESSION);
+        let error = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &older,
+            Some(middleware),
+        )
+        .expect_err("a peer without HTTP session hooks rejects the service");
+        assert!(matches!(
+            error,
+            NegotiationError::MissingGatewayCapabilities { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains(SUPERVISOR_MIDDLEWARE_HTTP_SESSION),
+            "{error}"
+        );
     }
 
     #[test]

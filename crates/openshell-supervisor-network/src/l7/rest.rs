@@ -918,8 +918,8 @@ where
     .await
 }
 
-/// Relay one request and its response. `live_body` carries a body that v2
-/// HTTP request hook middleware streams; `req` then holds only its head.
+/// Relay one request and its response. `live_body` carries a body that HTTP
+/// session hook request middleware streams; `req` then holds only its head.
 pub(crate) async fn relay_http_request_with_body_guarded_observed<C, U>(
     req: &L7Request,
     client: &mut C,

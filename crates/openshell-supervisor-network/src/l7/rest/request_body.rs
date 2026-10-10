@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Request bodies routed through v2 HTTP hook request middleware.
+//! Request bodies routed through HTTP session hook request middleware.
 //!
 //! The body reader normalizes one HTTP/1 request body into units for the
 //! stage pipeline without reading past the body, so a pipelined request stays

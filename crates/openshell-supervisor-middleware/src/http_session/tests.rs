@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! v2 HTTP hook registration rules and stage state machine.
+//! HTTP session hook registration rules and stage state machine.
 
 use std::sync::{Arc, Mutex};
 
-use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
+use openshell_core::extension_protocol::{
+    ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_SESSION, extension_metadata,
+    http_session_middleware_metadata,
+};
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBufferedMode, HttpBufferedResult,
     HttpContinue, HttpEvent, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart,
@@ -25,8 +28,7 @@ use crate::{
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
     let phase = match operation {
-        SupervisorMiddlewareOperation::HttpResponse
-        | SupervisorMiddlewareOperation::HttpResponseV2 => SupervisorMiddlewarePhase::PreReturn,
+        SupervisorMiddlewareOperation::HttpResponse => SupervisorMiddlewarePhase::PreReturn,
         _ => SupervisorMiddlewarePhase::PreCredentials,
     };
     MiddlewareBinding {
@@ -37,6 +39,7 @@ fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
     }
 }
 
+/// Manifest of a v1 HTTP hook service.
 fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     MiddlewareManifest {
         name: "example/guard".into(),
@@ -51,72 +54,82 @@ fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     }
 }
 
+/// Manifest of a service that requires the HTTP session hooks capability.
+fn session_manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
+    MiddlewareManifest {
+        extension: Some(http_session_middleware_metadata("example/guard", "test")),
+        ..manifest(bindings)
+    }
+}
+
 #[test]
-fn registration_selects_one_http_protocol_per_service() {
-    use SupervisorMiddlewareOperation::{
-        HttpRequest, HttpRequestV2, HttpResponse, HttpResponseV2, WebsocketMessage,
-    };
-    let cases: Vec<(&str, Vec<MiddlewareBinding>, Option<&str>)> = vec![
+fn registration_requires_the_http_session_capability_it_supports() {
+    use SupervisorMiddlewareOperation::{HttpRequest, HttpResponse, WebsocketMessage};
+    for (case, manifest) in [
         (
-            "v1 HTTP hook",
-            vec![binding(HttpRequest), binding(HttpResponse)],
-            None,
+            "v1 HTTP hooks",
+            manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
         ),
         (
-            "v2 HTTP hook in both directions",
-            vec![binding(HttpRequestV2), binding(HttpResponseV2)],
-            None,
+            "HTTP session hooks in both directions",
+            session_manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
         ),
         (
-            "v2 HTTP hook with a WebSocket binding",
-            vec![binding(HttpRequestV2), binding(WebsocketMessage)],
-            None,
+            "HTTP session hooks with a WebSocket binding",
+            session_manifest(vec![binding(HttpRequest), binding(WebsocketMessage)]),
         ),
-        (
-            "mixed hook versions in one service",
-            vec![binding(HttpRequest), binding(HttpResponseV2)],
-            Some("mixes v1 and v2 HTTP hook bindings"),
-        ),
-        (
-            "both hook versions for one stage",
-            vec![binding(HttpRequest), binding(HttpRequestV2)],
-            Some("mixes v1 and v2 HTTP hook bindings"),
-        ),
-        (
-            "v2 HTTP hook request operation at the response phase",
-            vec![MiddlewareBinding {
-                phase: SupervisorMiddlewarePhase::PreReturn as i32,
-                ..binding(HttpRequestV2)
-            }],
-            Some("unsupported middleware operation/phase pair"),
-        ),
-    ];
-    for (case, bindings, expected) in cases {
-        let result = validate_manifest_bindings("test service", &manifest(bindings), None);
-        match expected {
-            None => result.unwrap_or_else(|error| panic!("{case}: {error}")),
-            Some(expected) => {
-                let error = result.expect_err(case).to_string();
-                assert!(error.contains(expected), "{case}: {error}");
-            }
-        }
+    ] {
+        validate_manifest_bindings("test service", &manifest, None)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
     }
 
-    // A v2 HTTP hook binding without a payload limit is preflight-only.
-    let mut preflight_only = binding(HttpRequestV2);
+    // Peers that predate HTTP session hooks accept a service that only
+    // supports the capability, and would call its HTTP bindings through the
+    // v1 HTTP hooks.
+    let mut supported_only = manifest(vec![binding(HttpRequest)]);
+    supported_only
+        .extension
+        .as_mut()
+        .expect("test manifest carries extension metadata")
+        .supported_capabilities
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.into());
+    let error = validate_manifest_bindings("test service", &supported_only, None)
+        .expect_err("a supported but not required capability is rejected")
+        .to_string();
+    assert!(error.contains("without requiring it"), "{error}");
+
+    let error = validate_manifest_bindings(
+        "test service",
+        &session_manifest(vec![MiddlewareBinding {
+            phase: SupervisorMiddlewarePhase::PreReturn as i32,
+            ..binding(HttpRequest)
+        }]),
+        None,
+    )
+    .expect_err("a request operation at the response phase is rejected")
+    .to_string();
+    assert!(
+        error.contains("unsupported middleware operation/phase pair"),
+        "{error}"
+    );
+
+    // An HTTP session hook binding without a payload limit is preflight-only.
+    let mut preflight_only = binding(HttpRequest);
     preflight_only.max_payload_bytes = 0;
-    validate_manifest_bindings("test service", &manifest(vec![preflight_only]), Some(0))
-        .expect("a preflight-only binding carries no payload");
-    let mut payload = binding(HttpRequest);
-    payload.max_payload_bytes = 0;
-    validate_manifest_bindings("test service", &manifest(vec![payload]), None)
+    validate_manifest_bindings(
+        "test service",
+        &session_manifest(vec![preflight_only]),
+        Some(0),
+    )
+    .expect("a preflight-only binding carries no payload");
+    validate_manifest_bindings("test service", &manifest(vec![preflight_only]), None)
         .expect_err("a v1 HTTP hook binding needs a payload limit");
     validate_manifest_bindings(
         "test service",
-        &manifest(vec![binding(HttpRequestV2)]),
+        &session_manifest(vec![binding(HttpRequest)]),
         Some(0),
     )
-    .expect_err("a v2 HTTP hook binding with a payload limit needs an operator limit");
+    .expect_err("an HTTP session hook binding with a payload limit needs an operator limit");
 }
 
 /// What a scripted stage does at preflight.
@@ -136,7 +149,7 @@ enum Body {
     Uppercase,
 }
 
-/// In-memory v2 HTTP hook stage with a fixed script.
+/// In-memory HTTP session hook stage with a fixed script.
 struct ScriptedStage {
     name: &'static str,
     preflight: Preflight,
@@ -184,7 +197,7 @@ impl InProcessMiddleware for ScriptedStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: self.name.into(),
-            ..manifest(vec![binding(SupervisorMiddlewareOperation::HttpRequestV2)])
+            ..session_manifest(vec![binding(SupervisorMiddlewareOperation::HttpRequest)])
         }
     }
 
@@ -200,10 +213,10 @@ impl InProcessMiddleware for ScriptedStage {
         &self,
         _request: HttpRequestView<'_>,
     ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!("v2 HTTP hook test stage"))
+        Err(miette::miette!("HTTP session hook test stage"))
     }
 
-    async fn open_http_request_v2(
+    async fn open_http_request_session(
         &self,
         mut events: mpsc::Receiver<HttpEvent>,
     ) -> Result<HttpResultStream, tonic::Status> {
@@ -636,7 +649,7 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
     );
 }
 
-/// v2 HTTP hook service with only a response binding.
+/// HTTP session hook service with only a response binding.
 struct ResponseOnlyStage;
 
 #[tonic::async_trait]
@@ -644,7 +657,7 @@ impl InProcessMiddleware for ResponseOnlyStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: "example/response-only".into(),
-            ..manifest(vec![binding(SupervisorMiddlewareOperation::HttpResponseV2)])
+            ..session_manifest(vec![binding(SupervisorMiddlewareOperation::HttpResponse)])
         }
     }
 
@@ -660,7 +673,9 @@ impl InProcessMiddleware for ResponseOnlyStage {
         &self,
         _request: HttpRequestView<'_>,
     ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!("v2 HTTP hook response-only test stage"))
+        Err(miette::miette!(
+            "HTTP session hook response-only test stage"
+        ))
     }
 }
 

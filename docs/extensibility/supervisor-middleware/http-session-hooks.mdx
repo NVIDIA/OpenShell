@@ -1,24 +1,26 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "V2 HTTP Hooks"
-sidebar-title: "V2 HTTP Hooks"
-slug: "extensibility/supervisor-middleware/http-hooks-v2"
-description: "Build HTTP request and response middleware with the streaming EvaluateHttpRequestV2 and EvaluateHttpResponseV2 contract, and migrate a service from v1 HTTP hooks."
-keywords: "Supervisor Middleware, HTTP, EvaluateHttpRequestV2, EvaluateHttpResponseV2, Streaming, Body Modes, Preflight, Uninspectable Traffic, Migration"
+title: "HTTP Session Hooks"
+sidebar-title: "HTTP Session Hooks"
+slug: "extensibility/supervisor-middleware/http-session-hooks"
+description: "Build HTTP request and response middleware with the streaming EvaluateHttpRequestSession and EvaluateHttpResponseSession contract, and migrate a service from v1 HTTP hooks."
+keywords: "Supervisor Middleware, HTTP, EvaluateHttpRequestSession, EvaluateHttpResponseSession, Streaming, Body Modes, Preflight, Uninspectable Traffic, Migration"
 ---
 
-The v2 HTTP hooks let middleware inspect HTTP requests and responses of any size. Your service implements a bidirectional streaming RPC for each direction it binds: `SupervisorMiddleware.EvaluateHttpRequestV2` for requests and `SupervisorMiddleware.EvaluateHttpResponseV2` for responses. Both use the same event and result messages. At preflight your service decides whether to inspect the body, then receives the body either as one buffered piece or as a stream with no size limit. The request RPC also lets your service decide about connections that OpenShell cannot inspect.
+The HTTP session hooks let middleware inspect HTTP requests and responses of any size. Your service implements a bidirectional streaming RPC for each direction it binds: `SupervisorMiddleware.EvaluateHttpRequestSession` for requests and `SupervisorMiddleware.EvaluateHttpResponseSession` for responses. Both use the same event and result messages. At preflight your service decides whether to inspect the body, then receives the body either as one buffered piece or as a stream with no size limit. The request RPC also lets your service decide about connections that OpenShell cannot inspect.
 
 The v1 HTTP hooks, the `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate` RPCs described in [Supported Operations](/extensibility/supervisor-middleware/operations), still work and are deprecated for removal in 0.2.0. They can only inspect bodies that fit in one buffer within the payload limit. WebSocket middleware is the same under both hook versions.
 
-## Declare V2 HTTP Hooks
+## Declare HTTP Session Hooks
 
-The binding operation selects the hook version. In your `Describe` manifest, declare `HTTP_REQUEST_V2` at `PRE_CREDENTIALS` for requests, which OpenShell sends to `EvaluateHttpRequestV2`, and `HTTP_RESPONSE_V2` at `PRE_RETURN` for responses, which it sends to `EvaluateHttpResponseV2`. `HTTP_REQUEST` and `HTTP_RESPONSE` select v1 HTTP hooks. Gateways and supervisors that predate v2 HTTP hooks do not know the new operations, so they refuse your service at startup instead of calling a v1 HTTP hook RPC.
+A capability selects the hook version. In your `Describe` manifest, list `openshell.supervisor-middleware.http-session` in both `extension.supported_capabilities` and `extension.required_capabilities`, then declare `HTTP_REQUEST` at `PRE_CREDENTIALS` for requests and `HTTP_RESPONSE` at `PRE_RETURN` for responses. OpenShell sends requests to `EvaluateHttpRequestSession` and responses to `EvaluateHttpResponseSession`. Without the capability, the same bindings select v1 HTTP hooks.
+
+Gateways and supervisors that predate HTTP session hooks do not support the capability, so they refuse your service at startup instead of calling a v1 HTTP hook RPC. The capability must be required for this to work: the gateway refuses a manifest that lists it as supported but not required.
 
 A binding's `max_payload_bytes` limits the body your service inspects. A binding that sets it to `0` is offered no body modes, so it can only continue or reject.
 
-A service implements one HTTP hook version. The gateway refuses a manifest that has both v1 and v2 HTTP bindings. To serve both hook versions during a migration, run two registrations.
+The capability applies to every HTTP binding of a service, so a service implements one HTTP hook version. To serve both hook versions during a migration, run two registrations.
 
 ## Exchange Lifecycle
 
@@ -97,32 +99,32 @@ A response uses `Content-Length` framing when its output declares a length, and 
 
 ## Uninspectable Traffic
 
-Some connections select middleware but cannot be shown to it as HTTP messages. For each entry that selects such a connection and whose service binds `HTTP_REQUEST_V2`, OpenShell opens an `EvaluateHttpRequestV2` exchange with an `uninspectable` preflight. The preflight carries the destination host and port, the network policy name, and one of these reasons: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
+Some connections select middleware but cannot be shown to it as HTTP messages. For each entry that selects such a connection and whose HTTP session hook service binds `HTTP_REQUEST`, OpenShell opens an `EvaluateHttpRequestSession` exchange with an `uninspectable` preflight. The preflight carries the destination host and port, the network policy name, and one of these reasons: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
 
-The preflight never permits a body mode. `continue_without_body` allows the connection, and `reject` refuses it. Header mutations, failures, and timeouts refuse it too. OpenShell evaluates entries in chain order and stops at the first denial. Other entries in the same chain, including v1 HTTP hook entries and v2 services that bind only `HTTP_RESPONSE_V2`, follow their `on_error`.
+The preflight never permits a body mode. `continue_without_body` allows the connection, and `reject` refuses it. Header mutations, failures, and timeouts refuse it too. OpenShell evaluates entries in chain order and stops at the first denial. Other entries in the same chain, including v1 HTTP hook entries and HTTP session hook services that bind only `HTTP_RESPONSE`, follow their `on_error`.
 
-Because v2 HTTP request middleware decides for itself, a policy can attach it to `tls: skip` endpoints. Supervisors released before v2 HTTP hooks reject such a policy, so recreate those sandboxes with a current supervisor first.
+Because HTTP session hook request middleware decides for itself, a policy can attach it to `tls: skip` endpoints. Supervisors released before HTTP session hooks reject such a policy, so recreate those sandboxes with a current supervisor first.
 
 ## Failure Behavior
 
-The v2 HTTP hooks always fail closed, and `on_error` does not apply to them. A stage error, timeout, unknown or undecodable result, `UNIMPLEMENTED` status, invalid header mutation, oversized body, or lifecycle violation fails the message:
+The HTTP session hooks always fail closed, and `on_error` does not apply to them. A stage error, timeout, unknown or undecodable result, `UNIMPLEMENTED` status, invalid header mutation, oversized body, or lifecycle violation fails the message:
 
 - A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection.
 - A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without a terminating chunk or error body and records a high-severity finding.
 - An uninspectable connection is refused.
 
-The gateway rejects `on_error: fail_open` on any entry whose service runs v2 HTTP hooks, including a service that also has WebSocket bindings. A policy stored before its service moved to v2 HTTP hooks still loads. Supervisors run its HTTP traffic fail-closed once they reach the service, and follow its `on_error` while they cannot.
+The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP session hooks, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP session hooks still loads. Supervisors run its HTTP traffic fail-closed once they reach the service, and follow its `on_error` while they cannot.
 
-A request or response chain cannot mix v1 and v2 HTTP hook entries. [Mix HTTP Hook Versions](/extensibility/supervisor-middleware/configure#mix-http-hook-versions) describes the policy rule.
+A request or response chain cannot mix v1 HTTP hook and HTTP session hook entries. [Mix HTTP Hook Versions](/extensibility/supervisor-middleware/configure#mix-http-hook-versions) describes the policy rule.
 
 ## Migrate from V1 HTTP Hooks
 
-To move a service to v2 HTTP hooks:
+To move a service to HTTP session hooks:
 
-1. In `Describe`, replace `HTTP_REQUEST` with `HTTP_REQUEST_V2` and `HTTP_RESPONSE` with `HTTP_RESPONSE_V2`.
-2. Implement `EvaluateHttpRequestV2` and `EvaluateHttpResponseV2` for the bindings you declare, and remove `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. A v1 request evaluation maps to BUFFERED. Response modes map as follows: `HEADERS_ONLY` becomes `continue_without_body` with header mutations, `WHOLE_BODY_BYTES` becomes BUFFERED, `STREAM_BYTES` becomes STREAM, and `block_delivery` becomes `reject`.
+1. In `Describe`, add `openshell.supervisor-middleware.http-session` to `extension.supported_capabilities` and `extension.required_capabilities`. Keep the `HTTP_REQUEST` and `HTTP_RESPONSE` bindings.
+2. Implement `EvaluateHttpRequestSession` and `EvaluateHttpResponseSession` for the bindings you declare, and remove `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. A v1 request evaluation maps to BUFFERED. Response modes map as follows: `HEADERS_ONLY` becomes `continue_without_body` with header mutations, `WHOLE_BODY_BYTES` becomes BUFFERED, `STREAM_BYTES` becomes STREAM, and `block_delivery` becomes `reject`.
 3. Change `on_error: fail_open` to `fail_closed` on policy entries that use the service.
 4. Separate the endpoint selectors of the service from v1 HTTP hook entries, including `openshell/regex`.
-5. Upgrade the gateway before you deploy the new service version, because a gateway that predates v2 HTTP hooks does not start with it. Recreate sandboxes whose supervisors predate v2 HTTP hooks, because those supervisors refuse the service.
+5. Upgrade the gateway before you deploy the new service version, because a gateway that predates HTTP session hooks does not start with it. Recreate sandboxes whose supervisors predate HTTP session hooks, because those supervisors refuse the service.
 
-The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements v2 HTTP hooks in both modes.
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements HTTP session hooks in both modes.

@@ -24,7 +24,7 @@ pub async fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata};
+    use openshell_core::extension_protocol::http_session_middleware_metadata;
     use openshell_core::proto::{
         HttpRequestResult, MiddlewareBinding, MiddlewareEndpointSelector, MiddlewareManifest,
         NetworkMiddlewareConfig, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
@@ -32,23 +32,23 @@ mod tests {
     use openshell_supervisor_middleware::{HttpRequestView, InProcessMiddleware};
     use std::sync::Arc;
 
-    /// v2 HTTP hook middleware with the given HTTP operations, and
+    /// HTTP session hook middleware with the given HTTP operations, and
     /// optionally a WebSocket binding.
-    struct ProtocolTwoMiddleware {
+    struct HttpSessionMiddleware {
         name: &'static str,
         operations: &'static [SupervisorMiddlewareOperation],
         websocket: bool,
     }
 
     #[tonic::async_trait]
-    impl InProcessMiddleware for ProtocolTwoMiddleware {
+    impl InProcessMiddleware for HttpSessionMiddleware {
         async fn describe(&self) -> MiddlewareManifest {
             let mut bindings: Vec<_> = self
                 .operations
                 .iter()
                 .map(|operation| MiddlewareBinding {
                     operation: *operation as i32,
-                    phase: if *operation == SupervisorMiddlewareOperation::HttpResponseV2 {
+                    phase: if *operation == SupervisorMiddlewareOperation::HttpResponse {
                         SupervisorMiddlewarePhase::PreReturn as i32
                     } else {
                         SupervisorMiddlewarePhase::PreCredentials as i32
@@ -68,12 +68,7 @@ mod tests {
             MiddlewareManifest {
                 name: self.name.into(),
                 bindings,
-                extension: Some(extension_metadata(
-                    ExtensionFamily::SupervisorMiddleware,
-                    self.name,
-                    "test",
-                    [],
-                )),
+                extension: Some(http_session_middleware_metadata(self.name, "test")),
                 ..Default::default()
             }
         }
@@ -90,28 +85,28 @@ mod tests {
             &self,
             _request: HttpRequestView<'_>,
         ) -> miette::Result<HttpRequestResult> {
-            Err(miette::miette!("v2 HTTP hook test middleware"))
+            Err(miette::miette!("HTTP session hook test middleware"))
         }
     }
 
     async fn registry() -> MiddlewareRegistry {
         let mut services = openshell_supervisor_middleware_builtins::services();
-        services.push(Arc::new(ProtocolTwoMiddleware {
+        services.push(Arc::new(HttpSessionMiddleware {
             name: "example/guard",
             operations: &[
-                SupervisorMiddlewareOperation::HttpRequestV2,
-                SupervisorMiddlewareOperation::HttpResponseV2,
+                SupervisorMiddlewareOperation::HttpRequest,
+                SupervisorMiddlewareOperation::HttpResponse,
             ],
             websocket: false,
         }));
-        services.push(Arc::new(ProtocolTwoMiddleware {
+        services.push(Arc::new(HttpSessionMiddleware {
             name: "example/guard-with-websocket",
-            operations: &[SupervisorMiddlewareOperation::HttpRequestV2],
+            operations: &[SupervisorMiddlewareOperation::HttpRequest],
             websocket: true,
         }));
-        services.push(Arc::new(ProtocolTwoMiddleware {
+        services.push(Arc::new(HttpSessionMiddleware {
             name: "example/response-guard",
-            operations: &[SupervisorMiddlewareOperation::HttpResponseV2],
+            operations: &[SupervisorMiddlewareOperation::HttpResponse],
             websocket: false,
         }));
         MiddlewareRegistry::connect_services(services, Vec::new())
@@ -148,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_is_rejected_on_v2_http_hook_middleware() {
+    async fn fail_open_is_rejected_on_http_session_hook_middleware() {
         let registry = registry().await;
         for middleware in ["example/guard", "example/guard-with-websocket"] {
             let error = validate_policy(
@@ -159,7 +154,7 @@ mod tests {
                 )]),
             )
             .await
-            .expect_err("v2 HTTP hook middleware is always fail-closed");
+            .expect_err("HTTP session hook middleware is always fail-closed");
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(
                 error.message().contains("cannot use on_error: fail_open"),
@@ -216,7 +211,7 @@ mod tests {
         .expect("disjoint selectors may use different hook versions");
 
         // The regex middleware has no response binding, so a response-only
-        // v2 HTTP hook service may share its selector.
+        // HTTP session hook service may share its selector.
         validate_policy(
             &registry,
             &policy(vec![
@@ -232,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_skip_rule_exempts_registered_v2_http_hook_middleware() {
+    async fn tls_skip_rule_exempts_registered_http_session_hook_middleware() {
         let registry = registry().await;
         let tls_skip_policy = |middleware: &str| {
             let mut policy = SandboxPolicy {
@@ -268,7 +263,7 @@ mod tests {
         assert_eq!(
             conflicts("example/response-guard").len(),
             1,
-            "a response-only v2 HTTP hook service is never asked about tls: skip tunnels"
+            "a response-only HTTP session hook service is never asked about tls: skip tunnels"
         );
         assert_eq!(
             conflicts(openshell_supervisor_middleware_builtins::BUILTIN_REGEX).len(),

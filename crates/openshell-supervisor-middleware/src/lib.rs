@@ -4,12 +4,12 @@
 //! Supervisor middleware registration and chain execution.
 
 pub mod headers;
-mod http_v2;
+mod http_session;
 mod remote;
 mod response;
 mod websocket;
 
-pub use http_v2::{
+pub use http_session::{
     ChainHttpHookVersion, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
     HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish, HttpRequestPreflightInput,
     HttpRequestPreflightOutcome, HttpRequestSession, HttpResponseDelivery,
@@ -43,7 +43,8 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_SESSION, gateway_metadata,
+    negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
@@ -62,8 +63,8 @@ pub use openshell_core::middleware::{
 };
 pub type MiddlewareService = dyn SupervisorMiddleware<
         EvaluateWebSocketSessionStream = WebSocketResponseStream,
-        EvaluateHttpRequestV2Stream = HttpResultStream,
-        EvaluateHttpResponseV2Stream = HttpResultStream,
+        EvaluateHttpRequestSessionStream = HttpResultStream,
+        EvaluateHttpResponseSessionStream = HttpResultStream,
     >;
 
 struct GeneratedMiddlewareEndpoint {
@@ -220,18 +221,18 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         self.endpoint.open_http_response_pre_return(requests).await
     }
 
-    async fn open_http_request_v2(
+    async fn open_http_request_session(
         &self,
         requests: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
-        self.endpoint.open_http_request_v2(requests).await
+        self.endpoint.open_http_request_session(requests).await
     }
 
-    async fn open_http_response_v2(
+    async fn open_http_response_session(
         &self,
         requests: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
-        self.endpoint.open_http_response_v2(requests).await
+        self.endpoint.open_http_response_session(requests).await
     }
 }
 
@@ -394,11 +395,12 @@ impl OnError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HttpHookVersion {
     /// v1 HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
-    /// Removed in 0.2.0.
+    /// Deprecated and removed in 0.2.0.
     V1,
-    /// v2 HTTP hooks (`EvaluateHttpRequestV2`, `EvaluateHttpResponseV2`).
-    /// Always fail-closed.
-    V2,
+    /// HTTP session hooks (`EvaluateHttpRequestSession`,
+    /// `EvaluateHttpResponseSession`), selected by requiring
+    /// [`SUPERVISOR_MIDDLEWARE_HTTP_SESSION`]. Always fail-closed.
+    Session,
 }
 
 impl HttpHookVersion {
@@ -407,83 +409,95 @@ impl HttpHookVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V1 => "http_hook_v1",
-            Self::V2 => "http_hook_v2",
+            Self::Session => "http_session_hook",
         }
     }
 }
 
-/// HTTP hook version of an operation: `None` for a WebSocket or unknown
-/// operation. The operation selects the hook version, so peers that predate
-/// v2 HTTP hooks reject its operations at Describe.
-fn operation_http_hook_version(operation: i32) -> Option<HttpHookVersion> {
-    match SupervisorMiddlewareOperation::try_from(operation) {
+/// True when the service requires the HTTP session hooks capability. Peers
+/// that predate HTTP session hooks do not support it, so they reject the
+/// service at Describe instead of calling the v1 HTTP hooks.
+fn requires_http_session(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+    })
+}
+
+/// HTTP hook version of one binding: `None` for a WebSocket or unknown
+/// operation. The service's capabilities select the hook version for all of
+/// its HTTP bindings.
+fn binding_http_hook_version(
+    manifest: &MiddlewareManifest,
+    binding: &MiddlewareBinding,
+) -> Option<HttpHookVersion> {
+    match SupervisorMiddlewareOperation::try_from(binding.operation) {
         Ok(
             SupervisorMiddlewareOperation::HttpRequest
             | SupervisorMiddlewareOperation::HttpResponse,
-        ) => Some(HttpHookVersion::V1),
-        Ok(
-            SupervisorMiddlewareOperation::HttpRequestV2
-            | SupervisorMiddlewareOperation::HttpResponseV2,
-        ) => Some(HttpHookVersion::V2),
+        ) => Some(if requires_http_session(manifest) {
+            HttpHookVersion::Session
+        } else {
+            HttpHookVersion::V1
+        }),
         _ => None,
     }
 }
 
-/// True when a binding's `operation` serves the `stage` operation's chain.
-/// `HTTP_REQUEST` and `HTTP_RESPONSE` chains also take v2 HTTP hooks
-/// bindings.
-fn serves_operation(operation: i32, stage: SupervisorMiddlewareOperation) -> bool {
-    let v2_operation = match stage {
-        SupervisorMiddlewareOperation::HttpRequest => {
-            Some(SupervisorMiddlewareOperation::HttpRequestV2)
-        }
-        SupervisorMiddlewareOperation::HttpResponse => {
-            Some(SupervisorMiddlewareOperation::HttpResponseV2)
-        }
-        _ => None,
-    };
-    operation == stage as i32
-        || v2_operation.is_some_and(|v2_operation| operation == v2_operation as i32)
-}
-
 /// Hook version of a described service's HTTP bindings, or `None` when it has no
-/// HTTP binding. Registration guarantees every HTTP binding uses one hook version.
+/// HTTP binding.
 fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookVersion> {
     manifest
         .bindings
         .iter()
-        .find_map(|binding| operation_http_hook_version(binding.operation))
+        .find_map(|binding| binding_http_hook_version(manifest, binding))
 }
 
-/// The `HTTP_REQUEST_V2` binding, whose `EvaluateHttpRequestV2` exchange also
-/// carries preflights for traffic `OpenShell` cannot inspect.
+/// The `HTTP_REQUEST` binding of an HTTP session hooks service, whose
+/// `EvaluateHttpRequestSession` exchange also carries preflights for traffic
+/// `OpenShell` cannot inspect.
 fn uninspectable_traffic_binding(manifest: &MiddlewareManifest) -> Option<&MiddlewareBinding> {
+    if !requires_http_session(manifest) {
+        return None;
+    }
     manifest.bindings.iter().find(|binding| {
-        binding.operation == SupervisorMiddlewareOperation::HttpRequestV2 as i32
+        binding.operation == SupervisorMiddlewareOperation::HttpRequest as i32
             && binding.phase == SupervisorMiddlewarePhase::PreCredentials as i32
     })
 }
 
-/// A service implements v1 HTTP hooks or v2 HTTP hooks, never both.
-fn validate_manifest_http_hook_version(source: &str, manifest: &MiddlewareManifest) -> Result<()> {
-    let protocols: HashSet<_> = manifest
-        .bindings
-        .iter()
-        .filter_map(|binding| operation_http_hook_version(binding.operation))
-        .collect();
-    if protocols.len() > 1 {
+/// A service that supports the HTTP session hooks capability must also
+/// require it. Only a required capability makes peers that predate HTTP
+/// session hooks reject the service; otherwise they would call its HTTP
+/// bindings through the v1 HTTP hooks.
+fn validate_manifest_http_session_capability(
+    source: &str,
+    manifest: &MiddlewareManifest,
+) -> Result<()> {
+    let supported = manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+    });
+    if supported && !requires_http_session(manifest) {
         return Err(miette!(
-            "{source} mixes v1 and v2 HTTP hook bindings; one service implements one HTTP hook version, so serve each hook version from its own registration"
+            "{source} supports {SUPERVISOR_MIDDLEWARE_HTTP_SESSION} without requiring it; list it in required_capabilities so that peers without HTTP session hooks reject the service instead of calling v1 HTTP hooks"
         ));
     }
     Ok(())
 }
 
-/// v1 HTTP hooks and WebSocket bindings carry payloads. A v2 HTTP hook
+/// v1 HTTP hooks and WebSocket bindings carry payloads. An HTTP session hook
 /// binding that advertises no payload limit is offered no body modes, so it
 /// can only continue or reject at preflight.
-fn binding_requires_payload_limit(binding: &MiddlewareBinding) -> bool {
-    operation_http_hook_version(binding.operation) != Some(HttpHookVersion::V2)
+fn binding_requires_payload_limit(
+    manifest: &MiddlewareManifest,
+    binding: &MiddlewareBinding,
+) -> bool {
+    binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Session)
         || binding.max_payload_bytes > 0
 }
 
@@ -546,10 +560,10 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
-    /// Effective failure policy. v2 HTTP hook entries always fail closed,
+    /// Effective failure policy. HTTP session hook entries always fail closed,
     /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        if self.http_hook_version == Some(HttpHookVersion::V2) {
+        if self.http_hook_version == Some(HttpHookVersion::Session) {
             OnError::FailClosed
         } else {
             self.entry.on_error
@@ -806,23 +820,23 @@ impl MiddlewareDispatch {
         }
     }
 
-    async fn open_http_request_v2(
+    async fn open_http_request_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
         match self {
-            Self::InProcess(service) => service.open_http_request_v2(receiver).await,
-            Self::Grpc(service) => service.open_http_request_v2(receiver).await,
+            Self::InProcess(service) => service.open_http_request_session(receiver).await,
+            Self::Grpc(service) => service.open_http_request_session(receiver).await,
         }
     }
 
-    async fn open_http_response_v2(
+    async fn open_http_response_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, tonic::Status> {
         match self {
-            Self::InProcess(service) => service.open_http_response_v2(receiver).await,
-            Self::Grpc(service) => service.open_http_response_v2(receiver).await,
+            Self::InProcess(service) => service.open_http_response_session(receiver).await,
+            Self::Grpc(service) => service.open_http_response_session(receiver).await,
         }
     }
 }
@@ -904,7 +918,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     /// Policy configs already warned that `fail_open` does not apply to their
-    /// v2 HTTP hook service.
+    /// HTTP session hook service.
     fail_open_warnings: Arc<std::sync::Mutex<HashSet<String>>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
@@ -1055,17 +1069,11 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
     ) {
         (
-            Some(
-                SupervisorMiddlewareOperation::HttpRequest
-                | SupervisorMiddlewareOperation::HttpRequestV2,
-            ),
+            Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::HttpPreCredentials),
         (
-            Some(
-                SupervisorMiddlewareOperation::HttpResponse
-                | SupervisorMiddlewareOperation::HttpResponseV2,
-            ),
+            Some(SupervisorMiddlewareOperation::HttpResponse),
             Some(SupervisorMiddlewarePhase::PreReturn),
         ) => Ok(SupportedBinding::HttpResponsePreReturn),
         (
@@ -1093,7 +1101,7 @@ fn validate_manifest_bindings(
         return Err(miette!("{source} describes no bindings"));
     }
 
-    validate_manifest_http_hook_version(source, manifest)?;
+    validate_manifest_http_session_capability(source, manifest)?;
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
         supported_binding(source, binding)?;
@@ -1102,7 +1110,7 @@ fn validate_manifest_bindings(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let payload_limit_required = binding_requires_payload_limit(binding);
+        let payload_limit_required = binding_requires_payload_limit(manifest, binding);
         let advertised = validate_payload_limit(source, binding, payload_limit_required)?;
         if binding.request_timeout.is_some() {
             middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
@@ -1484,9 +1492,10 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// True when `implementation` binds `HTTP_REQUEST_V2`, whose exchange
-    /// also decides about traffic `OpenShell` cannot inspect. The gateway uses
-    /// it to exempt such middleware from the `tls: skip` conflict rule.
+    /// True when `implementation` binds `HTTP_REQUEST` with HTTP session
+    /// hooks, whose exchange also decides about traffic `OpenShell` cannot
+    /// inspect. The gateway uses it to exempt such middleware from the
+    /// `tls: skip` conflict rule.
     #[must_use]
     pub fn decides_uninspectable_traffic(&self, implementation: &str) -> bool {
         self.services.iter().any(|state| {
@@ -1497,19 +1506,19 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// Gateway rules for policies that use v2 HTTP hook middleware.
+    /// Gateway rules for policies that use HTTP session hook middleware.
     ///
-    /// - `on_error: fail_open` is rejected on an entry whose service runs v2
-    ///   HTTP hooks, including one with WebSocket bindings. v2 HTTP hooks are
-    ///   always fail-closed, but a supervisor that cannot describe the
-    ///   service, including one that predates v2 HTTP hooks, follows
+    /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
+    ///   session hooks, including one with WebSocket bindings. HTTP session hooks
+    ///   are always fail-closed, but a supervisor that cannot describe the
+    ///   service, including one that predates HTTP session hooks, follows
     ///   `on_error` and would skip it under `fail_open`.
     /// - Two entries whose endpoint selectors may overlap must use the same
     ///   HTTP hook version for every HTTP operation both serve: one HTTP message
     ///   never runs both hook versions.
     ///
     /// Supervisors do not apply these rules to stored policies; they run an
-    /// v2 HTTP hook entry fail-closed and refuse a mixed chain at runtime.
+    /// HTTP session hook entry fail-closed and refuse a mixed chain at runtime.
     pub async fn validate_http_hook_rules(&self, policy: &SandboxPolicy) -> Result<()> {
         let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
         let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
@@ -1527,10 +1536,10 @@ impl MiddlewareRegistry {
                 continue;
             };
             if OnError::parse(&config.on_error)? == OnError::FailOpen
-                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::V2)
+                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::Session)
             {
                 return Err(miette!(
-                    "middleware config '{name}' cannot use on_error: fail_open with '{}': v2 HTTP hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP session hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
                     config.middleware
                 ));
             }
@@ -1551,8 +1560,8 @@ impl MiddlewareRegistry {
                         manifest
                             .bindings
                             .iter()
-                            .find(|binding| serves_operation(binding.operation, operation))
-                            .map(|binding| operation_http_hook_version(binding.operation))
+                            .find(|binding| binding.operation == operation as i32)
+                            .map(|binding| binding_http_hook_version(manifest, binding))
                     };
                     let (Some(left_protocol), Some(right_protocol)) =
                         (protocol(left_manifest), protocol(right_manifest))
@@ -1565,7 +1574,7 @@ impl MiddlewareRegistry {
                         continue;
                     }
                     let describe = |protocol: Option<HttpHookVersion>| match protocol {
-                        Some(HttpHookVersion::V2) => "v2 HTTP hooks",
+                        Some(HttpHookVersion::Session) => "HTTP session hooks",
                         _ => "v1 HTTP hooks",
                     };
                     let operation_name = match operation {
@@ -1795,16 +1804,16 @@ impl ChainRunner {
             .unwrap_or(manifest.name.as_str())
     }
 
-    /// The service's binding for one stage. An HTTP stage takes the binding
-    /// of either HTTP hook version; registration allows only one of them.
+    /// The service's binding for one stage.
     fn binding(
         manifest: &MiddlewareManifest,
         operation: SupervisorMiddlewareOperation,
         phase: SupervisorMiddlewarePhase,
     ) -> Option<&MiddlewareBinding> {
-        manifest.bindings.iter().find(|binding| {
-            binding.phase == phase as i32 && serves_operation(binding.operation, operation)
-        })
+        manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.operation == operation as i32 && binding.phase == phase as i32)
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
@@ -1863,7 +1872,7 @@ impl ChainRunner {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
                 // An undescribed service follows its on_error. The gateway
-                // rejects fail_open for v2 HTTP hook services.
+                // rejects fail_open for HTTP session hook services.
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
@@ -1880,13 +1889,14 @@ impl ChainRunner {
                 unbound.push(entry);
                 continue;
             };
-            let http_hook_version = operation_http_hook_version(binding.operation);
-            if http_hook_version == Some(HttpHookVersion::V2) && entry.on_error == OnError::FailOpen
+            let http_hook_version = binding_http_hook_version(manifest, &binding);
+            if http_hook_version == Some(HttpHookVersion::Session)
+                && entry.on_error == OnError::FailOpen
             {
                 self.warn_fail_open_not_applied(&entry);
             }
             let timeout = state.timeout_for_binding(&binding)?;
-            let payload_limit_required = binding_requires_payload_limit(&binding);
+            let payload_limit_required = binding_requires_payload_limit(manifest, &binding);
             let advertised =
                 validate_payload_limit("middleware manifest", &binding, payload_limit_required)?;
             let max_payload_bytes = if payload_limit_required {
@@ -1924,8 +1934,8 @@ impl ChainRunner {
     }
 
     /// Warn once per policy config that its `fail_open` does not apply to an
-    /// v2 HTTP hook service. The gateway rejects such policies, but one
-    /// stored before the service moved to v2 HTTP hooks still loads.
+    /// HTTP session hook service. The gateway rejects such policies, but one
+    /// stored before the service moved to HTTP session hooks still loads.
     fn warn_fail_open_not_applied(&self, entry: &ChainEntry) {
         let key = format!("{}\0{}", entry.name, entry.implementation);
         let first = self
@@ -1938,7 +1948,7 @@ impl ChainRunner {
             tracing::warn!(
                 config = %entry.name,
                 middleware = %entry.implementation,
-                "middleware config sets on_error: fail_open, but its service runs v2 HTTP hooks, which always fails closed; HTTP traffic fails closed"
+                "middleware config sets on_error: fail_open, but its service runs HTTP session hooks, which always fail closed; HTTP traffic fails closed"
             );
         }
     }
@@ -2039,12 +2049,12 @@ impl ChainRunner {
         admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
-        // This engine runs v1 HTTP hooks only. A chain with a v2 HTTP hook
-        // entry runs on the v2 pipeline; one that reaches here mixes both
+        // This engine runs v1 HTTP hooks only. A chain with an HTTP session hook
+        // entry runs on the HTTP session hook pipeline; one that reaches here mixes both
         // hook versions and fails closed.
         if let Some(entry) = entries
             .iter()
-            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::V2))
+            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::Session))
         {
             return Ok(ChainOutcome {
                 allowed: false,
@@ -3147,22 +3157,22 @@ mod tests {
     impl SupervisorMiddleware for ScriptedService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
@@ -3228,22 +3238,22 @@ mod tests {
     impl SupervisorMiddleware for SlowService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
@@ -3313,22 +3323,22 @@ mod tests {
     impl SupervisorMiddleware for TwoStageService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
@@ -3609,22 +3619,22 @@ mod tests {
     impl SupervisorMiddleware for RecordingService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
@@ -3756,22 +3766,22 @@ mod tests {
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
@@ -5622,22 +5632,22 @@ mod tests {
     impl SupervisorMiddleware for OpenAiRedactionService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: Request<tonic::Streaming<HttpEvent>>,
-        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseV2Stream>, TonicStatus>
+        ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }

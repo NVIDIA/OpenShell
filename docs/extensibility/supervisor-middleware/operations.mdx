@@ -14,13 +14,13 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST_V2` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttpRequestV2` |
-| `HTTP_RESPONSE_V2` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttpResponseV2` |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | v1 HTTP hook request inspection, deprecated for removal in 0.2.0. | `EvaluateHttpRequest` |
-| `HTTP_RESPONSE` | `PRE_RETURN` | v1 HTTP hook response inspection, deprecated for removal in 0.2.0. | `HttpResponsePreReturn.Evaluate` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttpRequestSession`, or v1 `EvaluateHttpRequest` |
+| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `EvaluateHttpResponseSession`, or v1 `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
+
+A service that requires the `openshell.supervisor-middleware.http-session` capability receives its HTTP bindings through the [HTTP session hooks](/extensibility/supervisor-middleware/http-session-hooks). Any other service receives them through the v1 HTTP hooks, which are deprecated for removal in 0.2.0.
 
 When several middleware match the same traffic, OpenShell calls them in ascending `order`, and each middleware sees the changes that earlier middleware made.
 
@@ -44,7 +44,7 @@ HTTP middleware can check a request before it leaves the sandbox, and the respon
 
 <Note>
 
-This section describes the v1 HTTP hooks, which are deprecated for removal in 0.2.0. [V2 HTTP Hooks](/extensibility/supervisor-middleware/http-hooks-v2) describes their replacement, including its limits and how to migrate.
+This section describes the v1 HTTP hooks, which are deprecated for removal in 0.2.0. [HTTP Session Hooks](/extensibility/supervisor-middleware/http-session-hooks) describes their replacement, including its limits and how to migrate.
 
 </Note>
 
@@ -220,7 +220,7 @@ OpenShell reassembles fragmented messages and decompresses `permessage-deflate` 
 
 OpenShell does not send binary messages, control frames, or messages from the external service to middleware. Binary messages pass through unchanged, and OpenShell records an `unsupported_message_type` coverage event. Message sequence numbers count binary messages too, so your service can see gaps between text messages.
 
-Only middleware that declares `WEBSOCKET_MESSAGE` receives messages. Middleware that declares only `HTTP_REQUEST_V2` or `HTTP_REQUEST` still inspects the upgrade request, and OpenShell records a `binding_not_selected` coverage event for it.
+Only middleware that declares `WEBSOCKET_MESSAGE` receives messages. Middleware that declares only `HTTP_REQUEST` still inspects the upgrade request, and OpenShell records a `binding_not_selected` coverage event for it.
 
 </Accordion>
 <Accordion title="Denials and Failures">
@@ -254,6 +254,6 @@ A denied message closes the connection with code `1008`. When middleware fails, 
 | Time to assemble a message | WebSocket messages | 30 seconds without progress, or 2 minutes in total. |
 | Time to forward a message | WebSocket messages | 2 minutes. |
 
-When a payload exceeds one middleware's limit, that middleware fails. Other middleware keep their own limits. This table describes the v1 HTTP hooks for HTTP traffic. [V2 HTTP Hooks](/extensibility/supervisor-middleware/http-hooks-v2#limits-and-deadlines) lists its own limits.
+When a payload exceeds one middleware's limit, that middleware fails. Other middleware keep their own limits. This table describes the v1 HTTP hooks for HTTP traffic. [HTTP Session Hooks](/extensibility/supervisor-middleware/http-session-hooks#limits-and-deadlines) lists its own limits.
 
 Middleware evaluation capacity in each sandbox is shared by all operations. When it is full, OpenShell returns `503 Service Unavailable` for an HTTP request before reading its body. When WebSocket message assembly capacity is full, OpenShell closes the connection with code `1013`.

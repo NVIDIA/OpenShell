@@ -119,22 +119,22 @@ impl GrpcMiddlewareService {
         self.service.open_http_response_pre_return(receiver).await
     }
 
-    /// Open a remote v2 HTTP hook request exchange through the gRPC
+    /// Open a remote HTTP session hook request exchange through the gRPC
     /// adapter.
-    pub async fn open_http_request_v2(
+    pub async fn open_http_request_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
-        self.service.open_http_request_v2(receiver).await
+        self.service.open_http_request_session(receiver).await
     }
 
-    /// Open a remote v2 HTTP hook response exchange through the gRPC
+    /// Open a remote HTTP session hook response exchange through the gRPC
     /// adapter.
-    pub async fn open_http_response_v2(
+    pub async fn open_http_response_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
-        self.service.open_http_response_v2(receiver).await
+        self.service.open_http_response_session(receiver).await
     }
 }
 
@@ -202,6 +202,8 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         request: Request<HttpRequestEvaluation>,
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
+        // v1 HTTP hooks stay callable until their removal in 0.2.0.
+        #[allow(deprecated)]
         client.evaluate_http_request(request).await
     }
 
@@ -224,6 +226,8 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         let mut client = self.response_client.clone();
+        // v1 HTTP hooks stay callable until their removal in 0.2.0.
+        #[allow(deprecated)]
         let responses = client
             .evaluate(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
@@ -233,29 +237,29 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         Ok(Box::pin(responses))
     }
 
-    async fn open_http_request_v2(
+    async fn open_http_request_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         let mut client = self.client.clone();
         let responses = client
-            .evaluate_http_request_v2(Request::new(tokio_stream::wrappers::ReceiverStream::new(
-                receiver,
-            )))
+            .evaluate_http_request_session(Request::new(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            ))
             .await?
             .into_inner();
         Ok(Box::pin(responses))
     }
 
-    async fn open_http_response_v2(
+    async fn open_http_response_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
     ) -> std::result::Result<HttpResultStream, Status> {
         let mut client = self.client.clone();
         let responses = client
-            .evaluate_http_response_v2(Request::new(tokio_stream::wrappers::ReceiverStream::new(
-                receiver,
-            )))
+            .evaluate_http_response_session(Request::new(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            ))
             .await?
             .into_inner();
         Ok(Box::pin(responses))

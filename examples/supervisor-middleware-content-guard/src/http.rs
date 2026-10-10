@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! v2 HTTP hooks (`EvaluateHttpRequestV2` and
-//! `EvaluateHttpResponseV2`) for requests, responses, and uninspectable
+//! HTTP session hooks (`EvaluateHttpRequestSession` and
+//! `EvaluateHttpResponseSession`) for requests, responses, and uninspectable
 //! connections.
 //!
 //! The guard selects its configured body mode, BUFFERED by default, and falls
@@ -29,7 +29,7 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one v2 HTTP hook exchange. Both RPCs share this handler: the
+/// Run one HTTP session hook exchange. Both RPCs share this handler: the
 /// preflight subject says whether it is a request, a response, or traffic
 /// OpenShell cannot inspect.
 pub(crate) fn stage_stream<S>(mut events: S) -> HttpResultStream

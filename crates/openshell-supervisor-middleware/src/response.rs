@@ -1245,21 +1245,23 @@ mod tests {
     {
         type EvaluateWebSocketSessionStream = super::super::WebSocketResponseStream;
 
-        type EvaluateHttpRequestV2Stream = super::super::HttpResultStream;
+        type EvaluateHttpRequestSessionStream = super::super::HttpResultStream;
 
-        async fn evaluate_http_request_v2(
+        async fn evaluate_http_request_session(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> Result<tonic::Response<Self::EvaluateHttpRequestV2Stream>, tonic::Status> {
+        ) -> Result<tonic::Response<Self::EvaluateHttpRequestSessionStream>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseV2Stream = super::super::HttpResultStream;
+        type EvaluateHttpResponseSessionStream = super::super::HttpResultStream;
 
-        async fn evaluate_http_response_v2(
+        async fn evaluate_http_response_session(
             &self,
             _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
-        ) -> Result<tonic::Response<Self::EvaluateHttpResponseV2Stream>, tonic::Status> {
+        ) -> Result<tonic::Response<Self::EvaluateHttpResponseSessionStream>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 

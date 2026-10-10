@@ -41,7 +41,7 @@ timeout = "500ms"
 </ParamField>
 
 <ParamField path="max_payload_bytes" type="integer" required={true}>
-  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises. May be `0` only when every binding of the service is a [v2 HTTP hook](/extensibility/supervisor-middleware/http-hooks-v2) binding that advertises a `0` payload limit.
+  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises. May be `0` only when the service uses [HTTP session hooks](/extensibility/supervisor-middleware/http-session-hooks) and every binding advertises a `0` payload limit.
 </ParamField>
 
 <ParamField path="timeout" type="string" default="500ms">
@@ -150,7 +150,7 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 </ParamField>
 
 <ParamField path="on_error" type="'fail_closed' | 'fail_open'" default="fail_closed">
-  What happens when the middleware fails. Refer to [Choose Failure Behavior](#choose-failure-behavior). Services that use v2 HTTP hooks accept only `fail_closed`.
+  What happens when the middleware fails. Refer to [Choose Failure Behavior](#choose-failure-behavior). Services that use HTTP session hooks accept only `fail_closed`.
 </ParamField>
 
 <ParamField path="config" type="object">
@@ -165,9 +165,9 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 
 ### Mix HTTP Hook Versions
 
-Each HTTP request or response runs through middleware of one [HTTP hook version](/extensibility/supervisor-middleware/http-hooks-v2). The gateway rejects a policy in which two entries whose endpoint selectors may overlap use different HTTP hook versions for the same operation, requests or responses. To fix it, separate the selectors or move both services to the same hook version. If a chain still mixes hook versions at runtime, OpenShell blocks the traffic with the reason `middleware_hook_versions_mixed`.
+Each HTTP request or response runs through middleware of one [HTTP hook version](/extensibility/supervisor-middleware/http-session-hooks). The gateway rejects a policy in which two entries whose endpoint selectors may overlap use different HTTP hook versions for the same operation, requests or responses. To fix it, separate the selectors or move both services to the same hook version. If a chain still mixes hook versions at runtime, OpenShell blocks the traffic with the reason `middleware_hook_versions_mixed`.
 
-The built-in `openshell/regex` middleware uses v1 HTTP hooks for requests, so it cannot share a selector with a v2 HTTP hook service that inspects requests.
+The built-in `openshell/regex` middleware uses v1 HTTP hooks for requests, so it cannot share a selector with an HTTP session hook service that inspects requests.
 
 ## Choose Failure Behavior
 
@@ -179,11 +179,11 @@ Middleware fails when it cannot complete its check, for example when its service
 
 </Warning>
 
-Middleware that uses v2 HTTP hooks always fails closed. The gateway rejects `fail_open` on an entry whose service uses v2 HTTP hooks, including a service that also inspects WebSocket messages. A policy stored before the service moved to v2 HTTP hooks still loads, and supervisors block its HTTP traffic on failure and log a warning.
+Middleware that uses HTTP session hooks always fails closed. The gateway rejects `fail_open` on an entry whose service uses HTTP session hooks, including a service that also inspects WebSocket messages. A policy stored before the service moved to HTTP session hooks still loads, and supervisors block its HTTP traffic on failure and log a warning.
 
 A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
 
-`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, a v1 HTTP hook entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic. An entry whose service binds `HTTP_REQUEST_V2` can, because the service [decides](/extensibility/supervisor-middleware/http-hooks-v2#uninspectable-traffic) whether to allow such connections.
+`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, a v1 HTTP hook entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic. An entry whose service binds `HTTP_REQUEST` with HTTP session hooks can, because the service [decides](/extensibility/supervisor-middleware/http-session-hooks#uninspectable-traffic) whether to allow such connections.
 
 ## Operate Middleware Services
 

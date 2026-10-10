@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! v2 HTTP hook decisions about traffic `OpenShell` cannot inspect.
+//! HTTP session hook decisions about traffic `OpenShell` cannot inspect.
 //!
 //! A connection that selects middleware but cannot be shown to it as HTTP
 //! messages (`tls: skip`, h2c, unsupported tunnels, raw TCP, SQL passthrough)
-//! opens one `EvaluateHttpRequestV2` exchange per selected stage whose
-//! service binds `HTTP_REQUEST_V2`, in chain order, with an uninspectable
+//! opens one `EvaluateHttpRequestSession` exchange per selected stage whose
+//! HTTP session hook service binds `HTTP_REQUEST`, in chain order, with an uninspectable
 //! preflight. Each stage continues, which allows the connection, or rejects
 //! it. Any failure or timeout denies.
 //! Other entries keep the v1 HTTP hook rule: `fail_open` lets the
@@ -44,7 +44,7 @@ pub struct UninspectableTrafficInput {
 pub struct UninspectableInvocation {
     pub config_name: String,
     pub implementation: String,
-    /// `Continue`, `Reject`, or `FailClosed` for a v2 HTTP hook stage;
+    /// `Continue`, `Reject`, or `FailClosed` for an HTTP session hook stage;
     /// `FailOpen` or `FailClosed` for another entry, by its `on_error`.
     pub outcome: HttpStageOutcome,
     pub http_hook_version: Option<HttpHookVersion>,
@@ -60,7 +60,7 @@ pub struct UninspectableOutcome {
     /// Platform-owned reason for a denial: `middleware_denied:<config>[:<code>]`
     /// for a rejection, `middleware_failed: <reason>` otherwise.
     pub reason: String,
-    /// Present only when a v2 HTTP hook stage rejected the connection.
+    /// Present only when an HTTP session hook stage rejected the connection.
     pub denial: Option<MiddlewareDenial>,
     /// One record per evaluated entry, in chain order.
     pub invocations: Vec<UninspectableInvocation>,
@@ -95,7 +95,7 @@ impl StageHead for UninspectableHead<'_> {
 
 impl ChainRunner {
     /// Decide whether an uninspectable connection that selects `entries` may
-    /// proceed. Every entry whose service binds `HTTP_REQUEST_V2` must
+    /// proceed. Every entry whose HTTP session hook service binds `HTTP_REQUEST` must
     /// continue; other entries follow their `on_error`. Evaluation stops at
     /// the first denial.
     pub async fn evaluate_uninspectable(
@@ -172,7 +172,7 @@ impl ChainRunner {
     }
 
     /// Resolve an entry to its service for an uninspectable preflight, using
-    /// the timeout of its `HTTP_REQUEST_V2` binding.
+    /// the timeout of its `HTTP_REQUEST` binding.
     async fn describe_uninspectable_entry(
         &self,
         entry: &ChainEntry,
@@ -189,7 +189,7 @@ impl ChainRunner {
             binding: Some(binding),
             max_payload_bytes: 0,
             timeout,
-            http_hook_version: Some(HttpHookVersion::V2),
+            http_hook_version: Some(HttpHookVersion::Session),
         })
     }
 }
@@ -208,7 +208,7 @@ fn failed(entry: &ChainEntry, reason: &str) -> UninspectableInvocation {
         config_name: entry.name.clone(),
         implementation: entry.implementation.clone(),
         outcome: HttpStageOutcome::FailClosed,
-        http_hook_version: Some(HttpHookVersion::V2),
+        http_hook_version: Some(HttpHookVersion::Session),
         reason_code: None,
         failure_reason: Some(reason.to_string()),
     }
@@ -219,7 +219,7 @@ fn record(invocation: HttpStageInvocation) -> UninspectableInvocation {
         config_name: invocation.config_name,
         implementation: invocation.implementation,
         outcome: invocation.outcome,
-        http_hook_version: Some(HttpHookVersion::V2),
+        http_hook_version: Some(HttpHookVersion::Session),
         reason_code: invocation.reason_code,
         failure_reason: invocation.failure_reason,
     }
