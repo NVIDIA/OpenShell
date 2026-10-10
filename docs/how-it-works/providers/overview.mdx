@@ -501,7 +501,7 @@ The provider types available to `--type` are the IDs of the profiles you
 imported. List them:
 
 ```shell
-openshell provider list-profiles
+openshell profile list
 ```
 
 The repository's
@@ -520,14 +520,6 @@ adjust the binary paths for your image, and import your copy.
 Attach an inference provider to each sandbox that needs it and configure the
 workload to call the provider's native endpoint. The workload, not OpenShell,
 selects the model and request timeout.
-
-| Provider | Example profile | Native base URL | Credential variable |
-|---|---|---|---|
-| OpenAI | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
-| Anthropic | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
-| NVIDIA API Catalog | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
-| DeepInfra | `deepinfra` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` |
-| Google Vertex AI | `google-vertex-ai` | Region and model dependent | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |
 
 An OpenAI-compatible protocol does not make the `openai` profile safe for an
 arbitrary host. Baseten, Bitdeer, Groq, Ollama, LM Studio, self-hosted NIM, and
