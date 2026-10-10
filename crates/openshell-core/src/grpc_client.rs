@@ -1323,6 +1323,7 @@ pub struct SettingsPollResult {
     pub version: u32,
     pub policy_hash: String,
     pub config_revision: u64,
+    pub settings_revision: u64,
     pub policy_source: PolicySource,
     /// Effective settings keyed by name.
     pub settings: HashMap<String, crate::proto::EffectiveSetting>,
@@ -1349,6 +1350,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         version: inner.version,
         policy_hash: inner.policy_hash,
         config_revision: inner.config_revision,
+        settings_revision: inner.settings_revision,
         policy_source: PolicySource::try_from(inner.policy_source)
             .unwrap_or(PolicySource::Unspecified),
         settings: inner.settings,
@@ -1362,6 +1364,32 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
             .parse()
             .unwrap_or_default(),
         extension_authentication_enabled: inner.extension_authentication_enabled,
+    }
+}
+
+/// Delivered snapshots go through the polling projection, so both paths
+/// apply the same defaults and validation.
+impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
+    fn from(snapshot: crate::proto::SandboxConfigSnapshot) -> Self {
+        settings_poll_result(crate::proto::GetSandboxConfigResponse {
+            policy: snapshot.policy,
+            version: snapshot.version,
+            policy_hash: snapshot.policy_hash,
+            settings: snapshot.settings,
+            config_revision: snapshot.config_revision,
+            policy_source: snapshot.policy_source,
+            global_policy_version: snapshot.global_policy_version,
+            provider_env_revision: snapshot.provider_env_revision,
+            supervisor_middleware_services: snapshot.supervisor_middleware_services,
+            workspace: snapshot.workspace,
+            policy_validation_failure_mode: snapshot.policy_validation_failure_mode,
+            extension_authentication_enabled: snapshot.extension_authentication_enabled,
+            configuration_admitted: snapshot.configuration_admitted,
+            provider_attachment_epoch: snapshot.provider_attachment_epoch,
+            configuration_instance_id: snapshot.configuration_instance_id,
+            configuration_error: snapshot.configuration_error,
+            settings_revision: snapshot.settings_revision,
+        })
     }
 }
 
@@ -1408,6 +1436,25 @@ mod settings_poll_tests {
     }
 
     #[test]
+    fn delivered_sandbox_snapshot_uses_the_polling_projection() {
+        let result = super::SettingsPollResult::from(crate::proto::SandboxConfigSnapshot {
+            version: 7,
+            policy_hash: "hash-7".to_string(),
+            config_revision: 42,
+            provider_env_revision: 9,
+            workspace: "workspace-a".to_string(),
+            extension_authentication_enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(result.version, 7);
+        assert_eq!(result.policy_hash, "hash-7");
+        assert_eq!(result.config_revision, 42);
+        assert_eq!(result.provider_env_revision, 9);
+        assert_eq!(result.workspace, "workspace-a");
+        assert!(result.extension_authentication_enabled);
+    }
+
+    #[test]
     fn workspace_selector_is_omitted_until_bootstrap_learns_the_workspace() {
         assert!(learned_workspace_selector(None).is_none());
 
@@ -1436,6 +1483,130 @@ pub struct ProviderEnvironmentResult {
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
     pub non_secret_environment_keys: Vec<String>,
+}
+
+/// Delivered snapshots go through the polling projection, so both paths
+/// reject invalid expiration times and withhold on unknown readiness reasons.
+impl TryFrom<crate::proto::ProviderEnvironmentSnapshot> for ProviderEnvironmentResult {
+    type Error = miette::Report;
+
+    fn try_from(snapshot: crate::proto::ProviderEnvironmentSnapshot) -> Result<Self> {
+        use crate::proto::ProviderEnvironmentValueClassification;
+
+        let mut response = GetSandboxProviderEnvironmentResponse {
+            provider_env_revision: snapshot.provider_env_revision,
+            dynamic_credentials: snapshot.dynamic_credentials,
+            provider_attachment_epoch: snapshot.provider_attachment_epoch,
+            policy_hash: snapshot.policy_hash,
+            readiness_reason: snapshot.readiness_reason,
+            files: snapshot.files,
+            ..Default::default()
+        };
+        for value in snapshot.values {
+            if let Some(expiration_time) = value.expiration_time {
+                response
+                    .credential_expiration_times
+                    .insert(value.name.clone(), expiration_time);
+            }
+            match ProviderEnvironmentValueClassification::try_from(value.classification)
+                .unwrap_or_default()
+            {
+                ProviderEnvironmentValueClassification::NonSecret => {
+                    response
+                        .non_secret_environment_keys
+                        .push(value.name.clone());
+                }
+                ProviderEnvironmentValueClassification::StaticCredential => {
+                    if let Some(binding) = value.static_credential_binding {
+                        response
+                            .static_credential_bindings
+                            .insert(value.name.clone(), binding);
+                    }
+                }
+                ProviderEnvironmentValueClassification::Unspecified => {}
+            }
+            response.environment.insert(value.name, value.value);
+        }
+        provider_environment_result(response)
+    }
+}
+
+#[cfg(test)]
+mod provider_snapshot_tests {
+    use super::ProviderEnvironmentResult;
+    use crate::proto::{
+        ProviderEnvironmentSnapshot, ProviderEnvironmentValue,
+        ProviderEnvironmentValueClassification, ProviderReadinessReason, StaticCredentialBinding,
+    };
+
+    #[test]
+    fn delivered_provider_snapshot_preserves_secret_classification_metadata() {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            provider_env_revision: 11,
+            values: vec![
+                ProviderEnvironmentValue {
+                    name: "REGION".to_string(),
+                    value: "west".to_string(),
+                    classification: ProviderEnvironmentValueClassification::NonSecret.into(),
+                    ..Default::default()
+                },
+                ProviderEnvironmentValue {
+                    name: "TOKEN".to_string(),
+                    value: "redacted".to_string(),
+                    classification: ProviderEnvironmentValueClassification::StaticCredential.into(),
+                    static_credential_binding: Some(StaticCredentialBinding::default()),
+                    expiration_time: Some(prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: 123_000_000,
+                    }),
+                },
+            ],
+            ..Default::default()
+        })
+        .expect("valid provider snapshot");
+        assert_eq!(result.provider_env_revision, 11);
+        assert_eq!(result.environment.len(), 2);
+        assert_eq!(result.non_secret_environment_keys, ["REGION"]);
+        assert!(result.static_credential_bindings.contains_key("TOKEN"));
+        assert_eq!(
+            result.credential_expires_at_ms.get("TOKEN"),
+            Some(&1_900_000_000_123)
+        );
+        assert_eq!(
+            result.readiness_reason,
+            ProviderReadinessReason::Unspecified
+        );
+    }
+
+    #[test]
+    fn delivered_provider_snapshot_withholds_unknown_readiness_reason() {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            readiness_reason: i32::MAX,
+            ..Default::default()
+        })
+        .expect("valid provider snapshot");
+        assert_eq!(
+            result.readiness_reason,
+            ProviderReadinessReason::CredentialsWithheld
+        );
+    }
+
+    #[test]
+    fn delivered_provider_snapshot_rejects_invalid_credential_expiration() {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            values: vec![ProviderEnvironmentValue {
+                name: "TOKEN".to_string(),
+                value: "redacted".to_string(),
+                expiration_time: Some(prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: -1,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
 }
 
 pub struct ProviderSubjectTokenExchangeResult {

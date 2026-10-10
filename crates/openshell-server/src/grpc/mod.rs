@@ -51,7 +51,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -789,7 +790,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+        Box::pin(crate::supervisor_session::handle_connect_supervisor(
+            &self.state,
+            request,
+        ))
+        .await
     }
 
     async fn report_main_process_exit(
@@ -897,6 +902,13 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<PeerNotifyConfigUpdateResponse>, Status> {
+        crate::config_delivery::handle_peer_notify_config_update(&self.state, request)
+    }
 }
 
 fn public_extension_info(extension: &NegotiatedExtension) -> NegotiatedExtensionInfo {
@@ -949,7 +961,9 @@ pub mod test_support {
 
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{Principal, UserPrincipal};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::compute::{
         NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
     };
@@ -959,7 +973,172 @@ pub mod test_support {
     use crate::supervisor_session::SupervisorSessionRegistry;
     use crate::tracing_bus::TracingLogBus;
     use openshell_core::Config;
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use openshell_core::proto::open_shell_server::OpenShellServer;
+    use openshell_core::proto::{
+        GatewayMessage, SandboxPolicy, SupervisorHello, SupervisorMessage, supervisor_message,
+    };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
     use tonic::Request;
+
+    /// A live `ConnectSupervisor` stream against an in-process gateway.
+    pub struct SupervisorStreamHarness {
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        /// Held so the supervisor side of the stream stays open.
+        pub outbound: mpsc::Sender<SupervisorMessage>,
+        pub inbound: tonic::Streaming<GatewayMessage>,
+    }
+
+    impl Drop for SupervisorStreamHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Switch a test state to push delivery, which tracks durable completion.
+    pub fn enable_push_delivery(state: &mut Arc<ServerState>) {
+        Arc::get_mut(state)
+            .expect("test state is not shared yet")
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+    }
+
+    /// Configuration stream features advertised by a test supervisor hello.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StreamFeatures {
+        /// Predates streamed configuration and keeps polling.
+        Legacy,
+        /// Applies and acknowledges streamed configuration, connecting before
+        /// its workload starts.
+        Apply,
+        /// Applies streamed configuration and reconnects after its workload
+        /// started.
+        ApplyAfterStart,
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream whose hello
+    /// advertises the given configuration stream features. Returns the gRPC
+    /// status when the gateway rejects the stream before accepting it.
+    pub async fn connect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_image_policy(state, sandbox_id, features, None).await
+    }
+
+    pub async fn connect_supervisor_stream_with_image_policy(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+        image_policy: Option<SandboxPolicy>,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let result = image_policy.clone().map_or(
+            openshell_core::proto::image_policy_discovery::Result::Missing(()),
+            openshell_core::proto::image_policy_discovery::Result::Policy,
+        );
+        connect_supervisor_stream_with_image_policy_discovery(
+            state,
+            sandbox_id,
+            features,
+            openshell_core::proto::ImagePolicyDiscovery {
+                result: Some(result),
+            },
+        )
+        .await
+    }
+
+    pub async fn connect_supervisor_stream_with_image_policy_discovery(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+        image_policy_discovery: openshell_core::proto::ImagePolicyDiscovery,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_optional_image_policy_discovery(
+            state,
+            sandbox_id,
+            features,
+            Some(image_policy_discovery),
+            0,
+        )
+        .await
+    }
+
+    /// Model a stock supervisor reconnect, which omits the one-shot image
+    /// policy discovery after its initial session has been prepared and
+    /// advances its connection epoch.
+    pub async fn reconnect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_optional_image_policy_discovery(
+            state, sandbox_id, features, None, 1,
+        )
+        .await
+    }
+
+    async fn connect_supervisor_stream_with_optional_image_policy_discovery(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+        image_policy_discovery: Option<openshell_core::proto::ImagePolicyDiscovery>,
+        connection_epoch: u64,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    super::OpenShellService::new(Arc::clone(state)),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (outbound, rx) = mpsc::channel(4);
+        outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: sandbox_id.into(),
+                    instance_id: "instance".into(),
+                    supports_config_push: features != StreamFeatures::Legacy,
+                    workload_pending: features == StreamFeatures::Apply,
+                    connection_epoch,
+                    image_policy_discovery,
+                    supports_provider_readiness: false,
+                    redirected: false,
+                    supports_session_redirect: false,
+                })),
+            })
+            .await
+            .unwrap();
+        let inbound = match client.connect_supervisor(ReceiverStream::new(rx)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                server.abort();
+                return Err(status);
+            }
+        };
+        Ok(SupervisorStreamHarness {
+            server,
+            outbound,
+            inbound,
+        })
+    }
 
     /// Wrap a proto message in a `Request` with a dev principal injected.
     ///
@@ -1005,6 +1184,7 @@ pub mod test_support {
         crate::provider_profile_sources::ProviderProfileSources::from_config(
             &[openshell_core::GatewayProviderProfileSourceConfig::User],
             None,
+            crate::provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL,
         )
         .expect("user-only provider profile source configuration should be valid")
     }

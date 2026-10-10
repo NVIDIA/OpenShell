@@ -123,7 +123,8 @@ mod tests {
     // Unspecified (treated as Never), zero count, and absent timestamps.
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
+    // inventories; the provider-environment file map and peer configuration
+    // notification are public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
@@ -136,17 +137,20 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
-    // SessionRedirect and SupervisorHello.redirected are supervisor control
-    // traffic and are never stored.
+    // SessionRedirect, SupervisorHello.redirected, and
+    // SupervisorHello.workload_pending are supervisor control traffic and are
+    // never stored.
     // Token-grant owner fields add gateway-derived metadata to endpoints and
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
+    // stored operations but never recorded on one: it is not terminal.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "3d3333f2cfbd27ada63523b02aa60793951920a480e6f8d3488cac2a3fd8ac3f";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "b25f60b565e31942f54724fde26b327f350614586eadf551b3dbea3d59735fd5";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -189,6 +193,9 @@ mod tests {
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -554,14 +561,24 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_CONFIG_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer config RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -569,7 +586,9 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -613,7 +632,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
+                (332, 28),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

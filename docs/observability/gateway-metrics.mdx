@@ -138,9 +138,10 @@ curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessi
 
 ## Histograms and Summaries
 
-The multi-replica latency metrics are Prometheus histograms with `_bucket`,
-`_sum`, and `_count` series and buckets from 1 millisecond to 15 seconds, so
-`histogram_quantile` can aggregate them across replicas. The older
+The multi-replica latency metrics and the configuration build and apply
+durations are Prometheus histograms with `_bucket`, `_sum`, and `_count` series
+and buckets from 1 millisecond to 15 seconds, so `histogram_quantile` can
+aggregate them across replicas. The older
 `*_duration_seconds` metrics and the interceptor latency metric are summaries
 with `quantile` labels that each replica computes on its own. Do not average
 summary quantiles across pods.
@@ -231,6 +232,54 @@ The gateway also records every API request and its background database check:
 | `openshell_server_readiness_database_healthy` | Gauge | None | `1` when the last background database check succeeded, otherwise `0`. |
 | `openshell_server_readiness_database_probe_duration_seconds` | Summary | `outcome` | Duration of the background database check. `outcome` is `success`, `db_error`, or `timeout`. |
 
+## Configuration Delivery Metrics
+
+With `config_delivery_mode = "push"`, the gateway builds each supervisor's
+configuration and sends it over the supervisor session. These metrics stay
+empty in poll mode, where `GetSandboxConfig` and
+`GetSandboxProviderEnvironment` in the request metrics carry the same work.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_supervisor_config_builds_total` | Counter | `component`, `lane`, `outcome` | Configuration builds for sessions on this replica. |
+| `openshell_supervisor_config_build_duration_seconds` | Histogram | `component`, `outcome` | Time to build one component, including store reads and credential resolution. |
+| `openshell_supervisor_config_queue_wait_seconds` | Summary | `lane` | Time from a session needing a rebuild to its build starting. |
+| `openshell_supervisor_config_dirty_sessions` | Gauge | None | Sessions with a rebuild pending. |
+| `openshell_supervisor_config_waiting_sessions` | Gauge | None | Sessions waiting for a build slot. |
+| `openshell_supervisor_config_deliveries_total` | Counter | `component`, `outcome` | What happened to each built snapshot. |
+| `openshell_supervisor_config_apply_results_total` | Counter | `component`, `outcome` | Apply results that supervisors reported. |
+| `openshell_supervisor_config_apply_duration_seconds` | Histogram | `component`, `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
+| `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
+| `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
+| `openshell_supervisor_config_bootstrap_revision_mismatches_total` | Counter | None | Bootstrap builds retried because the two components disagreed on provider revision, provider attachments, or effective policy. |
+| `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
+| `openshell_supervisor_config_result_writes_total` | Counter | `kind`, `outcome` | Admission and policy-result writes for running workloads, which a single background writer persists after the supervisor is acknowledged. |
+| `openshell_supervisor_config_result_writes_pending` | Gauge | None | Sandboxes with result writes waiting for the background writer. |
+
+The labels take these values:
+
+- `component` is `sandbox_config` or `provider_environment`. On
+  `apply_results_total` and `apply_duration_seconds` it is the protocol name,
+  such as `CONFIG_COMPONENT_SANDBOX_CONFIG`, and `outcome` is a
+  `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
+- `lane` is `sandbox` for a change to one sandbox, or `fanout` for a change
+  that reaches many sandboxes, including the 30-second reconcile of each
+  session. The reconcile rebuilds the sandbox configuration, and also any
+  component the supervisor last failed to apply. A quarter of the build slots
+  are reserved for the `sandbox` lane.
+- On builds, `outcome` is `ok`, `failed`, or `timeout`. A failed build retries
+  with a per-session backoff from 1 to 30 seconds.
+- On deliveries, `outcome` is `queued`, `replaced` (a newer snapshot replaced
+  an unsent one), `coalesced` (held until the supervisor acknowledges its
+  previous update), `unchanged`, `no_active_session`, `unsupported_session`,
+  `payload_too_large`, `owner_moved`, or `owner_lookup_failed`.
+- On peer notifications, `outcome` is `accepted`, `stale_owner`,
+  `unsupported_peer`, `peer_error`, or `timeout`.
+- On result writes, `kind` is `admission` or `policy_result`, and `outcome`
+  is `written`, `coalesced` (a newer admission for the sandbox replaced a
+  queued one), `stale_session` (the session ended before its admission was
+  written), `retried`, or `dropped`.
+
 ## Gateway Interceptor Metrics
 
 Gateways with [gateway interceptors](/extensibility/gateway-interceptors)
@@ -244,6 +293,8 @@ record their evaluations:
 | `openshell_gateway_interceptor_fail_open_total` | Counter | None | Interceptor failures that let the request continue. |
 | `openshell_gateway_interceptor_fail_closed_total` | Counter | None | Interceptor failures that rejected the request. |
 | `openshell_gateway_interceptor_post_commit_observation_failures_total` | Counter | `stage` | Failed post-commit observations. `stage` is `response_body` or `evaluation`. |
+| `openshell_server_provider_profile_source_refreshes_total` | Counter | `outcome` | Refreshes of interceptor provider-profile snapshots. `outcome` is `ok` or `failed`. |
+| `openshell_server_provider_profile_source_snapshot_age_seconds` | Gauge | None | Age of the oldest cached provider-profile snapshot after the last refresh. Reads fail closed past three refresh intervals. |
 
 ## OCSF Log Metrics
 

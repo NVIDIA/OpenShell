@@ -46,6 +46,33 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Gateway delivery path for supervisor configuration.
+///
+/// `Push` sends configuration over the supervisor session to supervisors that
+/// apply streamed configuration, which then stop polling. Other supervisors
+/// keep polling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDeliveryMode {
+    #[default]
+    Poll,
+    Push,
+}
+
+impl FromStr for ConfigDeliveryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "push" => Ok(Self::Push),
+            _ => Err(format!(
+                "invalid config delivery mode '{value}'; expected poll or push"
+            )),
+        }
+    }
+}
+
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +235,9 @@ pub struct Config {
 
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
+    /// Whether supervisors poll for configuration or receive it over their session.
+    pub config_delivery_mode: ConfigDeliveryMode,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
@@ -883,6 +913,7 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
@@ -1149,10 +1180,11 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
+        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1170,6 +1202,19 @@ mod tests {
             PolicyValidationFailureMode::RetainLastValid
         );
         assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
+    }
+
+    #[test]
+    fn config_delivery_defaults_to_poll_and_rejects_unknown_modes() {
+        assert_eq!(
+            Config::new(None).config_delivery_mode,
+            ConfigDeliveryMode::Poll
+        );
+        assert_eq!(
+            "push".parse::<ConfigDeliveryMode>().unwrap(),
+            ConfigDeliveryMode::Push
+        );
+        assert!("enabled".parse::<ConfigDeliveryMode>().is_err());
     }
 
     #[test]

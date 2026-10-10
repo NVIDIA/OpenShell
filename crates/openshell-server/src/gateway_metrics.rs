@@ -32,6 +32,10 @@ pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_build_duration_seconds";
+pub const SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_apply_duration_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -48,8 +52,12 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 2] =
-    [RELAY_CLAIM_DURATION_SECONDS, PEER_REQUEST_DURATION_SECONDS];
+const BUCKETED_HISTOGRAMS: [&str; 4] = [
+    RELAY_CLAIM_DURATION_SECONDS,
+    PEER_REQUEST_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +257,16 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time to build one pushed supervisor configuration component, including store reads and credential resolution."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time from queuing a pushed configuration update on the supervisor session to receiving its apply result."
     );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
@@ -577,6 +595,18 @@ mod tests {
             PEER_REQUEST_DURATION_SECONDS,
             LABEL_OPERATION => "relay",
             LABEL_OUTCOME => "success"
+        )
+        .record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+            "component" => "sandbox_config",
+            "outcome" => "ok"
+        )
+        .record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+            "component" => "CONFIG_COMPONENT_SANDBOX_CONFIG",
+            "outcome" => "CONFIG_APPLY_OUTCOME_APPLIED"
         )
         .record(sample);
         histogram!(

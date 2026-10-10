@@ -181,6 +181,11 @@ image_preparation_timeout_seconds = 1800
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
 
+# How supervisors receive configuration. "poll" keeps periodic polling.
+# "push" sends configuration over the supervisor session to supervisors that
+# apply it; supervisors that do not support streamed configuration keep polling.
+config_delivery_mode = "poll"
+
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
 # service URLs under that domain.
@@ -512,6 +517,8 @@ provider_profile_sources = [
 ```
 
 The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
+
+The gateway fetches each interceptor source's snapshot at startup and then every 10 seconds, and serves profile reads from that copy. When the snapshot revision changes, the gateway pushes new configuration to sandboxes that receive it over their supervisor session. If refreshes keep failing, the gateway serves the last snapshot for up to 30 seconds, then fails reads that need the catalog with `UNAVAILABLE` until a refresh succeeds.
 
 `failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
