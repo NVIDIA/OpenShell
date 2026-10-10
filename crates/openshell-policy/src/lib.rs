@@ -1208,7 +1208,7 @@ impl fmt::Display for PolicyViolation {
             Self::MissingSigningService { policy_name, host } => {
                 write!(
                     f,
-                    "network policy '{policy_name}': endpoint '{host}' has credential_signing \
+                    "network policy '{policy_name}': endpoint '{host}' has SigV4 credential_signing \
                      set but signing_service is empty"
                 )
             }
@@ -1220,7 +1220,7 @@ impl fmt::Display for PolicyViolation {
                 write!(
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has unrecognized \
-                     credential_signing value '{value}' (expected sigv4, sigv4:body, or sigv4:no_body)"
+                     credential_signing value '{value}' (expected sigv4, sigv4:body, sigv4:no_body, or oci)"
                 )
             }
             Self::CredentialSigningWithBodyRewrite { policy_name, host } => {
@@ -1527,7 +1527,7 @@ fn validate_sandbox_policy_with_mcp_presence(
             if !ep.credential_signing.is_empty()
                 && !matches!(
                     ep.credential_signing.as_str(),
-                    "sigv4" | "sigv4:body" | "sigv4:no_body"
+                    "sigv4" | "sigv4:body" | "sigv4:no_body" | "oci"
                 )
             {
                 violations.push(PolicyViolation::UnknownCredentialSigning {
@@ -1536,7 +1536,9 @@ fn validate_sandbox_policy_with_mcp_presence(
                     value: ep.credential_signing.clone(),
                 });
             }
-            if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
+            // OCI signatures are host-independent and need no service name;
+            // only SigV4 derives its credential scope from `signing_service`.
+            if ep.credential_signing.starts_with("sigv4") && ep.signing_service.is_empty() {
                 violations.push(PolicyViolation::MissingSigningService {
                     policy_name: name.clone(),
                     host: ep.host.clone(),
@@ -4048,6 +4050,36 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::UnknownCredentialSigning { .. }))
         );
+    }
+
+    #[test]
+    fn validate_accepts_oci_credential_signing_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "oci".into(),
+            NetworkPolicyRule {
+                name: "test".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "objectstorage.us-chicago-1.oraclecloud.com".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    credential_signing: "oci".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        if let Err(violations) = validate_sandbox_policy(&policy) {
+            assert!(
+                !violations.iter().any(|v| matches!(
+                    v,
+                    PolicyViolation::MissingSigningService { .. }
+                        | PolicyViolation::UnknownCredentialSigning { .. }
+                )),
+                "oci signing must not require signing_service: {violations:?}"
+            );
+        }
     }
 
     #[test]

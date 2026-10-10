@@ -47,6 +47,9 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// OCI signing hashes POST, PUT, and PATCH bodies, so it buffers them under the
+/// same ceiling as `SigV4` body signing.
+const MAX_OCI_BODY_BYTES: usize = MAX_SIGV4_BODY_BYTES;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
     let chain = openshell_supervisor_middleware::ChainRunner::new(
@@ -925,6 +928,9 @@ where
     let header_source = if options.credential_signing.is_sigv4() {
         raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end])?;
         &raw_for_rewrite[..]
+    } else if options.credential_signing.is_oci() {
+        raw_for_rewrite = crate::oci_signature::strip_oci_headers(&req.raw_header[..header_end])?;
+        &raw_for_rewrite[..]
     } else {
         &req.raw_header[..header_end]
     };
@@ -1042,7 +1048,9 @@ where
                             SigV4PayloadMode::UnsignedPayload
                         }
                         crate::l7::CredentialSigning::SigV4 => detect_payload_mode(header_str)?,
-                        crate::l7::CredentialSigning::None => unreachable!(),
+                        crate::l7::CredentialSigning::None | crate::l7::CredentialSigning::Oci => {
+                            unreachable!("guarded by is_sigv4()")
+                        }
                     };
 
                     if payload_mode == SigV4PayloadMode::SignBody {
@@ -1201,6 +1209,142 @@ where
                 "SigV4 signing configured but no secret resolver available",
             )));
         }
+    } else if options.credential_signing.is_oci() {
+        // Defense-in-depth: credential_signing and request_body_credential_rewrite
+        // are mutually exclusive (validated at policy load time).
+        if options.request_body_credential_rewrite {
+            return Err(miette!(
+                "credential_signing and request_body_credential_rewrite are \
+                 mutually exclusive on the same endpoint"
+            ));
+        }
+        // POST, PUT, and PATCH bodies are hashed into the OCI signature, so the
+        // proxy needs them before forwarding. Acknowledge `Expect: 100-continue`
+        // so the client transmits the body.
+        if has_expect_continue(header_str) {
+            client
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .into_diagnostic()?;
+            client.flush().await.into_diagnostic()?;
+        }
+        let Some(resolver) = options.resolver else {
+            return Err(miette::Report::new(CredentialUnavailableError::new(
+                "OCI signing configured but no secret resolver available",
+            )));
+        };
+        let key_id = resolver
+            .resolve_current_env_key_checked(crate::oci_signature::KEY_ID_ENV, "oci")
+            .map_err(miette::Report::new)?;
+        let private_key = resolver
+            .resolve_current_env_key_checked(crate::oci_signature::PRIVATE_KEY_ENV, "oci")
+            .map_err(miette::Report::new)?;
+        let (Some(key_id), Some(private_key)) = (key_id, private_key) else {
+            return Err(miette::Report::new(CredentialUnavailableError::new(
+                "OCI signing configured but OCI_KEY_ID and OCI_PRIVATE_KEY not found in provider",
+            )));
+        };
+        let signing_key =
+            crate::oci_signature::OciSigningKey::from_credentials(key_id, private_key)?;
+        let method = header_str.split_whitespace().next().unwrap_or("GET");
+
+        let mode = if crate::oci_signature::method_signs_body(method) {
+            let body_length = parse_body_length(header_str)?;
+            if matches!(body_length, BodyLength::Chunked) {
+                return Err(miette!(
+                    "OCI signing hashes {method} bodies and requires Content-Length; \
+                     chunked transfer encoding is not supported for signed OCI requests"
+                ));
+            }
+            let overflow = &req.raw_header[header_end..];
+            let mut full_request = rewrite_result.rewritten.clone();
+            full_request.extend_from_slice(overflow);
+            if let BodyLength::ContentLength(body_len) = body_length {
+                if body_len > MAX_OCI_BODY_BYTES as u64 {
+                    return Err(miette!(
+                        "OCI body signing buffers at most {MAX_OCI_BODY_BYTES} bytes"
+                    ));
+                }
+                let already_have = overflow.len() as u64;
+                if body_len > already_have {
+                    let remaining = usize::try_from(body_len - already_have).unwrap_or(usize::MAX);
+                    let mut body_buf = vec![0u8; remaining];
+                    client.read_exact(&mut body_buf).await.into_diagnostic()?;
+                    full_request.extend_from_slice(&body_buf);
+                }
+            }
+            // Re-check policy after body buffering — a slow upload may have
+            // outlived a policy reload.
+            if let Some(guard) = options.generation_guard {
+                guard.ensure_current()?;
+            }
+            let signed =
+                crate::oci_signature::sign_request(&full_request, options.host, &signing_key)?;
+            ensure_credential_generation_current(options)?;
+            upstream.write_all(&signed).await.into_diagnostic()?;
+            "sign_body"
+        } else {
+            // Generic headers only; the body, if any, streams through unsigned,
+            // matching the OCI SDKs.
+            let signed_headers = crate::oci_signature::sign_headers_only(
+                &rewrite_result.rewritten,
+                options.host,
+                &signing_key,
+            )?;
+            ensure_credential_generation_current(options)?;
+            upstream
+                .write_all(&signed_headers)
+                .await
+                .into_diagnostic()?;
+
+            let overflow = &req.raw_header[header_end..];
+            if !overflow.is_empty() {
+                if let Some(guard) = options.generation_guard {
+                    guard.ensure_current()?;
+                }
+                upstream.write_all(overflow).await.into_diagnostic()?;
+            }
+            let overflow_len = overflow.len() as u64;
+            match req.body_length {
+                BodyLength::ContentLength(len) => {
+                    let remaining = len.saturating_sub(overflow_len);
+                    if remaining > 0 {
+                        relay_fixed(client, upstream, remaining, options.generation_guard).await?;
+                    }
+                }
+                BodyLength::Chunked => {
+                    relay_chunked(
+                        client,
+                        upstream,
+                        &req.raw_header[header_end..],
+                        options.generation_guard,
+                    )
+                    .await?;
+                }
+                BodyLength::None => {}
+            }
+            "headers_only"
+        };
+
+        // OCSF event after successful signing and upstream write. The key id
+        // is deliberately omitted: for principals it is the security token.
+        let event = openshell_ocsf::NetworkActivityBuilder::new(ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Traffic)
+            .action(openshell_ocsf::ActionId::Allowed)
+            .disposition(openshell_ocsf::DispositionId::Allowed)
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+                options.host,
+                options.port,
+            ))
+            .message(format!(
+                "OCI re-signed {host}:{port} mode={mode}",
+                host = options.host,
+                port = options.port,
+            ))
+            .build();
+        openshell_ocsf::ocsf_emit!(event);
     } else if options.request_body_credential_rewrite {
         let body = collect_and_rewrite_request_body(
             req,
@@ -10350,6 +10494,247 @@ mod tests {
             "Non-secret query params should be preserved, got: {forwarded}"
         );
         assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    async fn relay_oci_and_capture(
+        raw_header: Vec<u8>,
+        body_length: BodyLength,
+        resolver: &SecretResolver,
+        host: &str,
+    ) -> Result<String> {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(65536);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(65536);
+
+        let header_str = String::from_utf8_lossy(&raw_header);
+        let first_line = header_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        let req = L7Request {
+            action: parts.first().unwrap_or(&"GET").to_string(),
+            target: parts.get(1).unwrap_or(&"/").to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            let mut total = 0usize;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if expected_total.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_total = Some(end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(resolver),
+                credential_signing: crate::l7::CredentialSigning::Oci,
+                host,
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await?;
+        drop(proxy_to_upstream);
+
+        upstream_task
+            .await
+            .map_err(|e| miette!("upstream task failed: {e}"))
+    }
+
+    fn oci_test_resolver() -> (String, SecretResolver) {
+        use base64::Engine as _;
+        let pem = crate::oci_signature::test_support::fresh_private_key_pem();
+        // Provider credential values are single-line, so operators store the
+        // base64 of the PEM file; the resolver would reject a raw PEM.
+        let single_line = base64::prelude::BASE64_STANDARD.encode(pem.as_bytes());
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                (
+                    "OCI_KEY_ID".to_string(),
+                    crate::oci_signature::test_support::TEST_KEY_ID.to_string(),
+                ),
+                ("OCI_PRIVATE_KEY".to_string(), single_line),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        (pem, resolver.expect("resolver"))
+    }
+
+    fn forwarded_header<'a>(forwarded: &'a str, name: &str) -> Option<&'a str> {
+        forwarded.split("\r\n").skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    fn oci_signature_verifies(forwarded: &str, pem: &str, signing_string: &str) -> bool {
+        use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+        use base64::Engine as _;
+        let authorization = forwarded_header(forwarded, "authorization").expect("authorization");
+        let start = authorization.find("signature=\"").expect("signature param") + 11;
+        let end = authorization[start..].find('"').unwrap() + start;
+        let signature = base64::prelude::BASE64_STANDARD
+            .decode(&authorization[start..end])
+            .expect("base64");
+        let key = crate::oci_signature::OciSigningKey::from_credentials(
+            crate::oci_signature::test_support::TEST_KEY_ID,
+            pem,
+        )
+        .unwrap();
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key_der())
+            .verify(signing_string.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn relay_oci_signing_replaces_client_signature_on_get() {
+        let (pem, resolver) = oci_test_resolver();
+        let host = "objectstorage.us-chicago-1.oraclecloud.com";
+        let raw = format!(
+            "GET /n/ns/b/bucket/o?limit=5 HTTP/1.1\r\nHost: {host}\r\nAuthorization: Signature keyId=\"openshell:resolve:env:OCI_KEY_ID\",signature=\"bogus\"\r\nDate: Mon, 01 Jan 2024 00:00:00 GMT\r\nAccept: application/json\r\n\r\n"
+        );
+        let forwarded = relay_oci_and_capture(raw.into_bytes(), BodyLength::None, &resolver, host)
+            .await
+            .expect("relay should succeed");
+
+        assert_eq!(
+            forwarded.matches("authorization:").count(),
+            1,
+            "exactly one proxy-signed authorization header: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("openshell:resolve:env"),
+            "placeholder must never reach upstream: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("Mon, 01 Jan 2024"),
+            "client date must be replaced"
+        );
+        let authorization = forwarded_header(&forwarded, "authorization").unwrap();
+        assert!(authorization.contains("headers=\"date (request-target) host\""));
+        assert!(authorization.contains(&format!(
+            "keyId=\"{}\"",
+            crate::oci_signature::test_support::TEST_KEY_ID
+        )));
+        assert!(forwarded_header(&forwarded, "x-content-sha256").is_none());
+        assert_eq!(
+            forwarded_header(&forwarded, "accept"),
+            Some("application/json")
+        );
+
+        let date = forwarded_header(&forwarded, "date").expect("proxy date header");
+        let signing_string =
+            format!("date: {date}\n(request-target): get /n/ns/b/bucket/o?limit=5\nhost: {host}");
+        assert!(oci_signature_verifies(&forwarded, &pem, &signing_string));
+    }
+
+    #[tokio::test]
+    async fn relay_oci_signing_buffers_and_hashes_post_body() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let (pem, resolver) = oci_test_resolver();
+        let host = "inference.generativeai.us-chicago-1.oci.oraclecloud.com";
+        let body = r#"{"compartmentId":"ocid1.compartment.oc1..example","chatRequest":{}}"#;
+        let raw = format!(
+            "POST /20231130/actions/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n{body}",
+            body.len()
+        );
+        let forwarded = relay_oci_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(body.len() as u64),
+            &resolver,
+            host,
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.ends_with(body),
+            "body forwarded intact: {forwarded}"
+        );
+        assert!(
+            forwarded_header(&forwarded, "expect").is_none(),
+            "proxy consumes Expect"
+        );
+        let expected_hash =
+            base64::prelude::BASE64_STANDARD.encode(sha2::Sha256::digest(body.as_bytes()));
+        assert_eq!(
+            forwarded_header(&forwarded, "x-content-sha256"),
+            Some(expected_hash.as_str())
+        );
+        let authorization = forwarded_header(&forwarded, "authorization").unwrap();
+        assert!(authorization.contains(
+            "headers=\"date (request-target) host content-length content-type x-content-sha256\""
+        ));
+        let date = forwarded_header(&forwarded, "date").unwrap();
+        let signing_string = format!(
+            "date: {date}\n(request-target): post /20231130/actions/chat\nhost: {host}\ncontent-length: {}\ncontent-type: application/json\nx-content-sha256: {expected_hash}",
+            body.len()
+        );
+        assert!(oci_signature_verifies(&forwarded, &pem, &signing_string));
+    }
+
+    #[tokio::test]
+    async fn relay_oci_signing_rejects_chunked_post() {
+        let (_, resolver) = oci_test_resolver();
+        let host = "objectstorage.us-chicago-1.oraclecloud.com";
+        let raw = format!(
+            "PUT /n/ns/b/bucket/o/x HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        let err = relay_oci_and_capture(raw.into_bytes(), BodyLength::Chunked, &resolver, host)
+            .await
+            .expect_err("chunked PUT cannot be hashed");
+        assert!(err.to_string().contains("Content-Length"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn relay_oci_signing_fails_closed_without_credentials() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("OTHER_TOKEN".to_string(), "x".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let host = "objectstorage.us-chicago-1.oraclecloud.com";
+        let raw = format!("GET /n/ HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let err = relay_oci_and_capture(raw.into_bytes(), BodyLength::None, &resolver, host)
+            .await
+            .expect_err("missing OCI credentials must fail closed");
+        assert!(err.to_string().contains("OCI_KEY_ID"), "{err}");
     }
 
     #[tokio::test]
