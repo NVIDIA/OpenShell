@@ -933,6 +933,27 @@ pub fn build_proxy_command(
     )
 }
 
+/// Build the `ssh` options shared by every sandbox session.
+///
+/// Every sandbox is addressed as the host `sandbox`, so a user's `ControlMaster`
+/// or `ControlPath` would reuse one sandbox's connection for another. Command
+/// line options beat `ssh_config`, so connection sharing is turned off here.
+pub fn sandbox_ssh_args(proxy_command: &str, log_level: &str) -> Vec<String> {
+    [
+        format!("ProxyCommand={proxy_command}"),
+        "StrictHostKeyChecking=no".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "GlobalKnownHostsFile=/dev/null".to_string(),
+        format!("LogLevel={log_level}"),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "ControlPersist=no".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
+}
+
 /// Error returned when a `CreateSshSessionResponse` fails validation.
 ///
 /// The response fields flow into a `ProxyCommand` string executed by
@@ -1327,6 +1348,23 @@ mod tests {
             cmd,
             "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --workspace workspace-1 --token tok.456 --gateway-name name_1"
         );
+    }
+
+    #[test]
+    fn sandbox_ssh_args_disable_connection_sharing() {
+        let args = sandbox_ssh_args("openshell ssh-proxy", "DEBUG");
+        let options: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-o");
+                pair[1].as_str()
+            })
+            .collect();
+        assert!(options.contains(&"ProxyCommand=openshell ssh-proxy"));
+        assert!(options.contains(&"LogLevel=DEBUG"));
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(options.contains(&option), "missing {option}");
+        }
     }
 
     /// Helper: return the concatenation of characters that appear outside
