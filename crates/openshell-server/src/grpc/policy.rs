@@ -592,15 +592,12 @@ fn validation_result_for_agent_proposal(
             return "validation unavailable".to_string();
         }
     };
-    // If the baseline prover run fails (e.g. the current policy uses a shape
-    // the prover hasn't caught up to yet), fall back to an empty baseline so
-    // every merged finding surfaces as new. Safer to over-warn than miss a
-    // real regression introduced by the proposal.
+    // A delta requires conclusive results for both policies.
     let base_findings = match run_prover_findings(&current_policy, credentials) {
         Ok(findings) => findings,
         Err(error) => {
-            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
-            Vec::new()
+            warn!(error = %error, "prover validation unavailable for baseline policy");
+            return "validation unavailable".to_string();
         }
     };
 
@@ -660,8 +657,8 @@ fn proposal_prover_result(
     let base_findings = match run_prover_findings(current_effective_policy, credentials) {
         Ok(findings) => findings,
         Err(error) => {
-            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
-            Vec::new()
+            warn!(error = %error, "prover validation unavailable for baseline policy");
+            return "validation unavailable".to_string();
         }
     };
     let new_findings = finding_delta(&base_findings, &candidate_findings);
@@ -688,7 +685,7 @@ fn compute_proposal_review_token(
     credentials: &CredentialSet,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v2\0");
+    hasher.update(b"openshell-proposal-evaluator-v3\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -726,7 +723,7 @@ fn compute_failed_proposal_evaluation_hash(
     application_error: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v2-failed\0");
+    hasher.update(b"openshell-proposal-evaluator-v3-failed\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -930,7 +927,7 @@ fn run_prover_findings(
     let registry =
         load_embedded_binary_registry().map_err(|e| format!("load registry failed: {e}"))?;
     let model = build_model(prover_policy, credentials.clone(), registry);
-    Ok(run_all_queries(&model))
+    run_all_queries(&model).map_err(|e| format!("prover analysis failed: {e}"))
 }
 
 /// Build a `CredentialSet` for the sandbox by walking its attached providers.
@@ -17500,6 +17497,260 @@ mod tests {
             reconciled.rejection_reason,
             "covered by active policy revision 7"
         );
+    }
+
+    #[tokio::test]
+    async fn sibling_endpoint_proposals_do_not_hide_new_findings_from_auto_approval() {
+        use openshell_core::proto::{L7Allow, NetworkEnforcementMode};
+
+        for (first, second, expected) in [
+            ("GET", "*", "credential_reach_expansion"),
+            ("POST", "DELETE", "capability_expansion"),
+        ] {
+            for reverse in [false, true] {
+                let state = test_server_state().await;
+                state
+                    .store
+                    .put_message(&test_provider("github-pat", "github"))
+                    .await
+                    .unwrap();
+                let endpoint = |method: &str| NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: method.to_string(),
+                            path: "/**".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                };
+                let mut rule = NetworkPolicyRule {
+                    name: "github_split".to_string(),
+                    endpoints: vec![endpoint(first), endpoint(second)],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                    }],
+                };
+                let mut base = ProtoSandboxPolicy::default();
+                if first == "POST" {
+                    base.network_policies.insert(
+                        "existing".to_string(),
+                        NetworkPolicyRule {
+                            name: "existing".to_string(),
+                            endpoints: vec![endpoint("POST")],
+                            binaries: rule.binaries.clone(),
+                        },
+                    );
+                }
+                if reverse {
+                    rule.endpoints.reverse();
+                }
+                let sandbox = test_sandbox(
+                    "sb-siblings",
+                    "siblings",
+                    base,
+                    vec!["github-pat".to_string()],
+                );
+                state.store.put_message(&sandbox).await.unwrap();
+                seed_sandbox_approval_mode(&state, "siblings", "auto").await;
+                let response = handle_submit_policy_analysis(
+                    &state,
+                    with_sandbox(
+                        Request::new(SubmitPolicyAnalysisRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            name: "siblings".to_string(),
+                            analysis_mode: "agent_authored".to_string(),
+                            proposed_chunks: vec![PolicyChunk {
+                                rule_name: rule.name.clone(),
+                                proposed_rule: Some(rule),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        "sb-siblings",
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(
+                    response.accepted_chunks, 1,
+                    "{:?}",
+                    response.rejection_reasons
+                );
+                let chunk = state
+                    .store
+                    .get_draft_chunk(&response.accepted_chunk_ids[0])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    chunk.application_error.is_empty(),
+                    "{}",
+                    chunk.application_error
+                );
+                assert!(
+                    current_draft_chunk_security_notes(&chunk)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    chunk.validation_result.contains(expected),
+                    "{}",
+                    chunk.validation_result
+                );
+                if first == "POST" {
+                    assert!(chunk.validation_result.contains("DELETE"));
+                }
+                assert_eq!(chunk.status, "pending");
+                let active = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+                    .await
+                    .unwrap();
+                assert!(!active.network_policies.contains_key("github_split"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_approval_refreshes_legacy_verdict_and_blocks_unavailable_validation() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-verdict-refresh",
+            "verdict-refresh",
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_sandbox(
+                Request::new(SubmitPolicyAnalysisRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    name: "verdict-refresh".to_string(),
+                    analysis_mode: "agent_authored".to_string(),
+                    proposed_chunks: vec![PolicyChunk {
+                        rule_name: "example".to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: "example".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "example.com".to_string(),
+                                port: 443,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                "sb-verdict-refresh",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = &response.accepted_chunk_ids[0];
+        let mut chunk = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let evaluation =
+            evaluate_stored_chunk_against_live_inputs(&state, "default", &sandbox, &chunk, None)
+                .await
+                .unwrap();
+
+        // Reconstruct a v2 token for unchanged inputs and no attached credentials.
+        let mut legacy = Sha256::new();
+        legacy.update(b"openshell-proposal-evaluator-v2\0");
+        legacy.update(evaluation.rule_name.as_bytes());
+        legacy.update(canonical_rule_bytes(&evaluation.rule));
+        legacy.update(evaluation.current_hash().as_bytes());
+        legacy.update(evaluation.candidate_hash().as_bytes());
+        chunk.review_token = hex::encode(legacy.finalize());
+        chunk.validation_result = "prover: no new findings".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&chunk)
+                .await
+                .unwrap()
+        );
+        let context = || AutoApproveChunkContext {
+            sandbox: &sandbox,
+            workspace: "default",
+            source: "agent_authored",
+            resolved_from: "sandbox",
+        };
+        let error = auto_approve_chunk(&state, chunk_id, context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let mut refreshed = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(refreshed.review_token, chunk.review_token);
+        assert_eq!(refreshed.review_token, evaluation.review_token);
+        assert_eq!(refreshed.status, "pending");
+
+        refreshed.validation_result = "validation unavailable".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&refreshed)
+                .await
+                .unwrap()
+        );
+        let error = auto_approve_chunk(&state, chunk_id, context())
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("prover validation unavailable"));
+        let blocked = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.status, "pending");
+        assert!(
+            blocked
+                .application_error
+                .contains("prover validation unavailable")
+        );
+        assert!(
+            current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+                .await
+                .unwrap()
+                .network_policies
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn proposal_prover_errors_in_either_policy_block_the_delta() {
+        let valid = ProtoSandboxPolicy::default();
+        let invalid = ProtoSandboxPolicy {
+            version: u32::MAX,
+            ..Default::default()
+        };
+        for (base, candidate) in [(&valid, &invalid), (&invalid, &valid)] {
+            assert_eq!(
+                proposal_prover_result(base, candidate, &CredentialSet::default()),
+                "validation unavailable"
+            );
+        }
     }
 
     /// `protocol: rest, access: full` on a host where the binary had no

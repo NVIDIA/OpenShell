@@ -186,6 +186,12 @@ not form part of the authored policy schema.
 
 See `src/model.rs`. Briefly:
 
+- Endpoint facts are indexed by rule, endpoint position, and effective port.
+  Sibling endpoints retain their own grants even when their destinations overlap.
+- Query entrypoints return an error if the base constraints are inconsistent or
+  the solver cannot reach a conclusion. Callers must propagate that error; it
+  cannot be accepted as a finding or compared as an empty finding list.
+
 - Bool sorts per `(binary, endpoint)` pair encode policy reachability,
   filtered by binary capability flags (`can_exfiltrate`,
   `bypasses_l7`).

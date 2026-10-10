@@ -683,6 +683,8 @@ openshell rule history dev
 
 Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
+`validation unavailable` blocks approval until the gateway can analyze both the current and proposed policies. It is not an accepted-risk finding.
+
 ---
 
 ## Workflow 5: BYOC (Bring Your Own Container)
