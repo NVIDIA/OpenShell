@@ -4183,12 +4183,8 @@ async fn expose_service_endpoint(
             )),
         })
         .await
-        .map_err(service_expose_status_error)
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
         .map(tonic::Response::into_inner)
-}
-
-fn service_expose_status_error(status: Status) -> miette::Report {
-    service_status_error("expose service", "sandbox:write", status)
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
@@ -4215,7 +4211,14 @@ pub async fn service_list(
             }),
         })
         .await
-        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .map_err(|status| {
+            service_status_error(
+                "list services",
+                "sandbox:read",
+                sandbox.unwrap_or_default(),
+                status,
+            )
+        })?
         .into_inner();
 
     let next_page_token = response.next_page_token.clone();
@@ -4265,7 +4268,7 @@ pub async fn service_get(
             name: service.to_string(),
         })
         .await
-        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .map_err(|status| service_status_error("get service", "sandbox:read", sandbox, status))?
         .into_inner();
 
     print_service_endpoint_table(&[response], server, false);
@@ -4291,7 +4294,7 @@ pub async fn service_delete(
             )),
         })
         .await
-        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .map_err(|status| service_status_error("delete service", "sandbox:write", sandbox, status))?
         .into_inner();
 
     if !deletion_completed(response.outcome)? {
@@ -4315,13 +4318,23 @@ pub async fn service_delete(
     Ok(())
 }
 
-fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+fn service_status_error(
+    action: &str,
+    required_scope: &str,
+    sandbox: &str,
+    status: Status,
+) -> miette::Report {
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => {
             miette!("{action} failed: permission denied (requires {required_scope})")
         }
         Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" && !sandbox.is_empty() => {
+            miette!(
+                "{action} failed: sandbox \"{sandbox}\" not found (the first argument is the sandbox name, not the service name)"
+            )
+        }
         Code::NotFound if message == "sandbox not found" => {
             miette!("{action} failed: sandbox not found")
         }
@@ -6902,7 +6915,7 @@ mod tests {
         policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
         ready_false_condition_message, relay_local_socket, resolve_from,
         rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        service_endpoint_to_json, service_status_error, service_url_for_gateway,
         workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
@@ -7847,14 +7860,63 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_status_error_mentions_required_scope() {
-        let report = service_expose_status_error(Status::permission_denied(
-            "scope 'sandbox:write' required",
-        ));
+    fn service_status_error_mentions_required_scope() {
+        let report = service_status_error(
+            "expose service",
+            "sandbox:write",
+            "demo",
+            Status::permission_denied("scope 'sandbox:write' required"),
+        );
 
         assert_eq!(
             report.to_string(),
             "expose service failed: permission denied (requires sandbox:write)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_names_missing_sandbox() {
+        let report = service_status_error(
+            "delete service",
+            "sandbox:write",
+            "web-http",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "delete service failed: sandbox \"web-http\" not found \
+             (the first argument is the sandbox name, not the service name)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_omits_empty_sandbox_name() {
+        let report = service_status_error(
+            "list services",
+            "sandbox:read",
+            "",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "list services failed: sandbox not found"
+        );
+    }
+
+    #[test]
+    fn service_status_error_keeps_missing_service_message() {
+        let report = service_status_error(
+            "get service",
+            "sandbox:read",
+            "demo",
+            Status::not_found("service endpoint not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "get service failed: service endpoint not found"
         );
     }
 
