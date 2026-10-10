@@ -110,6 +110,8 @@ struct ProviderState {
     readiness_sequence: Arc<AtomicU64>,
     corrupt_mutation_receipt: Arc<Mutex<Option<ReceiptCorruption>>>,
     fail_mutation_after_save: Arc<Mutex<Option<Status>>>,
+    /// Plain resource-version conflicts to return before an attachment saves.
+    sandbox_provider_conflicts: Arc<AtomicU64>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
@@ -428,6 +430,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         if !self
             .state
             .providers
@@ -490,6 +504,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
@@ -6034,4 +6060,96 @@ async fn provider_create_from_gcloud_adc_missing_client_secret() {
         providers.is_empty(),
         "no provider must be created when ADC validation fails"
     );
+}
+
+#[tokio::test]
+async fn provider_attachment_retries_resource_version_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for action in ["attach", "detach"] {
+        let sandbox_name = "conflicted";
+        server.state.sandbox_providers.lock().await.insert(
+            sandbox_name.to_string(),
+            if action == "attach" {
+                Vec::new()
+            } else {
+                vec![READINESS_PROVIDER.to_string()]
+            },
+        );
+        server.state.sandbox_provider_requests.lock().await.clear();
+        server
+            .state
+            .sandbox_provider_conflicts
+            .store(2, Ordering::SeqCst);
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "sandbox",
+                "provider",
+                action,
+                sandbox_name,
+                READINESS_PROVIDER,
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{action}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            server.state.sandbox_provider_requests.lock().await.len(),
+            3,
+            "{action} retried each conflict once"
+        );
+        assert_eq!(
+            server
+                .state
+                .sandbox_providers
+                .lock()
+                .await
+                .get(sandbox_name)
+                .unwrap()
+                .contains(&READINESS_PROVIDER.to_string()),
+            action == "attach"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_attachment_reports_persistent_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("contended".to_string(), Vec::new());
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(u64::MAX, Ordering::SeqCst);
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "attach",
+            "contended",
+            READINESS_PROVIDER,
+        ],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Please retry the command"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.state.sandbox_provider_requests.lock().await.len(), 5);
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(0, Ordering::SeqCst);
 }
