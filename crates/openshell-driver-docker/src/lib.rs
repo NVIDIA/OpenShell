@@ -58,7 +58,9 @@ use openshell_core::proto_struct::{
 use openshell_core::{
     AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, UpstreamProxyConfig,
 };
-use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+use openshell_isolation_interface::contract::{
+    IdentityComponentOrigin, ResolvedWorkloadIdentity, root_identity_rejection_message,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
@@ -699,6 +701,39 @@ fn resolve_docker_identity_from_accounts(
     } else {
         "image"
     };
+    // Where each numeric component came from, for an actionable rejection
+    // message. This does not change which identity is resolved or enforced.
+    let uid_origin = if requested_user.is_empty() {
+        IdentityComponentOrigin::ImageUser
+    } else {
+        IdentityComponentOrigin::Policy
+    };
+    let gid_origin = if !requested_group.is_empty() {
+        IdentityComponentOrigin::Policy
+    } else if !group_selector.is_empty() {
+        // The group came from the image's `USER` in its `user:group` form.
+        IdentityComponentOrigin::ImageUser
+    } else {
+        // The group was inherited from the user's `/etc/passwd` entry.
+        IdentityComponentOrigin::ImagePasswd
+    };
+    let image_reference = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .map(|template| template.image.trim())
+        .filter(|reference| !reference.is_empty())
+        .unwrap_or(image.id.as_str());
+    if let Some(message) = root_identity_rejection_message(
+        image_reference,
+        uid,
+        uid_origin,
+        gid,
+        gid_origin,
+        &supplementary_gids,
+    ) {
+        return Err(Status::failed_precondition(message));
+    }
     ResolvedWorkloadIdentity::new(
         uid,
         gid,
