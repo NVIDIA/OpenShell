@@ -279,8 +279,8 @@ jobs:
         ]
 
   # Run driver-specific integration tests:
-  # These suites require the binary installer's CLI path, local HTTP gateway,
-  # and system service configuration for their Podman user-namespace fixtures.
+  # Exercise the packaged gateway service and credentials. Namespace fixtures
+  # use the installer-published service owner and active XDG configuration.
   driver-specific-integration:
     needs: prepare-integration
     permissions:
@@ -294,9 +294,9 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"driver-podman"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"driver-podman"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"e2e-podman"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"driver-podman"}
         ]
 
   docker-e2e:

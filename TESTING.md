@@ -286,13 +286,48 @@ Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
-Run the portable subset in a disposable rootless Podman guest:
+Run the portable subset in a disposable rootless Podman guest. Stage matching
+candidate CLI and gateway RPMs at `artifacts/packages/rpm/openshell.rpm` and
+`artifacts/packages/rpm/openshell-gateway.rpm`; `build-artifacts` builds the
+binary, runtime-image, and test inputs but does not build these packages:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
-nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm driver-podman
 ```
+
+The driver suites also support the `binaries` installer. The shared installer
+roles save the active gateway configuration, registration name, service scope,
+service owner, and network name in `/var/lib/openshell-test/gateway.yaml`.
+Suites resolve `openshell` from PATH and use that registration, including the
+packaged gateway's HTTPS client credentials. Namespace fixtures modify the
+installed TOML and restart its system or user service. Package metadata points
+to the service owner's XDG `gateway.toml`, which can be absent when the service
+uses defaults and `gateway.env`. The default namespace comparison preserves
+that state; configured profiles create a minimal versioned TOML override only
+if the package has not seeded one.
+
+Failure diagnostics select the matching journal unit and user ID. Missing
+metadata or credentials fail the run; suites do not replace package setup with
+an HTTP gateway.
+
+Before merging harness changes, run all three driver-specific combinations
+locally: rootful RPM `driver-podman`, rootless RPM `driver-podman`, and rootless
+RPM `e2e-podman`. Use matching candidate packages, runtime images, and test
+archives. Add `test:e2e` to the PR and check that its branch integration jobs ran
+and passed; a successful workflow with skipped jobs does not validate these
+changes.
+
+Ansible sources participate in tmachine's installation cache
+hash, so older cached installations are rebuilt with this metadata.
+
+The `driver-podman` and `e2e-podman` suites support rootful and rootless Podman.
+Rootful tmachine setup grants the `tmachine` group access to the Podman socket
+so workload image loading and E2E tests run as the local user.
+DEB and RPM installers share the gateway role; available environments pair
+DEB with Ubuntu/Docker and RPM with Fedora/Podman. A DEB/Podman run requires an
+Ubuntu Podman environment.
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
 
