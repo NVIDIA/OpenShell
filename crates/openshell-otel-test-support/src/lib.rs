@@ -71,6 +71,7 @@ pub struct ReceivedTraces {
     pub service_names: Vec<String>,
     pub gateway_names: Vec<String>,
     pub compute_drivers: Vec<String>,
+    pub encodings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,13 @@ impl TraceService for Collector {
                 .received
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(encoding) = request
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|value| value.to_str().ok())
+            {
+                received.encodings.push(encoding.to_string());
+            }
             for resource_span in request.into_inner().resource_spans {
                 if let Some(resource) = resource_span.resource {
                     for attribute in resource.attributes {
@@ -133,20 +141,42 @@ pub struct OtlpTestServer {
 
 impl OtlpTestServer {
     pub async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// Serve over TLS at `https://localhost:<port>` using `identity`.
+    pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
+        Self::start_with(Some(identity)).await
+    }
+
+    async fn start_with(identity: Option<tonic::transport::Identity>) -> Self {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("OTLP test collector should bind a loopback listener");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = if identity.is_some() {
+            format!("https://localhost:{port}")
+        } else {
+            format!("http://127.0.0.1:{port}")
+        };
         let collector = Collector {
             received: Arc::clone(&received),
             exported: Arc::clone(&exported),
         };
+        let mut server = tonic::transport::Server::builder();
+        if let Some(identity) = identity {
+            server = server
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .expect("OTLP test collector should accept its TLS identity");
+        }
+        let service = TraceServiceServer::new(collector)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(TraceServiceServer::new(collector))
+            server
+                .add_service(service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
