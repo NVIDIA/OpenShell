@@ -2472,6 +2472,17 @@ pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result
     provider_policy_composition_enabled_in(&global_settings)
 }
 
+/// Components a global setting change can alter. The provider environment
+/// reads global settings only for the global policy, so other keys rebuild
+/// just the sandbox configuration.
+fn global_setting_components(key: &str) -> crate::config_delivery::ConfigComponents {
+    if key == POLICY_SETTING_KEY {
+        crate::config_delivery::ConfigComponents::ALL
+    } else {
+        crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+    }
+}
+
 fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
     Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
@@ -4221,10 +4232,7 @@ async fn handle_update_config_inner(
 
             global_settings.revision = global_settings.revision.wrapping_add(1);
             save_global_settings(state.store.as_ref(), &global_settings).await?;
-            crate::config_delivery::publish_all_connected(
-                state,
-                crate::config_delivery::ConfigComponents::ALL,
-            );
+            crate::config_delivery::publish_all_connected(state, global_setting_components(key));
 
             if req.delete_setting
                 && key == POLICY_SETTING_KEY
@@ -21523,6 +21531,18 @@ mod tests {
             );
             assert_eq!(setting.scope, SettingScope::Unspecified as i32);
         }
+    }
+
+    #[test]
+    fn global_setting_components_rebuild_provider_environment_only_for_policy() {
+        assert_eq!(
+            global_setting_components(POLICY_SETTING_KEY),
+            crate::config_delivery::ConfigComponents::ALL
+        );
+        assert_eq!(
+            global_setting_components("ocsf_json_enabled"),
+            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+        );
     }
 
     #[test]
