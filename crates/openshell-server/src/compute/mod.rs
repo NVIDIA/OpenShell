@@ -201,6 +201,9 @@ mod traced_driver {
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const START_PHASE_CAS_RETRY_LIMIT: usize = 3;
+/// Stop completion races driver watch events for the terminating runtime,
+/// which every HA replica applies without the per-replica lifecycle gate.
+const STOP_PHASE_CAS_RETRY_LIMIT: usize = 5;
 const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
 
 /// Serializes request-side lifecycle mutations for the same stable sandbox ID.
@@ -1557,7 +1560,7 @@ impl ComputeRuntime {
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
         let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-        let current = self
+        let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
             .await
@@ -1569,40 +1572,71 @@ impl ComputeRuntime {
             ));
         }
 
-        provisioning_operation::ensure_operation_settled(&current)?;
-        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-        if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-            || is_failed_main_process_result(&current)
-        {
-            self.cleanup_stopped_sandbox_sessions(&current)
-                .await
-                .map_err(Status::internal)?;
-            return Ok(current);
-        }
-        let automatic_restart = is_automatic_restart_transition(&current);
-        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) && !automatic_restart {
-            return Err(Status::failed_precondition(format!(
-                "sandbox must be Ready or in an automatic restart to stop (current phase: {phase:?})"
-            )));
-        }
+        let mut attempt = 1;
+        let (previous, stopping) = loop {
+            provisioning_operation::ensure_operation_settled(&current)?;
+            let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                || is_failed_main_process_result(&current)
+            {
+                self.cleanup_stopped_sandbox_sessions(&current)
+                    .await
+                    .map_err(Status::internal)?;
+                return Ok(current);
+            }
+            let automatic_restart = is_automatic_restart_transition(&current);
+            if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) && !automatic_restart
+            {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox must be Ready or in an automatic restart to stop (current phase: {phase:?})"
+                )));
+            }
 
-        let (previous, stopping) = if phase == SandboxPhase::Stopping {
-            // Acquiring the lifecycle gate proves that no local worker still
-            // owns this transition. Retry the idempotent driver operation.
-            (current.clone(), current)
-        } else {
-            let previous = current.clone();
-            let stopping = self
+            if phase == SandboxPhase::Stopping {
+                // Acquiring the lifecycle gate proves that no local worker still
+                // owns this transition. Retry the idempotent driver operation.
+                break (current.clone(), current);
+            }
+
+            match self
                 .write_lifecycle_phase(
                     &current,
                     SandboxPhase::Stopping,
                     "Stopping",
                     "Sandbox stop requested",
                 )
-                .await?;
-            self.sandbox_index.update_from_sandbox(&stopping);
-            self.sandbox_watch_bus.notify(&sandbox_id);
-            (previous, stopping)
+                .await
+            {
+                Ok(stopping) => {
+                    self.sandbox_index.update_from_sandbox(&stopping);
+                    self.sandbox_watch_bus.notify(&sandbox_id);
+                    break (current, stopping);
+                }
+                Err(crate::persistence::PersistenceError::Conflict { .. })
+                    if attempt < STOP_PHASE_CAS_RETRY_LIMIT =>
+                {
+                    attempt += 1;
+                    current = self
+                        .store
+                        .get_message::<Sandbox>(&sandbox_id)
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!("fetch sandbox after stop conflict: {error}"))
+                        })?
+                        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                    if current.object_name() != sandbox_name {
+                        return Err(Status::aborted(
+                            "sandbox name changed during stop; retry explicitly",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(crate::grpc::persistence_error_to_status(
+                        error,
+                        "update sandbox lifecycle",
+                    ));
+                }
+            }
         };
         drop(global_guard);
 
@@ -1664,28 +1698,7 @@ impl ComputeRuntime {
         match result {
             Ok(_) => {
                 let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-                let latest = self
-                    .store
-                    .get_message::<Sandbox>(&sandbox_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
-                let phase = SandboxPhase::try_from(latest.phase()).unwrap_or(SandboxPhase::Unknown);
-                let stopped = if phase == SandboxPhase::Stopped {
-                    latest
-                } else if phase == SandboxPhase::Stopping {
-                    self.write_lifecycle_phase(
-                        &latest,
-                        SandboxPhase::Stopped,
-                        "Stopped",
-                        "Sandbox compute is stopped",
-                    )
-                    .await?
-                } else {
-                    return Err(Status::aborted(
-                        "sandbox lifecycle changed while stop completed",
-                    ));
-                };
+                let stopped = self.commit_sandbox_stopped(&sandbox_id).await?;
                 self.cleanup_stopped_sandbox_sessions(&stopped)
                     .await
                     .map_err(Status::internal)?;
@@ -2327,7 +2340,7 @@ impl ComputeRuntime {
         phase: SandboxPhase,
         reason: &str,
         message: &str,
-    ) -> Result<Sandbox, Status> {
+    ) -> Result<Sandbox, crate::persistence::PersistenceError> {
         let sandbox_id = sandbox.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(sandbox);
         let reason = reason.to_string();
@@ -2347,7 +2360,60 @@ impl ComputeRuntime {
                 },
             )
             .await
-            .map_err(|e| crate::grpc::persistence_error_to_status(e, "update sandbox lifecycle"))
+    }
+
+    /// Commit `Stopped` after the driver confirmed the stop.
+    ///
+    /// Other replicas apply watch events for the terminating runtime without
+    /// this replica's lifecycle gate, so the CAS can lose to an unrelated
+    /// status write. Re-read and retry while the record is still `Stopping`.
+    async fn commit_sandbox_stopped(&self, sandbox_id: &str) -> Result<Sandbox, Status> {
+        let mut attempt = 1;
+        loop {
+            let latest = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            match SandboxPhase::try_from(latest.phase()).unwrap_or(SandboxPhase::Unknown) {
+                SandboxPhase::Stopped => return Ok(latest),
+                SandboxPhase::Stopping => {}
+                _ => {
+                    return Err(Status::aborted(
+                        "sandbox lifecycle changed while stop completed",
+                    ));
+                }
+            }
+            match self
+                .write_lifecycle_phase(
+                    &latest,
+                    SandboxPhase::Stopped,
+                    "Stopped",
+                    "Sandbox compute is stopped",
+                )
+                .await
+            {
+                Ok(stopped) => return Ok(stopped),
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) if attempt < STOP_PHASE_CAS_RETRY_LIMIT => {
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        current_resource_version,
+                        "Retrying sandbox stop completion after a concurrent sandbox update"
+                    );
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(crate::grpc::persistence_error_to_status(
+                        error,
+                        "update sandbox lifecycle",
+                    ));
+                }
+            }
+        }
     }
 
     async fn restore_lifecycle_snapshot(&self, owned: &Sandbox, previous: &Sandbox) -> bool {
@@ -3574,15 +3640,7 @@ impl ComputeRuntime {
                         )
                         .await
                     {
-                        Ok(_) => match self
-                            .write_lifecycle_phase(
-                                &sandbox,
-                                SandboxPhase::Stopped,
-                                "Stopped",
-                                "Sandbox compute is stopped",
-                            )
-                            .await
-                        {
+                        Ok(_) => match self.commit_sandbox_stopped(&sandbox_id).await {
                             Ok(updated) => {
                                 self.sandbox_index.update_from_sandbox(&updated);
                                 self.sandbox_watch_bus.notify(updated.object_id());
@@ -11546,6 +11604,83 @@ mod tests {
 
         assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_retries_lifecycle_writes_after_concurrent_replica_write() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect conflict injector");
+        sqlx::query("CREATE TABLE injected_conflicts (marker TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create conflict marker table");
+        // Another replica applies a watch event between each lifecycle read
+        // and its CAS write: once before `Stopping`, once before `Stopped`.
+        for trigger in [
+            "CREATE TRIGGER inject_replica_write_stopping \
+             BEFORE UPDATE OF payload ON objects \
+             WHEN instr(NEW.payload, CAST('Sandbox stop requested' AS BLOB)) > 0 \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts WHERE marker = 'stopping') \
+             BEGIN \
+               INSERT INTO injected_conflicts (marker) VALUES ('stopping'); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = OLD.object_type AND id = OLD.id; \
+               SELECT RAISE(IGNORE); \
+             END",
+            "CREATE TRIGGER inject_replica_write_stopped \
+             BEFORE UPDATE OF payload ON objects \
+             WHEN instr(NEW.payload, CAST('Sandbox compute is stopped' AS BLOB)) > 0 \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts WHERE marker = 'stopped') \
+             BEGIN \
+               INSERT INTO injected_conflicts (marker) VALUES ('stopped'); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = OLD.object_type AND id = OLD.id; \
+               SELECT RAISE(IGNORE); \
+             END",
+        ] {
+            sqlx::query(trigger)
+                .execute(&pool)
+                .await
+                .expect("install conflict trigger");
+        }
+
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        let sandbox = sandbox_record(
+            "sb-stop-replica-race",
+            "stop-replica-race",
+            SandboxPhase::Ready,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stopped = runtime
+            .stop_sandbox("default", sandbox.object_name())
+            .await
+            .expect("stop must retry lifecycle writes after a concurrent write");
+
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(driver.stop_calls(), 1);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        let injected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM injected_conflicts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            injected, 2,
+            "both lifecycle writes must hit an injected conflict"
+        );
+        pool.close().await;
     }
 
     #[tokio::test]
