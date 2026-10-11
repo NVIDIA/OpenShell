@@ -40,6 +40,7 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -85,9 +86,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -7130,7 +7133,53 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     ))
 }
 
+/// How long a host process gets to exit after SIGTERM before it is killed.
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// Seconds the supervisor waits for the workload to exit after SIGTERM before
+/// it kills the workload.
+const SUPERVISOR_WORKLOAD_TERM_SECS: u64 = 5;
+/// Seconds the guest waits for the sandbox's remaining processes to exit, then
+/// for the forced kill to be reaped, when it terminates the boundary.
+const GUEST_PROCESS_TREE_SECS: u64 = DEFAULT_STOP_TIMEOUT_SECS as u64 + 2;
+/// Seconds the guest allows for flushing its filesystem.
+const GUEST_FLUSH_SECS: u64 = 3;
+
+/// How long the host supervisor gets to finish its orderly shutdown after
+/// SIGTERM: the workload's termination wait, then the guest's process-tree
+/// termination and filesystem flush. The values mirror those bounds, so a
+/// healthy stop, even a slow one, finishes inside it. A supervisor still
+/// running after this is stuck on an unresponsive guest and is killed.
+///
+/// The workload wait, the flush bound and the caller deadline below are copies
+/// of values defined in other crates; only the stop timeout is shared. Nothing
+/// fails to compile if one of those changes, so the assertion below checks the
+/// copies, not the originals. The grace is also the exact sum of the stage
+/// maxima with no slack: a stop in which every stage runs to its limit can
+/// kill the supervisor just before it acknowledges.
+const SUPERVISOR_SHUTDOWN_GRACE: Duration =
+    Duration::from_secs(SUPERVISOR_WORKLOAD_TERM_SECS + GUEST_PROCESS_TREE_SECS + GUEST_FLUSH_SECS);
+
+/// The gateway cancels a stop that runs longer than this when it reclaims an
+/// expired provisioning attempt, which would skip the stop's cleanup steps.
+const STOP_CALLER_DEADLINE: Duration = Duration::from_secs(30);
+
+// The longest stop is the supervisor's grace plus the VM's.
+const _: () = assert!(
+    SUPERVISOR_SHUTDOWN_GRACE.as_secs() + PROCESS_TERMINATION_GRACE.as_secs()
+        < STOP_CALLER_DEADLINE.as_secs()
+);
+
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
+    terminate_vm_process_within(child, PROCESS_TERMINATION_GRACE)
+        .await
+        .map(|_| ())
+}
+
+async fn terminate_vm_process_within(
+    child: &mut Child,
+    grace: Duration,
+) -> Result<ExitStatus, std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -7140,19 +7189,45 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
         )));
     }
 
-    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(_) => {
-            child.kill().await?;
-            child.wait().await.map(|_| ())
-        }
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status
+    } else {
+        child.kill().await?;
+        child.wait().await
     }
 }
 
+/// Stop the host supervisor first, then the VM it was supervising.
+///
+/// The supervisor exits immediately when the parent-liveness pipe reaches EOF,
+/// treating it as driver death. The pipe therefore stays open until the
+/// supervisor has exited, so SIGTERM runs its orderly shutdown (terminate the
+/// workload, then have the guest terminate and flush its filesystem) instead
+/// of losing a race with the pipe closing.
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
+    terminate_sandbox_processes_within(process, SUPERVISOR_SHUTDOWN_GRACE).await
+}
+
+async fn terminate_sandbox_processes_within(
+    process: &mut VmProcess,
+    supervisor_grace: Duration,
+) -> Result<(), std::io::Error> {
+    let supervisor_pid = process.supervisor.id();
+    let supervisor_error = terminate_vm_process_within(&mut process.supervisor, supervisor_grace)
+        .await
+        .inspect(|status| {
+            // An orderly shutdown returns the workload's exit code, which can
+            // be nonzero even after the guest acknowledges termination.
+            if status.signal().is_some() {
+                warn!(
+                    ?supervisor_pid,
+                    %status,
+                    "VM host supervisor was terminated by a signal; guest filesystem flush was not confirmed and recent writes may be lost"
+                );
+            }
+        })
+        .err();
     process.supervisor_liveness.take();
-    let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
     match (supervisor_error, vm_error) {
@@ -11667,6 +11742,189 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// The supervisor exits at once when its parent-liveness pipe reaches EOF,
+    /// so a stop must signal it while the pipe is still open. The stand-in
+    /// supervisor takes 200 ms to handle SIGTERM, long enough for a prematurely
+    /// closed pipe to be seen first.
+    #[tokio::test]
+    async fn stop_signals_supervisor_before_closing_its_liveness_pipe() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap 'sleep 0.2; echo term >>"$events"; exit 143' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor installs its SIGTERM handler");
+
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
+        };
+        terminate_sandbox_processes(&mut process).await.unwrap();
+
+        let log = fs::read_to_string(&events).unwrap();
+        let first_event = log.lines().find(|line| *line != "ready");
+        assert_eq!(
+            first_event,
+            Some("term"),
+            "SIGTERM must reach the supervisor before its liveness pipe closes; events: {log:?}"
+        );
+        assert!(
+            fs::read_to_string(&driver_log).unwrap().is_empty(),
+            "an orderly supervisor shutdown must not warn about lost writes"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A supervisor that ignores SIGTERM is killed once its grace expires, and
+    /// only then is its liveness pipe closed.
+    #[tokio::test]
+    async fn stop_kills_a_supervisor_that_ignores_sigterm_after_the_grace() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap '' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor starts");
+
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
+        };
+        let grace = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        terminate_sandbox_processes_within(&mut process, grace)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= grace,
+            "the supervisor must get its full grace before the kill: {elapsed:?}"
+        );
+        assert!(
+            process.supervisor.try_wait().unwrap().is_some(),
+            "the supervisor is gone once the grace has expired"
+        );
+        assert!(process.supervisor_liveness.is_none());
+        // The liveness pipe closes only after the supervisor has been dealt with.
+        let closed = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("eof")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the liveness pipe is closed after the stop");
+        let driver_log = fs::read_to_string(&driver_log).unwrap();
+        assert!(
+            driver_log.contains("WARN")
+                && driver_log.contains("guest filesystem flush was not confirmed"),
+            "a forced supervisor shutdown must warn that recent writes may be lost: {driver_log:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     async fn insert_test_record(
