@@ -4547,6 +4547,7 @@ async fn prepare_docker_boundary_files(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
+    let host_gateway_ip = resolve_docker_supervisor_host_address(docker, sandbox, config).await?;
     let provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
         generation: launch_authentication
@@ -4575,7 +4576,7 @@ async fn prepare_docker_boundary_files(
         // host-networked supervisor. This is normally loopback, but container
         // CI reaches the gateway and host fixtures through the job
         // container's bridge address.
-        host_gateway_ip: docker_supervisor_host_address(&config.supervisor_grpc_endpoint),
+        host_gateway_ip,
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
     }
@@ -5036,6 +5037,168 @@ fn docker_supervisor_host_address(grpc_endpoint: &str) -> Option<IpAddr> {
         // Leave IPv6 and named remote endpoints to normal name resolution.
         url::Host::Ipv6(_) | url::Host::Domain(_) => None,
     }
+}
+
+fn docker_host_gateway_resolver_body(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> ContainerCreateBody {
+    ContainerCreateBody {
+        image: Some(config.supervisor_image_id.clone()),
+        user: Some(format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")),
+        entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
+        cmd: Some(vec!["--help".to_string()]),
+        labels: Some(docker_auxiliary_container_labels(
+            sandbox,
+            config,
+            LABEL_ISOLATION_ROLE_STAGING,
+        )),
+        host_config: Some(HostConfig {
+            network_mode: Some("none".to_string()),
+            extra_hosts: Some(vec![format!("{HOST_OPEN_SHELL_INTERNAL}:host-gateway")]),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            readonly_rootfs: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn parse_docker_host_gateway_hosts(contents: &[u8]) -> CoreResult<IpAddr> {
+    let text = std::str::from_utf8(contents).map_err(|error| {
+        Error::config(format!(
+            "Docker host gateway hosts file is not UTF-8: {error}"
+        ))
+    })?;
+    let mut addresses = Vec::new();
+    for line in text.lines() {
+        let fields = line
+            .split_once('#')
+            .map_or(line, |(entry, _)| entry)
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if fields.len() < 2 || !fields[1..].contains(&HOST_OPEN_SHELL_INTERNAL) {
+            continue;
+        }
+        let address = fields[0].parse::<IpAddr>().map_err(|error| {
+            Error::config(format!(
+                "Docker host gateway hosts entry has an invalid address: {error}"
+            ))
+        })?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+
+    let ipv4 = addresses
+        .iter()
+        .filter(|address| address.is_ipv4())
+        .copied()
+        .collect::<Vec<_>>();
+    let address = match ipv4.as_slice() {
+        [address] => *address,
+        [] if addresses.len() == 1 => addresses[0],
+        [] => {
+            return Err(Error::config(
+                "Docker host gateway resolver did not return one concrete address",
+            ));
+        }
+        _ => {
+            return Err(Error::config(
+                "Docker host gateway resolver returned ambiguous IPv4 addresses",
+            ));
+        }
+    };
+    let normalized = match address {
+        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        IpAddr::V4(_) => address,
+    };
+    if address.is_unspecified()
+        || address.is_multicast()
+        || normalized == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || normalized == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+    {
+        return Err(Error::config(format!(
+            "Docker host gateway resolver returned unsafe address '{address}'"
+        )));
+    }
+    Ok(address)
+}
+
+async fn resolve_docker_supervisor_host_address(
+    docker: &Docker,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<IpAddr>, Status> {
+    if let Some(address) = docker_supervisor_host_address(&config.supervisor_grpc_endpoint) {
+        return Ok(Some(address));
+    }
+    let endpoint = Url::parse(&config.supervisor_grpc_endpoint).map_err(|error| {
+        Status::failed_precondition(format!("parse Docker supervisor endpoint: {error}"))
+    })?;
+    if !matches!(endpoint.host(), Some(url::Host::Domain(name)) if name.eq_ignore_ascii_case(HOST_DOCKER_INTERNAL))
+    {
+        return Ok(None);
+    }
+
+    let resolver_name = temp_extract_container_name();
+    let created = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(resolver_name.as_str())
+                    .build(),
+            ),
+            docker_host_gateway_resolver_body(sandbox, config),
+        )
+        .await
+        .map_err(|error| {
+            Status::internal(format!("create Docker host gateway resolver: {error}"))
+        })?;
+
+    let result = async {
+        docker
+            .start_container(&created.id, None)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("start Docker host gateway resolver: {error}"))
+            })?;
+        let mut wait = docker.wait_container(
+            &created.id,
+            None::<bollard::query_parameters::WaitContainerOptions>,
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), wait.next())
+            .await
+            .map_err(|_| Status::deadline_exceeded("Docker host gateway resolver timed out"))?
+            .ok_or_else(|| Status::internal("Docker host gateway resolver wait ended"))?
+            .map_err(|error| {
+                Status::internal(format!("wait for Docker host gateway resolver: {error}"))
+            })?;
+        if status.status_code != 0 {
+            return Err(Status::failed_precondition(format!(
+                "Docker host gateway resolver exited with status {}",
+                status.status_code
+            )));
+        }
+        let hosts = download_path_from_container(docker, &created.id, "/etc/hosts", true)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        parse_docker_host_gateway_hosts(&hosts)
+            .map(Some)
+            .map_err(|error| Status::failed_precondition(error.to_string()))
+    }
+    .await;
+    let cleanup = docker
+        .remove_container(
+            &created.id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await
+        .map_err(|error| Status::internal(format!("remove Docker host gateway resolver: {error}")));
+    let address = result?;
+    cleanup?;
+    Ok(address)
 }
 
 async fn spawn_docker_control_process(

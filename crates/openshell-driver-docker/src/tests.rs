@@ -554,6 +554,27 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires a local Docker daemon and supervisor image; creates and removes one confined resolver container"]
+async fn live_docker_host_gateway_resolution_uses_daemon_owned_address() {
+    let image = std::env::var("OPENSHELL_TEST_DOCKER_SUPERVISOR_IMAGE")
+        .expect("set OPENSHELL_TEST_DOCKER_SUPERVISOR_IMAGE to an existing immutable image");
+    let mut config = runtime_config();
+    config.supervisor_image_id = image;
+    config.supervisor_grpc_endpoint = "https://host.docker.internal:17670".to_string();
+    let docker = Docker::connect_with_local_defaults().unwrap();
+
+    let address = resolve_docker_supervisor_host_address(&docker, &test_sandbox(), &config)
+        .await
+        .unwrap()
+        .expect("Docker Desktop endpoint must resolve to one concrete pin");
+
+    assert!(address.is_ipv4());
+    assert!(!address.is_unspecified());
+    assert!(!address.is_multicast());
+    assert_ne!(address, IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)));
+}
+
 type TestDriverClient =
     openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
         tonic::transport::Channel,
@@ -3070,6 +3091,55 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
         docker_supervisor_host_address("https://gateway.example.com:17670"),
         None
     );
+}
+
+#[test]
+fn docker_host_gateway_resolver_is_confined_and_uses_engine_pin() {
+    let sandbox = test_sandbox();
+    let config = runtime_config();
+    let body = docker_host_gateway_resolver_body(&sandbox, &config);
+    let host = body.host_config.expect("resolver host config");
+
+    assert_eq!(
+        body.image.as_deref(),
+        Some(config.supervisor_image_id.as_str())
+    );
+    assert_eq!(
+        body.entrypoint,
+        Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()])
+    );
+    assert_eq!(body.cmd, Some(vec!["--help".to_string()]));
+    assert_eq!(host.network_mode.as_deref(), Some("none"));
+    assert_eq!(
+        host.extra_hosts,
+        Some(vec!["host.openshell.internal:host-gateway".to_string()])
+    );
+    assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
+    assert_eq!(host.cap_add, None);
+    assert_eq!(host.readonly_rootfs, Some(true));
+}
+
+#[test]
+fn docker_host_gateway_parser_prefers_one_engine_pinned_ipv4_address() {
+    let hosts = b"127.0.0.1 localhost\n\
+                  172.29.0.254 host.openshell.internal\n\
+                  fdc4:f303:9324::254 host.openshell.internal\n";
+
+    assert_eq!(
+        parse_docker_host_gateway_hosts(hosts).unwrap(),
+        "172.29.0.254".parse::<IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn docker_host_gateway_parser_rejects_missing_ambiguous_and_metadata_addresses() {
+    for hosts in [
+        b"127.0.0.1 localhost\n".as_slice(),
+        b"172.29.0.254 host.openshell.internal\n172.30.0.254 host.openshell.internal\n".as_slice(),
+        b"169.254.169.254 host.openshell.internal\n".as_slice(),
+    ] {
+        assert!(parse_docker_host_gateway_hosts(hosts).is_err());
+    }
 }
 
 #[test]
