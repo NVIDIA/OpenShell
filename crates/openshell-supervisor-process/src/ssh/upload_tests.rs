@@ -23,6 +23,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 struct Process {
     status: watch::Sender<Option<BoundaryExitStatus>>,
+    waited: watch::Sender<bool>,
     terminated: watch::Sender<bool>,
     signals: mpsc::UnboundedSender<BoundarySignal>,
 }
@@ -31,13 +32,15 @@ struct Process {
 impl BoundaryProcess for Process {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         let mut status = self.status.subscribe();
-        Ok(status
+        let result = status
             .wait_for(Option::is_some)
             .await
             .unwrap()
             .as_ref()
             .copied()
-            .unwrap())
+            .unwrap();
+        self.waited.send_replace(true);
+        Ok(result)
     }
 
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
@@ -82,6 +85,7 @@ fn exec_session() -> (ExecSession, Control) {
     let (signal_tx, signals) = mpsc::unbounded_channel();
     let process = Arc::new(Process {
         status: watch::channel(None).0,
+        waited: watch::channel(false).0,
         terminated: watch::channel(false).0,
         signals: signal_tx,
     });
@@ -311,7 +315,7 @@ async fn credit_violation_and_truncated_eof_are_typed_and_terminate() {
 async fn broken_stdin_and_early_exit_wake_credit_waiter() {
     for early_exit in [false, true] {
         tokio::time::timeout(DEADLINE, async {
-            let (session, control) = exec_session();
+            let (session, mut control) = exec_session();
             let client = test_client(
                 None,
                 Arc::new(Exec(Mutex::new([session].into()))),
@@ -319,6 +323,11 @@ async fn broken_stdin_and_early_exit_wake_credit_waiter() {
             )
             .await;
             let (mut channel, mut reader) = start(&client).await;
+            let diagnostic = "mkdir: /tmp/existing-file/child: Not a directory";
+            let mut stderr = diagnostic.as_bytes().to_vec();
+            stderr.resize(8192, b' ');
+            // Filling more than the pipe holds proves the drain captured the cause.
+            control.stderr.write_all(&stderr).await.unwrap();
             if early_exit {
                 control.process.status.send_replace(Some(BoundaryExitStatus::Exited(1)));
             } else {
@@ -326,7 +335,7 @@ async fn broken_stdin_and_early_exit_wake_credit_waiter() {
                 send(&channel, Frame::Data(vec![7; MAX_DATA_BYTES])).await;
             }
             let expected = if early_exit { FailureCode::Extract } else { FailureCode::InputWrite };
-            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(error) if error.code == expected));
+            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(error) if error.code == expected && error.message.contains(diagnostic)));
             control.process.terminated.subscribe().wait_for(|terminated| *terminated).await.unwrap();
         })
         .await
@@ -505,11 +514,38 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
 
 #[tokio::test]
 async fn mismatched_end_and_extended_data_fail_without_result() {
-    for extended in [false, true] {
+    for (extended, after_exit, pending_output_status) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         tokio::time::timeout(DEADLINE, async {
-            let (session, control) = exec_session();
+            let (mut session, mut control) = exec_session();
+            let (output_status, receiver) = oneshot::channel();
+            if pending_output_status {
+                session.output_status = Some(receiver);
+            }
             let client = test_client(None, Arc::new(Exec(Mutex::new([session].into()))), russh::client::Config::default()).await;
             let (mut channel, mut reader) = start(&client).await;
+            if after_exit {
+                let summary = UploadSummary { bytes: 1, sha256: Sha256::digest(b"x").into() };
+                send(&channel, Frame::Data(b"x".to_vec())).await;
+                send(&channel, Frame::End(summary)).await;
+                let mut bytes = Vec::new();
+                control.stdin.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, b"x");
+                assert_eq!(reader.frame(&mut channel).await, Frame::Ack(1));
+                control.process.status.send_replace(Some(BoundaryExitStatus::Exited(0)));
+                control.process.waited.subscribe().wait_for(|waited| *waited).await.unwrap();
+                if pending_output_status {
+                    control.stdout.shutdown().await.unwrap();
+                    control.stderr.shutdown().await.unwrap();
+                    assert_eq!(control.stdout.read(&mut [0]).await.unwrap(), 0);
+                    assert_eq!(control.stderr.read(&mut [0]).await.unwrap(), 0);
+                    tokio::task::yield_now().await;
+                }
+            }
             if extended {
                 channel.extended_data(1, b"unexpected".as_slice()).await.unwrap();
             } else {
@@ -517,6 +553,24 @@ async fn mismatched_end_and_extended_data_fail_without_result() {
             }
             assert!(matches!(reader.frame(&mut channel).await, Frame::Error(failure) if failure.code == FailureCode::Protocol));
             control.process.terminated.subscribe().wait_for(|terminated| *terminated).await.unwrap();
+            // Error and cleanup must arrive while output EOF/status is still held.
+            if after_exit && !pending_output_status {
+                assert_eq!(control.stdout.read(&mut [0]).await.unwrap(), 0);
+                assert_eq!(control.stderr.read(&mut [0]).await.unwrap(), 0);
+            }
+            if pending_output_status {
+                assert!(output_status.is_closed());
+            }
+            assert!(reader.frames.is_empty());
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::ExitStatus { exit_status } => reader.statuses.push(exit_status),
+                    ChannelMsg::Data { .. } => panic!("unexpected upload frame after ERROR"),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(reader.statuses, [74]);
         }).await.expect("invalid upload input did not terminate");
     }
 }

@@ -33,13 +33,6 @@ pub enum ProtocolError {
     Json(#[from] serde_json::Error),
 }
 
-impl ProtocolError {
-    #[must_use]
-    pub const fn is_io(&self) -> bool {
-        matches!(self, Self::Io(_))
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationKind {

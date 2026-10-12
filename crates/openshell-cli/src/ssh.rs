@@ -1502,7 +1502,7 @@ pub async fn sandbox_sync_up_files(
         files: files.to_vec(),
         archive_prefix: file_list_archive_prefix(local_path),
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_upload(|| {
         let source = source.clone();
         async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
     })
@@ -1542,7 +1542,7 @@ pub async fn sandbox_sync_up(
         local_path: local_path.to_path_buf(),
         tar_name,
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_upload(|| {
         let source = source.clone();
         async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
     })
@@ -1589,9 +1589,10 @@ async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Re
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let output = tokio::task::spawn_blocking(move || ssh.output())
+    let output = TokioCommand::from(ssh)
+        .kill_on_drop(true)
+        .output()
         .await
-        .into_diagnostic()?
         .into_diagnostic()?;
     if !output.status.success() {
         return Err(miette::miette!(
@@ -1709,6 +1710,25 @@ async fn sandbox_sync_down_once(
             sandbox_sync_down_directory(&session, &sandbox_path, dest).await
         }
     }
+}
+
+async fn retry_sandbox_upload<F, Fut, T>(run: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    #[cfg(unix)]
+    {
+        // Tokio retains handlers after listeners drop; cover setup and retry delays too.
+        let mut signals = TerminationSignals::new()?;
+        tokio::select! {
+            biased;
+            _ = signals.recv() => Err(Report::new(upload::UploadError::Cancelled)),
+            result = retry_sandbox_sync("upload", run) => result,
+        }
+    }
+    #[cfg(not(unix))]
+    retry_sandbox_sync("upload", run).await
 }
 
 async fn retry_sandbox_sync<F, Fut, T>(operation: &str, mut run: F) -> Result<T>
@@ -2496,6 +2516,151 @@ mod tests {
         assert!(sync_error_is_retryable(&Report::new(
             upload::UploadError::Transport("SSH relay disconnected".into())
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_cancellation_covers_retry_delay_and_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PHASE_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_PHASE";
+        const MARKER_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_MARKER";
+        const PID_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_PROBE_PID";
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        if let Some(phase) = std::env::var_os(PHASE_ENV) {
+            let marker = PathBuf::from(std::env::var_os(MARKER_ENV).unwrap());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut attempts = 0;
+                let error = retry_sandbox_upload(|| {
+                    attempts += 1;
+                    assert_eq!(attempts, 1, "cancelled upload started another attempt");
+                    let marker = marker.clone();
+                    let setup = phase == "setup";
+                    async move {
+                        if setup {
+                            let session = SshSessionConfig {
+                                proxy_command: String::new(),
+                                sandbox_id: String::new(),
+                                sandbox_name: String::new(),
+                                gateway_url: String::new(),
+                                token: String::new(),
+                                main_terminal: false,
+                                replica: None,
+                            };
+                            return ssh_run_capture_stdout(&session, "unused").await.map(|_| ());
+                        }
+                        let mut command = Command::new("sh");
+                        command.args(["-c", "exit 255"]);
+                        let error = upload::run(
+                            command,
+                            UploadPlan {
+                                destination_directory: "/tmp/upload".into(),
+                                expected_destination: None,
+                            },
+                            |_| Ok(()),
+                        )
+                        .await
+                        .unwrap_err();
+                        assert!(matches!(error, upload::UploadError::Transport(_)));
+                        // A spawned task runs only after the current-thread
+                        // runtime reaches the retry wait.
+                        tokio::spawn(async move {
+                            fs::write(marker, "retry delay").unwrap();
+                        });
+                        Err(Report::new(error))
+                    }
+                })
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<upload::UploadError>(),
+                    Some(upload::UploadError::Cancelled)
+                ));
+                assert_eq!(attempts, 1);
+                if phase == "setup" {
+                    let pid = fs::read_to_string(std::env::var_os(PID_ENV).unwrap())
+                        .unwrap()
+                        .parse::<i32>()
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_millis(750), async {
+                        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("cancelled probe must be terminated and reaped");
+                }
+            });
+            return;
+        }
+
+        for phase in ["retry delay", "setup"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let marker = temporary.path().join("ready");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "ssh::tests::upload_cancellation_covers_retry_delay_and_setup",
+                    "--nocapture",
+                ])
+                .env(PHASE_ENV, phase)
+                .env(MARKER_ENV, &marker)
+                .env(PID_ENV, temporary.path().join("probe-pid"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if phase == "setup" {
+                let ssh = temporary.path().join("ssh");
+                fs::write(
+                    &ssh,
+                    "#!/bin/sh\n\
+                     printf '%s' \"$$\" > \"$OPENSHELL_UPLOAD_CANCEL_PROBE_PID\"\n\
+                     printf setup > \"$OPENSHELL_UPLOAD_CANCEL_MARKER\"\n\
+                     exec sleep 60\n",
+                )
+                .unwrap();
+                fs::set_permissions(ssh, fs::Permissions::from_mode(0o755)).unwrap();
+                let mut path = temporary.path().as_os_str().to_os_string();
+                path.push(":");
+                path.push(std::env::var_os("PATH").unwrap_or_default());
+                command.env("PATH", path);
+            }
+            let mut probe = Probe(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read_to_string(&marker).is_ok_and(|ready| ready == phase) {
+                assert!(probe.0.try_wait().unwrap().is_none(), "probe exited early");
+                assert!(Instant::now() < deadline, "probe did not reach {phase}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(probe.0.id().cast_signed()),
+                Signal::SIGINT,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(status) = probe.0.try_wait().unwrap() {
+                    assert!(status.success(), "upload cancellation failed: {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cancellation waited through {phase}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     #[test]

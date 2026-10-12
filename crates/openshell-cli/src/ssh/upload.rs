@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use miette::Diagnostic;
 use openshell_core::upload::{
-    Frame, MAX_DATA_BYTES, MAX_DIAGNOSTIC_BYTES, ProtocolError, UploadPlan, UploadSummary,
-    WINDOW_BYTES, read_frame, write_frame,
+    Frame, MAX_DIAGNOSTIC_BYTES, ProtocolError, UploadPlan, UploadSummary, read_frame, write_frame,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -120,15 +119,6 @@ where
     let diagnostics = tokio::spawn(read_diagnostic(stderr));
     let diagnostic_guard = AbortTasks(vec![diagnostics.abort_handle()]);
 
-    #[cfg(unix)]
-    let mut signals = super::TerminationSignals::new()
-        .map_err(|error| UploadError::Transport(error.to_string()))?;
-    #[cfg(unix)]
-    let result = tokio::select! {
-        result = transfer(stdout, stdin, plan, producer) => result,
-        _ = signals.recv() => Err(UploadError::Cancelled),
-    };
-    #[cfg(not(unix))]
     let result = transfer(stdout, stdin, plan, producer).await;
 
     let status = if result.is_err() {
@@ -211,17 +201,6 @@ async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     else {
         return Err(server_failure(hello, "expected HELLO"));
     };
-    // A peer cannot increase local memory use by advertising larger limits.
-    if window_bytes == 0
-        || window_bytes > WINDOW_BYTES
-        || max_data_bytes == 0
-        || usize::try_from(max_data_bytes).unwrap_or(usize::MAX) > MAX_DATA_BYTES
-        || max_data_bytes > window_bytes
-    {
-        return Err(UploadError::Protocol(
-            "supervisor advertised invalid upload limits".to_string(),
-        ));
-    }
     write_frame(writer, &Frame::Begin(plan))
         .await
         .map_err(protocol_error)?;
@@ -433,7 +412,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::upload::{FailureCode, UploadFailure};
+    use openshell_core::upload::{FailureCode, MAX_DATA_BYTES, UploadFailure, WINDOW_BYTES};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf};

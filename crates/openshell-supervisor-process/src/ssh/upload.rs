@@ -269,13 +269,23 @@ async fn finish(
     handle: &Handle,
     result: Result<UploadSummary, UploadFailure>,
 ) {
+    let (result, process) = shared.state.lock().map_or_else(
+        |_| {
+            (
+                Err(failure(FailureCode::Internal, "upload state unavailable")),
+                None,
+            )
+        },
+        |mut state| {
+            // Commit the result under the same lock that records protocol failure.
+            let result = state.failure.take().map_or(result, Err);
+            state.phase = Phase::Finished;
+            state.sender.take();
+            state.input_task.take();
+            (result, state.process.take())
+        },
+    );
     let failed = result.is_err();
-    let process = shared.state.lock().ok().and_then(|mut state| {
-        state.phase = Phase::Finished;
-        state.sender.take();
-        state.input_task.take();
-        state.process.take()
-    });
     if failed && let Some(process) = process {
         tokio::spawn(async move {
             let _ = process.terminate().await;
@@ -342,186 +352,202 @@ async fn drive(
         }
         changed.await;
     };
-    let command = build_extract_command(&plan)
-        .map_err(|error| failure(FailureCode::Protocol, error.to_string()))?;
-    // Remote backends may admit a process before returning its attachment.
-    // Keep startup owned independently of this channel: cancellation must
-    // terminate even a result delivered after the upload owner is dropped.
-    let (started_tx, started_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let result = boundary_exec
-            .exec(ExecSpec {
-                program: String::new(),
-                args: Vec::new(),
-                shell: Some(ShellSpec {
-                    command: Some(command),
-                    login,
-                }),
-                runtime_helper: None,
-                env: Vec::new(),
-                workdir: None,
-                pty: false,
-            })
+    let extraction = async {
+        let command = build_extract_command(&plan)
+            .map_err(|error| failure(FailureCode::Protocol, error.to_string()))?;
+        // Remote backends may admit a process before returning its attachment.
+        // Keep startup owned independently of this channel: cancellation must
+        // terminate even a result delivered after the upload owner is dropped.
+        let (started_tx, started_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = boundary_exec
+                .exec(ExecSpec {
+                    program: String::new(),
+                    args: Vec::new(),
+                    shell: Some(ShellSpec {
+                        command: Some(command),
+                        login,
+                    }),
+                    runtime_helper: None,
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                })
+                .await
+                .map(|exec| PendingExec(Some(exec)));
+            // A queued PendingExec also terminates on drop if the receiver was
+            // cancelled after send succeeded but before receiving the attachment.
+            let _ = started_tx.send(result);
+        });
+        let mut pending = started_rx
             .await
-            .map(|exec| PendingExec(Some(exec)));
-        // A queued PendingExec also terminates on drop if the receiver was
-        // cancelled after send succeeded but before receiving the attachment.
-        let _ = started_tx.send(result);
-    });
-    let mut pending = started_rx
-        .await
-        .map_err(|_| failure(FailureCode::Internal, "extraction startup stopped"))?
-        .map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
-    {
-        let mut state = shared
-            .state
-            .lock()
-            .map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
-        // Channel drop can run on another worker after the receive completes.
-        // Keep the startup guard armed until ownership is registered under the
-        // same lock that cancellation uses to mark the channel finished.
-        if state.phase == Phase::Finished || state.failure.is_some() {
-            return Err(failure(
-                FailureCode::Protocol,
-                "upload cancelled during startup",
-            ));
-        }
-        state.process = Some(
-            pending
-                .0
-                .as_ref()
-                .expect("owned startup result")
-                .process
-                .clone(),
-        );
-    }
-    let mut exec = pending.0.take().expect("registered startup result");
-    let stdin = exec
-        .stdin
-        .take()
-        .ok_or_else(|| failure(FailureCode::Internal, "extraction process has no stdin"))?;
-    let (sender, input_task, mut progress) = InputTask::spawn_with_progress(stdin);
-    {
-        let mut state = shared
-            .state
-            .lock()
-            .map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
-        if state.phase == Phase::Finished {
-            return Err(failure(
-                FailureCode::Protocol,
-                "upload cancelled during startup",
-            ));
-        }
-        if let Some(error) = state.failure.take() {
-            return Err(error);
-        }
-        state.sender = Some(sender);
-        state.input_task = Some(input_task);
-        state.progress = Some(progress.clone());
-        state.phase = Phase::Receiving;
-    }
-    let diagnostic = Arc::new(Mutex::new(Vec::new()));
-    let stdout = DrainTask::spawn(exec.stdout, diagnostic.clone());
-    let stderr = exec
-        .stderr
-        .map(|stderr| DrainTask::spawn(stderr, diagnostic.clone()));
-    let mut exit = Box::pin(exec.process.wait());
-    if !send(handle, channel, Frame::Ready).await {
-        return Err(failure(
-            FailureCode::Internal,
-            "upload reply delivery failed",
-        ));
-    }
-    let mut acknowledged = 0;
-    let status = loop {
-        let changed = shared.changed.notified();
+            .map_err(|_| failure(FailureCode::Internal, "extraction startup stopped"))?
+            .map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
         {
             let mut state = shared
                 .state
                 .lock()
                 .map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
+            // Channel drop can run on another worker after the receive completes.
+            // Keep the startup guard armed until ownership is registered under the
+            // same lock that cancellation uses to mark the channel finished.
+            if state.phase == Phase::Finished || state.failure.is_some() {
+                return Err(failure(
+                    FailureCode::Protocol,
+                    "upload cancelled during startup",
+                ));
+            }
+            state.process = Some(
+                pending
+                    .0
+                    .as_ref()
+                    .expect("owned startup result")
+                    .process
+                    .clone(),
+            );
+        }
+        let mut exec = pending.0.take().expect("registered startup result");
+        let stdin = exec
+            .stdin
+            .take()
+            .ok_or_else(|| failure(FailureCode::Internal, "extraction process has no stdin"))?;
+        let (sender, input_task, mut progress) = InputTask::spawn_with_progress(stdin);
+        {
+            let mut state = shared
+                .state
+                .lock()
+                .map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
+            if state.phase == Phase::Finished {
+                return Err(failure(
+                    FailureCode::Protocol,
+                    "upload cancelled during startup",
+                ));
+            }
             if let Some(error) = state.failure.take() {
                 return Err(error);
             }
+            state.sender = Some(sender);
+            state.input_task = Some(input_task);
+            state.progress = Some(progress.clone());
+            state.phase = Phase::Receiving;
         }
-        let latest = *progress.borrow_and_update();
-        if latest.state == InputState::Failed {
+        let diagnostic = Arc::new(Mutex::new(Vec::new()));
+        let stdout = DrainTask::spawn(exec.stdout, diagnostic.clone());
+        let stderr = exec
+            .stderr
+            .map(|stderr| DrainTask::spawn(stderr, diagnostic.clone()));
+        let mut exit = Box::pin(exec.process.wait());
+        if !send(handle, channel, Frame::Ready).await {
             return Err(failure(
-                FailureCode::InputWrite,
-                "failed to write extraction stdin",
+                FailureCode::Internal,
+                "upload reply delivery failed",
             ));
         }
-        if latest.consumed - acknowledged >= ACK_INTERVAL
-            || (latest.state == InputState::Drained && latest.consumed != acknowledged)
-        {
-            if !send(handle, channel, Frame::Ack(latest.consumed)).await {
+        let mut acknowledged = 0;
+        let status = loop {
+            let latest = *progress.borrow_and_update();
+            if latest.state == InputState::Failed {
                 return Err(failure(
-                    FailureCode::Internal,
-                    "upload reply delivery failed",
+                    FailureCode::InputWrite,
+                    diagnostic_message(&diagnostic, "failed to write extraction stdin"),
                 ));
             }
-            acknowledged = latest.consumed;
-        }
-        tokio::select! {
-            status = &mut exit => {
-                let status = status.map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
-                let final_progress = *progress.borrow();
-                let (final_summary, final_received) = shared.state.lock().map(|state| (state.summary, state.received)).map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
-                if final_summary.is_none() || final_progress.consumed != final_received {
-                    return Err(extract_failure(status, "extraction process exited before upload completed"));
+            if latest.consumed - acknowledged >= ACK_INTERVAL
+                || (latest.state == InputState::Drained && latest.consumed != acknowledged)
+            {
+                if !send(handle, channel, Frame::Ack(latest.consumed)).await {
+                    return Err(failure(
+                        FailureCode::Internal,
+                        "upload reply delivery failed",
+                    ));
                 }
-                // A pipe shutdown can wake the child just before the writer
-                // publishes Drained. Await that final watch update rather than
-                // treating the successful EOF race as an early extraction exit.
-                while progress.borrow().state == InputState::Writing {
-                    progress.changed().await.map_err(|_| failure(FailureCode::InputWrite, "extraction stdin writer stopped"))?;
-                }
-                if progress.borrow().state != InputState::Drained {
-                    return Err(failure(FailureCode::InputWrite, "failed to close extraction stdin"));
-                }
-                if final_received != acknowledged && !send(handle, channel, Frame::Ack(final_received)).await {
-                    return Err(failure(FailureCode::Internal, "upload reply delivery failed"));
-                }
-                break status;
+                acknowledged = latest.consumed;
             }
-            () = changed => {}
-            result = progress.changed() => {
-                if result.is_err() {
-                    return Err(failure(FailureCode::InputWrite, "extraction stdin writer stopped"));
+            tokio::select! {
+                status = &mut exit => {
+                    let status = status.map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
+                    let final_progress = *progress.borrow();
+                    let (final_summary, final_received) = shared.state.lock().map(|state| (state.summary, state.received)).map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?;
+                    if final_summary.is_none() || final_progress.consumed != final_received {
+                        return Err(extract_failure(status, &diagnostic_message(&diagnostic, "extraction process exited before upload completed")));
+                    }
+                    // A pipe shutdown can wake the child just before the writer
+                    // publishes Drained. Await that final watch update rather than
+                    // treating the successful EOF race as an early extraction exit.
+                    while progress.borrow().state == InputState::Writing {
+                        progress.changed().await.map_err(|_| failure(FailureCode::InputWrite, "extraction stdin writer stopped"))?;
+                    }
+                    if progress.borrow().state != InputState::Drained {
+                        return Err(failure(FailureCode::InputWrite, diagnostic_message(&diagnostic, "failed to close extraction stdin")));
+                    }
+                    if final_received != acknowledged && !send(handle, channel, Frame::Ack(final_received)).await {
+                        return Err(failure(FailureCode::Internal, "upload reply delivery failed"));
+                    }
+                    break status;
+                }
+                result = progress.changed() => {
+                    if result.is_err() {
+                        return Err(failure(FailureCode::InputWrite, "extraction stdin writer stopped"));
+                    }
                 }
             }
-        }
-    };
-    stdout
-        .join()
-        .await
-        .map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
-    if let Some(stderr) = stderr {
-        stderr
+        };
+        stdout
             .join()
             .await
             .map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
-    }
-    let status = if let Some(output_status) = exec.output_status {
-        output_status
-            .await
-            .map_err(|_| failure(FailureCode::Extract, "extraction output delivery failed"))?
-    } else {
-        status
+        if let Some(stderr) = stderr {
+            stderr
+                .join()
+                .await
+                .map_err(|error| failure(FailureCode::Extract, error.to_string()))?;
+        }
+        let status = if let Some(output_status) = exec.output_status {
+            output_status
+                .await
+                .map_err(|_| failure(FailureCode::Extract, "extraction output delivery failed"))?
+        } else {
+            status
+        };
+        if status != BoundaryExitStatus::Exited(0) {
+            let diagnostic = diagnostic_message(&diagnostic, "extraction process failed");
+            return Err(extract_failure(status, &diagnostic));
+        }
+        shared
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.summary)
+            .ok_or_else(|| failure(FailureCode::Internal, "upload summary unavailable"))
     };
-    if status != BoundaryExitStatus::Exited(0) {
-        let diagnostic = diagnostic.lock().map_or_else(
-            |_| String::new(),
-            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
-        );
-        return Err(extract_failure(status, &diagnostic));
+    tokio::pin!(extraction);
+    loop {
+        let changed = shared.changed.notified();
+        let error = shared
+            .state
+            .lock()
+            .map_err(|_| failure(FailureCode::Internal, "upload state unavailable"))?
+            .failure
+            .clone();
+        if let Some(error) = error {
+            return Err(error);
+        }
+        tokio::select! {
+            result = &mut extraction => return result,
+            () = changed => {}
+        }
     }
-    shared
-        .state
+}
+
+fn diagnostic_message(diagnostic: &Mutex<Vec<u8>>, fallback: &str) -> String {
+    diagnostic
         .lock()
         .ok()
-        .and_then(|state| state.summary)
-        .ok_or_else(|| failure(FailureCode::Internal, "upload summary unavailable"))
+        .filter(|bytes| !bytes.is_empty())
+        .map_or_else(
+            || fallback.to_string(),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        )
 }
 
 fn extract_failure(status: BoundaryExitStatus, diagnostic: &str) -> UploadFailure {
