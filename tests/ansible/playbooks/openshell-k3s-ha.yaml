@@ -2,62 +2,43 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- import_playbook: openshell-k3s.yaml
-
-- name: Add PostgreSQL and TLS to the K3s test installation
+- name: Stage PostgreSQL for the HA gateway
   hosts: all
   become: true
   gather_facts: false
   tasks:
-    - name: Copy PostgreSQL fixture
-      ansible.builtin.copy:
-        src: "{{ openshell_postgres_fixture }}"
-        dest: /var/lib/openshell/artifacts/postgres.yaml
-        mode: "0600"
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    # The install layer boots fresh, so the K3s API may still be starting.
+    - name: Create OpenShell namespace
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, create, namespace, openshell]
+      register: k3s_namespace
+      until: k3s_namespace.rc == 0
+      retries: 30
+      delay: 2
 
     - name: Apply PostgreSQL fixture
       ansible.builtin.command:
-        argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, apply, --filename, /var/lib/openshell/artifacts/postgres.yaml]
+        argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, apply, --filename, "-"]
+        stdin: "{{ lookup('ansible.builtin.file', openshell_postgres_fixture) }}"
 
-    - name: Wait for PostgreSQL
-      ansible.builtin.command:
-        argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, rollout, status, deployment/openshell-e2e-postgres, --timeout=300s]
-      changed_when: false
+- import_playbook: openshell-k3s.yaml
+  vars:
+    openshell_k3s_helm_values_overlay: |
+      replicaCount: 3
+      workload:
+        kind: deployment
+      server:
+        externalDbSecret: openshell-e2e-postgres-credentials
+        disableTls: false
 
-    - name: Write PostgreSQL and TLS values overlay
-      ansible.builtin.copy:
-        dest: /var/lib/openshell/artifacts/values-ha.yaml
-        mode: "0600"
-        content: |
-          replicaCount: 3
-          workload:
-            kind: deployment
-          server:
-            externalDbSecret: openshell-e2e-postgres-credentials
-            disableTls: false
-            auth:
-              # Kubernetes has no mTLS user-identity mode. Require the client
-              # certificate at the TLS layer and use the fixture's dev user.
-              allowUnauthenticatedUsers: true
-
-    - name: Apply PostgreSQL and TLS overlay to OpenShell
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/helm
-          - upgrade
-          - openshell
-          - /var/lib/openshell/artifacts/helm-chart.tgz
-          - --namespace
-          - openshell
-          - --values
-          - /var/lib/openshell/artifacts/values.yaml
-          - --values
-          - /var/lib/openshell/artifacts/values-ha.yaml
-          - --wait
-          - --timeout=5m
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-
+- name: Register the HA gateway over mTLS
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
     # The chart's server certificate covers the Service DNS name but not its
     # ClusterIP, and the node resolver cannot reach cluster DNS.
     - name: Resolve the gateway Service name to its ClusterIP
@@ -91,6 +72,7 @@
       loop: [ca.crt, tls.crt, tls.key]
       no_log: true
 
+    # The base playbook registered a plaintext endpoint; replace it.
     - name: Remove baseline guest gateway registration
       become: false
       ansible.builtin.command:
@@ -103,13 +85,3 @@
           become: false
       vars:
         openshell_client_gateway_endpoint: "https://openshell.openshell.svc.cluster.local:{{ k3s_gateway_address.stdout.split(':')[1] }}"
-
-    - name: Wait for authenticated gateway API
-      become: false
-      ansible.builtin.command:
-        argv: [timeout, 10s, /usr/local/bin/openshell, sandbox, list, --output, json]
-      register: k3s_gateway_api
-      until: k3s_gateway_api.rc == 0
-      retries: 24
-      delay: 5
-      changed_when: false
