@@ -126,7 +126,9 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable. Resource and Event
+indefinitely when the API server is slow or unavailable. The request client's
+read timeout restarts when each request is written, so time a pooled connection
+spends idle does not shorten the next request's timeout. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
 

@@ -31,6 +31,11 @@ tokio-stream = { workspace = true }
 kube = { workspace = true }
 kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }
+hyper-timeout = "0.5"
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+rustls = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
@@ -48,10 +53,10 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+hyper = { workspace = true }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
-tower = { workspace = true }
 
 [lints]
 workspace = true

@@ -11,6 +11,7 @@ use crate::config::{
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
 };
+use crate::kube_client::kubernetes_client;
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
@@ -160,7 +161,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -777,14 +778,13 @@ impl KubernetesComputeDriver {
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
+        let client = kubernetes_client(kube_config)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client =
-            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
+        let watch_client = kubernetes_client(watch_kube_config)?;
 
         let operator_allowlist = if matches!(config.workspace_mode, WorkspaceMode::Operator) {
             let allowlist = OperatorNamespaceAllowlist::new();
