@@ -58,6 +58,14 @@
       ansible.builtin.command:
         argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
 
+    # DIAGNOSTIC PROBE, NOT FOR MERGE (#3712): `script` backs the PTY helper
+    # used by the sandbox_lifecycle tests.
+    - name: Install guest tools used by the E2E archive
+      become: true
+      ansible.builtin.dnf:
+        name: util-linux-script
+        state: present
+
     - name: Run Podman E2E archive tests
       ansible.builtin.command:
         argv:
@@ -107,6 +115,53 @@
     - name: Show OpenShell gateway journal after Podman E2E test failure
       ansible.builtin.debug:
         var: podman_e2e_gateway_journal.stdout_lines
+      when: podman_e2e_test_result.rc != 0
+
+    # DIAGNOSTIC PROBE, NOT FOR MERGE (#3712): evidence for the IP-literal
+    # timeouts in proxy_egress_pipeline and the policy DNS failure in
+    # transparent_tcp.
+    - name: Capture Podman network diagnostics after Podman E2E test failure
+      ansible.builtin.shell: |
+        echo "== podman network inspect tmachine"
+        podman network inspect tmachine
+        echo "== podman ps -a"
+        podman ps -a
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: /run/user/1000
+      changed_when: false
+      failed_when: false
+      when: podman_e2e_test_result.rc != 0
+      register: podman_e2e_podman_diagnostics
+
+    - name: Capture guest network diagnostics after Podman E2E test failure
+      become: true
+      ansible.builtin.shell: |
+        echo "== ip -brief addr"
+        ip -brief addr
+        echo "== ip route"
+        ip route
+        echo "== getenforce"
+        getenforce
+        echo "== nft ruleset (first 80 lines)"
+        nft list ruleset 2>&1 | head -80
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      when: podman_e2e_test_result.rc != 0
+      register: podman_e2e_guest_diagnostics
+
+    - name: Show Podman network diagnostics after Podman E2E test failure
+      ansible.builtin.debug:
+        var: podman_e2e_podman_diagnostics.stdout_lines
+      when: podman_e2e_test_result.rc != 0
+
+    - name: Show guest network diagnostics after Podman E2E test failure
+      ansible.builtin.debug:
+        var: podman_e2e_guest_diagnostics.stdout_lines
       when: podman_e2e_test_result.rc != 0
 
     - name: Require Podman E2E archive success
