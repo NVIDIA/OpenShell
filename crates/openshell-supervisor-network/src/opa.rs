@@ -3489,17 +3489,15 @@ mod tests {
         assert!(yaml_config.get("endpoint_id").is_none());
         assert!(yaml_config.get("policy_hash").is_none());
         let mut expected = yaml_config.clone();
+        // Grant reporting binds every protocol to the canonical policy. Derive
+        // this metadata independently and compare all remaining configuration.
+        expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
+        assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
         if is_mcp_protocol(&endpoint.protocol) {
-            // Gateway MCP observations carry canonical endpoint/policy identity.
-            // Derive only that metadata independently; compare every remaining
-            // configuration field without filtering actual runtime output.
             expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
-            expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
             assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
-            assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
         } else {
             assert!(proto_config.get("endpoint_id").is_none());
-            assert!(proto_config.get("policy_hash").is_none());
         }
         assert_eq!(
             &expected, proto_config,
@@ -3867,10 +3865,17 @@ network_policies:
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };
-            assert_eq!(
-                yaml_engine.query_endpoint_config(&input).unwrap(),
-                proto_engine.query_endpoint_config(&input).unwrap()
-            );
+            let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap();
+            let proto_config = proto_engine.query_endpoint_config(&input).unwrap();
+            match (&yaml_config, &proto_config) {
+                (Some(yaml_config), Some(proto_config)) => assert_endpoint_config_parity(
+                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
+                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &proto,
+                    &proto.network_policies["parity"].endpoints[0],
+                ),
+                _ => assert_eq!(yaml_config, proto_config),
+            }
             for engine in [&yaml_engine, &proto_engine] {
                 assert!(matches!(
                     engine.evaluate_network_action(&input).unwrap(),
