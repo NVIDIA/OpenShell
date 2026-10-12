@@ -203,6 +203,16 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    /// Seconds between each sandbox supervisor's polls for a changed
+    /// policy or settings. Unset keeps the supervisor default (10 s).
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_SUPERVISOR_POLICY_POLL_INTERVAL_SECS",
+        value_parser = clap::value_parser!(u64)
+            .range(1..=openshell_core::sandbox_env::POLICY_POLL_INTERVAL_SECS_MAX)
+    )]
+    supervisor_policy_poll_interval_secs: Option<u64>,
+
     // Corporate forward proxy for sandbox egress. Operator-owned: these reach
     // the host supervisor on its argv, which the sandbox image and the
     // user-supplied environment cannot influence.
@@ -327,6 +337,7 @@ async fn main() -> Result<()> {
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        supervisor_policy_poll_interval_secs: args.supervisor_policy_poll_interval_secs,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
     })

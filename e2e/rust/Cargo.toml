@@ -60,6 +60,11 @@ path = "tests/vm_overlay.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
+name = "vm_policy_poll_interval"
+path = "tests/vm_policy_poll_interval.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
