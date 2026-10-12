@@ -675,12 +675,40 @@ async fn create_rest_fixture(
         "subject_token=stored-closure",
     ])
     .await?;
-    SandboxGuard::create_keep_with_args(
+    let sandbox = SandboxGuard::create_keep_with_args(
         &["--name", name, "--provider", name],
         &["sh", "-lc", &sandbox_script()],
         "token-server-ready",
     )
-    .await
+    .await?;
+    cli(&[
+        "settings",
+        "set",
+        name,
+        "--key",
+        "agent_policy_proposals_enabled",
+        "--value",
+        "true",
+    ])
+    .await?;
+    sandbox
+        .exec(&[
+            "python3",
+            "-c",
+            r"import time, urllib.request, urllib.error
+deadline = time.monotonic() + 60
+while True:
+    try:
+        with urllib.request.urlopen('http://policy.local/v1/denials?last=1', timeout=2):
+            break
+    except urllib.error.HTTPError as error:
+        if error.code != 404 or time.monotonic() >= deadline:
+            raise
+        time.sleep(0.2)
+",
+        ])
+        .await?;
+    Ok(sandbox)
 }
 
 async fn recovery_cases(
