@@ -741,6 +741,15 @@ kubectl -n openshell get svc openshell -o wide
 kubectl -n openshell get endpoints openshell
 ```
 
+For kind CI diagnostics, direct Kubernetes E2E lanes expose the gateway through
+NodePort `30080`, mapped to runner `127.0.0.1:17670`. The runner registers that
+endpoint when `OPENSHELL_E2E_KUBE_NODEPORT_PORT=17670`; gateway health checks
+still use port-forwarding. Envoy Gateway lanes retain their proxy Service
+port-forward. Inspect the NodePort mapping and Service if the direct CI endpoint
+is unreachable. Port-forwarding can delay SSH session cleanup and cause a
+replacement connection to attach read-only, so compare transports when debugging
+reconnect failures.
+
 For local port-forward testing:
 
 ```bash

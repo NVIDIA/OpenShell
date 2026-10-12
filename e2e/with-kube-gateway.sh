@@ -7,14 +7,15 @@
 # Modes:
 #   - OPENSHELL_E2E_KUBE_CONTEXT set:
 #       Target the named kubectl context, install the chart into an ephemeral
-#       namespace, and port-forward the gateway. Cluster lifecycle is the
+#       namespace, and connect through the configured gateway transport. Cluster lifecycle is the
 #       caller's responsibility (e.g. CI provisions kind via helm/kind-action).
 #   - OPENSHELL_E2E_KUBE_CONTEXT unset:
 #       Create a local k3d cluster via tasks/scripts/helm-k3s-local.sh, install
 #       the chart, port-forward, and tear the cluster down on exit.
 #
 # On vanilla Kubernetes, Helm e2e talks to the gateway in plaintext over
-# `kubectl port-forward` (ci/values-skaffold.yaml). The certgen hook still runs
+# a mapped NodePort in kind CI, or `kubectl port-forward` for other clusters
+# (ci/values-skaffold.yaml). The certgen hook still runs
 # so the gateway has sandbox JWT signing keys.
 #
 # On OpenShift, that port-forward is too slow for `sandbox connect`. That command
@@ -27,6 +28,9 @@
 #
 # Every OpenShift-specific branch below is gated on OPENSHIFT_DETECTED, so the
 # vanilla-Kubernetes path stays exactly the same.
+#
+# Set OPENSHELL_E2E_KUBE_NODEPORT_PORT to the localhost port mapped to gateway
+# NodePort 30080 (kind CI uses 17670). This requires a matching cluster port map.
 #
 # Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
 # files, relative to the repository root or absolute, to layer additional chart
@@ -307,13 +311,29 @@ wait_for_envoy_service() {
   return 1
 }
 
-start_gateway_portforward() {
+start_gateway_connection() {
   local elapsed=0
   local pf_timeout=30
   local target_port=8080
   local target_namespace="${NAMESPACE}"
   local target_service="${RELEASE_NAME}"
   local target_service_ref=""
+
+  # kind CI maps this NodePort to localhost so SSH streams avoid kubectl's
+  # port-forward transport. Local/external clusters retain their existing path.
+  if [ -n "${OPENSHELL_E2E_KUBE_NODEPORT_PORT:-}" ]; then
+    LOCAL_PORT="${OPENSHELL_E2E_KUBE_NODEPORT_PORT}"
+    echo "Waiting for mapped gateway NodePort at 127.0.0.1:${LOCAL_PORT}..."
+    while [ "${elapsed}" -lt "${pf_timeout}" ]; do
+      if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+        return 0
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    echo "ERROR: mapped gateway NodePort did not accept TCP within ${pf_timeout}s" >&2
+    return 1
+  fi
 
   LOCAL_PORT="$(e2e_pick_port)"
   if use_envoy_gateway; then
@@ -697,7 +717,7 @@ scenario_cleanup_external_pg() {
   cleanup_postgres_fixture my-pg-credentials
 }
 
-# Run a single DB-backend scenario: install chart → port-forward → run tests → cleanup.
+# Run a single DB-backend scenario: install chart → connect → run tests → cleanup.
 # Usage: run_scenario "label" "type" [extra --set flags...]
 #   type: sqlite | external-pg
 run_scenario() {
@@ -731,9 +751,9 @@ run_scenario() {
       return
     fi
   else
-    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    if ! start_gateway_portforward; then
-      scenario_record_failure "${scenario_label}" "port-forward failed"
+    # Vanilla Kubernetes: use a mapped NodePort in kind CI, otherwise port-forward.
+    if ! start_gateway_connection; then
+      scenario_record_failure "${scenario_label}" "gateway connection failed"
       return
     fi
     GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
@@ -1406,6 +1426,20 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     helm_values_args+=(--values "${values_file}")
   done
 fi
+if [ -n "${OPENSHELL_E2E_KUBE_NODEPORT_PORT:-}" ]; then
+  if use_envoy_gateway || [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    echo "ERROR: mapped gateway NodePort requires a direct vanilla Kubernetes gateway" >&2
+    exit 2
+  fi
+  if ! [[ "${OPENSHELL_E2E_KUBE_NODEPORT_PORT}" =~ ^[0-9]+$ ]] ||
+    [ "${OPENSHELL_E2E_KUBE_NODEPORT_PORT}" -lt 1 ] ||
+    [ "${OPENSHELL_E2E_KUBE_NODEPORT_PORT}" -gt 65535 ]; then
+    echo "ERROR: OPENSHELL_E2E_KUBE_NODEPORT_PORT must be a TCP port (1-65535)" >&2
+    exit 2
+  fi
+  # These overrides must follow extra values so the Service matches kind's map.
+  helm_values_args+=(--set "service.type=NodePort" --set "service.nodePort=30080")
+fi
 if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
@@ -1481,8 +1515,8 @@ else
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
   else
-    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    start_gateway_portforward || exit 1
+    # Vanilla Kubernetes: use a mapped NodePort in kind CI, otherwise port-forward.
+    start_gateway_connection || exit 1
     GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \
