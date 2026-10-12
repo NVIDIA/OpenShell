@@ -213,6 +213,10 @@ pub enum IdentityComponentOrigin {
 /// [`ResolvedWorkloadIdentity::new`]; this helper changes nothing about it. It
 /// only explains an already-rejected identity in terms a user can act on,
 /// naming the image, which component is zero, and where its value came from.
+/// The remediation it suggests is tailored to the cause: a root UID points at
+/// `process.run_as_user`, a root primary group at `process.run_as_group`, and a
+/// root supplementary group at choosing a different user or image, because
+/// those policy fields do not drop supplementary group memberships.
 ///
 /// Returns `None` when no component is zero.
 #[must_use]
@@ -226,8 +230,12 @@ pub fn root_identity_rejection_message(
 ) -> Option<String> {
     use IdentityComponentOrigin::{ImageGroup, ImagePasswd, ImageUser, Policy};
 
-    let remediation = "OpenShell never runs a workload as root. Use an image with a non-root `USER`, \
-or set `process.run_as_user` and `process.run_as_group` to a non-root identity in the creation policy.";
+    // The shared invariant. The remediation that follows is tailored to which
+    // component is zero: advice that fits a root UID can be wrong for a root
+    // group, and advice that fits a root primary group can be wrong for a root
+    // supplementary group, because `process.run_as_user` and
+    // `process.run_as_group` do not drop supplementary memberships.
+    const NEVER_ROOT: &str = "OpenShell never runs a workload as root.";
 
     if uid == 0 {
         let origin = match uid_origin {
@@ -235,7 +243,9 @@ or set `process.run_as_user` and `process.run_as_group` to a non-root identity i
             _ => "the image's `USER`",
         };
         return Some(format!(
-            "image '{image_reference}' resolves to a root workload: {origin} selects UID 0. {remediation}"
+            "image '{image_reference}' resolves to a root workload: {origin} selects UID 0. {NEVER_ROOT} \
+Use an image with a non-root `USER`, or set `process.run_as_user` and `process.run_as_group` \
+to a non-root identity in the creation policy."
         ));
     }
     if gid == 0 {
@@ -246,13 +256,17 @@ or set `process.run_as_user` and `process.run_as_group` to a non-root identity i
             ImageGroup => "the image's `/etc/group`",
         };
         return Some(format!(
-            "image '{image_reference}' resolves to a root primary group: {origin} selects GID 0. {remediation}"
+            "image '{image_reference}' resolves to a root primary group: {origin} selects GID 0. {NEVER_ROOT} \
+Set `process.run_as_group` to a non-root group in the creation policy, or use an image whose \
+user has a non-root primary group."
         ));
     }
     if supplementary_gids.contains(&0) {
         return Some(format!(
             "image '{image_reference}' lists the workload user in group 0 (root) through its `/etc/group`. \
-Overriding `process.run_as_group` alone does not remove this supplementary membership. {remediation}"
+{NEVER_ROOT} `process.run_as_user` and `process.run_as_group` do not drop supplementary group \
+memberships, so overriding them cannot remove this one. Use an image whose user is not a member \
+of the root group, or select a user that is not listed in group 0 in `/etc/group`."
         ));
     }
     None
@@ -745,10 +759,14 @@ mod root_identity_rejection_tests {
         assert!(message.contains("root primary group"));
         assert!(message.contains("the image's `/etc/passwd`"));
         assert!(message.contains("GID 0"));
+        // A root primary group is remedied by `run_as_group`; advising
+        // `run_as_user` would be beside the point.
+        assert!(message.contains("`process.run_as_group`"));
+        assert!(!message.contains("`process.run_as_user`"));
     }
 
     #[test]
-    fn supplementary_group_zero_mentions_etc_group_and_override_limit() {
+    fn supplementary_group_zero_advises_changing_user_not_setting_policy_fields() {
         let message = root_identity_rejection_message(
             "example:1.0",
             1000,
@@ -760,7 +778,11 @@ mod root_identity_rejection_tests {
         .expect("supplementary group 0 is rejected");
         assert!(message.contains("group 0 (root)"));
         assert!(message.contains("/etc/group"));
-        assert!(message.contains("does not remove this supplementary membership"));
+        // The advice must explain that the policy fields cannot drop a
+        // supplementary membership, so a user who has already set them is not
+        // told to set them again.
+        assert!(message.contains("do not drop supplementary group memberships"));
+        assert!(message.contains("user is not a member"));
     }
 
     #[test]
