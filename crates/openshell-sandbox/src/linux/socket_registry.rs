@@ -119,10 +119,15 @@ impl SocketEntry {
     /// Replace the stable state. Callers perform policy and notification
     /// revalidation before invoking this commit primitive.
     pub fn set_state(&mut self, state: SocketState) {
+        if matches!(state, SocketState::Listening { .. }) {
+            // Native accept needs no broker reference. Only workload aliases
+            // should keep a listener alive after this transition.
+            self.release_preconnect();
+        }
         self.state = state;
     }
 
-    /// Close the temporary source descriptor after a connection commits.
+    /// Close the temporary source descriptor after a connection or listen commits.
     pub fn release_preconnect(&mut self) {
         self.retained_preconnect = None;
     }
@@ -268,10 +273,7 @@ impl SocketRegistry {
             ));
         }
         let identity = tentative.identity;
-        let retain_source = matches!(
-            state,
-            SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. }
-        );
+        let retain_source = matches!(state, SocketState::Created | SocketState::Bound { .. });
         self.entries.insert(
             identity.inode,
             SocketEntry {
@@ -367,6 +369,24 @@ mod tests {
             nonblocking: false,
             creator_generation: 11,
         }
+    }
+
+    #[test]
+    fn listening_commit_does_not_retain_source() {
+        let mut registry = SocketRegistry::new(7, 1).unwrap();
+        let source = tcp_socket();
+        let installed = rustix::io::fcntl_dupfd_cloexec(&source, 3).unwrap();
+        let tentative = registry.stage(source, metadata()).unwrap();
+        let local = "127.0.0.1:12345".parse().unwrap();
+        registry
+            .commit_with_state(tentative, SocketState::Listening { local })
+            .unwrap();
+        let entry = registry
+            .resolve(std::process::id(), installed.as_raw_fd())
+            .unwrap();
+        assert_eq!(entry.state(), &SocketState::Listening { local });
+        assert!(entry.retained_preconnect().is_err());
+        assert_eq!(registry.retained_preconnect_count(), 0);
     }
 
     #[test]
