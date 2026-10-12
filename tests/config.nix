@@ -95,9 +95,9 @@ let
         };
       }
       {
-        name = "k3s-ha-tls";
+        name = "k3s-ha";
         use_galaxy = false;
-        playbooks = [ "ansible/playbooks/openshell-k3s-ha-tls.yaml" ];
+        playbooks = [ "ansible/playbooks/openshell-k3s-ha.yaml" ];
         inputs = {
           openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
           agent_sandbox_version = "0.5.0";

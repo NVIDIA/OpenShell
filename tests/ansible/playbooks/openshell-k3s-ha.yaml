@@ -26,7 +26,7 @@
 
     - name: Write PostgreSQL and TLS values overlay
       ansible.builtin.copy:
-        dest: /var/lib/openshell/artifacts/values-ha-tls.yaml
+        dest: /var/lib/openshell/artifacts/values-ha.yaml
         mode: "0600"
         content: |
           replicaCount: 3
@@ -52,7 +52,7 @@
           - --values
           - /var/lib/openshell/artifacts/values.yaml
           - --values
-          - /var/lib/openshell/artifacts/values-ha-tls.yaml
+          - /var/lib/openshell/artifacts/values-ha.yaml
           - --wait
           - --timeout=5m
       environment:
