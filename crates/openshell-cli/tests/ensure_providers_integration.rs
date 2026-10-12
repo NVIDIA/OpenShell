@@ -876,69 +876,72 @@ async fn run_server() -> TestServer {
 #[tokio::test]
 async fn provider_create_forwards_labels_for_explicit_and_discovered_credentials() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-test-key")]);
-    let labels = vec!["env=dev".to_string(), "team=ml".to_string()];
-    let credentials = vec!["NVIDIA_API_KEY=test-explicit".to_string()];
-    for (name, source, credentials) in [
-        (
-            "explicit",
-            run::ProviderCreateCredentialSource::ExplicitCredentials,
-            credentials.as_slice(),
-        ),
-        (
-            "discovered",
-            run::ProviderCreateCredentialSource::Existing,
-            &[],
-        ),
-    ] {
-        run::provider_create_with_options(run::ProviderCreateOptions {
-            server: &ts.endpoint,
-            name,
-            provider_type: "nvidia",
-            labels: &labels,
-            credentials,
-            credential_source: source,
-            config: &[],
-            workspace: "default",
-            profile_workspace: "",
-            tls: &ts.tls,
-        })
-        .await
-        .unwrap();
-        let providers = ts.openshell.state.providers.lock().await;
-        let provider = &providers[name];
-        assert_eq!(
-            provider.metadata.as_ref().unwrap().labels,
-            HashMap::from([("env".into(), "dev".into()), ("team".into(), "ml".into())])
-        );
-        assert!(provider.credentials.contains_key("NVIDIA_API_KEY"));
-    }
+    Environment::from_pairs(&[("NVIDIA_API_KEY", "nvapi-test-key")])
+        .run_async(async {
+            let labels = vec!["env=dev".to_string(), "team=ml".to_string()];
+            let credentials = vec!["NVIDIA_API_KEY=test-explicit".to_string()];
+            for (name, source, credentials) in [
+                (
+                    "explicit",
+                    run::ProviderCreateCredentialSource::ExplicitCredentials,
+                    credentials.as_slice(),
+                ),
+                (
+                    "discovered",
+                    run::ProviderCreateCredentialSource::Existing,
+                    &[],
+                ),
+            ] {
+                run::provider_create_with_options(run::ProviderCreateOptions {
+                    server: &ts.endpoint,
+                    name,
+                    provider_type: "nvidia",
+                    labels: &labels,
+                    credentials,
+                    credential_source: source,
+                    config: &[],
+                    workspace: "default",
+                    profile_workspace: "",
+                    tls: &ts.tls,
+                })
+                .await
+                .unwrap();
+                let providers = ts.openshell.state.providers.lock().await;
+                let provider = &providers[name];
+                assert_eq!(
+                    provider.metadata.as_ref().unwrap().labels,
+                    HashMap::from([("env".into(), "dev".into()), ("team".into(), "ml".into())])
+                );
+                assert!(provider.credentials.contains_key("NVIDIA_API_KEY"));
+            }
 
-    for label in ["no-equals-sign", "=no-key"] {
-        let err = run::provider_create_with_options(run::ProviderCreateOptions {
-            server: &ts.endpoint,
-            name: "invalid",
-            provider_type: "nvidia",
-            labels: &[label.into()],
-            credentials: &credentials,
-            credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
-            config: &[],
-            workspace: "default",
-            profile_workspace: "",
-            tls: &ts.tls,
+            for label in ["no-equals-sign", "=no-key"] {
+                let err = run::provider_create_with_options(run::ProviderCreateOptions {
+                    server: &ts.endpoint,
+                    name: "invalid",
+                    provider_type: "nvidia",
+                    labels: &[label.into()],
+                    credentials: &credentials,
+                    credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+                    config: &[],
+                    workspace: "default",
+                    profile_workspace: "",
+                    tls: &ts.tls,
+                })
+                .await
+                .unwrap_err();
+                assert!(err.to_string().contains("--label"));
+            }
+            assert!(
+                !ts.openshell
+                    .state
+                    .providers
+                    .lock()
+                    .await
+                    .contains_key("invalid")
+            );
         })
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("--label"));
-    }
-    assert!(
-        !ts.openshell
-            .state
-            .providers
-            .lock()
-            .await
-            .contains_key("invalid")
-    );
+        .await;
 }
 
 #[tokio::test]
