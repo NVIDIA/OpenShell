@@ -468,6 +468,14 @@ gateway compatibility, without discovery or a proxy. CI runs four cases under
 `test:e2e` and includes them in `Core E2E result`. Its reusable kind setup installs
 pinned Calico only for this lane; other jobs retain kindnet. Local k3s already
 enforces policy. The lower-level `verify.py` can target a predeployed release.
+
+Set `KATA_CONTAINERS_RUNTIME_CLASS` to the desired RuntimeClass name (for example,
+`kata-qemu`) to pass it as `server.defaultRuntimeClassName` to Helm. The wrapper
+labels that RuntimeClass `openshell.ai/sandbox-attachable=true` before installation;
+the class must exist and the caller must have permission to label it. Cleanup
+restores the original label value, or removes the label if it was absent, even
+when the test run fails.
+
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
