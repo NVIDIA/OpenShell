@@ -123,7 +123,6 @@ let
     "no_proxy"
     "podman_corporate_proxy"
     "podman_gateway_start"
-    "podman_oci_identity"
     "provider_auto_create"
     # The provider-refresh feature suite covers revoked Keycloak grants. This
     # binary instead covers stable workload handles across repeated rotations

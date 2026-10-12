@@ -53,9 +53,14 @@
       ansible.builtin.command:
         argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --no-capture]
       environment:
+        HOME: /home/tmachine
         OPENSHELL_BIN: /usr/local/bin/openshell
         OPENSHELL_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
         OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default('') }}"
+        # Tests that inspect the gateway's containers reach its Podman store.
+        # Rootful Podman's store belongs to root.
+        OPENSHELL_TEST_CONTAINER_ENGINE: "{{ 'podman' if tmachine_container_runtime_is_rootless else 'sudo -n podman' }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
       register: podman_test_result
       changed_when: false
       failed_when: false

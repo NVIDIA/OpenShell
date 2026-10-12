@@ -5,8 +5,8 @@
 //!
 //! Each test builds a small image with the container engine that backs the
 //! target gateway, creates a sandbox from it through the candidate CLI, and
-//! checks the process identity, workspace, and image content seen by both the
-//! sandbox main process and `sandbox exec`.
+//! checks the process identity, privileges, workspace, and image content seen
+//! by both the sandbox main process and `sandbox exec`.
 //!
 //! `OPENSHELL_BIN` names the candidate CLI. `OPENSHELL_TEST_CONTAINER_ENGINE`
 //! is the command that builds images into the gateway's image store, such as
@@ -288,17 +288,26 @@ async fn sandbox_cleanup_precedes_image_removal_on_success_and_failure() {
 }
 
 /// Shell checks for the identity, working directory, and `HOME` of a sandbox
-/// child. A custom workspace must not also get the managed `/sandbox`. With
+/// child. The image user gains no capabilities and cannot read the sandbox's
+/// control credentials. A custom workspace is the image directory itself, not
+/// a mount over it, and does not also get the managed `/sandbox`. With
 /// `image_file`, also check that root-owned image content is present and
 /// unchanged in the workspace.
 fn workspace_checks(identity: &str, workspace: &str, image_file: bool) -> String {
     let mut checks = format!(
         "test \"$(id -u):$(id -g)\" = {identity}; \
          test \"$(pwd -P)\" = {workspace}; \
-         test \"$HOME\" = {workspace};"
+         test \"$HOME\" = {workspace}; \
+         awk '/^(CapEff|CapBnd):/ && $2 != \"0000000000000000\" {{ exit 1 }} \
+              /^NoNewPrivs:/ && $2 != 1 {{ exit 1 }}' /proc/self/status; \
+         test ! -r /.openshell/channel/sandbox/server.key; \
+         test ! -r /.openshell/supervisor/runtime-descriptor.json;"
     );
     if workspace != "/sandbox" {
-        checks.push_str(" test ! -e /sandbox;");
+        checks.push_str(&format!(
+            " awk -v w={workspace} '$5 == w {{ exit 1 }}' /proc/self/mountinfo; \
+             test ! -e /sandbox;"
+        ));
     }
     if image_file {
         checks.push_str(
