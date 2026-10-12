@@ -184,6 +184,9 @@ pub(crate) enum ProxyIdentityMode {
         /// Per-sandbox context for host-side proxies. The process-wide OCSF
         /// context cannot identify one sandbox when a gateway hosts many.
         event_context: Option<Arc<EventContext>>,
+        /// Connections that reach this proxy through a tunnel (the MXC proxy
+        /// peer) and the original sandbox connection each one stands for.
+        forwarded_clients: crate::windows_process::ForwardedClients,
     },
     /// Static fallback for platforms without socket-owner resolution and for
     /// tests that need to inject a deterministic identity.
@@ -216,7 +219,25 @@ impl ProxyIdentityMode {
             identity_cache: Arc::new(BinaryIdentityCache::new()),
             required_proxy_authorization,
             event_context: None,
+            forwarded_clients: crate::windows_process::ForwardedClients::default(),
         }
+    }
+
+    /// Share a tunnelled-connection registry with this identity mode (see
+    /// [`crate::windows_process::ForwardedClients`]).
+    #[cfg(target_os = "windows")]
+    pub(super) fn with_forwarded_clients(
+        mut self,
+        clients: crate::windows_process::ForwardedClients,
+    ) -> Self {
+        match &mut self {
+            Self::Windows {
+                forwarded_clients, ..
+            } => *forwarded_clients = clients,
+            #[cfg(test)]
+            Self::Static { .. } => {}
+        }
+        self
     }
 
     #[cfg(any(not(any(target_os = "linux", target_os = "windows")), test))]
@@ -266,6 +287,21 @@ impl ProxyIdentityMode {
                 ..
             } => context,
             _ => openshell_ocsf::ctx::ctx(),
+        }
+    }
+
+    /// Whether `peer` is a connection that reached this proxy through a
+    /// registered tunnel (see [`crate::windows_process::ForwardedClients`]).
+    fn is_tunnelled_client(&self, peer: Option<SocketAddr>) -> bool {
+        match (self, peer) {
+            #[cfg(target_os = "windows")]
+            (
+                Self::Windows {
+                    forwarded_clients, ..
+                },
+                Some(peer),
+            ) => forwarded_clients.is_tunnelled(peer),
+            _ => false,
         }
     }
 
@@ -1934,6 +1970,7 @@ async fn handle_tcp_connection(
         return Ok(());
     }
     if let Some(expected) = identity_mode.required_proxy_authorization()
+        && !identity_mode.is_tunnelled_client(client.peer_addr().ok())
         && !has_valid_proxy_authorization(request, expected)
     {
         warn!("Rejected host proxy request with missing or invalid per-sandbox credentials");
@@ -3170,9 +3207,16 @@ fn authorize_egress_intent(
             intent,
         ),
         #[cfg(target_os = "windows")]
-        ProxyIdentityMode::Windows { identity_cache, .. } => {
-            authorize_egress_intent_windows(connection, engine, identity_cache, intent)
-        }
+        ProxyIdentityMode::Windows {
+            identity_cache,
+            forwarded_clients,
+            ..
+        } => authorize_egress_intent_windows(
+            forwarded_clients.resolve(connection),
+            engine,
+            identity_cache,
+            intent,
+        ),
         #[cfg(any(not(any(target_os = "linux", target_os = "windows")), test))]
         ProxyIdentityMode::Static {
             binary_path,

@@ -119,6 +119,7 @@ mod token_probe {
 
         let (can_create_service, create_service_error) = service_manager_create_access();
         let snapshot = serde_json::json!({
+            "is_elevated": token_u32(token, 20), // TokenElevation
             "is_appcontainer": token_u32(token, 29), // TokenIsAppContainer
             "has_appcontainer_sid": has_appcontainer_sid(token),
             "can_create_service": can_create_service,
@@ -993,31 +994,218 @@ fn pc_oneshot_token_is_appcontainer_without_admin_access() {
     drop(tempdir);
 }
 
+/// Opt-in qualifications preserve the generic suite's skip-safe contract.
+/// Once enabled, unsuitable hosts or a skipped workload fail qualification.
+fn require_unelevated_basecontainer() -> Option<PathBuf> {
+    if std::env::var("OPENSHELL_MXC_QUALIFY_NO_UAC").as_deref() != Ok("1") {
+        eprintln!("SKIP: set OPENSHELL_MXC_QUALIFY_NO_UAC=1 for strict no-UAC qualification");
+        return None;
+    }
+    let snapshot = token_probe::snapshot();
+    assert_eq!(
+        snapshot["is_elevated"], 0,
+        "no-UAC qualification must run from an unelevated harness: {snapshot}"
+    );
+    assert!(
+        !std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|v| v == "1"),
+        "no-UAC qualification must use real MXC"
+    );
+    let wxc = wxc_path().expect("no-UAC qualification requires real wxc-exec");
+    let output = Command::new(&wxc)
+        .arg("--probe")
+        .output()
+        .expect("MXC probe");
+    assert!(output.status.success(), "MXC probe failed: {output:?}");
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).expect("MXC probe JSON");
+    assert_eq!(probe["tier"], "base-container", "MXC probe: {probe}");
+    assert_eq!(probe["needsDaclAugmentation"], false, "MXC probe: {probe}");
+    assert_eq!(
+        probe["probes"]["baseContainerSupportsIngressHostLoopbackAllow"], true,
+        "MXC probe: {probe}"
+    );
+    eprintln!("EVIDENCE: unelevated host token={snapshot}; MXC probe={probe}");
+    Some(wxc)
+}
+
+/// Exercise the actual `OpenShell` driver, host proxy, CA injection and L7 policy
+/// from an unelevated harness with the optional `AppContainer` peer disabled.
+#[tokio::test]
+#[ignore = "requires unelevated BaseContainer host, real wxc-exec and outbound HTTPS"]
+async fn pc_basecontainer_https_proxy_without_elevation() {
+    let Some(_wxc) = require_unelevated_basecontainer() else {
+        return;
+    };
+    assert!(
+        https_egress_reads_injected_ca_bundle(None).await,
+        "no-UAC HTTPS qualification must execute, not skip"
+    );
+    assert_eq!(token_probe::snapshot()["is_elevated"], 0);
+    eprintln!(
+        "EVIDENCE: BaseContainer host proxy, peer disabled: HTTPS GET passed, \
+         injected CA verified, HTTPS POST denied with 403; harness remained unelevated"
+    );
+}
+
+/// Independently exercise MXC's native `runtimeConfig.networkProxy` contract
+/// with an ordinary host listener. No peer profile or firewall rule is created.
+#[tokio::test]
+#[ignore = "requires unelevated BaseContainer host and real wxc-exec"]
+async fn pc_basecontainer_runtime_proxy_without_elevation() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(wxc) = require_unelevated_basecontainer() else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local proxy listener");
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let (_tempdir, temp_path) = temp_fixture();
+    let response_path = PathBuf::from(&temp_path).join("proxy-response.txt");
+    let curl = PathBuf::from(std::env::var("SYSTEMROOT").expect("SYSTEMROOT"))
+        .join("System32")
+        .join("curl.exe");
+    assert!(curl.exists(), "Windows curl.exe required");
+    let config = serde_json::json!({
+        "version": "1.0.0",
+        "containerId": format!("no-uac-proxy-{}", uuid::Uuid::new_v4()),
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": format!(
+                "cmd /d /c echo PROXY=%HTTP_PROXY% && \"{}\" --fail --silent \
+                 --show-error --max-time 15 --noproxy \"\" --proxy \"%HTTP_PROXY%\" \
+                 http://example.invalid/no-uac --output \"{}\"",
+                curl.display(), response_path.display(),
+            ),
+            "cwd": temp_path,
+            "timeout": 30_000,
+        },
+        "filesystem": { "readwritePaths": [temp_path] },
+        "ui": { "disable": false, "clipboard": "none", "injection": false },
+        "network": {
+            "egress": { "default": "deny" },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
+        },
+        "runtimeConfig": { "networkProxy": proxy_url },
+    });
+    let b64 =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&config).unwrap());
+    let request_probe = Command::new(&wxc)
+        .args(["--probe", "--config-base64", &b64])
+        .output()
+        .expect("request-aware MXC probe");
+    assert!(
+        request_probe.status.success(),
+        "request probe failed: {request_probe:?}"
+    );
+    let probe: serde_json::Value =
+        serde_json::from_slice(&request_probe.stdout).expect("request probe JSON");
+    assert_eq!(probe["tier"], "base-container", "request probe: {probe}");
+
+    let proxy = async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut stream, _) = listener.accept().await.expect("proxy connection");
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let len = stream.read(&mut chunk).await.expect("proxy request");
+                assert_ne!(len, 0, "proxy request ended before headers");
+                request.extend_from_slice(&chunk[..len]);
+                assert!(request.len() <= 8192, "proxy request headers too large");
+            }
+            let request = String::from_utf8(request).expect("HTTP request text");
+            assert!(
+                request.starts_with("GET http://example.invalid/no-uac HTTP/1.1\r\n"),
+                "expected absolute-form request through configured proxy: {request}"
+            );
+            let body = "openshell-no-uac-proxy";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("proxy response");
+            stream.shutdown().await.expect("close proxy response");
+            request
+        })
+        .await
+        .expect("configured proxy must receive request")
+    };
+    let workload = tokio::task::spawn_blocking(move || {
+        Command::new(&wxc)
+            .args(["--config-base64", &b64])
+            .output()
+            .expect("real MXC workload")
+    });
+    let (request, output) = tokio::join!(proxy, workload);
+    let output = output.expect("MXC workload task");
+    assert!(
+        output.status.success(),
+        "runtime proxy workload failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("PROXY={proxy_url}")),
+        "MXC must inject the configured HTTP_PROXY: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(response_path).expect("proxied response"),
+        "openshell-no-uac-proxy"
+    );
+    assert_eq!(token_probe::snapshot()["is_elevated"], 0);
+    eprintln!(
+        "EVIDENCE: native runtimeConfig.networkProxy={proxy_url}; peer identity omitted; \
+         real BaseContainer delivered {}; harness remained unelevated",
+        request.lines().next().unwrap()
+    );
+}
+
 /// Run an HTTPS request through the real driver and `ProcessContainer`. The
 /// workload explicitly reads the injected bundle before curl uses it, proving
-/// that the driver's internal TLS share is reachable from the `AppContainer`.
+/// that the driver's internal TLS share is reachable from the MXC workload.
 #[tokio::test]
 #[ignore = "requires real wxc-exec and outbound HTTPS"]
 async fn pc_https_egress_reads_injected_ca_bundle() {
+    https_egress_reads_injected_ca_bundle(None).await;
+}
+
+/// The same real HTTPS/L7 policy proof through the `AppContainer` peer. This
+/// requires a staged AC-readable helper and firewall-management permission.
+#[tokio::test]
+#[ignore = "requires real wxc-exec, outbound HTTPS and peer firewall permission"]
+async fn pc_peer_https_egress_reads_injected_ca_bundle() {
+    let Ok(peer) = std::env::var("OPENSHELL_MXC_PEER_EXE") else {
+        eprintln!("SKIP: set OPENSHELL_MXC_PEER_EXE to a staged AC-readable helper");
+        return;
+    };
+    https_egress_reads_injected_ca_bundle(Some(peer)).await;
+}
+
+async fn https_egress_reads_injected_ca_bundle(peer: Option<String>) -> bool {
     let Some(wxc) = wxc_path() else {
         eprintln!("SKIP: wxc-exec not found");
-        return;
+        return false;
     };
 
     if let Err(reason) = probe_processcontainer(&wxc) {
         eprintln!("SKIP: processcontainer not live: {reason}");
-        return;
+        return false;
     }
-    if let Err(reason) = probe_processcontainer_host_loopback(&wxc) {
+    if peer.is_none()
+        && let Err(reason) = probe_processcontainer_host_loopback(&wxc)
+    {
         eprintln!("SKIP: processcontainer governed egress unavailable: {reason}");
-        return;
+        return false;
     }
     let system_root = std::env::var("SYSTEMROOT").expect("SYSTEMROOT must be set on Windows");
     let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
     let curl = PathBuf::from(system_root).join("System32").join("curl.exe");
     if !curl.exists() {
         eprintln!("SKIP: Windows curl.exe not found at {}", curl.display());
-        return;
+        return false;
     }
 
     let output_dir = tempfile::tempdir().expect("HTTPS output directory");
@@ -1114,6 +1302,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let config = MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
         egress_proxy: true,
+        pc_proxy_peer_path: peer.unwrap_or_default(),
         egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };
@@ -1175,6 +1364,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
             || post_response.contains("no matching L7 allow rule"),
         "POST denial must come from the OpenShell L7 policy: {post_response}"
     );
+    true
 }
 
 /// Prove that host-proxy binary policy follows the process that owns each TCP

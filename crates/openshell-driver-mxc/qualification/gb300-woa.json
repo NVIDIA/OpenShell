@@ -179,7 +179,7 @@
       ],
       "pass_criteria": [
         "Release build exits 0",
-        "openshell-gateway.exe, openshell.exe, openshell-supervisor-relay.exe, and libz3.dll exist for aarch64-pc-windows-msvc",
+        "openshell-gateway.exe, openshell.exe, openshell-supervisor-relay.exe, openshell-mxc-peer.exe, and libz3.dll exist for aarch64-pc-windows-msvc",
         "Size and SHA256 are recorded for every artifact"
       ],
       "artifact_roles": [
@@ -309,7 +309,8 @@
         "node.exe PE machine is ARM64",
         "OpenClaw package version is captured",
         "Sandbox reaches ready and the authenticated host-side OpenClaw client returns ok=true through openshell forward service",
-        "Allowed HTTPS succeeds while denied host and direct Internet bypass remain blocked"
+        "Allowed HTTPS succeeds while denied host and direct Internet bypass remain blocked",
+        "ProcessContainer uses the default forwarding mode; broad private-network ingress and host-loopback reachability are recorded as MXC limitations, and proxy-peer mode is not claimed to support forwarding"
       ],
       "artifact_roles": [
         "openclaw_forward_log",
@@ -523,10 +524,10 @@
       ],
       "commands": [],
       "pass_criteria": [
-        "Dynamic service forwarding is tested without claiming interactive exec/connect support"
+        "Dynamic service forwarding is tested in the default network mode without claiming proxy-peer forwarding or interactive exec/connect support"
       ],
       "artifact_roles": [],
-      "reason": "The supervisor relay supports launch, shutdown, and dynamic forwarding but not the Linux ConnectSupervisor protocol."
+      "reason": "The MXC driver supports launch, shutdown, and dynamic service forwarding in the default network mode but not in proxy-peer mode or through the Linux ConnectSupervisor protocol."
     },
     {
       "id": "nemoclaw-native-x64",

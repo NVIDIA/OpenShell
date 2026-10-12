@@ -79,8 +79,9 @@ stages only tracked examples plus freshly built ARM64 binaries. It never treats
 an existing source tree or an earlier result bundle as current evidence.
 
 The evidence directory contains environment/source provenance, the MXC host
-probe, command logs with timings, ARM64 binary hashes, the complete MXC policy
-and OpenClaw bundles, `evidence.json`, and the final validation log. Do not put
-provider credentials in command lines or retained files. Optional credential
-coverage must use a scoped non-production credential and prove that retained
-artifacts contain no secret value.
+probe, command logs with timings, ARM64 hashes for the gateway, CLI, supervisor
+relay, proxy peer, and Z3 runtime, the complete MXC policy and OpenClaw bundles,
+`evidence.json`, and the final validation log. Do not put provider credentials
+in command lines or retained files. Optional credential coverage must use a
+scoped non-production credential and prove that retained artifacts contain no
+secret value.

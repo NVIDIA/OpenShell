@@ -336,7 +336,7 @@ if ([string]::IsNullOrWhiteSpace($targetRoot)) {
 }
 $releaseDir = Join-Path $targetRoot "$RustTarget\release"
 $binaryRows = @()
-foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "libz3.dll")) {
+foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "openshell-mxc-peer.exe", "libz3.dll")) {
     $path = Join-Path $releaseDir $binary
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required ARM64 release artifact is missing: $path"

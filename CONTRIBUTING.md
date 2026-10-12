@@ -365,8 +365,9 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundl
 
 Use the platform-native `windows:*` mise tasks for Windows MSVC development.
 The lane supports x64 and ARM64 and builds `openshell-gateway.exe`,
-`openshell.exe`, and `openshell-supervisor-relay.exe`. It does not enable
-Docker, Kubernetes, Podman, or VM-backed execution on Windows.
+`openshell.exe`, `openshell-supervisor-relay.exe`, and
+`openshell-mxc-peer.exe`. It does not enable Docker, Kubernetes, Podman, or
+VM-backed execution on Windows.
 
 Install Visual Studio C++ Build Tools, a compatible Windows SDK, Rust through
 rustup, mise, and the Visual Studio LLVM tools used by `bindgen`. Test-bearing
@@ -383,7 +384,7 @@ install the Windows compiler toolchain.
 | Task | Purpose |
 |---|---|
 | `windows:lint:<x64\|arm64>` | Run Clippy for the Windows-supported workspace on the selected target architecture. |
-| `windows:build:<x64\|arm64>` | Build the three Windows release executables. |
+| `windows:build:<x64\|arm64>` | Build the four Windows release executables. |
 | `windows:test:<x64\|arm64>` | Run the workspace suite natively; the target must match the host architecture. |
 | `windows:test:unsupported:<x64\|arm64>` | Run the focused unsupported-driver contracts. |
 | `windows:test:mxc-real:<x64\|arm64>` | Run the probe-gated real-`wxc-exec` integration suite on the matching host. |

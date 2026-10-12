@@ -98,6 +98,7 @@ try {
     $toml = [regex]::Replace($toml, '(?m)^wxc_exec_path\s*=.*$', "wxc_exec_path = `"$mockWxc`"")
     $toml = $toml.Replace('C:/openshell-openclaw', $shareFwd)
     $toml = [regex]::Replace($toml, '(?m)^pc_relay_spawner_path\s*=.*$', 'pc_relay_spawner_path = ""')
+    $toml = [regex]::Replace($toml, '(?m)^pc_proxy_peer_path\s*=.*$', 'pc_proxy_peer_path = ""')
     $tomlUsed = Join-Path $resultDir "mxc-openclaw-gateway.used.toml"
     [System.IO.File]::WriteAllText($tomlUsed, $toml, [System.Text.UTF8Encoding]::new($false))
 

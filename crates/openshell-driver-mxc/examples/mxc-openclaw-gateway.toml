@@ -6,8 +6,9 @@
 # Runs OpenClaw's gateway inside an MXC ProcessContainer, with its port
 # reachable from the host via dynamic `openshell forward service` bridging
 # (openshell-supervisor-relay.exe + the driver's on-demand relay -- see
-# crates/openshell-driver-mxc/src/relay.rs). There is no static/always-on
-# bridge: every `forward service` call opens its own short-lived relay.
+# crates/openshell-driver-mxc/src/relay.rs).
+# There is no static/always-on bridge: every `forward service` call opens its
+# own short-lived relay.
 #
 # Driven by run-openclaw-forward-test.ps1, which patches wxc_exec_path and
 # stages node.exe / openclaw-capture.mjs / openshell-supervisor-relay.exe /
@@ -49,9 +50,14 @@ pc_minimal_env = true
 # --port above: used as an early liveness check (does the target ever bind
 # it?) and as the target port openshell-supervisor-relay bridges by default.
 # There is no static bridge -- relay bridging is entirely on-demand via
-# ForwardSink::open_dynamic_forward / the control channel's "forward" op,
-# driven by `openshell forward service --target-port 18889`.
+# ForwardSink::open_dynamic_forward, driven by
+# `openshell forward service --target-port 18889`.
 pc_relay_spawner_path = "C:/openshell-openclaw/openshell-supervisor-relay.exe"
 pc_relay_target_port  = 18889
+
+# Proxy-peer mode is egress-only under MXC 1.0 and therefore cannot be combined
+# with this dynamic-forwarding demonstration. Set this only for workloads that
+# do not need `openshell forward service`.
+pc_proxy_peer_path = ""
 
 debug = true

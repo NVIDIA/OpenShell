@@ -96,8 +96,13 @@ impl RelayProcess {
     /// observe. Confirmed by hand: without continuous draining, this
     /// deadlocks the relay process itself, not just this test.
     async fn spawn_capturing_stderr(target_port: u16) -> Self {
+        Self::spawn_capturing_stderr_with_env(target_port, &[]).await
+    }
+
+    async fn spawn_capturing_stderr_with_env(target_port: u16, env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_openshell-supervisor-relay"))
             .arg(target_port.to_string())
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -187,7 +192,7 @@ impl RelayProcess {
     async fn expect_ready(&mut self) {
         let v = self.next_json().await;
         assert_eq!(v["event"], "ready");
-        assert_eq!(v["protocol_version"], 4);
+        assert_eq!(v["protocol_version"], 5);
     }
 
     async fn launch(&mut self, id: u64, command: &[&str]) -> Value {
@@ -719,4 +724,90 @@ async fn concurrent_forwards_do_not_cross_talk() {
         ),
         other => panic!("unexpected message on B: {other:?}"),
     }
+}
+
+// Drive the real binary with ambient proxy variables, just as IsolationSession
+// inherits its user's environment. The launch request supplies a curated env.
+async fn assert_proxy_environment(inherit: Option<bool>, explicit_proxy: bool) {
+    let ambient = "http://127.0.0.1:43210/ambient-test";
+    let mut relay = RelayProcess::spawn_capturing_stderr_with_env(
+        0,
+        &[
+            ("HTTP_PROXY", ambient),
+            ("HTTPS_PROXY", ambient),
+            ("http_proxy", ambient),
+            ("https_proxy", ambient),
+            ("NO_PROXY", "ambient-bypass"),
+        ],
+    )
+    .await;
+    relay.expect_ready().await;
+    let root = std::env::var("SYSTEMROOT").unwrap();
+    let powershell = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let script = "Write-Output ('PROXY=' + $env:HTTP_PROXY); Write-Output ('SECURE=' + $env:HTTPS_PROXY); Write-Output ('BYPASS=' + $env:NO_PROXY); Start-Sleep -Seconds 60";
+    let mut env = vec![format!("SYSTEMROOT={root}"), "CURATED=1".to_string()];
+    if explicit_proxy {
+        env.push("HTTP_PROXY=http://127.0.0.1:12345/explicit-test".to_string());
+    }
+    let mut data = json!({"command": [powershell, "-NoProfile", "-Command", script], "env": env});
+    if let Some(inherit) = inherit {
+        data["inherit_proxy_env"] = json!(inherit);
+    }
+    relay.send(json!({"id":1,"op":"launch","data":data})).await;
+    assert_eq!(relay.next_json().await["ok"], true);
+    let expected = if explicit_proxy {
+        "http://127.0.0.1:12345/explicit-test"
+    } else if inherit == Some(true) {
+        ambient
+    } else {
+        ""
+    };
+    let secure = if inherit == Some(true) { ambient } else { "" };
+    let rx = relay.stderr_lines.as_mut().unwrap();
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_mins(1), async {
+        while let Some(line) = rx.recv().await {
+            output.push(line.clone());
+            if line.starts_with("[target stdout] BYPASS=") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("target environment probe must finish");
+    assert!(
+        output.contains(&format!("[target stdout] PROXY={expected}")),
+        "{output:?}"
+    );
+    assert!(
+        output.contains(&format!("[target stdout] SECURE={secure}")),
+        "{output:?}"
+    );
+    assert!(
+        output.contains(&"[target stdout] BYPASS=".to_string()),
+        "{output:?}"
+    );
+    relay.send(json!({"id":2,"op":"shutdown"})).await;
+    assert_eq!(relay.next_json().await["ok"], true);
+    tokio::time::timeout(TIMEOUT, relay.child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn curated_launch_without_peer_metadata_drops_ambient_proxy() {
+    assert_proxy_environment(None, false).await;
+}
+#[tokio::test]
+async fn non_peer_launch_explicitly_drops_ambient_proxy() {
+    assert_proxy_environment(Some(false), false).await;
+}
+#[tokio::test]
+async fn peer_launch_preserves_mxc_proxy_without_no_proxy_bypass() {
+    assert_proxy_environment(Some(true), false).await;
+}
+#[tokio::test]
+async fn peer_launch_keeps_explicit_proxy_override() {
+    assert_proxy_environment(Some(true), true).await;
 }

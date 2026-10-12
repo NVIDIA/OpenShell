@@ -10,8 +10,8 @@
 #     system paths and share_dir).
 #   - TCP socket binding on port 22000 (governed by pc_capabilities in the
 #     gateway TOML, not by filesystem policy here).
-#   - Private/loopback client access for openshell-supervisor-relay to dial
-#     the driver's on-demand relay — granted by pc_capabilities in the TOML.
+#   - Private/loopback client access for openshell-supervisor-relay to dial the
+#     sandbox-local target — granted by pc_allow_local_network in the TOML.
 #   - No writes to the host filesystem.
 #
 # workload directory (passed by run-ws-agent-test.ps1, default C:\work\openshell-mxc-ws)
@@ -25,7 +25,9 @@
 #
 # This example intentionally omits network_policies because it does not need
 # governed Internet egress. The driver therefore does not start a host CONNECT
-# proxy or inject proxy environment variables for this sandbox.
+# proxy or inject proxy environment variables for this sandbox. The gateway
+# TOML explicitly accepts MXC's broader private-network ingress and host-loopback
+# posture because MXC 1.0 cannot provide sandbox-local-only forwarding.
 version: 1
 
 filesystem_policy:

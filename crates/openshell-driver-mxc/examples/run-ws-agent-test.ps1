@@ -222,7 +222,7 @@ function Start-Gw {
                 ForEach-Object { Info $_ }
             throw "gateway exited early (code $($p.ExitCode)). See $gwLog."
         }
-        if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+        if ([System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port -contains $Port) {
             return $p
         }
         Start-Sleep -Milliseconds 400
@@ -268,7 +268,8 @@ function Register-Cli {
 function Wait-PortOpen([int]$port, [int]$seconds) {
     $deadline = (Get-Date).AddSeconds($seconds)
     while ((Get-Date) -lt $deadline) {
-        if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        if ($listeners.Port -contains $port) {
             return $true
         }
         Start-Sleep -Milliseconds 500
@@ -279,7 +280,8 @@ function Wait-PortOpen([int]$port, [int]$seconds) {
 function Wait-PortClosed([int]$port, [int]$seconds) {
     $deadline = (Get-Date).AddSeconds($seconds)
     while ((Get-Date) -lt $deadline) {
-        if (-not (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)) {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        if ($listeners.Port -notcontains $port) {
             return $true
         }
         Start-Sleep -Milliseconds 500
@@ -352,7 +354,6 @@ function Render-Toml {
     }
 
     $relayExeFwd = Fwd $relayExe
-
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*pc_relay_spawner_path\s*=.*$',
         "pc_relay_spawner_path = `"$relayExeFwd`"")
 
@@ -425,11 +426,9 @@ try {
         Ok "wxc-exec: $WxcExecPath"
 
         # A real run exercises process_container with egress_proxy disabled
-        # (mxc-ws-gateway.toml). The sandbox connects directly to the driver's
-        # route-selected private-interface relay listener through the
-        # privateNetworkClientServer capability; the governed host CONNECT
-        # proxy is not part of this qualification path. Elevation is not
-        # required here; keep logging the elevation state for diagnostics only.
+        # (mxc-ws-gateway.toml). The sandbox reaches its loopback target over
+        # the spawner control channel; proxy-peer mode is intentionally disabled
+        # because MXC 1.0 proxy peers do not support dynamic forwarding.
         $wid   = [Security.Principal.WindowsIdentity]::GetCurrent()
         $wp    = New-Object Security.Principal.WindowsPrincipal($wid)
         $admin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -638,7 +637,7 @@ try {
             # log line can land a couple of seconds after the raw TCP connect
             # already succeeded (observed up to ~2.3s). Poll for it rather
             # than checking once immediately, or this races and fails spuriously.
-            $readyPattern = "port $WsPort ready after"
+            $readyPattern = "host confirmed target listener on port $WsPort"
             $readyDeadline = (Get-Date).AddSeconds(15)
             $readyOk = $false
             while ((Get-Date) -lt $readyDeadline -and -not $readyOk) {

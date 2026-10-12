@@ -185,12 +185,20 @@ impl openshell_server::ComputeDriverForwardSink for MxcForwardSink {
         &self,
         sandbox_id: &str,
         target_port: u16,
-    ) -> Result<(std::net::SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>), String> {
+    ) -> Result<
+        (std::net::SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>),
+        openshell_server::ComputeDriverForwardError,
+    > {
         let (addr, nonce, handle) = self
             .0
             .open_dynamic_forward(sandbox_id, target_port)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| match error {
+                openshell_driver_mxc::OpenDynamicForwardError::ProxyPeerForwardUnsupported(_) => {
+                    openshell_server::ComputeDriverForwardError::Unsupported(error.to_string())
+                }
+                _ => openshell_server::ComputeDriverForwardError::Other(error.to_string()),
+            })?;
         Ok((addr, nonce.to_vec(), Box::new(handle)))
     }
 }
