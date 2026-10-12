@@ -116,7 +116,7 @@ impl GatewayTrust {
         )
         .map_err(|_| "could not stage public fixture CA")?;
         fs::write(context.join("Dockerfile"), format!(
-            "FROM {base_image} AS original\nFROM {E2E_WORKLOAD_IMAGE} AS bundle\nUSER 0\nCOPY --from=original /etc/ssl/certs/ca-certificates.crt /tmp/roots.crt\nCOPY fixture-ca.crt /tmp/fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; p=Path('/tmp/roots.crt'); p.write_bytes(p.read_bytes()+b'\\n'+Path('/tmp/fixture-ca.crt').read_bytes())\"]\nFROM {base_image}\nCOPY --from=bundle /tmp/roots.crt /etc/ssl/certs/ca-certificates.crt\n"
+            "FROM {base_image} AS original\nFROM {E2E_WORKLOAD_IMAGE} AS bundle\nUSER 0\nCOPY --from=original /etc/ssl/certs/ca-certificates.crt /tmp/roots.crt\nCOPY fixture-ca.crt /tmp/fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; p=Path('/tmp/roots.crt'); p.write_bytes(p.read_bytes()+Path('/tmp/fixture-ca.crt').read_bytes())\"]\nFROM {base_image}\nCOPY --from=bundle /tmp/roots.crt /etc/ssl/certs/ca-certificates.crt\n"
         )).map_err(|_| "could not write supervisor fixture Dockerfile")?;
         let engine = ContainerEngine::from_env()?;
         let image = format!(
@@ -125,7 +125,14 @@ impl GatewayTrust {
         );
         let mut build = Command::from(engine.command());
         build.args(["build", "--tag", &image]).arg(&context);
-        checked(&mut build, "build trusted supervisor fixture").await?;
+        build.kill_on_drop(true);
+        let status = tokio::time::timeout(Duration::from_secs(300), build.status())
+            .await
+            .map_err(|_| "build trusted supervisor fixture timed out")?
+            .map_err(|_| "build trusted supervisor fixture could not start")?;
+        if !status.success() {
+            return Err("build trusted supervisor fixture failed".into());
+        }
         Ok(Self {
             directory,
             engine,
@@ -648,7 +655,7 @@ async fn create_rest_fixture(
     let contents = fs::read_to_string(profile.path())
         .map_err(|_| "fixture profile is missing")?
         .replace("http://127.0.0.1:", "https://127.0.0.1:")
-        .replace("cache_ttl_seconds: 300", "cache_ttl_seconds: 0");
+        .replace("cache_ttl_seconds: 300", "cache_ttl: \"0s\"");
     fs::write(profile.path(), contents).map_err(|_| "could not set verified token endpoint")?;
     run_cli(&[
         "profile",
