@@ -96,17 +96,25 @@ let
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
 
-  # Follow-up: binaries that do not yet run in the rootless tmachine guest. They
-  # need wrapper-owned managed-gateway controls (restart, configuration), SPIFFE
-  # fixtures, the caller driver-config setting, or guest tools. The corporate
-  # proxy and gateway-start binaries self-skip without wrapper-owned gateway
-  # metadata, so exclude them rather than report false passes.
+  # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
+  # entry says what it needs. Entries marked "wrapper lane" still run in the
+  # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
+  # there until tmachine provides what they need.
   podmanE2eFollowUpBinaries = [
+    # Needs the caller driver-config settings (`allow_driver_config`,
+    # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper
+    # lane.
     "driver_config_volume"
+    # The next three self-skip without wrapper-owned gateway metadata (restart
+    # and configuration control), so exclude them rather than report false
+    # passes. Wrapper lane.
     "local_driver_token_restart"
     "podman_corporate_proxy"
     "podman_gateway_start"
+    # Its move to conformance is deferred until the isolation work in #4120; see
+    # #4246.
     "provider_auto_create"
+    # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
     "provider_token_exchange"
     # One test times out reaching support-container IPs from the sandbox in the
     # rootless guest; the other tests in the binary pass. Nextest archive
