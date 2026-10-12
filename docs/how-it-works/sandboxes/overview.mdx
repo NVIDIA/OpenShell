@@ -852,6 +852,16 @@ Upload files from your host into the sandbox:
 openshell sandbox upload my-sandbox ./src
 ```
 
+Uploads stream with bounded buffering and wait for the sandbox to consume
+data, so the 4 MiB process-input budget does not limit the total upload size.
+Upgrade both the CLI and the supervisor runtime used by your sandboxes to use
+this behavior. The CLI reports an unsupported upload protocol before sending
+file data to an older supervisor.
+
+Uploads extract directly into the destination. If you cancel an upload or it
+fails, files already extracted remain and may be incomplete. Retry against the
+existing sandbox after checking the destination, or remove the partial files.
+
 When you omit the destination, OpenShell discovers the sandbox's working
 directory and uploads there. For a named local directory, OpenShell preserves
 the basename, matching `scp -r` and `cp -r`. If that directory already exists,

@@ -4,9 +4,13 @@
 //! Embedded SSH server for sandbox access.
 
 mod input;
+mod upload;
 
 #[cfg(test)]
 mod exec_input_tests;
+
+#[cfg(test)]
+mod upload_tests;
 
 use crate::main_session::{MainOutput, MainSession};
 #[cfg(unix)]
@@ -371,6 +375,8 @@ async fn handle_connection(
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
+    upload: Option<upload::UploadChannel>,
+    command_started: bool,
     input_sender: Option<InputSender>,
     input_task: Option<input::InputTask>,
     process: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryProcess>>,
@@ -607,6 +613,10 @@ impl russh::server::Handler for SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("pty_request on unknown channel {channel:?}"))?;
+        if state.upload.is_some() || state.command_started {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         state.pty_request = Some(PtyRequest {
             term: term.to_string(),
             col_width,
@@ -652,6 +662,14 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some() || state.command_started)
+        {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
         // preceding pty_request and expects pipe-based I/O with clean LF line
@@ -674,6 +692,14 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some() || state.command_started)
+        {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         let command = String::from_utf8_lossy(data).trim().to_string();
         if command.is_empty() {
             session.channel_success(channel)?;
@@ -698,6 +724,28 @@ impl russh::server::Handler for SshHandler {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let Some(state) = self.channels.get_mut(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        if state.upload.is_some() || state.command_started || state.main_attached {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        if name == openshell_core::upload::SUBSYSTEM {
+            if state.pty_request.is_some() {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+            state.upload = Some(upload::UploadChannel::spawn(
+                channel,
+                session.handle(),
+                self.boundary_exec.clone(),
+                !state.no_login_shell,
+            ));
+            session.channel_success(channel)?;
+            return Ok(());
+        }
         if name == "openshell-main" {
             let Some(state) = self.channels.get(&channel) else {
                 session.channel_failure(channel)?;
@@ -881,6 +929,14 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(upload) = self
+            .channels
+            .get_mut(&channel)
+            .and_then(|state| state.upload.as_mut())
+        {
+            upload.data(data);
+            return Ok(());
+        }
         let Some(state) = self.channels.get_mut(&channel) else {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
@@ -951,6 +1007,10 @@ impl russh::server::Handler for SshHandler {
         // closes stdin. Commands such as `cat | tar xf -` need this half-close
         // to finish while their output remains available to the SSH client.
         if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(upload) = state.upload.as_mut() {
+                upload.eof();
+                return Ok(());
+            }
             if state.main_attached
                 && let Some(owner) = state.main_input_owner.take()
                 && let Some(main_session) = self.main_session.as_ref()
@@ -965,6 +1025,23 @@ impl russh::server::Handler for SshHandler {
             state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
+        }
+        Ok(())
+    }
+
+    async fn extended_data(
+        &mut self,
+        channel: ChannelId,
+        _ext: u32,
+        _data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(upload) = self
+            .channels
+            .get_mut(&channel)
+            .and_then(|state| state.upload.as_mut())
+        {
+            upload.reject_extended_data();
         }
         Ok(())
     }
@@ -995,11 +1072,12 @@ impl russh::server::Handler for SshHandler {
             }
             return Ok(());
         }
-        let Some(process) = self
-            .channels
-            .get(&channel)
-            .and_then(|state| state.process.clone())
-        else {
+        let Some(process) = self.channels.get(&channel).and_then(|state| {
+            state
+                .process
+                .clone()
+                .or_else(|| state.upload.as_ref()?.process())
+        }) else {
             return Ok(());
         };
         let signal = match signal {
@@ -1112,6 +1190,7 @@ impl SshHandler {
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
         state.process = Some(exec.process.clone());
+        state.command_started = true;
         state.terminal = exec.terminal.take();
         let output_status = exec.output_status.take();
 

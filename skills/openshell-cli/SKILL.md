@@ -410,6 +410,8 @@ openshell sandbox upload my-sandbox ./src
 openshell sandbox download my-sandbox output ./local-output
 ```
 
+Uploads use bounded streaming and wait for sandbox input consumption; the 4 MiB process-input budget is not a total upload-size limit. Upgrade both the CLI and the supervisor runtime used by the sandbox. An older supervisor rejects the upload protocol before file data is sent. Failed or canceled uploads may leave incomplete files in the destination; check it before retrying or remove the partial files.
+
 Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
 
 `sandbox create --upload` checks every upload locally before provisioning and creates no sandbox if one is rejected. If a transfer fails after provisioning, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.

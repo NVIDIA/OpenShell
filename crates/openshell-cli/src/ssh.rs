@@ -3,6 +3,8 @@
 
 //! SSH connection and proxy utilities.
 
+mod upload;
+
 use crate::color::Colorize;
 use crate::tls::{
     GrpcClient, TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
@@ -18,6 +20,9 @@ use openshell_core::forward::{
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
     TcpForwardInit, tcp_forward_init,
+};
+use openshell_core::upload::{
+    DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
 };
 use std::fs;
 use std::future::Future;
@@ -64,7 +69,9 @@ const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
-const UPLOAD_DESTINATION_CHANGED_EXIT_CODE: i32 = 73;
+#[cfg(test)]
+const UPLOAD_DESTINATION_CHANGED_EXIT_CODE: i32 =
+    openshell_core::upload::DESTINATION_CHANGED_EXIT_CODE;
 static DEFAULT_SSH_LOG_LEVEL: OnceLock<&'static str> = OnceLock::new();
 
 /// Set the SSH log level derived from CLI verbosity before starting commands.
@@ -1197,74 +1204,13 @@ fn local_upload_path_is_file_like(path: &Path) -> bool {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UploadDestinationKind {
-    Directory,
-    File,
-    Missing,
-}
-
-impl UploadDestinationKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Directory => "directory",
-            Self::File => "file",
-            Self::Missing => "missing",
-        }
-    }
-}
-
-// Check every existing parent before interpreting a failed existence test as
-// absence. An inaccessible directory, a file used as a parent, or a dangling
-// parent symlink must fail inspection instead of selecting filename semantics.
-// Only fixed tokens go to stdout; diagnostics remain on stderr.
-const UPLOAD_DESTINATION_KIND_SH: &str = r#"upload_destination_kind() {
-    upload_path=$1
-    upload_parent=$2
-    while :; do
-        if [ -d "$upload_parent" ]; then
-            if [ ! -x "$upload_parent" ]; then
-                printf 'cannot inspect upload destination parent: %s\n' "$upload_parent" >&2
-                return 1
-            fi
-        elif [ -e "$upload_parent" ] || [ -L "$upload_parent" ]; then
-            printf 'upload destination parent is not a directory: %s\n' "$upload_parent" >&2
-            return 1
-        fi
-        case "$upload_parent" in
-            /|.) break ;;
-            */*) upload_parent=${upload_parent%/*}; [ -n "$upload_parent" ] || upload_parent=/ ;;
-            *) upload_parent=. ;;
-        esac
-    done
-    if [ -d "$upload_path" ]; then
-        printf directory
-    elif [ -e "$upload_path" ] || [ -L "$upload_path" ]; then
-        printf file
-    else
-        printf missing
-    fi
-}"#;
-
-fn upload_destination_kind_invocation(path: &str) -> String {
-    let (parent, _) = split_sandbox_path(path);
-    format!(
-        "upload_destination_kind {} {}",
-        shell_escape(path),
-        shell_escape(parent),
-    )
-}
-
 fn file_upload_destination_needs_probe(path: &str) -> bool {
     // Keep the existing /name heuristic: a top-level path means a directory.
     !path.ends_with('/') && split_sandbox_path(path).0 != "/"
 }
 
 fn build_upload_destination_probe_cmd(path: &str) -> String {
-    format!(
-        "{UPLOAD_DESTINATION_KIND_SH}\n{}",
-        upload_destination_kind_invocation(path),
-    )
+    openshell_core::upload::build_destination_probe(path)
 }
 
 fn parse_upload_destination_kind(output: &str) -> Result<UploadDestinationKind> {
@@ -1293,32 +1239,19 @@ fn resolve_file_upload_destination<'a>(
     }
 }
 
+#[cfg(test)]
 fn build_upload_extract_cmd(
     dest_dir: &str,
     expected_destination: Option<(&str, UploadDestinationKind)>,
 ) -> String {
-    let escaped_dest = shell_escape(dest_dir);
-    let extract = format!("mkdir -p -- {escaped_dest} && cat | tar xf - -C {escaped_dest}");
-    let Some((path, kind)) = expected_destination else {
-        return extract;
-    };
-
-    // Recheck before mkdir or tar can replace a path whose type changed after
-    // planning. This detects changes, but is not atomic with extraction and
-    // does not pin a symlink's target against concurrent replacement.
-    format!(
-        "{UPLOAD_DESTINATION_KIND_SH}\n\
-         upload_kind=$({probe}) || exit 1\n\
-         if [ \"$upload_kind\" != {expected} ]; then\n\
-             printf 'upload destination changed type before extraction: %s\\n' {path} >&2\n\
-             exit {changed_status}\n\
-         fi\n\
-         {extract}",
-        probe = upload_destination_kind_invocation(path),
-        expected = kind.as_str(),
-        path = shell_escape(path),
-        changed_status = UPLOAD_DESTINATION_CHANGED_EXIT_CODE,
-    )
+    openshell_core::upload::build_extract_command(&UploadPlan {
+        destination_directory: dest_dir.to_string(),
+        expected_destination: expected_destination.map(|(path, kind)| ExpectedDestination {
+            path: path.to_string(),
+            kind,
+        }),
+    })
+    .expect("test upload destination is valid")
 }
 
 /// Stream an archive into the sandbox and return its final destination.
@@ -1346,8 +1279,16 @@ async fn ssh_tar_upload(
     {
         let output = ssh_run_capture_stdout(&session, &build_upload_destination_probe_cmd(path))
             .await
+            .map_err(|error| {
+                if sync_error_is_retryable(&error) {
+                    error
+                } else {
+                    Report::new(upload::UploadError::Remote(error.to_string()))
+                }
+            })
             .wrap_err_with(|| format!("failed to inspect upload destination '{path}'"))?;
-        let kind = parse_upload_destination_kind(&output)?;
+        let kind = parse_upload_destination_kind(&output)
+            .map_err(|error| Report::new(upload::UploadError::Protocol(error.to_string())))?;
         let (directory, basename) = resolve_file_upload_destination(path, tar_name, kind);
         dest_dir = directory;
         *tar_name = basename;
@@ -1370,40 +1311,21 @@ async fn ssh_tar_upload(
     ssh.arg("-T")
         .arg("-o")
         .arg("RequestTTY=no")
+        .arg("-s")
         .arg("sandbox")
-        .arg(build_upload_extract_cmd(dest_dir, expected_destination))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-
-    let mut child = ssh.spawn().into_diagnostic()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
-
-    // Wait even when the writer gets a broken pipe. A failed remote guard can
-    // close stdin early; its status must not become a retryable write error.
-    let archive_result =
-        tokio::task::spawn_blocking(move || -> Result<()> { write_upload_archive(stdin, source) })
-            .await
-            .into_diagnostic()?;
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
-
-    if status.code() == Some(UPLOAD_DESTINATION_CHANGED_EXIT_CODE) {
-        return Err(miette::miette!(
-            "upload destination changed type before extraction; retry the upload"
-        ));
-    }
-    if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar extract exited with status {status}"
-        ));
-    }
-    archive_result?;
+        .arg(openshell_core::upload::SUBSYSTEM);
+    let plan = UploadPlan {
+        destination_directory: dest_dir.to_string(),
+        expected_destination: expected_destination.map(|(path, kind)| ExpectedDestination {
+            path: path.to_string(),
+            kind,
+        }),
+    };
+    upload::run(ssh, plan, move |writer| {
+        write_upload_archive(writer, source)
+    })
+    .await
+    .map_err(Report::new)?;
 
     Ok(final_path)
 }
@@ -1815,6 +1737,9 @@ where
 }
 
 fn sync_error_is_retryable(error: &Report) -> bool {
+    if let Some(error) = error.downcast_ref::<upload::UploadError>() {
+        return error.is_retryable();
+    }
     let message = format!("{error:?}").to_ascii_lowercase();
     [
         "broken pipe",
@@ -2555,6 +2480,22 @@ mod tests {
     fn sync_error_retry_filter_rejects_validation_failures() {
         let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
         assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn upload_errors_retry_only_explicit_transport_failures() {
+        for error in [
+            upload::UploadError::Unsupported,
+            upload::UploadError::Protocol("connection reset in malformed frame".into()),
+            upload::UploadError::Remote("destination /connection/unavailable".into()),
+            upload::UploadError::Archive("broken pipe while reading source".into()),
+            upload::UploadError::Cancelled,
+        ] {
+            assert!(!sync_error_is_retryable(&Report::new(error)));
+        }
+        assert!(sync_error_is_retryable(&Report::new(
+            upload::UploadError::Transport("SSH relay disconnected".into())
+        )));
     }
 
     #[test]
