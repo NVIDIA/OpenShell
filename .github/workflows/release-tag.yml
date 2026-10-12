@@ -254,6 +254,7 @@ jobs:
   qualification-result:
     name: Release Qualification
     if: always()
+    continue-on-error: ${{ needs.compute-versions.outputs.is_prerelease == 'true' }}
     needs:
       - compute-versions
       - protobuf-compatibility
@@ -326,10 +327,10 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Require current qualification profile before publication
-        if: steps.summary.outputs.current-profile-passed != 'true'
+      - name: Require current qualification profile for stable releases
+        if: needs.compute-versions.outputs.is_prerelease != 'true' && steps.summary.outputs.current-profile-passed != 'true'
         run: |
-          echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          echo "Stable release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
           exit 1
 
   build-python-wheel:
@@ -408,19 +409,47 @@ jobs:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
-  # Assemble release artifacts after the current qualification profile passes.
+  # Decide publication readiness once, then gate publishers on their predecessor.
+  # Prereleases publish automatically even when qualification fails.
+  # Future (#3559): a separate job protected by Environment Approval could allow
+  # stable publication after failed qualification. This gate would accept either
+  # successful qualification or that approval; artifact builds remain required.
   # ---------------------------------------------------------------------------
-  release:
-    name: Release
-    if: needs.qualification-result.outputs.current-profile-passed == 'true'
+  release-ready:
+    name: Release Ready
+    if: ${{ !cancelled() }}
     needs:
       - compute-versions
       - package-binaries
       - build-python-wheel
+      - build-images
       - qualification-result
       - build-deb
       - build-rpm
       - build-snap
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check publication prerequisites
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          QUALIFICATION_RESULT: ${{ needs.qualification-result.result }}
+          QUALIFICATION_PASSED: ${{ needs.qualification-result.outputs.current-profile-passed }}
+        run: |
+          if ! jq -e 'del(."qualification-result") | all(.[]; .result == "success")' <<< "$JOB_RESULTS"; then
+            echo "Release artifact builds must succeed before publication." >&2
+            exit 1
+          fi
+          if [[ "$IS_PRERELEASE" != "true" && ( "$QUALIFICATION_RESULT" != "success" || "$QUALIFICATION_PASSED" != "true" ) ]]; then
+            echo "Stable releases must pass qualification before publication." >&2
+            exit 1
+          fi
+
+  release:
+    name: Release
+    if: ${{ !cancelled() && needs.release-ready.result == 'success' }}
+    needs: [compute-versions, release-ready]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -708,6 +737,7 @@ jobs:
   # ---------------------------------------------------------------------------
   tag-ghcr-release:
     name: Tag GHCR Images
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     needs: [compute-versions, build-images, release]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
@@ -742,6 +772,7 @@ jobs:
 
   release-helm:
     name: Release Helm Chart (OCI)
+    if: ${{ !cancelled() && needs.tag-ghcr-release.result == 'success' }}
     needs: [compute-versions, release, tag-ghcr-release]
     runs-on: ubuntu-latest
     timeout-minutes: 10

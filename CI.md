@@ -42,8 +42,8 @@ missing baselines, merge conflicts, and tool failures always fail the check.
 
 Release Tag compares the tagged candidate cumulatively against the previous
 stable release, using the same minor-versus-patch policy. Its result is part
-of the qualification profile: failure blocks both pre-release and stable
-publication. Failed candidates retain build artifacts and evidence in Actions. This checks
+of the qualification profile: failure blocks stable publication while prereleases
+publish automatically. Failed qualification evidence remains available in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
@@ -237,8 +237,8 @@ candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
 Tagged releases treat Cargo Deny and Codex Security findings as failures of the
-currently implemented qualification profile. A profile failure prevents both
-pre-release and stable publication. CodeQL, Trivy, and Zizmor findings are
+currently implemented qualification profile. A profile failure prevents stable
+publication; prereleases publish automatically despite qualification failures. CodeQL, Trivy, and Zizmor findings are
 temporarily informational for tagged releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
@@ -259,7 +259,7 @@ gh workflow run security-scan.yml --ref main \
 
 To integrate it into a larger workflow, run it after the job that creates the
 candidate tag and stages source-addressed artifacts for scanning. Release-facing
-publication follows successful qualification. This example assumes an existing
+stable publication follows successful qualification. This example assumes an existing
 `build` job with outputs named `candidate_tag`, `gateway_image`, `sandbox_image`,
 and `chart_ref`; adapt those names to your workflow:
 
@@ -291,9 +291,12 @@ Set `needs: security` on a downstream promotion job to require successful scans.
 The tagged release workflow records protobuf, security, and integration outcomes in a
 qualification job after publishing its commit-addressed OCI images. A failed
 check remains visible in the workflow, with build artifacts and evidence retained
-in Actions storage. Both pre-release and stable publication require the implemented
-`release-tag-v1` profile to pass; that profile is an incremental subset of RFC
-0014 qualification.
+in Actions storage. Prereleases publish automatically despite qualification failures.
+The `Release Ready` job requires successful artifact builds for every release and a
+passing `release-tag-v1` profile for stable releases. That profile is an incremental
+subset of RFC 0014 qualification. The workflow contains a placeholder for a future
+environment approval path for stable candidates that fail qualification; it does
+not currently permit such an override.
 
 Each qualification attempt writes its result to the Actions run summary and
 uploads `qualification-summary.json` as a 90-day workflow artifact. After the
@@ -546,7 +549,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Successful artifact builds are required for both. Prereleases publish automatically despite qualification failures; stable releases require the currently implemented qualification profile to pass. The summary identifies the remaining RFC 0014 coverage and retains failed qualification evidence. Source-SHA OCI images remain available as qualification inputs. |
 | `.github/workflows/snap-package.yml` | Builds Snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing Snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after Snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
