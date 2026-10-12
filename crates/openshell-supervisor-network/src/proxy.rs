@@ -5108,16 +5108,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
             .windows(2)
             .position(|window| window == b"\r\n")?
             + pos;
-        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
-        let size = usize::from_str_radix(
-            size_line
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or_default(),
-            16,
-        )
-        .ok()?;
+        let size = crate::l7::http::parse_chunk_size_line(&bytes[pos..line_end]).ok()?;
         pos = line_end.checked_add(2)?;
 
         if size == 0 {
@@ -5126,6 +5117,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
                     .windows(2)
                     .position(|window| window == b"\r\n")?
                     + pos;
+                crate::l7::http::validate_chunk_trailer_line(&bytes[pos..trailer_end]).ok()?;
                 let empty = trailer_end == pos;
                 pos = trailer_end.checked_add(2)?;
                 if empty {
