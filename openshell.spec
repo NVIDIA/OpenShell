@@ -73,7 +73,9 @@ Summary:        OpenShell Python SDK for agent execution and management
 # versions of grpcio (1.48) and protobuf (3.19) than the SDK needs.
 # Users on distros with older packages can install these via pip/uv.
 Recommends:     python3-cloudpickle >= 3.0
+Recommends:     python3-googleapis-common-protos >= 1.63
 Recommends:     python3-grpcio >= 1.60
+Recommends:     python3-httpx >= 0.27
 Recommends:     python3-protobuf >= 4.25
 Recommends:     %{name}
 
@@ -207,7 +209,9 @@ Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
 Requires-Dist: cloudpickle>=3.0
+Requires-Dist: googleapis-common-protos>=1.63
 Requires-Dist: grpcio>=1.60
+Requires-Dist: httpx>=0.27
 Requires-Dist: protobuf>=4.25
 EOF
 
