@@ -21,3 +21,16 @@ The setup interface stays private to the supervisor. It adds no runtime backend 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.
 
 Console JSON is installed independently of optional file appenders and uses an INFO filter independent of the diagnostic filter. Its runtime enabled flag and target schema version are shared with the existing JSONL file layer. The supervisor retains the writer guards until shutdown. The gateway log push layer continues to emit shorthand only.
+
+## Safe runtime and parent liveness
+
+The supervisor drives the safe isolation-backend contract and network/policy
+orchestration. Its library and executable forbid unsafe code.
+
+For a VM host supervisor, the VM driver passes its parent-liveness pipe as stdin
+and sets the private `--parent-liveness-stdin` flag. A dedicated reader terminates
+the supervisor when the driver closes its write endpoint or exits. The driver
+protects both original pipe endpoints with close-on-exec and lets `Stdio` transfer
+the read endpoint to the child's stdin. The supervisor uses the standard stdin
+reader and does not adopt a numeric raw descriptor. This mode reserves stdin for
+liveness; sandbox workload input travels over the boundary protocol.

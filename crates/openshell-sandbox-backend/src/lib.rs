@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! `OpenShell` Sandbox Protocol and its concrete RFC 0012 backend.
 //!
 //! [`OpenShellRuntimeBackend`] is the supervisor-side implementation of the

@@ -1047,6 +1047,15 @@ mod tests {
     use super::*;
     use crate::google_cloud;
 
+    fn jwt_alias(placeholder: &str) -> String {
+        // Claims are irrelevant to injection authority: retain the exact issued
+        // identity in the signature while giving clients a parseable JWT envelope.
+        let suffix = placeholder
+            .strip_prefix("openshell:resolve:env:")
+            .expect("issued placeholder");
+        format!("e30.e30.OPENSHELL-RESOLVE-ENV-{suffix}")
+    }
+
     #[test]
     fn body_classification_distinguishes_literal_foreign_bound_and_revoked() {
         use crate::secrets::body::BodyCredentialError;
@@ -1721,6 +1730,14 @@ mod tests {
             None,
             "the expired access token must fail closed"
         );
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .is_err(),
+            "wrapping a placeholder must not bypass access-token expiry"
+        );
 
         state
             .install_bound_environment(
@@ -1740,6 +1757,12 @@ mod tests {
         assert_eq!(
             resolver.resolve_placeholder(&workload_placeholder),
             Some("current")
+        );
+        assert_eq!(
+            resolver
+                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .expect("refresh updates the JWT alias"),
+            Some("Bearer current".to_string())
         );
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
@@ -1762,6 +1785,10 @@ mod tests {
         )
         .expect("initial stable binding");
         let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+            jwt_alias(&workload_placeholder)
+        );
 
         for revision in 2..=13 {
             let token = format!("token-{revision}");
@@ -1782,6 +1809,16 @@ mod tests {
                     .expect("resolver")
                     .resolve_placeholder(&workload_placeholder),
                 Some(token.as_str())
+            );
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver");
+            let rewritten =
+                crate::secrets::rewrite_http_header_block(request.as_bytes(), Some(&resolver))
+                    .expect("the unchanged JWT alias uses the current token");
+            assert_eq!(
+                String::from_utf8(rewritten.rewritten).expect("HTTP header"),
+                format!("GET /v1 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n")
             );
         }
 
@@ -1804,6 +1841,14 @@ mod tests {
                 .expect("resolver")
                 .resolve_placeholder(&workload_placeholder),
             Some("token-14")
+        );
+        assert_eq!(
+            reconstructed
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .expect("the JWT alias survives supervisor reconstruction"),
+            Some("Bearer token-14".to_string())
         );
     }
 
@@ -1843,6 +1888,24 @@ mod tests {
             .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
             .expect("current resolver");
         assert_eq!(current.resolve_placeholder(&old_placeholder), None);
+        assert!(
+            current
+                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&old_placeholder)))
+                .is_err(),
+            "a JWT alias must not carry a revoked identity into the new epoch"
+        );
+        for alias in [
+            "e30.e30.OPENSHELL-RESOLVE-ENV-API_KEY",
+            "e30.e30.OPENSHELL-RESOLVE-ENV-sshort_API_KEY",
+            "e30.e30.OPENSHELL-RESOLVE-ENV-v18446744073709551616_API_KEY",
+        ] {
+            assert!(
+                current
+                    .rewrite_header_value(&format!("Bearer {alias}"))
+                    .is_err(),
+                "identityless and malformed JWT aliases must fail closed"
+            );
+        }
         assert_eq!(
             current.resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
             Some("new")
@@ -1853,6 +1916,13 @@ mod tests {
         let error = wrong_endpoint
             .rewrite_header_value(&state.snapshot().child_env["API_KEY"])
             .expect_err("new handle must not resolve at the old endpoint");
+        assert!(error.is_endpoint_mismatch());
+        let error = wrong_endpoint
+            .rewrite_header_value(&format!(
+                "Bearer {}",
+                jwt_alias(&state.snapshot().child_env["API_KEY"])
+            ))
+            .expect_err("JWT wrapping preserves endpoint authorization");
         assert!(error.is_endpoint_mismatch());
     }
 
@@ -1870,6 +1940,11 @@ mod tests {
             Vec::new(),
         )
         .expect("initial bindings");
+        let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+        let request = format!(
+            "POST /v2/inference HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            jwt_alias(&workload_placeholder)
+        );
 
         for revision in [10, 100, 9, 101, 8, 102, 7, 103, 6] {
             state
@@ -1888,12 +1963,19 @@ mod tests {
         }
 
         let resolver = state
-            .resolver_for_endpoint("api.example.com", 443, "/v1")
+            .resolver_for_endpoint("api.example.com", 443, "/v2/inference")
             .expect("resolver");
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
             Some("secret-6"),
             "an aged-out placeholder may use the current secret across revisions in both numeric directions while its provider identity is unchanged"
+        );
+        let rewritten =
+            crate::secrets::rewrite_http_header_block(request.as_bytes(), Some(&resolver))
+                .expect("an aged-out JWT alias retains the issued provider identity");
+        assert_eq!(
+            String::from_utf8(rewritten.rewritten).expect("HTTP request"),
+            "POST /v2/inference HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer secret-6\r\nContent-Length: 2\r\n\r\n{}"
         );
     }
 
@@ -1929,6 +2011,15 @@ mod tests {
             resolver.resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
             None,
             "an opaque revision from another provider identity must fail closed even when it is numerically greater"
+        );
+        assert!(
+            resolver
+                .rewrite_header_value(&format!(
+                    "Bearer {}",
+                    jwt_alias(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX))
+                ))
+                .is_err(),
+            "a JWT alias must not resolve a replacement provider's credential"
         );
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),

@@ -35,6 +35,7 @@ uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { workspace = true, features = ["termios"] }
 
 [dev-dependencies]
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }

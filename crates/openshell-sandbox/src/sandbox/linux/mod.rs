@@ -86,7 +86,7 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
 /// installation, so this order is mandatory for capability-free children.
 pub fn enforce_capability_free(
     prepared: PreparedSandbox,
-    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    child_hardening: &mut crate::linux::child_seccomp::ChildHardeningProgram,
 ) -> Result<()> {
     for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;

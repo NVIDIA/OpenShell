@@ -1072,37 +1072,7 @@ pub fn build_sandbox_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use crate::test_environment::Environment;
 
     #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
@@ -1903,16 +1873,17 @@ mod tests {
 
     #[test]
     fn stop_forward_removes_legacy_pid_file_without_signaling() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        assert!(!stop_forward("default", "sbx-1", 80).unwrap());
-        assert!(!pid_path.exists());
+                assert!(!stop_forward("default", "sbx-1", 80).unwrap());
+                assert!(!pid_path.exists());
+            });
     }
 
     #[test]
@@ -1927,33 +1898,35 @@ mod tests {
 
     #[test]
     fn list_forwards_marks_legacy_pid_records_not_alive() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        let forwards = list_forwards().unwrap();
-        assert_eq!(forwards.len(), 1);
-        assert_eq!(forwards[0].workspace, "default");
-        assert_eq!(forwards[0].sandbox_name, "sbx-1");
-        assert_eq!(forwards[0].port, 80);
-        assert!(!forwards[0].validated_alive);
+                let forwards = list_forwards().unwrap();
+                assert_eq!(forwards.len(), 1);
+                assert_eq!(forwards[0].workspace, "default");
+                assert_eq!(forwards[0].sandbox_name, "sbx-1");
+                assert_eq!(forwards[0].port, 80);
+                assert!(!forwards[0].validated_alive);
+            });
     }
 
     #[test]
     fn find_forward_by_port_ignores_legacy_pid_records() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "old", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-        let pid_path = forward_pid_path("default", "old", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        assert_eq!(find_forward_by_port(80).unwrap(), None);
+                assert_eq!(find_forward_by_port(80).unwrap(), None);
+            });
     }
 
     #[test]

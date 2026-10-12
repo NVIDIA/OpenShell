@@ -37,7 +37,7 @@ pub struct LocalBoundaryExec {
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     #[cfg(target_os = "linux")]
-    launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: crate::linux::workload_launcher::WorkloadLauncher,
 }
 
 impl LocalBoundaryExec {
@@ -50,8 +50,7 @@ impl LocalBoundaryExec {
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
-        #[cfg(target_os = "linux")]
-        launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        #[cfg(target_os = "linux")] launcher: crate::linux::workload_launcher::WorkloadLauncher,
     ) -> Self {
         Self {
             policy,
@@ -217,9 +216,8 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
@@ -329,9 +327,8 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
@@ -534,7 +531,7 @@ struct LocalTerminal {
 impl BoundaryTerminal for LocalTerminal {
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
         crate::pty::set_winsize(
-            self.master.as_raw_fd(),
+            &self.master,
             Winsize {
                 ws_row: rows.max(1),
                 ws_col: cols.max(1),
@@ -684,8 +681,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn executor() -> LocalBoundaryExec {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start test workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start test workload launcher");
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
                 let syscall = i64::from(notification.syscall);

@@ -3,14 +3,8 @@
 
 //! Host-side RFC 0012 backend for an already-provisioned remote boundary.
 
-#![allow(unsafe_code)]
-
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::mem::size_of;
-#[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd as _, IntoRawFd as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2094,42 +2088,16 @@ fn connect_host_vsock(
     guest_cid: u32,
     control_port: u32,
 ) -> Result<BoundaryDuplexStream, BackendError> {
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(BackendError::Unavailable(format!(
-            "create host vsock: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-    let family = libc::sa_family_t::try_from(libc::AF_VSOCK).map_err(|error| {
-        BackendError::Unavailable(format!("convert host vsock address family: {error}"))
-    })?;
-    let address = libc::sockaddr_vm {
-        svm_family: family,
-        svm_reserved1: 0,
-        svm_port: control_port,
-        svm_cid: guest_cid,
-        svm_zero: [0; 4],
-    };
-    let address_length =
-        libc::socklen_t::try_from(size_of::<libc::sockaddr_vm>()).map_err(|error| {
-            BackendError::Unavailable(format!("convert host vsock address length: {error}"))
+    let socket = socket2::Socket::new(socket2::Domain::VSOCK, socket2::Type::STREAM, None)
+        .map_err(|error| BackendError::Unavailable(format!("create host vsock: {error}")))?;
+    socket
+        .connect(&socket2::SockAddr::vsock(guest_cid, control_port))
+        .map_err(|error| {
+            BackendError::Unavailable(format!(
+                "connect host vsock CID {guest_cid} port {control_port}: {error}"
+            ))
         })?;
-    let result = unsafe {
-        libc::connect(
-            std::os::fd::AsRawFd::as_raw_fd(&fd),
-            (&raw const address).cast::<libc::sockaddr>(),
-            address_length,
-        )
-    };
-    if result != 0 {
-        return Err(BackendError::Unavailable(format!(
-            "connect host vsock CID {guest_cid} port {control_port}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd.into_raw_fd()) };
+    let stream = std::os::unix::net::UnixStream::from(socket);
     stream.set_nonblocking(true).map_err(|error| {
         BackendError::Unavailable(format!("set host vsock nonblocking: {error}"))
     })?;
