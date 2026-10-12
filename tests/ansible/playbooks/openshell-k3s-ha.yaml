@@ -11,9 +11,14 @@
       ansible.builtin.wait_for_connection:
 
     # The install layer boots fresh, so the K3s API may still be starting.
-    - name: Create OpenShell namespace
+    - name: Apply OpenShell namespace
       ansible.builtin.command:
-        argv: [/usr/local/bin/k3s, kubectl, create, namespace, openshell]
+        argv: [/usr/local/bin/k3s, kubectl, apply, --filename, "-"]
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: openshell
       register: k3s_namespace
       until: k3s_namespace.rc == 0
       retries: 30
@@ -23,6 +28,20 @@
       ansible.builtin.command:
         argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, apply, --filename, "-"]
         stdin: "{{ lookup('ansible.builtin.file', openshell_postgres_fixture) }}"
+
+    # Gateway Pods that start before the database crash-loop with growing backoff.
+    - name: Wait for PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - --namespace
+          - openshell
+          - rollout
+          - status
+          - deployment/openshell-e2e-postgres
+          - --timeout=300s
+      changed_when: false
 
 - import_playbook: openshell-k3s.yaml
   vars:
