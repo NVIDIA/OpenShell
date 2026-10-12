@@ -41,6 +41,7 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
+use openshell_server::config_file::OtlpConfig;
 
 #[cfg(all(
     not(target_os = "windows"),
@@ -265,7 +266,10 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = kubernetes_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -326,7 +330,10 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = docker_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
@@ -388,7 +395,10 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_podman::PodmanComputeDriver::new(config)

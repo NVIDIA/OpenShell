@@ -3,7 +3,7 @@
 
 //! Shared TLS export scenario for the one-test-per-binary TLS tests.
 
-use openshell_otel::{OtlpTraceConfig, ServiceName, provider_for};
+use openshell_otel::{OtlpExportConfig, ServiceName, provider_for};
 use openshell_otel_test_support::{OtlpTestServer, ReceivedTraces};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -55,7 +55,7 @@ pub async fn export_span_over_tls(server_trusted: bool) -> (bool, ReceivedTraces
         server_key.serialize_pem(),
     ))
     .await;
-    let (provider, error) = provider_for(Some(OtlpTraceConfig {
+    let (provider, error) = provider_for(Some(OtlpExportConfig {
         endpoint: collector.endpoint(),
         service_name: ServiceName::Fixed("tls-test"),
         service_version: None,

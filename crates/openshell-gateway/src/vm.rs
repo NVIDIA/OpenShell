@@ -660,8 +660,8 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
 }
 
 fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    if let Some(config) = otlp_config {
-        command.arg("--otlp-endpoint").arg(&config.endpoint);
+    if let Some(endpoint) = otlp_config.and_then(OtlpConfig::traces_endpoint) {
+        command.arg("--otlp-endpoint").arg(endpoint);
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
@@ -760,7 +760,7 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
+    use openshell_server::config_file::{OtlpConfig, OtlpTracesConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -808,8 +808,11 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                traces: Some(OtlpTracesConfig {
+                    endpoint: "http://collector.internal:4317".to_string(),
+                }),
+                ocsf: None,
             }),
             "production-us-west",
         );

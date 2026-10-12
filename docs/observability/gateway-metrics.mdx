@@ -275,6 +275,20 @@ record its queue and writer:
 | `openshell_ocsf_log_queue_records` | Gauge | None | Records waiting to be written. |
 | `openshell_ocsf_log_queue_bytes` | Gauge | None | Encoded bytes waiting to be written. |
 
+## OCSF Log Export Metrics
+
+Gateways with
+[OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export)
+enabled record its queue and exporter:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_ocsf_otlp_queued_total` | Counter | None | Records queued for export. |
+| `openshell_ocsf_otlp_exported_total` | Counter | None | Records in batches the collector acknowledged, including records it rejected in a partial success. |
+| `openshell_ocsf_otlp_dropped_total` | Counter | `reason` | Records the gateway discarded: `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`. |
+| `openshell_ocsf_otlp_export_errors_total` | Counter | None | Failed export attempts, including attempts that are retried. |
+| `openshell_ocsf_otlp_retries_total` | Counter | None | Export attempts retried after a failure. |
+
 ## Next Steps
 
 - To monitor capacity and choose autoscaling signals for multiple gateway

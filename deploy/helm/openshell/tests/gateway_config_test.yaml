@@ -273,6 +273,51 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
 
+  - it: renders OCSF export from gatewayConfig to the shared OTLP endpoint
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      gatewayConfig:
+        openshell.gateway.otlp.ocsf:
+          enabled: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\]\nendpoint\s*=\s*"http://otel-collector\.observability\.svc:4317"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[openshell\.gateway\.otlp\.ocsf\]\nenabled\s*=\s*true$'
+
+  - it: renders separate trace and OCSF endpoints from gatewayConfig
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway.otlp.traces:
+          endpoint: http://traces:4317
+        openshell.gateway.otlp.ocsf:
+          enabled: true
+          endpoint: http://siem-collector:4317
+          schema_version: "1.3"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\.ocsf\]\nenabled\s*=\s*true\nendpoint\s*=\s*"http://siem-collector:4317"\nschema_version\s*=\s*"1\.3"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\.traces\]\nendpoint\s*=\s*"http://traces:4317"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\]\nendpoint'
+
+  - it: omits OCSF export unless configured
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'otlp\.ocsf|schema_version'
+
   - it: omits OTLP tracing configuration by default
     template: templates/gateway-config.yaml
     asserts:

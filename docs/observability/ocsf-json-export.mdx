@@ -13,6 +13,8 @@ The [shorthand log format](/observability/logging) is optimized for humans and a
 
 Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
 
+To send gateway OCSF events directly to an OpenTelemetry collector instead, enable [OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export).
+
 The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/how-it-works/gateways/configuration#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
 
 This output is separate from the supervisor stderr and file output described below. Enabling one does not enable the other. The gateway JSONL sink does not archive supervisor log lines pushed to the gateway; those lines carry OCSF shorthand text, not the full structured record.

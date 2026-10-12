@@ -684,13 +684,15 @@ async fn run_from_args(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
     );
-    let (tracing_handle, setup_error) = crate::tracing_setup::install(
+    let (otlp_export, otlp_error) =
+        crate::otel_tracing::OtlpExport::start(otlp_config, gateway_resource);
+    let (tracing_handle, driver_otlp_error) = crate::tracing_setup::install(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
             .to_string(),
         &tracing_log_bus,
         ocsf_log.as_ref(),
-        otlp_config,
+        otlp_export.as_ref(),
         compute_driver_tracing,
         gateway_resource,
     );
@@ -727,17 +729,17 @@ async fn run_from_args(
     if has_oidc {
         info!("OIDC authentication enabled");
     }
-    if let Some(err) = &setup_error {
+    if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
             error = %err,
             "OTLP exporting is configured but could not be started; continuing without it"
         );
-    } else if let Some(otlp) = prepared
-        .config_file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.otlp.as_ref())
-    {
-        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+    } else if let Some(otlp) = &otlp_export {
+        info!(
+            traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
+            ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            "OTLP exporting enabled"
+        );
     }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
@@ -763,6 +765,9 @@ async fn run_from_args(
 
     tracing_handle.shutdown();
 
+    if let Some(otlp) = otlp_export {
+        otlp.shutdown().await;
+    }
     if let Some(log) = ocsf_log {
         log.shutdown().await;
     }

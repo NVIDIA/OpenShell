@@ -320,7 +320,7 @@ fn main() -> Result<()> {
     // The tonic exporter must be created inside the runtime that drives it.
     let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
         openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(|endpoint| {
-            openshell_otel::OtlpTraceConfig {
+            openshell_otel::OtlpExportConfig {
                 endpoint,
                 service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
                 service_version: Some(openshell_core::VERSION),
