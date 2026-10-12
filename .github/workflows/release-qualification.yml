@@ -149,8 +149,6 @@ jobs:
 
   compatibility-review:
     name: Compatibility Review (advisory)
-    needs: security
-    if: ${{ !cancelled() }}
     permissions:
       contents: read
       pull-requests: read

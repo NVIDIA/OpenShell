@@ -73,6 +73,7 @@ permissions:
 concurrency:
   group: codex-release-review
   cancel-in-progress: false
+  queue: max
 
 env:
   CODEX_SECURITY_MAX_CONCURRENT_THREADS: "8"

@@ -189,9 +189,11 @@ The full report retains unchanged findings with previous-comment links.
 `comment.md` contains only new or materially updated findings, and an unchanged
 review does not post another PR comment. Inspect the full artifact for outstanding
 breaks even when the bot is silent. The qualification summary points to it.
-The review starts after Security Scan finishes, and the two Codex workflows share
-the `codex-release-review` concurrency group to prevent overlapping API usage
-across runs. The qualification caller waits for both reviews to finish. Do not
+The review is scheduled independently of Security Scan. The two Codex workflows
+share the `codex-release-review` concurrency group with `queue: max`, retaining
+up to 100 pending reviews while preventing overlapping API usage across runs.
+Either review can run first; other security scanners run in parallel.
+The qualification caller waits for both reviews to finish. Do not
 rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
 with an existing candidate tag; that path does not publish release artifacts.
 

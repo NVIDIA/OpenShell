@@ -82,7 +82,11 @@ stable release to the exact candidate commit, using the same tag-derived
 patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
 and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
 and persisted state.
-Both Codex workflows share the `codex-release-review` concurrency group, so separate release or manual runs cannot overlap their API usage.
+Both Codex workflows share the `codex-release-review` concurrency group with
+`queue: max`, so only one review runs at a time and up to 100 pending reviews
+are retained across branch, release, and manual runs. The release compatibility
+review is scheduled independently of Security Scan; other security scanners run
+in parallel.
 It does not replace Buf or change the release train's version.
 
 The agent inspects code first, then uses `gh` with a read-only GitHub token to
