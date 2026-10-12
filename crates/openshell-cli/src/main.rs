@@ -1585,6 +1585,7 @@ enum SandboxCommands {
         /// Set a non-secret environment variable in the sandbox.
         /// Do not use this option for API keys, tokens, or other secrets; create
         /// a provider and attach it with `--provider` instead. Repeatable.
+        /// Each value is limited to 8 KiB and cannot contain a newline.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
@@ -1609,6 +1610,7 @@ enum SandboxCommands {
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
+        /// Each argument is limited to 32 KiB.
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },

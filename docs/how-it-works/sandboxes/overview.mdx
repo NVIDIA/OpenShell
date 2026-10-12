@@ -76,6 +76,10 @@ finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the
 sandbox image.
 
+The trailing command takes at most 256 arguments. Each argument is limited to
+32 KiB and all arguments together to 256 KiB. Send a larger input, such as a
+long system prompt, with `sandbox upload` and read it inside the sandbox.
+
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
 
 ```shell
@@ -400,6 +404,10 @@ openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
 Per-command variables override the sandbox-level environment for that command only.
 
 Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+
+`sandbox create` accepts at most 128 variables. Each value is limited to 8 KiB
+and cannot contain a newline, and all names and values together are limited to
+256 KiB. Send larger or multi-line values with `sandbox upload`.
 
 ## Label a Sandbox
 
