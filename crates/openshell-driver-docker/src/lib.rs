@@ -1843,7 +1843,7 @@ impl DockerComputeDriver {
         .await
         {
             Ok(control) => control,
-            Err(status) => {
+            Err(failure) => {
                 if self
                     .lifecycle_event_fences
                     .stop_requested(&sandbox.id, &sandbox.name)
@@ -1865,8 +1865,8 @@ impl DockerComputeDriver {
                     .await;
                 cleanup_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
-                    supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
-                    status.message(),
+                    failure.reason_or("ControlSupervisorStartFailed"),
+                    failure.status.message(),
                 ));
             }
         };
@@ -2154,17 +2154,17 @@ impl DockerComputeDriver {
         .await
         {
             Ok(process) => process,
-            Err(status) => {
+            Err(failure) => {
                 handle_docker_runtime_failure(
                     failure_context,
-                    supervisor_start_failure_reason(&status, "ControlSupervisorExited"),
+                    failure.reason_or("ControlSupervisorExited"),
                     format!(
                         "failed to start Docker control supervisor: {}",
-                        status.message()
+                        failure.status.message()
                     ),
                 )
                 .await;
-                return Err(status);
+                return Err(failure.status);
             }
         };
         self.replace_control_process(&sandbox.id, process).await;
@@ -5045,7 +5045,7 @@ async fn spawn_docker_control_process(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     failure_context: DockerRuntimeFailureContext,
-) -> Result<DockerControlProcess, Status> {
+) -> Result<DockerControlProcess, ControlStartFailure> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let main_process_spec = tokio::fs::read_to_string(directory.join(MAIN_PROCESS_SPEC_FILE))
         .await
@@ -5229,9 +5229,7 @@ async fn spawn_docker_control_process(
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
-        return Err(Status::internal(format!(
-            "start Docker supervisor container: {error}"
-        )));
+        return Err(Status::internal(format!("start Docker supervisor container: {error}")).into());
     }
     let sandbox_id = sandbox.id.clone();
     let (shutdown, mut shutdown_requested) = oneshot::channel();
@@ -5288,8 +5286,9 @@ async fn spawn_docker_control_process(
                 let log_tail =
                     docker_container_log_tail(&monitored_docker, &monitored_supervisor_id).await;
                 if reason == CONDITION_WORKSPACE_VALIDATION_FAILED {
+                    // The condition message stays fixed; supervisor output may
+                    // contain secrets.
                     warn!(%sandbox_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
-                    message = WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string();
                 } else if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
@@ -5334,17 +5333,26 @@ async fn wait_for_docker_supervisor_ready(
     workload_container_id: &str,
     sandbox_id: &str,
     failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
-) -> Result<(), Status> {
-    // The monitor records a workspace rejection before it removes the
-    // supervisor, so a later failed inspection must still report it.
-    match poll_docker_supervisor_ready(docker, supervisor_id, workload_container_id, sandbox_id)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(status) => Err(recorded_workspace_validation_failure(failures, sandbox_id)
+) -> Result<(), ControlStartFailure> {
+    let Err(failure) =
+        poll_docker_supervisor_ready(docker, supervisor_id, workload_container_id, sandbox_id)
             .await
-            .unwrap_or(status)),
+    else {
+        return Ok(());
+    };
+    // The monitor records a workspace rejection before it stops the workload
+    // and removes the supervisor, so readiness may only observe the cleanup.
+    // Other recorded failures keep the readiness status: their messages carry
+    // an untruncated log tail that must not travel in a gRPC status.
+    let recorded = failures
+        .lock()
+        .await
+        .get(sandbox_id)
+        .map(|failure| failure.reason);
+    if recorded == Some(CONDITION_WORKSPACE_VALIDATION_FAILED) {
+        return Err(ControlStartFailure::workspace_validation());
     }
+    Err(failure)
 }
 
 async fn poll_docker_supervisor_ready(
@@ -5352,7 +5360,7 @@ async fn poll_docker_supervisor_ready(
     supervisor_id: &str,
     workload_container_id: &str,
     sandbox_id: &str,
-) -> Result<(), Status> {
+) -> Result<(), ControlStartFailure> {
     // Gateway provisioning deadlines own startup expiration, including policy
     // repairs that extend the window. Unhealthy means not ready while the
     // supervisor is quarantined; only a stopped process is a startup failure.
@@ -5366,7 +5374,8 @@ async fn poll_docker_supervisor_ready(
         if sandbox.state.unwrap_or_default().running == Some(false) {
             return Err(Status::unavailable(
                 "Docker sandbox exited before supervisor became ready",
-            ));
+            )
+            .into());
         }
         let inspected = docker
             .inspect_container(supervisor_id, None)
@@ -5377,91 +5386,91 @@ async fn poll_docker_supervisor_ready(
         let state = inspected.state.unwrap_or_default();
         match state.health.and_then(|health| health.status) {
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
-            _ if state.running == Some(false)
-                && state.exit_code
-                    == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)) =>
-            {
-                let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
-                return Err(workspace_validation_status());
-            }
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
+                if state.exit_code == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)) {
+                    warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
+                    return Err(ControlStartFailure::workspace_validation());
+                }
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
                 return Err(Status::unavailable(format!(
                     "Docker supervisor exited before becoming ready{}",
                     format_log_tail(&log_tail)
-                )));
+                ))
+                .into());
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
 }
 
+/// A control supervisor that failed to start. `reason` is set only when the
+/// failure has a specific condition reason; callers choose their own default.
+#[derive(Debug)]
+struct ControlStartFailure {
+    reason: Option<&'static str>,
+    status: Status,
+}
+
+impl From<Status> for ControlStartFailure {
+    fn from(status: Status) -> Self {
+        Self {
+            reason: None,
+            status,
+        }
+    }
+}
+
+impl ControlStartFailure {
+    /// The sandbox rejected the image working directory. The message is fixed
+    /// text, because supervisor output may contain secrets.
+    fn workspace_validation() -> Self {
+        Self {
+            reason: Some(CONDITION_WORKSPACE_VALIDATION_FAILED),
+            status: Status::failed_precondition(WORKSPACE_VALIDATION_FAILED_MESSAGE),
+        }
+    }
+
+    fn reason_or(&self, default: &'static str) -> &'static str {
+        self.reason.unwrap_or(default)
+    }
+}
+
+/// Condition reason and message for a supervisor that exited unexpectedly.
+///
 /// Bollard reports nonzero Docker wait statuses as errors, not successful
 /// responses. Both forms must preserve the sandbox's workspace failure reason.
 fn docker_supervisor_wait_failure(
     result: Option<Result<ContainerWaitResponse, BollardError>>,
 ) -> (&'static str, String) {
-    match result {
+    let (exit_code, message) = match result {
         Some(Ok(status)) => (
-            supervisor_exit_reason(status.status_code),
+            Some(status.status_code),
             format!(
                 "Docker supervisor container exited with status {}",
                 status.status_code
             ),
         ),
         Some(Err(BollardError::DockerContainerWaitError { code, error })) => (
-            supervisor_exit_reason(code),
+            Some(code),
             format!("Docker supervisor container exited with status {code}: {error}"),
         ),
         Some(Err(error)) => (
-            "ControlSupervisorExited",
+            None,
             format!("failed to wait for Docker supervisor container: {error}"),
         ),
         None => (
-            "ControlSupervisorExited",
+            None,
             "Docker supervisor wait stream ended unexpectedly".to_string(),
         ),
-    }
-}
-
-async fn recorded_workspace_validation_failure(
-    failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
-    sandbox_id: &str,
-) -> Option<Status> {
-    let failures = failures.lock().await;
-    failures
-        .get(sandbox_id)
-        .filter(|failure| failure.reason == CONDITION_WORKSPACE_VALIDATION_FAILED)
-        .map(|_| workspace_validation_status())
-}
-
-/// Startup failure for a supervisor that exited because the sandbox rejected
-/// the image working directory. The message is fixed text, because supervisor
-/// output may contain secrets, and identifies the failure for
-/// [`supervisor_start_failure_reason`].
-fn workspace_validation_status() -> Status {
-    Status::failed_precondition(WORKSPACE_VALIDATION_FAILED_MESSAGE)
-}
-
-/// Condition reason for a supervisor that failed before becoming ready.
-fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'static str {
-    if status.code() == tonic::Code::FailedPrecondition
-        && status.message() == WORKSPACE_VALIDATION_FAILED_MESSAGE
-    {
-        CONDITION_WORKSPACE_VALIDATION_FAILED
+    };
+    if exit_code == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)) {
+        (
+            CONDITION_WORKSPACE_VALIDATION_FAILED,
+            WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string(),
+        )
     } else {
-        default
-    }
-}
-
-/// Condition reason for a supervisor that exited with `status_code`.
-fn supervisor_exit_reason(status_code: i64) -> &'static str {
-    if status_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
-        CONDITION_WORKSPACE_VALIDATION_FAILED
-    } else {
-        "ControlSupervisorExited"
+        ("ControlSupervisorExited", message)
     }
 }
 

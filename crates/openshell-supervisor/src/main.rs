@@ -494,8 +494,7 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
                 .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
                 .is_some() =>
         {
-            error!("Image workspace validation failed");
-            eprintln!("{error:?}");
+            error!(error = ?error, "Image workspace validation failed");
             Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
         }
         other => other,

@@ -336,13 +336,15 @@ and gateway plus the candidate multi-architecture sandbox and supervisor
 images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
 x86_64 artifacts; they do not replace ARM64 image coverage.
 
-Run it against a local gateway by naming the command that builds images into
-the gateway's image store:
+Run it against a local Docker or Podman gateway:
 
 ```shell
-OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh \
-  cargo test --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1
+mise run e2e:oci-image
+mise run e2e:oci-image:podman
 ```
+
+Both tasks set `OPENSHELL_TEST_CONTAINER_ENGINE`, the command that builds test
+images into the gateway's image store.
 
 Run the VM-backed Rust CLI e2e suite:
 
