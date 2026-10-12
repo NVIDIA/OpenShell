@@ -313,11 +313,10 @@ The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
-profiles, and inspects the Podman containers created from an OCI image. The E2E
-archive excludes binaries that still depend on wrapper-owned gateway controls,
-host fixtures, missing guest tools, or nondeterministic relay setup. The
-`driver-podman` suite replaces the removed `podman_userns` and
-`podman_oci_identity` E2E binaries. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+gateway controls, host fixtures, missing guest tools, or nondeterministic relay
+setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
