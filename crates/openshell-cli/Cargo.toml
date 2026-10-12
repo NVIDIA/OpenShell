@@ -79,7 +79,6 @@ tokio-stream = { workspace = true }
 
 # URL parsing
 url = { workspace = true }
-wiremock = "0.6"
 
 # Logging
 tracing = { workspace = true }
