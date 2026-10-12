@@ -172,6 +172,8 @@ export interface ServiceExposure {
   targetPort: number;
   /** Handling for an incoming application Authorization header. */
   authorizationMode?: ServiceAuthorizationMode;
+  /** HTTP readiness path; omission checks listener responsiveness. */
+  readinessPath?: string;
 }
 
 export enum ServiceAuthorizationMode {
@@ -1043,6 +1045,7 @@ export class SandboxClient {
         spec: specInit,
         serviceExposures:
           spec.serviceExposures?.map((exposure) => ({
+            readinessCheck: exposure.readinessPath === undefined ? undefined : { path: exposure.readinessPath },
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
@@ -1070,6 +1073,7 @@ export class SandboxClient {
         workloadTemplate: spec.workloadTemplate,
         serviceExposures:
           spec.serviceExposures?.map((exposure) => ({
+            readinessCheck: exposure.readinessPath === undefined ? undefined : { path: exposure.readinessPath },
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),

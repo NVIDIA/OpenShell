@@ -5,6 +5,7 @@ package converter
 
 import (
 	"testing"
+	"time"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
@@ -12,6 +13,32 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestServiceHealthRoundTripCopiesObservationPointers(t *testing.T) {
+	checked := time.Now().UTC().Truncate(time.Second)
+	code := uint32(503)
+	input := &v1.ServiceEndpoint{
+		AuthorizationMode: v1.ServiceAuthorizationModeStrip,
+		ReadinessCheck:    &v1.HTTPReadinessCheck{Path: "/readyz"},
+		Health: &v1.ServiceHealth{
+			State:           v1.ServiceHealthStateUnhealthy,
+			LastCheckedTime: &checked,
+			HTTPStatusCode:  &code,
+			Message:         "HTTP check returned 503",
+		},
+	}
+	wire := ServiceEndpointToProto(input)
+	result := ServiceEndpointFromProto(wire)
+	assert.Equal(t, input, result)
+	*result.Health.HTTPStatusCode = 200
+	result.ReadinessCheck.Path = "/changed"
+	assert.Equal(t, uint32(503), wire.Health.GetHttpStatusCode())
+	assert.Equal(t, uint32(503), *input.Health.HTTPStatusCode)
+	assert.Equal(t, "/readyz", wire.Endpoint.ReadinessCheck.Path)
+	assert.Equal(t, "/readyz", input.ReadinessCheck.Path)
+	wire.Health.HttpStatusCode = nil
+	assert.Nil(t, ServiceEndpointFromProto(wire).Health.HTTPStatusCode)
+}
 
 func TestServiceEndpointFromProto(t *testing.T) {
 	resp := &pb.ServiceEndpointResponse{

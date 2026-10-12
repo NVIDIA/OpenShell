@@ -928,6 +928,16 @@ request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
 
+Use `sandbox create --expose PORT --expose-readiness-path /readyz` or
+`service expose SANDBOX PORT SERVICE --readiness-path /readyz` for continuous
+application readiness checks. Confirm these flags with installed CLI help.
+Without a readiness path, service health checks HTTP responsiveness at `/`.
+Read health with `service get` or `service list --output json`. Readiness
+requires HTTP 2xx; responsiveness accepts any HTTP status. Probes send no
+credentials, run every five seconds, and time out after one second. Three
+failures mark unhealthy and one success restores health. `Unknown` includes
+stale or unavailable observations. Health does not control routing or restarts.
+
 Exposed services strip `Authorization` by default. Select
 `bearer-passthrough` only when the application inside the sandbox authenticates
 its own clients. This mode accepts either no `Authorization` header or exactly

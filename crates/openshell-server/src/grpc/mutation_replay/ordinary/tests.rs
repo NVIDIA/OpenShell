@@ -474,7 +474,13 @@ async fn service_deletion_replays_without_parent_and_does_not_delete_replacement
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(replay(&state, expose.clone()).await, endpoint);
+    let replayed = replay(&state, expose.clone()).await;
+    assert_eq!(replayed.endpoint, endpoint.endpoint);
+    assert_eq!(replayed.url, endpoint.url);
+    assert!(
+        replayed.health.is_none(),
+        "mutation replay must not replay historical health"
+    );
     let delete = DeleteServiceRequest {
         sandbox: "service-parent".into(),
         name: "web".into(),

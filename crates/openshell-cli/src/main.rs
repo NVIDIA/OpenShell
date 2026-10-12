@@ -1544,6 +1544,10 @@ enum SandboxCommands {
         #[arg(long, value_enum, default_value_t, requires = "expose")]
         expose_authorization_mode: CliServiceAuthorizationMode,
 
+        /// HTTP readiness path on the exposed service; only 2xx responses are ready.
+        #[arg(long, value_name = "PATH", requires = "expose")]
+        expose_readiness_path: Option<String>,
+
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
         /// Use --tty to force a PTY even when auto-detection fails, or
@@ -2406,6 +2410,10 @@ enum ServiceCommands {
         /// Handling for an incoming application Authorization header.
         #[arg(long, value_enum, default_value_t)]
         authorization_mode: CliServiceAuthorizationMode,
+
+        /// HTTP readiness path; omission preserves an existing readiness check.
+        #[arg(long, value_name = "PATH")]
+        readiness_path: Option<String>,
     },
 
     /// List exposed sandbox service endpoints.
@@ -2942,6 +2950,7 @@ async fn run_async() -> Result<()> {
                     service,
                     target_port,
                     authorization_mode,
+                    readiness_path,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -2950,6 +2959,7 @@ async fn run_async() -> Result<()> {
                         &service,
                         target_port,
                         authorization_mode.into(),
+                        readiness_path.as_deref(),
                         &cli.workspace,
                         &tls,
                     )
@@ -3354,6 +3364,7 @@ async fn run_async() -> Result<()> {
                     forward,
                     expose,
                     expose_authorization_mode,
+                    expose_readiness_path,
                     tty,
                     no_tty,
                     detach,
@@ -3444,6 +3455,7 @@ async fn run_async() -> Result<()> {
                             forward,
                             expose,
                             expose_authorization_mode: expose_authorization_mode.into(),
+                            expose_readiness_path: expose_readiness_path.as_deref(),
                             command: &command,
                             tty_override,
                             auto_providers_override,
@@ -6818,6 +6830,7 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
@@ -6827,6 +6840,45 @@ mod tests {
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn readiness_paths_parse_for_exposure_and_require_a_create_exposure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "expose",
+            "sandbox",
+            "4500",
+            "--readiness-path",
+            "/readyz",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Commands::Service {
+            command: Some(ServiceCommands::Expose { readiness_path: Some(path), .. }),
+        }) if path == "/readyz"));
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--expose-readiness-path",
+                "/readyz",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--expose",
+                "4500",
+                "--expose-readiness-path",
+                "/readyz",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -6842,6 +6894,7 @@ mod tests {
                         target_port,
                         service,
                         authorization_mode,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");

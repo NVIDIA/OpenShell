@@ -1063,6 +1063,7 @@ mod tests {
 
     fn endpoint() -> ServiceEndpoint {
         ServiceEndpoint {
+            readiness_check: None,
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "endpoint-id".to_string(),
                 name: "my-sandbox--web".to_string(),
@@ -1616,6 +1617,7 @@ mod tests {
         let store = crate::persistence::test_store().await;
 
         let ep = ServiceEndpoint {
+            readiness_check: None,
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "ep-1".to_string(),
                 name: "my-sandbox--web".to_string(),

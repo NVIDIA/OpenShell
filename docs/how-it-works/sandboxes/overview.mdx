@@ -536,6 +536,7 @@ let sandbox = client.create_sandbox(openshell_sdk::SandboxSpec {
         service: String::new(),
         target_port: 4500,
         authorization_mode: openshell_sdk::ServiceAuthorizationMode::BearerPassthrough,
+        ..Default::default()
     }],
     ..Default::default()
 }).await?;
@@ -632,9 +633,37 @@ openshell service list my-sandbox --output yaml
 
 Structured list output contains `services` and `next_page_token` fields. Each
 record contains `workspace`, `sandbox`, `service`, `target_port`,
-`authorization_mode`, and `url`.
+`authorization_mode`, `url`, `readiness_check`, and `health`.
 The unnamed service uses an empty `service` string. Pass the returned token to
 `--page-token` to continue. An empty result has an empty `services` collection.
+
+The gateway schedules HTTP checks on exposed services every five
+seconds. Any HTTP response to `GET /` passes. Configure an application readiness
+path to require a 2xx response instead:
+
+```shell
+openshell service expose my-sandbox 8080 web --readiness-path /readyz
+```
+
+At creation, use `--expose PORT --expose-readiness-path /readyz`. Omitting
+`--readiness-path` when updating an endpoint preserves its configured check.
+Checks send no credentials and do not follow redirects; the readiness endpoint
+must be accessible without application authentication.
+Routine probe relay activity is logged at debug level. Older supervisors that
+do not recognize the probe marker emit their usual relay events.
+
+Each check has a one-second timeout. Three consecutive failures mark the
+service unhealthy; one success restores health. Table output shows
+`Ready` / `Not ready` for application readiness or `Responsive` / `Unresponsive`
+for a listener check. `Unknown` means the sandbox cannot be checked, results
+are stale, or a current check has not reached a conclusive result. Structured
+health includes `state`, `last_checked_time`, `http_status_code`, and `message`.
+Health is cached separately on each gateway replica and becomes unknown after
+15 seconds without an observation. Changes to the service or sandbox runtime
+invalidate previous results. Checks continue while the sandbox is ready;
+service health does not change sandbox phase, routing, or restart behavior.
+Each replica runs at most 16 checks concurrently. Large fleets of slow services
+can delay checks beyond the nominal interval; stale results remain unknown.
 
 Show or delete one endpoint:
 

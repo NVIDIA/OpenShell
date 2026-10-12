@@ -52,6 +52,10 @@ if (deletion.outcome === 'accepted') {
 }
 ```
 
+Set `readinessPath: '/readyz'` on a service exposure for continuous application
+readiness checks requiring HTTP 2xx. Omission checks HTTP responsiveness at `/`.
+Read cached observations through `@nvidia/openshell-sdk/raw` service RPCs.
+
 Deletion returns a typed result, not a boolean. `accepted` means cleanup is
 pending; `unspecified` and unknown outcomes do not establish completion.
 `sandboxId` identifies the original sandbox. Missing targets are errors unless

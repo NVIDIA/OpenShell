@@ -10419,6 +10419,7 @@ mod tests {
 
     fn service_endpoint_record(id: &str, sandbox: &Sandbox) -> ServiceEndpoint {
         ServiceEndpoint {
+            readiness_check: None,
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: format!("{}--web", sandbox.object_name()),
