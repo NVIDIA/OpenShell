@@ -2757,15 +2757,15 @@ def test_sandbox_ref_includes_conditions() -> None:
     ready = proto.status.conditions.add()
     ready.type = "Ready"
     ready.status = "True"
-    ready.reason = "MainProcessReady"
-    ready.message = "main process is ready"
+    ready.reason = "BackendReady"
+    ready.message = "Container is running"
     ready.transition_time.FromMilliseconds(1_700_000_000_000)
 
     failed = proto.status.conditions.add()
-    failed.type = "Initialized"
-    failed.status = "False"
-    failed.reason = "ContainerConfigError"
-    failed.message = "failed before main process started"
+    failed.type = "Ready"
+    failed.status = "Unknown"
+    failed.reason = "InspectFailed"
+    failed.message = "Container inspect failed: connection refused"
 
     ref = _sandbox_ref(proto)
 
@@ -2773,15 +2773,15 @@ def test_sandbox_ref_includes_conditions() -> None:
         SandboxConditionRef(
             type="Ready",
             status="True",
-            reason="MainProcessReady",
-            message="main process is ready",
+            reason="BackendReady",
+            message="Container is running",
             transition_time_ms=1_700_000_000_000,
         ),
         SandboxConditionRef(
-            type="Initialized",
-            status="False",
-            reason="ContainerConfigError",
-            message="failed before main process started",
+            type="Ready",
+            status="Unknown",
+            reason="InspectFailed",
+            message="Container inspect failed: connection refused",
             transition_time_ms=None,
         ),
     )
