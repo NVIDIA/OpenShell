@@ -96,32 +96,21 @@ let
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
 
-  # Follow-up: migrate these wrapper-coupled tests once tmachine provides their
-  # managed-gateway controls, SPIFFE fixtures, caller driver-config setting,
-  # guest tools, and matching workload-image identity behavior. The corporate
-  # proxy and gateway-start binaries currently self-skip without wrapper-owned
-  # gateway metadata, so exclude them rather than report false passes.
+  # Follow-up: binaries that do not yet run in the rootless tmachine guest. They
+  # need wrapper-owned managed-gateway controls (restart, configuration), SPIFFE
+  # fixtures, the caller driver-config setting, or guest tools. The corporate
+  # proxy and gateway-start binaries self-skip without wrapper-owned gateway
+  # metadata, so exclude them rather than report false passes.
   podmanE2eFollowUpBinaries = [
-    "credential_gating"
     "driver_config_volume"
-    "forward_proxy_graphql_l7"
-    "forward_proxy_jsonrpc_l7"
-    "forward_proxy_l7_bypass"
-    "host_gateway_alias"
-    "landlock"
     "local_driver_token_restart"
-    # Standalone tmachine runs can time out while opening the localhost relay.
-    # Follow up on making the relay setup deterministic before restoring it.
-    "no_proxy"
     "podman_corporate_proxy"
     "podman_gateway_start"
-    "podman_oci_identity"
     "provider_auto_create"
-    # The provider-refresh feature suite covers revoked Keycloak grants. This
-    # binary instead covers stable workload handles across repeated rotations
-    # and explicit refresh reconfiguration in a long-running sandbox.
-    "provider_refresh_handles"
     "provider_token_exchange"
+    # One test times out reaching support-container IPs from the sandbox in the
+    # rootless guest; the other tests in the binary pass. Nextest archive
+    # filters cannot select individual tests, so keep the complete binary here.
     "proxy_egress_pipeline"
     # Conformance covers stop/start workspace preservation and deletion while
     # stopped. The remaining canonical-main, TTY, attachment replay, and
@@ -130,7 +119,6 @@ let
     "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
-    "websocket_conformance"
     "workspace_lifecycle"
   ];
   podmanE2eArchiveFilter =
