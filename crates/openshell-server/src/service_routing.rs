@@ -777,14 +777,10 @@ fn validate_application_authorization<B>(
     let value = value
         .to_str()
         .map_err(|_| ServiceRouteError::invalid_request())?;
-    let Some((scheme, credential)) = value.split_once(' ') else {
-        return Err(ServiceRouteError::invalid_request());
-    };
-    let credential = credential.trim_start_matches(' ');
-    if !scheme.eq_ignore_ascii_case("bearer") || !is_bearer_token68(credential) {
-        return Err(ServiceRouteError::invalid_request());
+    match openshell_core::auth::strip_bearer_scheme(value) {
+        Some(credential) if is_bearer_token68(credential) => Ok(()),
+        _ => Err(ServiceRouteError::invalid_request()),
     }
-    Ok(())
 }
 
 fn is_bearer_token68(value: &str) -> bool {

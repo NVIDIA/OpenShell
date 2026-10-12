@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "reviewed_surfaces", "unreviewed_surfaces", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["no_unaddressed_breaks", "unaddressed_breaks", "needs_review"]
+    },
+    "summary": {"type": "string"},
+    "reviewed_surfaces": {"type": "array", "items": {"type": "string"}},
+    "unreviewed_surfaces": {"type": "array", "items": {"type": "string"}},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["surface", "change", "impact", "evidence", "recommendation"],
+        "properties": {
+          "surface": {"type": "string"},
+          "change": {"type": "string"},
+          "impact": {"type": "string"},
+          "evidence": {"type": "string"},
+          "recommendation": {"type": "string"}
+        }
+      }
+    }
+  }
+}

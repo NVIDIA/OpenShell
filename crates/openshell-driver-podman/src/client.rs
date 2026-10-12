@@ -181,12 +181,12 @@ pub struct ImageInspect {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(default, rename_all = "PascalCase")]
 pub struct ImageConfig {
-    #[serde(default)]
     pub user: String,
-    #[serde(default)]
     pub env: Vec<String>,
+    pub working_dir: String,
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// A container summary returned by the list API.
@@ -1284,13 +1284,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_config_defaults_missing_oci_fields() {
+        let empty: ImageConfig = serde_json::from_str("{}").unwrap();
+        assert!(empty.user.is_empty());
+        assert!(empty.env.is_empty());
+        assert!(empty.working_dir.is_empty());
+        assert!(empty.volumes.is_none());
+
+        let partial: ImageConfig = serde_json::from_str(r#"{"User":"app:staff"}"#).unwrap();
+        assert_eq!(partial.user, "app:staff");
+        assert!(partial.env.is_empty());
+        assert!(partial.working_dir.is_empty());
+        assert!(partial.volumes.is_none());
+    }
+
     #[tokio::test]
-    async fn inspect_image_reads_immutable_id_and_oci_user() {
+    async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project","Volumes":{"/workspace/project/cache":{}}}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -1301,9 +1316,15 @@ mod tests {
             .expect("image inspect should parse");
 
         assert_eq!(image.id, "sha256:immutable");
-        assert_eq!(
-            image.config.as_ref().map(|config| config.user.as_str()),
-            Some("app:staff")
+        let config = image.config.expect("fixture image config");
+        assert_eq!(config.user, "app:staff");
+        assert_eq!(config.env, vec!["A=one"]);
+        assert_eq!(config.working_dir, "/workspace/project");
+        assert!(
+            config
+                .volumes
+                .as_ref()
+                .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
         );
         handle.await.expect("stub task should finish");
         assert_eq!(

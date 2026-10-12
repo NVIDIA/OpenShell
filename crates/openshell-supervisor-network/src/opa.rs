@@ -6,6 +6,9 @@
 //! Wraps [`regorus::Engine`] to evaluate Rego policies for sandbox network
 //! access decisions. The engine is loaded once at sandbox startup and queried
 //! on every proxy CONNECT request.
+//!
+//! The baked policy uses the `openshell.endpoint_path_matches` native builtin
+//! registered here to share endpoint selector semantics with Rust route selection.
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
@@ -35,6 +38,24 @@ mod raw_schema;
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
 const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
+
+fn new_regorus_engine() -> Result<regorus::Engine> {
+    let mut engine = regorus::Engine::new();
+    engine
+        .add_extension(
+            "openshell.endpoint_path_matches".into(),
+            2,
+            Box::new(|params: Vec<regorus::Value>| {
+                let pattern = params[0].as_string()?;
+                let path = params[1].as_string()?;
+                Ok(regorus::Value::from(
+                    openshell_core::endpoint_path::matches(pattern, path),
+                ))
+            }),
+        )
+        .map_err(|_| miette::miette!("failed to register endpoint path matcher"))?;
+    Ok(engine)
+}
 
 /// Maximum number of fixed categories in one policy-load error.
 const POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS: usize = 8;
@@ -358,7 +379,7 @@ impl OpaEngine {
         // original error, including its source chain, at the load boundary.
         let yaml_str = std::fs::read_to_string(data_path)
             .map_err(|_| miette::miette!("failed to read YAML policy data file"))?;
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy_from_file(policy_path)
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -405,7 +426,7 @@ impl OpaEngine {
         require_binary_identity: bool,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -499,7 +520,7 @@ impl OpaEngine {
         emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
@@ -2424,6 +2445,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.provider_credentialed {
                         ep["provider_credentialed"] = true.into();
+                    }
+                    if !e.token_grant_owner.is_empty() {
+                        // Preserve the gateway's endpoint identity so admission
+                        // can select its grants without reconstructing ownership
+                        // from overlapping host and path selectors.
+                        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
                     }
                     if is_mcp_protocol(&e.protocol) {
                         // Derive endpoint identity from the policy endpoint while
@@ -5434,7 +5461,7 @@ process:
     }
 
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine().unwrap();
         engine
             .add_policy("policy.rego".into(), TEST_POLICY.into())
             .unwrap();
@@ -5446,6 +5473,195 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         val == regorus::Value::from(true)
+    }
+
+    fn token_grant_owner_engine(policies: serde_json::Value) -> OpaEngine {
+        // Owner identities are trusted runtime metadata, so these Rego tests
+        // load the already-normalized data that follows policy conversion.
+        let mut engine = new_regorus_engine().expect("register runtime builtins");
+        engine
+            .add_policy("policy.rego".into(), TEST_POLICY.into())
+            .expect("load owner admission policy");
+        engine
+            .add_data_json(&serde_json::json!({"network_policies": policies}).to_string())
+            .expect("load normalized owner metadata");
+        OpaEngine::with_engine(engine, true)
+    }
+
+    fn token_grant_owner_endpoint(owner: &str, path: &str, method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host": "api.example.test", "ports": [8080], "path": path,
+            "protocol": "rest", "token_grant_owner": owner,
+            "rules": [{"allow": {"method": method, "path": path}}],
+        })
+    }
+
+    fn eval_token_grant_owners(engine: &OpaEngine, input: &serde_json::Value) -> Vec<String> {
+        let mut engine = engine.engine.lock().expect("owner query engine lock");
+        set_regorus_input(&mut engine, input.clone()).expect("owner query input");
+        let owners = engine
+            .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+            .expect("evaluate admitted grant owners");
+        let regorus::Value::Array(owners) = owners else {
+            panic!("owner query must always return an array, including denial");
+        };
+        owners
+            .iter()
+            .map(|owner| match owner {
+                regorus::Value::String(owner) => owner.to_string(),
+                _ => panic!("owner query must only return string identities"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn l7_token_grant_owners_require_exact_endpoint_admission() {
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "allowed": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-broad", "/a/**", "GET"),
+                    token_grant_owner_endpoint("owner-narrow", "/a/private/**", "POST"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "other_binary": {
+                "endpoints": [token_grant_owner_endpoint("owner-other", "/a/**", "GET")],
+                "binaries": [{"path": "/usr/bin/other-client"}],
+            },
+        }));
+        let input = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(
+            eval_l7(&engine, &input),
+            "broader endpoint permits forwarding"
+        );
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-broad"]);
+
+        let input = l7_input("api.example.test", 8080, "POST", "/a/private/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-narrow"]);
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_union_allow_and_global_deny() {
+        let mut broad = token_grant_owner_endpoint("owner-z", "/a/**", "GET");
+        broad["deny_rules"] = serde_json::json!([{"method": "GET", "path": "/a/private/blocked"}]);
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "broad": {
+                "endpoints": [broad],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "narrow": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-a", "/a/private/**", "GET"),
+                    token_grant_owner_endpoint("owner-z", "/a/private/**", "GET"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let allowed = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(eval_l7(&engine, &allowed));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &allowed),
+            ["owner-a", "owner-z"]
+        );
+
+        let denied = l7_input("api.example.test", 8080, "GET", "/a/private/blocked");
+        assert!(!eval_l7(&engine, &denied));
+        assert!(eval_token_grant_owners(&engine, &denied).is_empty());
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_binary_and_query_restrictions() {
+        let mut endpoint = token_grant_owner_endpoint("owner", "/a/**", "GET");
+        endpoint["rules"][0]["allow"]["query"] = serde_json::json!({"team": {"glob": "prod-*"}});
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [endpoint],
+                "binaries": [{"path": "/opt/tools/*"}],
+            },
+        }));
+        let mut input = l7_input_with_query(
+            "api.example.test",
+            8080,
+            "GET",
+            "/a/item",
+            serde_json::json!({"team": ["prod-east"]}),
+        );
+        input["exec"]["cmdline_paths"] = serde_json::json!(["/opt/tools/client"]);
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "argv cannot grant access"
+        );
+        input["exec"]["ancestors"] = serde_json::json!(["/opt/tools/client"]);
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner"]);
+        input["request"]["query_params"] = serde_json::json!({"team": ["prod-east", "dev"]});
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "every query value must match"
+        );
+    }
+
+    #[test]
+    fn l7_token_grant_owners_exclude_audit_denial_and_missing_metadata() {
+        let mut audit = token_grant_owner_endpoint("owner-audit", "/a/**", "GET");
+        audit["enforcement"] = "audit".into();
+        let mut missing = token_grant_owner_endpoint("", "/b/**", "GET");
+        missing
+            .as_object_mut()
+            .expect("endpoint object")
+            .remove("token_grant_owner");
+        let mut malformed = token_grant_owner_endpoint("", "/c/**", "GET");
+        malformed["token_grant_owner"] = 42.into();
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [audit, missing, malformed, token_grant_owner_endpoint("", "/d/**", "GET")],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let audit_denied = l7_input("api.example.test", 8080, "POST", "/a/item");
+        assert!(!eval_l7(&engine, &audit_denied));
+        assert!(eval_token_grant_owners(&engine, &audit_denied).is_empty());
+        for path in ["/b/item", "/c/item", "/d/item"] {
+            let input = l7_input("api.example.test", 8080, "GET", path);
+            assert!(eval_l7(&engine, &input));
+            assert!(eval_token_grant_owners(&engine, &input).is_empty());
+        }
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_proto_identity() {
+        let mut proto = test_proto();
+        proto.network_policies = std::collections::HashMap::from([(
+            "owner".to_owned(),
+            NetworkPolicyRule {
+                name: "owner".to_owned(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.test".to_owned(),
+                    port: 8080,
+                    path: "/a/**".to_owned(),
+                    protocol: "rest".to_owned(),
+                    token_grant_owner: "gateway-stamped-owner".to_owned(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_owned(),
+                            path: "/a/**".to_owned(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_owned(),
+                }],
+            },
+        )]);
+        let engine = OpaEngine::from_proto(&proto).expect("load stamped proto endpoint");
+        let input = l7_input("api.example.test", 8080, "GET", "/a/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &input),
+            ["gateway-stamped-owner"]
+        );
     }
 
     #[test]
@@ -5829,7 +6045,7 @@ network_policies:
 "#;
         let data_json: serde_json::Value =
             serde_yml::from_str(data).expect("fixture should parse as YAML");
-        let mut rego = regorus::Engine::new();
+        let mut rego = new_regorus_engine().unwrap();
         rego.add_policy("policy.rego".into(), TEST_POLICY.into())
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
@@ -5900,6 +6116,91 @@ network_policies:
             !eval_l7(&engine, &graphql_mutation),
             "REST rules on the same host must not allow a GraphQL mutation"
         );
+    }
+
+    #[test]
+    fn endpoint_path_matching_uses_canonical_rust_semantics() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("", "/p", true),
+            ("**", "/p/a", true),
+            ("/**", "/p/a", true),
+            ("/p", "/p", true),
+            ("/p", "/p/a", false),
+            ("/p/**", "/p", true),
+            ("/p/**", "/p/", true),
+            ("/p/**", "/p/a/b", true),
+            ("/p/**", "/prefix", false),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", true),
+            ("/v1/*", "/v1/a.json", true),
+            ("/v1/*", "/v1/a.b/c.d", true),
+            ("/v1/*", "/v2/a", false),
+            ("/v?/items", "/v1/items", true),
+            ("/v[12]/*", "/v2/a/b", true),
+            // A trailing /** treats its prefix literally, including glob syntax.
+            ("/v*/**", "/v1/a", false),
+            ("/v*/**", "/v*/a", true),
+            // Rust glob treats braces literally and invalid patterns as exact paths.
+            ("/a{b,c}", "/ab", false),
+            ("/a{b,c}", "/a{b,c}", true),
+            ("/[", "/[", true),
+            ("/[", "/p", false),
+        ] {
+            assert_eq!(
+                openshell_core::endpoint_path::matches(pattern, path),
+                expected
+            );
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({
+                    "endpoint": { "path": pattern },
+                    "request": { "path": path },
+                }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.endpoint_path_matches_request(input.endpoint, input.request)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "endpoint selector {pattern:?}, request path {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_path_matching_preserves_rule_path_globs() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("/p/**", "/p", false),
+            ("/p/**", "/p/a/b", true),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", false),
+        ] {
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({ "pattern": pattern, "path": path }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.path_matches(input.path, input.pattern)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "rule pattern {pattern:?}, request path {path:?}",
+            );
+        }
     }
 
     #[test]

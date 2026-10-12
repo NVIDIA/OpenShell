@@ -41,6 +41,16 @@ use crate::supervisor_owner::{
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a stopping replica waits for a redirected supervisor to publish its
+/// replacement session before marking the sandbox not ready.
+const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
+/// How long gateway shutdown waits for supervisor session cleanup, including
+/// handoff waits and the demotions that follow timed-out handoffs.
+pub(crate) const SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+// Timed-out handoffs demote one at a time after the grace expires, so leave at
+// least as much budget after the grace as the grace itself.
+const _: () =
+    assert!(SHUTDOWN_HANDOFF_GRACE.as_secs() * 2 <= SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT.as_secs());
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
@@ -2219,12 +2229,13 @@ async fn establish_supervisor_session(
     )
     .await
     {
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after endpoint status initialization failure");
-        }
+        abandon_session_setup(
+            &state,
+            &owner_index,
+            &owner_guard,
+            "endpoint status initialization",
+        )
+        .await;
         return Err(error);
     }
     if !state
@@ -2243,12 +2254,13 @@ async fn establish_supervisor_session(
         &session_id,
         provider_readiness,
     ) {
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after provider readiness initialization failure");
-        }
+        abandon_session_setup(
+            &state,
+            &owner_index,
+            &owner_guard,
+            "provider readiness initialization",
+        )
+        .await;
         return Err(error);
     }
 
@@ -2265,12 +2277,7 @@ async fn establish_supervisor_session(
     if tx.send(accepted).await.is_err() {
         // Only evict ourselves — a faster reconnect may already have
         // superseded this registration.
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %err, "supervisor session: failed to release owner after accept send failure");
-        }
+        abandon_session_setup(&state, &owner_index, &owner_guard, "accept send").await;
         return Err(Status::internal("failed to send session accepted"));
     }
 
@@ -2284,12 +2291,7 @@ async fn establish_supervisor_session(
         // response forces a reconnect, which gives the state transition a
         // fresh chance instead of leaving a healthy-looking supervisor tied
         // to a sandbox that never reaches Ready.
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        if let Err(release_error) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id, session_id, error = %release_error, "supervisor session: failed to release owner after lifecycle persistence failure");
-        }
+        abandon_session_setup(&state, &owner_index, &owner_guard, "lifecycle persistence").await;
         warn!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
@@ -2317,7 +2319,7 @@ async fn establish_supervisor_session(
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
-        run_session_loop(
+        let exit = run_session_loop(
             &state_clone,
             &sandbox_id_clone,
             &session_id,
@@ -2328,41 +2330,19 @@ async fn establish_supervisor_session(
             &mut owner_guard,
         )
         .await;
-        let terminal_finalized = state_clone
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id_clone, &session_id);
-        // Release only this exact ownership record. A newer supervisor session
-        // may already have published replacement ownership on another replica.
-        let owner_index = SupervisorOwnerIndex::new(state_clone.store.clone(), OWNER_TTL);
-        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id = %sandbox_id_clone, session_id = %session_id, error = %err, "supervisor session: failed to release owner record");
-        }
-        if let Some(terminal_finalized) = terminal_finalized {
-            info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
-            state_clone
-                .telemetry
-                .sandbox_session_disconnected(&sandbox_id_clone);
-            tokio::spawn(
-                crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
-                    Arc::clone(&state_clone),
-                    sandbox_id_clone.clone(),
-                ),
-            );
-            if let Err(err) = state_clone
-                .compute
-                .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
-                .await
-            {
-                warn!(
-                    sandbox_id = %sandbox_id_clone,
-                    session_id = %session_id,
-                    error = %err,
-                    "supervisor session: failed to mark sandbox disconnected"
-                );
-            }
-        } else {
-            info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended (already superseded)");
-        }
+        // Close both directions before cleanup. Queued messages, including a
+        // redirect, still reach the supervisor, and one without a redirect sees
+        // EOF at once instead of waiting out any handoff below.
+        drop(tx);
+        drop(inbound);
+        finish_supervisor_session(
+            &state_clone,
+            &sandbox_id_clone,
+            &session_id,
+            exit,
+            &owner_guard,
+        )
+        .await;
     });
 
     // Return the outbound stream.
@@ -2438,6 +2418,180 @@ pub async fn handle_finalize_main_process_exit(
     ))
 }
 
+/// Undo a session whose setup failed after the owner publish.
+///
+/// The publish may have replaced an owner whose replica kept the sandbox Ready
+/// for a shutdown handoff. Without the demotion, a failed takeover would leave
+/// the sandbox Ready with no session. The demotion is a no-op when another
+/// session has already taken over.
+async fn abandon_session_setup(
+    state: &ServerState,
+    owner_index: &SupervisorOwnerIndex,
+    owner_guard: &OwnerGuard,
+    failed_step: &str,
+) {
+    let sandbox_id = owner_guard.sandbox_id.as_str();
+    let session_id = owner_guard.session_id.as_str();
+    state
+        .supervisor_sessions
+        .remove_if_current(sandbox_id, session_id);
+    if let Err(err) = owner_index.release_if_current(owner_guard).await {
+        warn!(sandbox_id, session_id, failed_step, error = %err, "supervisor session: failed to release owner after setup failure");
+    }
+    if let Err(err) = state
+        .compute
+        .supervisor_session_disconnected(sandbox_id, false)
+        .await
+    {
+        warn!(
+            sandbox_id,
+            session_id,
+            failed_step,
+            error = %err,
+            "supervisor session: failed to mark sandbox disconnected after setup failure"
+        );
+    }
+}
+
+/// Why a supervisor session loop ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLoopExit {
+    /// This gateway is shutting down. `redirected` records whether a
+    /// `SessionRedirect` was queued for the supervisor.
+    GatewayShutdown { redirected: bool },
+    /// The session ended for any other reason.
+    Other,
+}
+
+/// Remove an ended session, release its ownership, and update the sandbox.
+async fn finish_supervisor_session(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    exit: SessionLoopExit,
+    owner_guard: &OwnerGuard,
+) {
+    let terminal_finalized = state
+        .supervisor_sessions
+        .remove_if_current(sandbox_id, session_id);
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    // A redirected supervisor reconnects to another replica right away. Keep
+    // this replica's owner record until its replacement session supersedes
+    // it, so every replica, including a reconciliation sweep, keeps seeing an
+    // owner and the sandbox stays Ready through the handoff. Without a
+    // redirect the supervisor reconnects with backoff through the Service, so
+    // waiting would only delay the demotion.
+    if exit == (SessionLoopExit::GatewayShutdown { redirected: true })
+        && terminal_finalized == Some(false)
+        && sandbox_may_be_ready(state, sandbox_id).await
+        && wait_for_replacement_owner(
+            &owner_index,
+            owner_guard,
+            tokio::time::Instant::now() + SHUTDOWN_HANDOFF_GRACE,
+        )
+        .await
+    {
+        info!(
+            sandbox_id,
+            session_id, "supervisor session: handed off to replacement session"
+        );
+    }
+    // Release only this exact ownership record. A newer supervisor session
+    // may already have published replacement ownership on another replica.
+    if let Err(err) = owner_index.release_if_current(owner_guard).await {
+        warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner record");
+    }
+    let Some(terminal_finalized) = terminal_finalized else {
+        info!(
+            sandbox_id,
+            session_id, "supervisor session: ended (already superseded)"
+        );
+        return;
+    };
+    info!(sandbox_id, session_id, "supervisor session: ended");
+    state.telemetry.sandbox_session_disconnected(sandbox_id);
+    tokio::spawn(
+        crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
+            Arc::clone(state),
+            sandbox_id.to_string(),
+        ),
+    );
+    if let Err(err) = state
+        .compute
+        .supervisor_session_disconnected(sandbox_id, terminal_finalized)
+        .await
+    {
+        warn!(
+            sandbox_id,
+            session_id,
+            error = %err,
+            "supervisor session: failed to mark sandbox disconnected"
+        );
+    }
+}
+
+/// Whether a handoff could keep the sandbox Ready. Only a known non-Ready
+/// phase rules it out; the disconnect that follows a handoff changes nothing
+/// for such a sandbox, so waiting would only slow shutdown.
+async fn sandbox_may_be_ready(state: &ServerState, sandbox_id: &str) -> bool {
+    match state.store.get_message::<Sandbox>(sandbox_id).await {
+        Ok(Some(sandbox)) => sandbox.phase() == SandboxPhase::Ready as i32,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// Wait until `deadline` for another session to supersede `owner_guard`.
+///
+/// Returns whether a fresh owner record from a different session appeared.
+/// Store errors are logged and polling continues, so a transient error during
+/// a roll does not cut the grace short. The deadline bounds every read.
+async fn wait_for_replacement_owner(
+    owner_index: &SupervisorOwnerIndex,
+    owner_guard: &OwnerGuard,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let sandbox_id = owner_guard.sandbox_id.as_str();
+    tokio::time::timeout_at(deadline, async {
+        let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+        loop {
+            match owner_index.read(sandbox_id).await {
+                Ok(Some(owner))
+                    if owner.session_id != owner_guard.session_id && owner.is_fresh(OWNER_TTL) =>
+                {
+                    return true;
+                }
+                Ok(_) => {}
+                Err(error) => warn!(
+                    sandbox_id,
+                    error = %error,
+                    "supervisor session: failed to read owner during handoff; retrying"
+                ),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Queue a shutdown redirect for a supervisor that supports one. Returns
+/// whether a redirect is now queued for the supervisor.
+fn queue_shutdown_redirect(
+    tx: &mpsc::Sender<GatewayMessage>,
+    supports_session_redirect: bool,
+    redirect: impl FnOnce() -> Option<SessionRedirect>,
+) -> bool {
+    supports_session_redirect
+        && redirect().is_some_and(|redirect| {
+            tx.try_send(GatewayMessage {
+                payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
+            })
+            .is_ok()
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session_loop(
     state: &Arc<ServerState>,
@@ -2445,10 +2599,10 @@ async fn run_session_loop(
     session_id: &str,
     supports_session_redirect: bool,
     tx: &mpsc::Sender<GatewayMessage>,
-    inbound: &mut tonic::Streaming<SupervisorMessage>,
+    inbound: &mut (impl tokio_stream::Stream<Item = Result<SupervisorMessage, Status>> + Unpin),
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
-) {
+) -> SessionLoopExit {
     let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
@@ -2459,21 +2613,17 @@ async fn run_session_loop(
         tokio::select! {
             () = async { let _ = gateway_shutdown.wait_for(|shutdown| *shutdown).await; } => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: gateway shutting down");
-                if supports_session_redirect
-                    && let Some(redirect) = preferred_peer_redirect(state, sandbox_id)
-                {
-                    let _ = tx.try_send(GatewayMessage {
-                        payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
-                    });
-                }
-                break;
+                let redirected = queue_shutdown_redirect(tx, supports_session_redirect, || {
+                    preferred_peer_redirect(state, sandbox_id)
+                });
+                return SessionLoopExit::GatewayShutdown { redirected };
             }
             _ = &mut shutdown_rx => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
                 break;
             }
-            msg = inbound.message() => {
-                match msg {
+            msg = tokio_stream::StreamExt::next(inbound) => {
+                match msg.transpose() {
                     Ok(Some(msg)) => {
                         if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
                             break;
@@ -2518,6 +2668,7 @@ async fn run_session_loop(
             }
         }
     }
+    SessionLoopExit::Other
 }
 
 async fn handle_supervisor_message(
@@ -2648,6 +2799,237 @@ mod tests {
     /// `register` signature without the receiver noise.
     fn make_shutdown() -> oneshot::Sender<()> {
         oneshot::channel::<()>().0
+    }
+
+    /// Store a Ready sandbox with a live local session that owns it.
+    async fn ready_sandbox_with_session(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> OwnerGuard {
+        let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        state.supervisor_sessions.register(
+            sandbox_id.into(),
+            session_id.into(),
+            tx,
+            make_shutdown(),
+        );
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                sandbox_id,
+                session_id,
+                "old-instance",
+                1,
+                &state.replica_id,
+                "local://old",
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn sandbox_phase(state: &Arc<ServerState>, sandbox_id: &str) -> SandboxPhase {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        SandboxPhase::try_from(sandbox.phase()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_reports_no_redirect_without_a_peer() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let mut owner_guard =
+            ready_sandbox_with_session(&state, "sb-no-peer", "session-no-peer").await;
+        state.gateway_shutting_down.store(true, Ordering::Release);
+        state.supervisor_sessions.shutdown.send_replace(true);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut inbound = futures::stream::pending::<Result<SupervisorMessage, Status>>();
+
+        let exit = run_session_loop(
+            &state,
+            "sb-no-peer",
+            "session-no-peer",
+            true,
+            &tx,
+            &mut inbound,
+            oneshot::channel().1,
+            &mut owner_guard,
+        )
+        .await;
+
+        assert_eq!(exit, SessionLoopExit::GatewayShutdown { redirected: false });
+        assert!(rx.try_recv().is_err(), "no redirect should be queued");
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_without_redirect_demotes_without_waiting() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let owner_guard =
+            ready_sandbox_with_session(&state, "sb-unredirected", "session-unredirected").await;
+
+        tokio::time::timeout(
+            SHUTDOWN_HANDOFF_GRACE / 5,
+            finish_supervisor_session(
+                &state,
+                "sb-unredirected",
+                "session-unredirected",
+                SessionLoopExit::GatewayShutdown { redirected: false },
+                &owner_guard,
+            ),
+        )
+        .await
+        .expect("a session without a redirect must not wait for a handoff");
+
+        assert_eq!(
+            sandbox_phase(&state, "sb-unredirected").await,
+            SandboxPhase::Provisioning
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_with_redirect_keeps_sandbox_ready_through_handoff() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let owner_guard =
+            ready_sandbox_with_session(&state, "sb-redirected", "session-redirected").await;
+
+        let finish_state = Arc::clone(&state);
+        let finish = tokio::spawn(async move {
+            finish_supervisor_session(
+                &finish_state,
+                "sb-redirected",
+                "session-redirected",
+                SessionLoopExit::GatewayShutdown { redirected: true },
+                &owner_guard,
+            )
+            .await;
+        });
+
+        // While the handoff is pending, a reconciliation sweep on any replica
+        // must still see an owner, or it would demote the sandbox.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!finish.is_finished());
+        assert!(
+            state
+                .compute
+                .supervisor_session_ready("sb-redirected")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sandbox_phase(&state, "sb-redirected").await,
+            SandboxPhase::Ready
+        );
+
+        // The redirected supervisor reconnects with a higher epoch, which
+        // supersedes the record the stopping replica still holds.
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-redirected",
+                "replacement-session",
+                "old-instance",
+                2,
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(SHUTDOWN_HANDOFF_GRACE, finish)
+            .await
+            .expect("handoff should finish once the replacement publishes")
+            .unwrap();
+
+        assert_eq!(
+            sandbox_phase(&state, "sb-redirected").await,
+            SandboxPhase::Ready
+        );
+        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .read("sb-redirected")
+            .await
+            .unwrap()
+            .expect("the replacement owner record must survive the release");
+        assert_eq!(owner.session_id, "replacement-session");
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_skips_handoff_for_sandbox_that_is_not_ready() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let owner_guard =
+            ready_sandbox_with_session(&state, "sb-not-ready", "session-not-ready").await;
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>("sb-not-ready")
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        tokio::time::timeout(
+            SHUTDOWN_HANDOFF_GRACE / 5,
+            finish_supervisor_session(
+                &state,
+                "sb-not-ready",
+                "session-not-ready",
+                SessionLoopExit::GatewayShutdown { redirected: true },
+                &owner_guard,
+            ),
+        )
+        .await
+        .expect("a sandbox that is not Ready must not wait for a handoff");
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_wait_ignores_own_record_and_gives_up_at_deadline() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let owner_guard =
+            ready_sandbox_with_session(&state, "sb-never-replaced", "session-own").await;
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        let started = tokio::time::Instant::now();
+
+        assert!(
+            !wait_for_replacement_owner(
+                &owner_index,
+                &owner_guard,
+                started + Duration::from_millis(300),
+            )
+            .await
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn test_redirect() -> SessionRedirect {
+        SessionRedirect {
+            peer_endpoint: "https://gw-1:8443".to_string(),
+            owner_replica_id: "gw-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn shutdown_redirect_is_queued_only_when_supported_available_and_sent() {
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(queue_shutdown_redirect(&tx, true, || Some(test_redirect())));
+        assert!(matches!(
+            rx.try_recv().unwrap().payload,
+            Some(gateway_message::Payload::SessionRedirect(_))
+        ));
+
+        assert!(!queue_shutdown_redirect(&tx, true, || None));
+        assert!(!queue_shutdown_redirect(&tx, false, || {
+            panic!("an unsupported supervisor must not compute a redirect")
+        }));
+
+        // A full outbound channel drops the redirect.
+        tx.try_send(GatewayMessage::default()).unwrap();
+        assert!(!queue_shutdown_redirect(
+            &tx,
+            true,
+            || Some(test_redirect())
+        ));
     }
 
     #[tokio::test]

@@ -157,7 +157,9 @@ device.
 Exact GPU device selection is driver-specific and still requires `--gpu`. For
 Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
 match the active driver; replace `docker` with `podman` when using Podman. CDI
-IDs are treated as opaque strings. The list must not contain duplicate IDs, and
+IDs must be valid CDI qualified names (`<vendor>/<class>=<name>`); host-device
+paths are rejected. Explicit selectors are not restricted to NVIDIA names.
+The list must not contain duplicate IDs, and
 its length must match the effective GPU count:
 
 ```shell
@@ -857,6 +859,8 @@ the upload merges into it and overwrites matching entries without deleting
 unrelated entries.
 
 OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
+
+For a single file uploaded without Git filtering, an existing destination directory receives `<directory>/<source-basename>`, with or without a trailing `/`. A symlink to a destination directory is preserved, and the file is written inside its target. A missing nested destination without `/` at the end instead names the uploaded file. For example, `openshell sandbox upload my-sandbox ./config.json /sandbox/settings.json --no-git-ignore` writes `settings.json`; uploading to an existing `/sandbox/settings` directory writes `settings/config.json`. Successful unfiltered uploads print the resulting path. Git-filtered uploads still treat the destination as a directory.
 
 Download files from the sandbox to your host:
 

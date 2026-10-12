@@ -27,9 +27,9 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
    will close automatically.
-5. Once vouched, you can submit pull requests.
+5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
-**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.
+**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
 
 ### Finding Work
 
@@ -67,6 +67,12 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 Do not start substantial issue-backed work until a maintainer has accepted the issue, unless a maintainer directly asks you to investigate or implement it. Once the work is authorized, use your agent to investigate the current code and behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
 
 Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
+
+Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
+
+Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+
+Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
 
@@ -484,10 +490,17 @@ By making a contribution to this project, I certify that:
 ```
 
 ```bash
-git commit -s -m "feat(sandbox): add new capability"
+git commit --signoff --message "feat(sandbox): add new capability"
 ```
 
-DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
+
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+### PR testing checklist
+
+Only mark a checklist item as complete after you have run and verified it, not as a plan for what you intend to test. Unchecked boxes at submission are fine; they show what still needs verification before merge.
 
 ## CI
 

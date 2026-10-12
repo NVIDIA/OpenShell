@@ -6,6 +6,8 @@
 pub(crate) mod destination;
 mod egress;
 mod relay;
+#[cfg(test)]
+pub(crate) use relay::relay_inspected_http_stream_for_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
@@ -41,8 +43,6 @@ use openshell_ocsf::{
     HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
-#[cfg(target_os = "linux")]
-use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -220,18 +220,7 @@ fn revision_scoped_dynamic_credentials(
     snapshot
         .dynamic_credentials
         .iter()
-        .map(|(key, credential)| {
-            let scoped_key = key.rsplit_once('\t').map_or_else(
-                || format!("rev:{}\t{key}", snapshot.revision),
-                |(endpoint_selector, provider_credential)| {
-                    format!(
-                        "{endpoint_selector}\trev:{}\t{provider_credential}",
-                        snapshot.revision
-                    )
-                },
-            );
-            (scoped_key, credential.clone())
-        })
+        .map(|(key, credential)| (snapshot.scoped_key(key), credential.clone()))
         .collect()
 }
 
@@ -1423,47 +1412,18 @@ fn build_transparent_tcp_allow_ocsf_event(
 
 #[cfg(target_os = "linux")]
 fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+    use nix::sys::socket::{getsockopt, sockopt};
+
     if stream.local_addr()?.is_ipv4() {
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut address: libc::sockaddr_in = std::mem::zeroed();
-            let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
-                .expect("sockaddr_in size fits socklen_t");
-            if libc::getsockopt(
-                fd,
-                libc::SOL_IP,
-                80, // SO_ORIGINAL_DST
-                std::ptr::addr_of_mut!(address).cast(),
-                std::ptr::addr_of_mut!(length),
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            return Ok(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::from(
-                    address.sin_addr.s_addr.to_ne_bytes(),
-                )),
-                u16::from_be(address.sin_port),
-            ));
-        }
-    }
-    #[allow(unsafe_code)]
-    unsafe {
-        let mut address: libc::sockaddr_in6 = std::mem::zeroed();
-        let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
-            .expect("sockaddr_in6 size fits socklen_t");
-        if libc::getsockopt(
-            fd,
-            libc::SOL_IPV6,
-            80, // IP6T_SO_ORIGINAL_DST
-            std::ptr::addr_of_mut!(address).cast(),
-            std::ptr::addr_of_mut!(length),
-        ) != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
+        let address = getsockopt(stream, sockopt::OriginalDst)?;
+        Ok(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::from(
+                address.sin_addr.s_addr.to_ne_bytes(),
+            )),
+            u16::from_be(address.sin_port),
+        ))
+    } else {
+        let address = getsockopt(stream, sockopt::Ip6tOriginalDst)?;
         Ok(SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
             u16::from_be(address.sin6_port),
@@ -5148,16 +5108,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
             .windows(2)
             .position(|window| window == b"\r\n")?
             + pos;
-        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
-        let size = usize::from_str_radix(
-            size_line
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or_default(),
-            16,
-        )
-        .ok()?;
+        let size = crate::l7::http::parse_chunk_size_line(&bytes[pos..line_end]).ok()?;
         pos = line_end.checked_add(2)?;
 
         if size == 0 {
@@ -5166,6 +5117,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
                     .windows(2)
                     .position(|window| window == b"\r\n")?
                     + pos;
+                crate::l7::http::validate_chunk_trailer_line(&bytes[pos..trailer_end]).ok()?;
                 let empty = trailer_end == pos;
                 pos = trailer_end.checked_add(2)?;
                 if empty {
@@ -5268,25 +5220,32 @@ async fn inject_token_grant_for_forward_request(
     method: &str,
     upstream_target: &str,
     forward_request_bytes: Vec<u8>,
-    l7_ctx: &crate::l7::relay::L7EvalContext,
+    l7_ctx: &mut crate::l7::relay::L7EvalContext,
+    inspection: Option<ForwardL7Reevaluation<'_>>,
 ) -> Result<Vec<u8>> {
-    let header_end = forward_request_bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(forward_request_bytes.len(), |p| p + 4);
-    let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
-        .into_diagnostic()
-        .map_err(|_| miette::miette!("Forward HTTP headers contain invalid UTF-8"))?;
-    let body_length = crate::l7::rest::parse_body_length(header_str)?;
-    let forward_request_for_token_grant = crate::l7::provider::L7Request {
-        action: method.to_string(),
-        target: upstream_target.to_string(),
-        query_params: std::collections::HashMap::new(),
-        raw_header: forward_request_bytes,
-        body_length,
-    };
+    let (path, _) = crate::l7::rest::parse_target_query(upstream_target)?;
+    let request = crate::l7::rest::request_from_buffered_http(
+        method,
+        path,
+        upstream_target,
+        forward_request_bytes,
+    )?;
+    if let Some(inspection) = inspection {
+        let (request, prepared_ctx) = crate::l7::relay::prepare_inspected_request(
+            request,
+            l7_ctx,
+            inspection.engine,
+            inspection.config,
+            inspection.request_info,
+        )
+        .await?;
+        *l7_ctx = prepared_ctx;
+        return Ok(request.raw_header);
+    }
 
-    crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
+    // L4-only forwarding keeps selector-based credentials; it has no inspected
+    // endpoint owner decision. Inspected requests always use preparation above.
+    crate::l7::token_grant_injection::inject_if_needed(request, l7_ctx)
         .await
         .map(|req| req.raw_header)
 }
@@ -6366,7 +6325,15 @@ async fn handle_forward_proxy(
         method,
         &upstream_target,
         forward_request_bytes,
-        &l7_ctx,
+        &mut l7_ctx,
+        forward_l7_reeval
+            .as_ref()
+            .zip(forward_tunnel_engine.as_ref())
+            .map(|((config, request_info), engine)| ForwardL7Reevaluation {
+                config,
+                engine,
+                request_info,
+            }),
     )
     .await
     {
@@ -6400,21 +6367,30 @@ async fn handle_forward_proxy(
     // asynchronous admission step. Holding an endpoint-scoped resolver across
     // middleware or token-grant awaits would let a revoked generation reach
     // the upstream.
-    let endpoint_credentials = endpoint_credentials_for_request(
-        l7_ctx.provider_credentials.as_ref(),
-        l7_ctx.secret_resolver.clone(),
-        &host_lc,
-        port,
-        &path,
-    );
+    let endpoint_credentials = if forward_l7_reeval.is_some() {
+        ForwardEndpointCredentials {
+            resolver: l7_ctx.secret_resolver.clone(),
+            body_classifier: l7_ctx.body_classifier.clone(),
+            revision: l7_ctx.provider_credential_revision,
+        }
+    } else {
+        endpoint_credentials_for_request(
+            l7_ctx.provider_credentials.as_ref(),
+            l7_ctx.secret_resolver.clone(),
+            &host_lc,
+            port,
+            &path,
+        )
+    };
     let secret_resolver = endpoint_credentials.resolver;
     let credential_generation = match (
         l7_ctx.provider_credentials.as_ref(),
         endpoint_credentials.revision,
     ) {
-        (Some(state), Some(revision)) => Some(crate::l7::rest::CredentialGenerationGuard::new(
-            state, revision,
-        )),
+        (Some(state), Some(revision)) => Some(
+            crate::l7::rest::CredentialGenerationGuard::new(state, revision)
+                .with_installation_id(l7_ctx.provider_credential_installation_id.as_deref()),
+        ),
         _ => None,
     };
     if let Some(guard) = credential_generation {
@@ -10256,7 +10232,7 @@ network_policies:
             },
         );
         let snapshot = ProviderCredentialSnapshot {
-            installation_id: String::new(),
+            installation_id: "fixture-installation".to_string(),
             revision: 42,
             child_env: std::collections::HashMap::new(),
             dynamic_credentials,
@@ -10265,7 +10241,7 @@ network_policies:
         let scoped = revision_scoped_dynamic_credentials(&snapshot);
 
         assert!(
-            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tprovider:access_token")
+            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tinstallation:fixture-installation\tprovider:access_token")
         );
     }
 
@@ -13191,12 +13167,13 @@ network_policies:
 
     #[tokio::test]
     async fn forward_proxy_injects_token_grant_before_rewriting_request() {
-        let (ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
+        let (mut ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
-            .await
-            .expect("forward token grant should inject");
+        let with_token =
+            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
+                .await
+                .expect("forward token grant should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13216,12 +13193,13 @@ network_policies:
 
     #[tokio::test]
     async fn forward_proxy_injects_token_exchange_before_rewriting_request() {
-        let (ctx, fixture) = forward_token_exchange_context(Ok("grant-token"));
+        let (mut ctx, fixture) = forward_token_exchange_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
-            .await
-            .expect("forward token exchange should inject");
+        let with_token =
+            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
+                .await
+                .expect("forward token exchange should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13243,12 +13221,13 @@ network_policies:
 
     #[tokio::test]
     async fn forward_proxy_token_grant_failure_returns_error_before_rewrite() {
-        let (ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
+        let (mut ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
-            .await
-            .expect_err("forward token grant failure should stop request rewriting");
+        let err =
+            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
+                .await
+                .expect_err("forward token grant failure should stop request rewriting");
 
         assert_eq!(err.to_string(), "Token grant failed");
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
@@ -13256,12 +13235,13 @@ network_policies:
 
     #[tokio::test]
     async fn forward_proxy_token_exchange_failure_returns_error_before_rewrite() {
-        let (ctx, fixture) = forward_token_exchange_context(Err("oauth unavailable"));
+        let (mut ctx, fixture) = forward_token_exchange_context(Err("oauth unavailable"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
-            .await
-            .expect_err("forward token exchange failure should stop request rewriting");
+        let err =
+            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
+                .await
+                .expect_err("forward token exchange failure should stop request rewriting");
 
         assert_eq!(err.to_string(), "Token grant failed");
         fixture.assert_one_token_exchange_request(
@@ -14862,23 +14842,10 @@ network_policies:
     // binary causes /proc/<pid>/exe readlink to return ENOENT on
     // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
     // the same crate so it inherits the user_home_t label.
-    fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
+    fn resolve_process_identity_denies_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
-        use std::ffi::CString;
         use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
-
-        struct ChildGuard(libc::pid_t);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
-                }
-            }
-        }
 
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
@@ -14902,41 +14869,8 @@ network_policies:
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
-        let fd = stream.as_raw_fd();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            assert!(flags >= 0, "F_GETFD failed");
-            assert_eq!(
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "F_SETFD failed"
-            );
-        }
-
-        let sleep_path = CString::new("/bin/sleep").unwrap();
-        let arg0 = CString::new("sleep").unwrap();
-        let arg1 = CString::new("30").unwrap();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        let child_pid = unsafe { libc::fork() };
-        assert!(child_pid >= 0, "fork failed");
-        if child_pid == 0 {
-            // libc/syscall FFI requires unsafe
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::execl(
-                    sleep_path.as_ptr(),
-                    arg0.as_ptr(),
-                    arg1.as_ptr(),
-                    std::ptr::null::<libc::c_char>(),
-                );
-                libc::_exit(127);
-            }
-        }
-
-        let _guard = ChildGuard(child_pid);
+        let guard = crate::test_support::spawn_socket_holder(&stream, true);
+        let child_pid = guard.0.id();
         let entrypoint_pid = std::process::id();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -15317,4 +15251,6 @@ network_policies:
 
     #[path = "compatibility.rs"]
     mod compatibility;
+    #[path = "token_grants.rs"]
+    mod token_grants;
 }

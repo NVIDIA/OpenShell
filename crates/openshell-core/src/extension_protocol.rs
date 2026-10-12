@@ -64,15 +64,23 @@ pub struct NegotiatedExtension {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NegotiationError {
     #[error(
-        "{family} extension '{name}' did not provide protocol metadata; upgrade the extension to a version that supports OpenShell extension negotiation"
+        "{family} extension '{name}' did not provide protocol metadata; upgrade the extension to a version that supports OpenShell extension negotiation (expected {expected})"
     )]
-    MissingMetadata { family: &'static str, name: String },
+    MissingMetadata {
+        family: &'static str,
+        name: String,
+        expected: String,
+    },
     #[error(
         "gateway did not provide protocol metadata to {family} extension '{name}'; upgrade the gateway and extension together"
     )]
     MissingGatewayMetadata { family: &'static str, name: String },
-    #[error("{family} extension '{name}' did not provide a protocol version")]
-    MissingProtocolVersion { family: &'static str, name: String },
+    #[error("{family} extension '{name}' did not provide a protocol version (expected {expected})")]
+    MissingProtocolVersion {
+        family: &'static str,
+        name: String,
+        expected: String,
+    },
     #[error(
         "{family} extension '{name}' uses unsupported protocol {remote_major}.{remote_minor}; gateway supports {local_major}.{local_minor}"
     )]
@@ -148,6 +156,14 @@ pub fn extension_metadata(
     }
 }
 
+/// Protocol version and base capability an extension of `family` must declare.
+fn expected_contract(family: ExtensionFamily) -> String {
+    format!(
+        "protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} and capability {}",
+        family.contract_capability()
+    )
+}
+
 pub fn negotiate(
     family: ExtensionFamily,
     configured_name: impl Into<String>,
@@ -156,20 +172,24 @@ pub fn negotiate(
 ) -> Result<NegotiatedExtension, NegotiationError> {
     let configured_name = configured_name.into();
     let family_name = family.as_str();
+    let expected = expected_contract(family);
     let extension = extension.ok_or_else(|| NegotiationError::MissingMetadata {
         family: family_name,
         name: configured_name.clone(),
+        expected: expected.clone(),
     })?;
     let version = extension.protocol_version.as_ref().ok_or_else(|| {
         NegotiationError::MissingProtocolVersion {
             family: family_name,
             name: configured_name.clone(),
+            expected: expected.clone(),
         }
     })?;
     let gateway_version = gateway.protocol_version.as_ref().ok_or_else(|| {
         NegotiationError::MissingProtocolVersion {
             family: family_name,
             name: "gateway".to_string(),
+            expected,
         }
     })?;
     if version.major != gateway_version.major {
@@ -401,10 +421,13 @@ mod tests {
     #[test]
     fn missing_metadata_and_major_skew_are_actionable() {
         let (gateway, mut extension) = compatible();
-        assert!(matches!(
-            negotiate(ExtensionFamily::Compute, "example", &gateway, None),
-            Err(NegotiationError::MissingMetadata { .. })
-        ));
+        let missing = negotiate(ExtensionFamily::Compute, "example", &gateway, None).unwrap_err();
+        assert!(matches!(missing, NegotiationError::MissingMetadata { .. }));
+        assert!(
+            missing
+                .to_string()
+                .contains("protocol 1.0 and capability openshell.compute.contract")
+        );
         extension.protocol_version.as_mut().unwrap().major = 2;
         assert!(matches!(
             negotiate(
@@ -415,6 +438,28 @@ mod tests {
             ),
             Err(NegotiationError::IncompatibleProtocol { .. })
         ));
+    }
+
+    #[test]
+    fn missing_protocol_version_names_the_expected_contract() {
+        let (gateway, mut extension) = compatible();
+        extension.protocol_version = None;
+        let error = negotiate(
+            ExtensionFamily::Compute,
+            "example",
+            &gateway,
+            Some(extension),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NegotiationError::MissingProtocolVersion { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("protocol 1.0 and capability openshell.compute.contract")
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ import {
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import { ProviderClient } from './providers.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -46,6 +47,11 @@ function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefin
   if (!timestamp) return undefined;
   const millis = timestamp.seconds * 1000n + BigInt(Math.trunc(timestamp.nanos / 1_000_000));
   return millis === 0n ? undefined : millis.toString();
+}
+
+function timestampEpochMs(timestamp: { seconds: bigint; nanos: number } | undefined): number | undefined {
+  const millis = timestampMillis(timestamp);
+  return millis ? Number(millis) : undefined;
 }
 
 // Generated protobuf message shapes that callers need to populate or round-trip
@@ -224,6 +230,8 @@ export interface SandboxRef {
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
   restartCount: number;
+  /** Creation time in epoch milliseconds; absent when the gateway omits it. */
+  createdAtMs?: number;
   nextRestartAtMs?: number;
   mainProcessStartedAtMs?: number;
 }
@@ -528,8 +536,6 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
-  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
-  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -548,8 +554,9 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
       : undefined,
     serviceUrls,
     restartCount: sandbox.status?.restartCount ?? 0,
-    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
-    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
+    createdAtMs: timestampEpochMs(meta.createdTime),
+    nextRestartAtMs: timestampEpochMs(sandbox.status?.nextRestartTime),
+    mainProcessStartedAtMs: timestampEpochMs(sandbox.status?.mainProcessStartedTime),
   };
 }
 
@@ -1809,6 +1816,8 @@ export class OpenShellClient {
   readonly sandbox: SandboxClient;
   /** Reusable sandbox workload template lifecycle. */
   readonly sandboxTemplates: SandboxTemplateClient;
+  /** Privileged provider credential retrieval; requires direct operator mTLS. */
+  readonly providers: ProviderClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1829,6 +1838,7 @@ export class OpenShellClient {
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
     this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
+    this.providers = new ProviderClient(transport);
   }
 
   /**

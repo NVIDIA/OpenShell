@@ -10,8 +10,8 @@ use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +41,10 @@ const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type
 const IDENTITY_AUDIENCE: &str = "identity-proxy";
 const IDENTITY_JWT_AUDIENCE: &str = "https://identity.openshell-e2e.test";
 const IDENTITY_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+// The harness gives this test binary one pair of SPIFFE listener endpoints.
+// Serialize their ownership even when the Rust test runner uses many threads.
+static SPIFFE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
 struct GrantObservations {
@@ -268,6 +272,13 @@ impl tonic::server::NamedService for SpiffeWorkloadApiServer {
 
 struct FixtureHandle {
     task: tokio::task::JoinHandle<()>,
+}
+
+impl FixtureHandle {
+    async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for FixtureHandle {
@@ -683,6 +694,68 @@ binaries:
     file
 }
 
+/// Writes a profile with one bearer token-exchange grant bound to `/{route}/**`.
+/// Each route carries its own audience so the token endpoint can tell which
+/// endpoint's grant the supervisor selected.
+fn write_route_profile(
+    profile_type: &str,
+    token_port: u16,
+    target_port: u16,
+    route: &str,
+) -> NamedTempFile {
+    let token_endpoint = format!("http://127.0.0.1:{token_port}/token");
+    let mut file = tempfile::Builder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .expect("create provider profile temp file");
+    let profile = format!(
+        r"id: {profile_type}
+display_name: Podman token exchange route e2e
+description: Route-bound bearer grant
+category: other
+credentials:
+  - name: subject_token
+    description: Stored user subject token
+    required: true
+  - name: access_token
+    description: Access token obtained through token exchange
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: {token_endpoint}
+      audience: audience-{route}
+      jwt_svid_audience: {token_endpoint}
+      client_assertion_type: {CLIENT_ASSERTION_TYPE}
+      requested_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
+      cache_ttl_seconds: 300
+      subject_token:
+        source: provider_credential
+        credential: subject_token
+        subject_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
+endpoints:
+  - host: host.openshell.internal
+    port: {target_port}
+    path: /{route}/**
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - 10.0.0.0/8
+      - 169.254.0.0/16
+      - 172.0.0.0/8
+      - 192.168.0.0/16
+binaries:
+  - /**
+"
+    );
+    file.write_all(profile.as_bytes())
+        .expect("write provider profile");
+    file.flush().expect("flush provider profile");
+    file
+}
+
 fn sandbox_script() -> String {
     r"set -eu
 echo token-server-ready
@@ -811,6 +884,7 @@ async fn create_provider_instance(
 
 #[tokio::test]
 async fn podman_provider_token_exchange_injects_independent_grants_across_sandboxes() {
+    let _fixture_guard = SPIFFE_FIXTURE_LOCK.lock().await;
     let gateway_socket = PathBuf::from(
         std::env::var("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET")
             .expect("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET must be set by e2e-podman.sh"),
@@ -882,6 +956,12 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
         run_cli_ignore_error(&["provider", "delete", name, "--yes"]).await;
         run_cli_ignore_error(&["profile", "delete", name, "--yes"]).await;
     }
+    // Release the shared SPIFFE endpoints before the next test binds them.
+    _target.shutdown().await;
+    _identity_token.shutdown().await;
+    _gateway_token.shutdown().await;
+    _provider_spiffe.shutdown().await;
+    _gateway_spiffe.shutdown().await;
 
     for outcome in [initial.0, initial.1, cached.0, cached.1] {
         assert_eq!(
@@ -916,5 +996,388 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
         observations.target_requests.load(Ordering::SeqCst),
         target_requests,
         "neither failed grant may forward any request bytes"
+    );
+}
+
+// Read one whole fixture request without consuming the following keepalive
+// request. OAuth forms can arrive separately from their headers.
+async fn read_route_fixture_request(
+    stream: &mut TcpStream,
+    observed_bytes: Option<&AtomicUsize>,
+) -> Result<Option<String>, String> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            if stream
+                .read(&mut byte)
+                .await
+                .map_err(|err| err.to_string())?
+                == 0
+            {
+                return if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    Err("partial fixture header".into())
+                };
+            }
+            bytes.push(byte[0]);
+            if let Some(observed) = observed_bytes {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            if bytes.len() > 16 * 1024 {
+                return Err("fixture header exceeds limit".into());
+            }
+        }
+        let header = std::str::from_utf8(&bytes).map_err(|err| err.to_string())?;
+        let length = header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>())
+            .transpose()
+            .map_err(|err| err.to_string())?
+            .unwrap_or(0);
+        if length > 64 * 1024 {
+            return Err("fixture body exceeds limit".into());
+        }
+        let header_len = bytes.len();
+        bytes.resize(header_len + length, 0);
+        stream
+            .read_exact(&mut bytes[header_len..])
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Some(observed) = observed_bytes {
+            observed.fetch_add(length, Ordering::Relaxed);
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|_| "fixture request timed out".to_owned())?
+}
+
+#[derive(Default)]
+struct RouteGrantState {
+    fail_next_b: AtomicBool,
+    supervisor_requests: Mutex<Vec<String>>,
+}
+
+async fn start_route_token_endpoint(port: u16, state: Arc<RouteGrantState>) -> FixtureHandle {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        .await
+        .expect("bind route token endpoint");
+    let task = tokio::spawn(async move {
+        let mut requests = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    let state = state.clone();
+                    requests.spawn(async move {
+                        let Ok(Some(request)) = read_route_fixture_request(&mut stream, None).await else { return; };
+                        let form = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+                        let fields = form.split('&').filter_map(|part| part.split_once('=')).collect::<HashMap<_, _>>();
+                        let subject = fields.get("subject_token").copied().unwrap_or_default();
+                        let route = match subject {
+                            "stored-a" | "intermediate-a" => "a",
+                            "stored-b" | "intermediate-b" => "b",
+                            _ => "",
+                        };
+                        let supervisor = subject.starts_with("intermediate-");
+                        let valid = !route.is_empty() && request.starts_with("POST /token ")
+                            && fields.get("client_assertion").is_some_and(|value| !value.is_empty())
+                            // Gateway exchange targets the supervisor's SPIFFE
+                            // subject; final exchange targets the route audience.
+                            && fields.get("audience").is_some_and(|value| !value.is_empty()
+                                && (!supervisor || *value == format!("audience-{route}")));
+                        let fail = if valid && supervisor {
+                            state.supervisor_requests.lock().expect("route grant requests lock").push(route.to_owned());
+                            route == "b" && state.fail_next_b.swap(false, Ordering::SeqCst)
+                        } else { false };
+                        let (status, body) = if fail {
+                            ("HTTP/1.1 503 Service Unavailable", json!({"error": "temporary_failure"}).to_string())
+                        } else if valid {
+                            let stage = if supervisor { "final" } else { "intermediate" };
+                            ("HTTP/1.1 200 OK", json!({
+                                "access_token": format!("{stage}-{route}"), "token_type": "Bearer", "expires_in": 300
+                            }).to_string())
+                        } else {
+                            ("HTTP/1.1 400 Bad Request", json!({"error": "unexpected_route_exchange"}).to_string())
+                        };
+                        let response = format!("{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(response.as_bytes())).await;
+                    });
+                }
+                _ = requests.join_next(), if !requests.is_empty() => {}
+            }
+        }
+    });
+    FixtureHandle { task }
+}
+
+struct RouteTargetRequest {
+    connection: usize,
+    path: String,
+    authorization: Vec<String>,
+    bytes: usize,
+}
+
+struct RouteTargetHandle {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+impl RouteTargetHandle {
+    async fn drain(mut self) -> Result<(), String> {
+        if let Some(stop) = self.stop.take() {
+            // A closed receiver means the task already stopped; joining still
+            // reports its error rather than hiding it behind the stop signal.
+            let _ = stop.send(());
+        }
+        tokio::time::timeout(Duration::from_secs(35), &mut self.task)
+            .await
+            .map_err(|_| "route target did not drain accepted connections".to_owned())?
+            .map_err(|err| format!("route target task failed: {err}"))?
+    }
+}
+
+impl Drop for RouteTargetHandle {
+    fn drop(&mut self) {
+        // Failure and timeout cleanup must also cancel the owned JoinSet.
+        self.task.abort();
+    }
+}
+
+async fn start_route_target(
+    port: u16,
+    observed: Arc<Mutex<Vec<RouteTargetRequest>>>,
+    observed_bytes: Arc<AtomicUsize>,
+) -> RouteTargetHandle {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        .await
+        .expect("bind route target");
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let next_connection = AtomicUsize::new(1);
+        let mut connections = tokio::task::JoinSet::new();
+        let mut completed = Vec::new();
+        let mut accept_error = None;
+        loop {
+            tokio::select! {
+                // Once the workload has closed, accept queued connections
+                // before stopping so their buffered bytes are also observed.
+                biased;
+                accepted = listener.accept() => {
+                    let (mut stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(err) => {
+                            accept_error = Some(format!("route target accept failed: {err}"));
+                            break;
+                        }
+                    };
+                    let connection = next_connection.fetch_add(1, Ordering::Relaxed);
+                    let observed = observed.clone();
+                    let observed_bytes = observed_bytes.clone();
+                    connections.spawn(async move {
+                        loop {
+                            let Some(request) = read_route_fixture_request(&mut stream, Some(&observed_bytes)).await? else { return Ok::<(), String>(()); };
+                            let path = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or_default().to_owned();
+                            let authorization = request.lines().filter_map(|line| line.split_once(':'))
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                                .map(|(_, value)| value.trim().to_owned()).collect::<Vec<_>>();
+                            let expected = if path.starts_with("/a/") { "Bearer final-a" } else { "Bearer final-b" };
+                            let valid = authorization.len() == 1 && authorization[0] == expected;
+                            observed.lock().expect("route target observations lock").push(RouteTargetRequest { connection, path, authorization, bytes: request.len() });
+                            let status = if valid { "HTTP/1.1 200 OK" } else { "HTTP/1.1 401 Unauthorized" };
+                            let response = format!("{status}\r\nContent-Length: 0\r\n\r\n");
+                            tokio::time::timeout(Duration::from_secs(5), stream.write_all(response.as_bytes())).await
+                                .map_err(|_| "route target response write timed out".to_owned())?
+                                .map_err(|err| format!("route target response write failed: {err}"))?;
+                        }
+                    });
+                }
+                _ = &mut stopped => break,
+                Some(result) = connections.join_next(), if !connections.is_empty() => completed.push(result),
+            }
+        }
+        drop(listener);
+        // Only EOF proves that the byte counter includes everything sent on
+        // each accepted connection. Do not abort pending readers on success.
+        while let Some(result) = connections.join_next().await {
+            completed.push(result);
+        }
+        if let Some(error) = accept_error {
+            return Err(error);
+        }
+        for result in completed {
+            result.map_err(|err| format!("route target reader task failed: {err}"))??;
+        }
+        Ok(())
+    });
+    RouteTargetHandle {
+        stop: Some(stop),
+        task,
+    }
+}
+
+#[tokio::test]
+async fn podman_provider_routes_recover_and_select_a_b_a_on_one_connection() {
+    let _fixture_guard = SPIFFE_FIXTURE_LOCK.lock().await;
+    let gateway_socket = PathBuf::from(
+        std::env::var("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET")
+            .expect("gateway SPIFFE fixture endpoint"),
+    );
+    let provider_socket = PathBuf::from(
+        std::env::var("OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET")
+            .expect("provider SPIFFE fixture endpoint"),
+    );
+    // A remote Podman VM can forward this fixed loopback port to the test
+    // process. Keep the issuer URL on loopback so the fixture obeys the
+    // production token endpoint transport policy on both sides of the tunnel.
+    let token_port = std::env::var("OPENSHELL_E2E_TOKEN_PORT").map_or_else(
+        |_| find_free_port(),
+        |port| {
+            let port = port
+                .parse::<u16>()
+                .expect("OPENSHELL_E2E_TOKEN_PORT must be a valid TCP port");
+            assert_ne!(port, 0, "OPENSHELL_E2E_TOKEN_PORT must be nonzero");
+            port
+        },
+    );
+    let target_port = find_free_port();
+    let grants = Arc::new(RouteGrantState::default());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed_bytes = Arc::new(AtomicUsize::new(0));
+    let _gateway_spiffe = start_spiffe_workload_api(
+        &gateway_socket,
+        &format!("spiffe://{TRUST_DOMAIN}/openshell/gateway"),
+    )
+    .await;
+    let _provider_spiffe = start_spiffe_workload_api(
+        &provider_socket,
+        &format!("spiffe://{TRUST_DOMAIN}/openshell/sandbox/e2e"),
+    )
+    .await;
+    let _token_endpoint = start_route_token_endpoint(token_port, grants.clone()).await;
+    let _target = start_route_target(target_port, observed.clone(), observed_bytes.clone()).await;
+    let names = ["a", "b"].map(|route| format!("podman-route-{route}-{}", std::process::id()));
+    for name in &names {
+        run_cli_ignore_error(&["provider", "delete", name, "--yes"]).await;
+        run_cli_ignore_error(&["profile", "delete", name, "--yes"]).await;
+    }
+    let result: Result<String, String> = async {
+        for (route, name) in ["a", "b"].iter().zip(&names) {
+            let profile = write_route_profile(name, token_port, target_port, route);
+            run_cli(&[
+                "profile",
+                "import",
+                "-f",
+                profile.path().to_str().expect("UTF-8 profile path"),
+            ])
+            .await?;
+            run_cli(&[
+                "provider",
+                "create",
+                "--name",
+                name,
+                "--type",
+                name,
+                "--credential",
+                &format!("subject_token=stored-{route}"),
+            ])
+            .await?;
+        }
+        let mut sandbox = SandboxGuard::create_keep_with_args(
+            &["--provider", &names[0], "--provider", &names[1]],
+            &["sh", "-lc", &sandbox_script()],
+            "token-server-ready",
+        )
+        .await?;
+        grants.fail_next_b.store(true, Ordering::SeqCst);
+        // The supervisor mediates direct workload connections as CONNECT.
+        // HTTPConnection keeps one client socket for the successful A/B/A run.
+        let script = format!(
+            r#"import http.client
+host = 'host.openshell.internal'
+port = {target_port}
+first = http.client.HTTPConnection(host, port, timeout=10)
+first.request('GET', '/b/failure', headers={{'Authorization': 'Bearer stale-value'}})
+failed = first.getresponse()
+failed.read()
+assert failed.status == 502, 'the controlled grant failure must return 502'
+assert failed.will_close, 'the failed tunnel must close'
+first.close()
+recovered = http.client.HTTPConnection(host, port, timeout=10)
+connection = None
+for path in ['/a/first', '/b/second', '/a/third']:
+    recovered.request('GET', path, headers={{'Authorization': 'Bearer stale-value'}})
+    if connection is None:
+        connection = recovered.sock
+    assert recovered.sock is connection, 'client connection was replaced'
+    response = recovered.getresponse()
+    response.read()
+    assert response.status == 200, 'upstream rejected the selected credential'
+    assert recovered.sock is connection and connection.fileno() >= 0, 'keepalive connection closed'
+recovered.close()
+print('route-recovery-a-b-a-ok')
+"#
+        );
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            sandbox.exec(&["python3", "-c", &script]),
+        )
+        .await
+        .map_err(|_| "route workload timed out".to_owned());
+        sandbox.cleanup().await;
+        output?
+    }
+    .await;
+    for name in &names {
+        run_cli_ignore_error(&["provider", "delete", name, "--yes"]).await;
+        run_cli_ignore_error(&["profile", "delete", name, "--yes"]).await;
+    }
+    let target_result = _target.drain().await;
+    _token_endpoint.shutdown().await;
+    _provider_spiffe.shutdown().await;
+    _gateway_spiffe.shutdown().await;
+    let output = result.expect("gateway-configured route workload succeeds");
+    target_result.expect("route target observes EOF on every accepted connection");
+    assert!(output.contains("route-recovery-a-b-a-ok"));
+    let requests = observed.lock().expect("route target observations lock");
+    assert_eq!(requests.len(), 3, "failed grant must not reach the target");
+    assert_eq!(
+        observed_bytes.load(Ordering::Relaxed),
+        requests.iter().map(|request| request.bytes).sum::<usize>(),
+        "no partial failed request reached the target"
+    );
+    for ((request, path), token) in requests
+        .iter()
+        .zip(["/a/first", "/b/second", "/a/third"])
+        .zip(["Bearer final-a", "Bearer final-b", "Bearer final-a"])
+    {
+        assert_eq!(request.path, path);
+        assert_eq!(
+            request.connection, requests[0].connection,
+            "upstream connection reused"
+        );
+        assert_eq!(
+            request.authorization.len(),
+            1,
+            "one Authorization replacement"
+        );
+        assert!(
+            request.authorization[0] == token,
+            "the admitted path owns the injected token"
+        );
+    }
+    assert_eq!(
+        *grants
+            .supervisor_requests
+            .lock()
+            .expect("route grant requests lock"),
+        ["b", "a", "b"],
+        "failed grant retries; repeated A uses its own cached token"
     );
 }

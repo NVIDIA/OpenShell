@@ -72,6 +72,50 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
+### Advisory release compatibility review
+
+`Codex Compatibility Review` runs alongside tagged release qualification. It
+reviews the cumulative diff from the previous reachable stable release to the
+exact candidate commit, using the same tag-derived patch/minor policy as the
+protobuf check. It reviews public Rust, Python, Go, and TypeScript SDKs, API
+behavior, CLI contracts, configuration, policy, Helm, and persisted state.
+It does not replace Buf or change the release train's version.
+
+The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
+runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
+`CODEX_SECURITY_API_KEY` as Codex Security. The workflow uses `uv run` from the
+existing Nix devShell; the SDK is not an OpenShell package dependency.
+It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
+repository; candidate-side agent configuration and instructions are not loaded.
+It does not run candidate builds or tests. The review has a 30-minute execution
+limit inside a 40-minute job timeout.
+
+This rollout is report-only: findings and review failures cannot block
+publication. The job is independent of the required qualification dependency
+chain. Its summary distinguishes complete, incomplete, and failed execution
+from the agent's compatibility assessment. Missing credentials, invalid
+baselines, source mismatches, malformed reports, and timeouts are not clean
+reviews. A completed review still does not prove that no breaks exist.
+
+Each run retains `report.json` and `report.md` for 90 days in
+`compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
+revisions, the train, tool/model metadata, coverage gaps, and actionable
+findings. Raw agent transcripts are not published. The qualification summary
+links this separate advisory evidence without waiting for it; compatibility
+review remains missing from the blocking RFC profile during this rollout.
+
+After the workflow is available on the default branch, run a review without
+building or publishing a release:
+
+```shell
+gh workflow run codex-compatibility.yml -f candidate_ref=v0.1.3-pre.1
+```
+
+Use an existing release tag appropriate to the train being reviewed. Inspect
+the report before deciding whether to fix a finding, document an intentional
+minor-release break, or investigate an uncertain result. Enabling a blocking
+agent gate is separate work after calibration.
+
 `Branch E2E Checks` builds binaries and images only when an E2E suite is
 selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
@@ -100,10 +144,18 @@ push-triggered workflow jobs themselves.
 
 ### K3s conformance version baseline
 
-The tmachine `ubuntu-k3s` conformance lane pins Agent Sandbox v0.5.0 as the
-compatibility baseline for the v1beta1 Sandbox API. It does not track the local
+The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
+compatibility baseline for the v1beta1 Sandbox API. They do not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
+
+The `ubuntu-k3s` lanes register the gateway's ClusterIP Service directly, so
+recreating the Service requires reprovisioning the fixture. The `k3s` lane runs
+one plaintext gateway. The `k3s-ha` lane runs the supported HA configuration:
+three gateway replicas sharing PostgreSQL, serving TLS, with the CLI connecting
+over mTLS. Before conformance, every installer waits up to five minutes for a
+connected gateway; interactive shells skip the wait. K3s failures upload
+diagnostics as `tmachine-diagnostics-*` artifacts.
 
 ### Run only the policy advisor conformance tests
 
@@ -443,7 +495,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs. `Required CI Gates` publishes successful not-applicable statuses for both E2E contexts on merge-group events and subsequent merge-group workflow completions.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -485,6 +537,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
+| `.github/workflows/codex-compatibility.yml` | Reviews cumulative tagged-release compatibility with Codex and retains advisory findings and coverage; it does not gate publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
@@ -496,9 +549,9 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
-| `.github/workflows/snap-package.yml` | Builds Snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing Snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after Snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 

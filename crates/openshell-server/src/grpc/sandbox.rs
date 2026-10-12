@@ -322,6 +322,9 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
 fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
     match principal {
         crate::auth::principal::Principal::User(user) => Ok(user.identity.subject.clone()),
+        crate::auth::principal::Principal::Operator(operator) => {
+            Ok(format!("operator:{}", operator.identity.subject))
+        }
         _ => Err(Status::permission_denied(
             "rootfs tar staging requires a user principal",
         )),

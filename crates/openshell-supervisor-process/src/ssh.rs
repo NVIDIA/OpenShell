@@ -652,14 +652,19 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
         // preceding pty_request and expects pipe-based I/O with clean LF line
         // endings.  Forcing a PTY here caused CRLF translation which made
         // VS Code misdetect the platform as Windows (and then try to run
         // `powershell`).
-        self.start_shell(channel, session.handle(), None).await?;
+        match self.start_shell(channel, session.handle(), None).await {
+            Ok(()) => session.channel_success(channel)?,
+            Err(error) => {
+                warn!(%error, ?channel, "failed to start boundary shell");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 
@@ -669,13 +674,21 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
         let command = String::from_utf8_lossy(data).trim().to_string();
         if command.is_empty() {
+            session.channel_success(channel)?;
             return Ok(());
         }
-        self.start_shell(channel, session.handle(), Some(command))
-            .await?;
+        match self
+            .start_shell(channel, session.handle(), Some(command))
+            .await
+        {
+            Ok(()) => session.channel_success(channel)?,
+            Err(error) => {
+                warn!(%error, ?channel, "failed to start boundary exec");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 

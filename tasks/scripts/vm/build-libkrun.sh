@@ -416,7 +416,7 @@ ensure_cargo_for_libkrun
 ensure_libclang_for_libkrun
 
 # LIBKRUN_REF is sourced from pins.env (line 32); env-var override still works.
-LIBKRUN_REF="${LIBKRUN_REF:-728df8125077d0db44265f6e997c72b81b65c015}"
+LIBKRUN_REF="${LIBKRUN_REF:-227b2de6ed323fe180e02f871c5f325a90c13cc2}"
 
 if [ ! -d libkrun ]; then
   echo "    Cloning libkrun..."

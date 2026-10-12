@@ -196,6 +196,8 @@ openshell provider delete my-github
 
 `provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
 
+For an external updater whose workload must retain its original environment reference, use a credential profile with `stable_placeholder: true` and a gateway and supervisor that support that mode. The CLI checks gateway support before importing or updating the opt-in. The default remains `false`, preserving existing revision-scoped behavior and ordinary legacy gateway operation. Preserve the supervisor-issued value; never manufacture a placeholder. After the supervisor installs a value-only update, the retained reference resolves the current credential only at its effective host, port, and path binding. Replacement, expiry, changed binding, or an activated detach prevents old authority from resolving. Remove the opt-in and activate that change before downgrading the gateway. See the provider profiles documentation for the lifecycle contract and its separation from gateway-managed refresh and `token_grant`.
+
 ### Configure credential refresh
 
 Use refresh commands only when the provider profile and gateway support refreshable credentials:
@@ -242,12 +244,22 @@ When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 `LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
 user must obtain a new OAuth grant and run `provider refresh configure`,
 `fix_configuration` means an operator must repair the OAuth client, scopes, or
-administrator policy, and `investigate` means the issuer returned an
-unrecognized response. The gateway parks `reauthorize` records until a manual
-rotate or reconfiguration. It retries
+administrator policy, and `investigate` can mean an unrecognized issuer
+response or an interrupted mint with an uncertain outcome. The gateway parks
+`reauthorize` records until a manual rotate or reconfiguration. It retries
 `fix_configuration` records hourly so externally repaired configuration can
 recover without rapid token-endpoint traffic. The existing access credential
 remains usable only until its recorded expiry.
+
+`refresh_in_progress` and `refresh_committing` can indicate active work. Check
+gateway health and refresh status again before treating them as failures;
+concurrent refresh requests wait for the active mint. If a gateway interruption
+leaves either marker behind and rotation reports an uncertain previous mint,
+the gateway will not reuse the grant automatically. Investigate the issuer state,
+then run `provider refresh configure` with a valid grant. Obtain a new OAuth
+grant first if the previous refresh token may have been consumed. Do not clear
+the marker directly or repeatedly rotate it; reconfiguration revokes old
+workload handles, so restart processes holding them.
 
 ---
 
@@ -869,6 +881,8 @@ openshell settings set --global --key ocsf_json_enabled --value true
 # OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
 openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
+
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 

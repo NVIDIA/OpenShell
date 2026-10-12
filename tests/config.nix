@@ -19,6 +19,14 @@ let
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
+  k3sInputs = {
+    agent_sandbox_version = "0.5.0";
+    openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+    openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+    openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+    openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+    openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+  };
   config = (pkgs.formats.yaml { }).generate "tmachine-config.yaml" {
     machines = [
       {
@@ -85,13 +93,14 @@ let
         name = "k3s";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
-        inputs = {
-          agent_sandbox_version = "0.5.0";
-          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
-          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
-          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
-          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
-          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        inputs = k3sInputs;
+      }
+      {
+        name = "k3s-ha";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s-ha.yaml" ];
+        inputs = k3sInputs // {
+          openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
         };
       }
       {

@@ -23,7 +23,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
@@ -225,6 +224,10 @@ When behavior, commands, or development workflows change, review the related age
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
+
+## Terminology
+
+- Treat `snap` as a common noun. Lowercase it in ordinary prose, but capitalize it where normal English sentence or title casing requires. Preserve proper names such as Snap Store, Snapcraft, and snapd.
 
 ## Security
 
