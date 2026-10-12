@@ -191,6 +191,12 @@ class _EntryFailureClient:
             raise self.close_error
 
 
+def _use_client(monkeypatch, client):
+    monkeypatch.setattr(
+        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
+    )
+
+
 @pytest.mark.parametrize(
     ("fail_at", "kwargs"),
     [
@@ -203,9 +209,7 @@ class _EntryFailureClient:
 )
 def test_context_entry_failure_closes_client(monkeypatch, fail_at, kwargs):
     client = _EntryFailureClient(fail_at)
-    monkeypatch.setattr(
-        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
-    )
+    _use_client(monkeypatch, client)
     managed = Sandbox(workspace="default", delete_on_exit=False, **kwargs)
 
     with pytest.raises(RuntimeError) as observed, managed:
@@ -219,9 +223,7 @@ def test_context_entry_failure_closes_client(monkeypatch, fail_at, kwargs):
 
 def test_context_entry_failure_keeps_original_error_when_close_fails(monkeypatch):
     client = _EntryFailureClient("wait_ready", close_error=OSError("close failed"))
-    monkeypatch.setattr(
-        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
-    )
+    _use_client(monkeypatch, client)
     managed = Sandbox(workspace="default")
 
     with pytest.raises(RuntimeError) as observed, managed:
@@ -235,9 +237,7 @@ def test_context_entry_failure_keeps_original_error_when_close_fails(monkeypatch
 
 def test_context_closes_client_once_on_success(monkeypatch):
     client = _EntryFailureClient(None)
-    monkeypatch.setattr(
-        SandboxClient, "from_active_cluster", classmethod(lambda _cls, **_kw: client)
-    )
+    _use_client(monkeypatch, client)
 
     with Sandbox(workspace="default", delete_on_exit=False):
         assert client.closed == 0
