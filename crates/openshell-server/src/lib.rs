@@ -1192,7 +1192,13 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             let certificate_sha256 =
-                                multiplex::extract_peer_certificate_sha256(&tls_stream);
+                                match multiplex::extract_peer_certificate_sha256(&tls_stream) {
+                                    Ok(fingerprint) => fingerprint,
+                                    Err(e) => {
+                                        error!(error = %e, client = %addr, "Failed to fingerprint peer certificate");
+                                        return;
+                                    }
+                                };
                             if let Err(e) = service
                                 .serve_with_verified_certificate(
                                     tls_stream,

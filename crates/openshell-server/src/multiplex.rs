@@ -1453,10 +1453,16 @@ where
 /// Fingerprint of the leaf certificate verified during the TLS handshake.
 pub fn extract_peer_certificate_sha256<S>(
     stream: &tokio_rustls::server::TlsStream<S>,
-) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let certificate = stream.get_ref().1.peer_certificates()?.first()?;
-    Some(format!("{:x}", Sha256::digest(certificate.as_ref())))
+) -> Result<Option<String>, openshell_crypto::CryptoError> {
+    let Some(certificate) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+    else {
+        return Ok(None);
+    };
+    openshell_crypto::sha256(certificate.as_ref()).map(|digest| Some(hex::encode(digest)))
 }
 
 /// Boxed body type for uniform handling.

@@ -116,8 +116,9 @@ scheduling randomness are not migrated. No SSH or PQC capability is asserted by
 the primitive capability report. OpenSSL, strict policy, module version discovery,
 and deployment qualification belong in follow-up work.
 
-Runtime refresh replay hashes and derived token IDs, bearer-cache fingerprints,
-Sandbox Protocol request digests and request-ID entropy, Kubernetes/VM runtime
+Operator certificate fingerprints, runtime refresh replay hashes and derived token
+IDs, bearer-cache fingerprints, Sandbox Protocol request digests and request-ID
+entropy, Kubernetes/VM runtime
 fence entropy, VM socket-directory entropy, and rootfs staging-token entropy use
 the selected backend.
 These operations retain SHA-256, UUID v4 encoding where applicable, and existing
@@ -136,6 +137,7 @@ not a whole-application crypto coverage claim:
 | UUID generation outside Sandbox Protocol request envelopes | Includes runtime identities, authentication nonces, and session identifiers as well as ordinary correlation IDs. These still use the UUID library's entropy source. They are not attested by context posture; a follow-up must classify each use and propagate entropy failure through currently infallible constructors. |
 | DNS policy contract fingerprints (`openshell-supervisor-network::policy_dns`) | These bind cached DNS state to policy and are security-relevant. They remain outside this migration; migrating the cache identity API and its failure handling is required for exclusive backend ownership. |
 | Credential-storage names (`credentials`, Kubernetes Secrets, Vault) | Deterministic namespace derivation, not encryption or proof of authorization. These retain their current hashing implementation and stored names; backend coverage is not asserted for them. |
+| Provider-refresh advisory-lock keys | Deterministic database lock selection for coordinating refreshes, not authentication or encryption. These remain outside the selected-backend contract. |
 | Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
 | Schema compatibility tests, content-cache identities, retry jitter, test fixtures | Non-authentication uses remain unchanged. |

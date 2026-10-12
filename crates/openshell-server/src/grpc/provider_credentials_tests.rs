@@ -754,7 +754,7 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
             tokio::spawn(async move {
                 if let Ok(stream) = acceptor.accept(stream).await {
                     let identity = extract_peer_identity(&stream);
-                    let fingerprint = extract_peer_certificate_sha256(&stream);
+                    let fingerprint = extract_peer_certificate_sha256(&stream).unwrap();
                     let _ = service
                         .serve_with_verified_certificate(
                             stream,
@@ -785,11 +785,11 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                 .distinguished_name
                 .push(rcgen::DnType::OrganizationalUnitName, role);
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-            let key = rcgen::KeyPair::generate().unwrap();
-            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            let key = openshell_crypto::pki::generate_keypair().unwrap();
+            let cert = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key).unwrap();
             tls = tls.identity(tonic::transport::Identity::from_pem(
                 cert.pem(),
-                key.serialize_pem(),
+                key.serialize_pem().unwrap(),
             ));
         }
         let channel = Endpoint::from_shared(format!("https://localhost:{}", address.port()))
