@@ -1896,16 +1896,19 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
 /// Read the `RETURNING` columns of a write, so the result describes that write
 /// and not whichever one landed last.
 fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     WriteResult {
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(row),
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
     }
 }
 
+fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
+    let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+    resource_version.max(1).cast_unsigned()
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -1915,7 +1918,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(&row),
     }
 }
 

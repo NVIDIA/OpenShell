@@ -2200,6 +2200,25 @@ async fn cas_concurrent_updates_one_succeeds() {
     assert_eq!(record.resource_version, 2);
 }
 
+/// Write `payload` to the shared `sandbox-1` row under `condition`.
+async fn put_sandbox_1(
+    store: &Store,
+    payload: &str,
+    condition: super::WriteCondition,
+) -> Result<super::WriteResult, PersistenceError> {
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            "default",
+            payload.as_bytes(),
+            None,
+            condition,
+        )
+        .await
+}
+
 /// Each write must report the version it produced, even while other writers
 /// race on the same row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2214,16 +2233,7 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let url = on_disk_store_url(&tmp.path().join("openshell.db"));
     let store = Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
-    store
-        .put_if(
-            "sandbox",
-            "id-1",
-            "sandbox-1",
-            "default",
-            b"initial",
-            None,
-            WriteCondition::MustCreate,
-        )
+    put_sandbox_1(&store, "initial", WriteCondition::MustCreate)
         .await
         .unwrap();
 
@@ -2233,16 +2243,7 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
             let mut versions = Vec::new();
             for write in 0..WRITES {
                 let payload = format!("{writer}-{write}");
-                let unconditional = store
-                    .put_if(
-                        "sandbox",
-                        "id-1",
-                        "sandbox-1",
-                        "default",
-                        payload.as_bytes(),
-                        None,
-                        WriteCondition::Unconditional,
-                    )
+                let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
                     .await
                     .unwrap();
                 versions.push(unconditional.resource_version);
@@ -2250,18 +2251,8 @@ async fn sqlite_concurrent_writes_return_their_own_resource_version() {
                 // Retry the version-checked update until it wins a race.
                 loop {
                     let current = store.get("sandbox", "id-1").await.unwrap().unwrap();
-                    match store
-                        .put_if(
-                            "sandbox",
-                            "id-1",
-                            "sandbox-1",
-                            "default",
-                            payload.as_bytes(),
-                            None,
-                            WriteCondition::MatchResourceVersion(current.resource_version),
-                        )
-                        .await
-                    {
+                    let condition = WriteCondition::MatchResourceVersion(current.resource_version);
+                    match put_sandbox_1(&store, &payload, condition).await {
                         Ok(result) => {
                             versions.push(result.resource_version);
                             break;
