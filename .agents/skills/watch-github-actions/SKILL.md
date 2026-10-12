@@ -167,7 +167,9 @@ During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Both tagged pre-release and stable
+the `release-tag-v1` qualification profile. Release Tag calls the reusable
+`release-qualification.yml` workflow to run the checks and collect their results.
+Both tagged pre-release and stable
 publication require this profile to pass. Failed, cancelled, or skipped suites
 block publication; build artifacts and qualification evidence remain in Actions
 storage for diagnosis. Source-SHA images are staging inputs for qualification.
@@ -186,8 +188,10 @@ review; a PR description, general approval, or earlier bot report is insufficien
 The full report retains unchanged findings with previous-comment links.
 `comment.md` contains only new or materially updated findings, and an unchanged
 review does not post another PR comment. Inspect the full artifact for outstanding
-breaks even when the bot is silent. The qualification summary points to it
-without waiting for completion. Do not
+breaks even when the bot is silent. The qualification summary points to it.
+The review starts after Security Scan finishes, and the two Codex workflows share
+the `codex-release-review` concurrency group to prevent overlapping API usage
+across runs. The qualification caller waits for both reviews to finish. Do not
 rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
 with an existing candidate tag; that path does not publish release artifacts.
 

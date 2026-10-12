@@ -71,8 +71,8 @@ permissions:
   security-events: write
 
 concurrency:
-  group: codex-security-release-qualification
-  cancel-in-progress: true
+  group: codex-release-review
+  cancel-in-progress: false
 
 env:
   CODEX_SECURITY_MAX_CONCURRENT_THREADS: "8"

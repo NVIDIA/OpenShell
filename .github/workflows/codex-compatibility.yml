@@ -46,7 +46,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: codex-compatibility-${{ inputs.candidate_ref }}-${{ github.run_id }}
+  group: codex-release-review
   cancel-in-progress: false
 
 jobs:
