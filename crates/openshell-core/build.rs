@@ -9,6 +9,19 @@ mod build_version;
 const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Preserve the vendored include-tree guarantee even when the caller has
+    // PROTOC_INCLUDE set: prost validates that ambient path independently of
+    // explicit includes. Re-enter with a child-only environment override.
+    if env::var_os("PROTOC_INCLUDE").is_some() {
+        let status = std::process::Command::new(env::current_exe()?)
+            .env_remove("PROTOC_INCLUDE")
+            .status()?;
+        if !status.success() {
+            return Err(format!("vendored protobuf build failed: {status}").into());
+        }
+        return Ok(());
+    }
+
     // --- Git-derived version ---
     // Compute a version from tags and commit metadata for local builds. In
     // Docker/CI builds where .git is absent, this silently does nothing and
@@ -26,16 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use a vendored protoc binary and include tree. System protoc installs
-    // often omit the well-known type includes (google/protobuf/struct.proto,
-    // etc.), and protobuf-src requires autotools/sh which breaks MSVC builds.
-    // SAFETY: This is run at build time in a single-threaded build script context.
-    // No other threads are reading environment variables concurrently.
-    #[allow(unsafe_code)]
-    unsafe {
-        env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
-        env::set_var("PROTOC_INCLUDE", protoc_bin_vendored::include_path()?);
-    }
+    // Configure the vendored compiler and well-known includes without changing
+    // the build process environment.
+    let mut proto_config = tonic_prost_build::Config::new();
+    proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+    let proto_include = protoc_bin_vendored::include_path()?;
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
@@ -54,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &[proto_root])?;
+        .compile_with_config(proto_config, &proto_files, &[proto_root, proto_include])?;
 
     println!(
         "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",

@@ -3,7 +3,8 @@
 
 mod helpers;
 
-use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
+use helpers::TempDir;
+use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -25,7 +26,6 @@ use openshell_core::proto::{
     ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
-use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -787,7 +787,7 @@ async fn run_server() -> TestServer {
             .unwrap();
     });
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = helpers::tempdir().unwrap();
     let ca_path = dir.path().join("ca.crt");
     let cert_path = dir.path().join("tls.crt");
     let key_path = dir.path().join("tls.key");
@@ -858,29 +858,32 @@ async fn sandbox_get_policy_only_round_trip() {
 #[tokio::test]
 async fn sandbox_get_with_persisted_last_sandbox() {
     let ts = run_server().await;
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    // Persist a last-used sandbox for "integration-cluster".
-    save_last_sandbox("integration-cluster", "default", "persisted-sb")
-        .expect("save_last_sandbox should succeed");
+    Environment::from_pairs(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())])
+        .run_async(async {
+            // Persist a last-used sandbox for "integration-cluster".
+            save_last_sandbox("integration-cluster", "default", "persisted-sb")
+                .expect("save_last_sandbox should succeed");
 
-    // Resolve the name (simulates what the CLI does in main.rs).
-    let resolved = load_last_sandbox("integration-cluster", "default")
-        .expect("load_last_sandbox should return the saved name");
-    assert_eq!(resolved, "persisted-sb");
+            // Resolve the name (simulates what the CLI does in main.rs).
+            let resolved = load_last_sandbox("integration-cluster", "default")
+                .expect("load_last_sandbox should return the saved name");
+            assert_eq!(resolved, "persisted-sb");
 
-    // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+            // Call sandbox_get with the resolved name.
+            run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
+                .await
+                .expect("sandbox_get should succeed");
 
-    let recorded = ts.openshell.state.last_get_name.lock().await.clone();
-    assert_eq!(
-        recorded.as_deref(),
-        Some("persisted-sb"),
-        "the persisted sandbox name should flow through to the gRPC request"
-    );
+            let recorded = ts.openshell.state.last_get_name.lock().await.clone();
+            assert_eq!(
+                recorded.as_deref(),
+                Some("persisted-sb"),
+                "the persisted sandbox name should flow through to the gRPC request"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -1018,27 +1021,30 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
 #[tokio::test]
 async fn explicit_name_takes_precedence_over_persisted() {
     let ts = run_server().await;
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    // Persist one name, but supply a different one explicitly.
-    save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
+    Environment::from_pairs(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())])
+        .run_async(async {
+            // Persist one name, but supply a different one explicitly.
+            save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(
-        &ts.endpoint,
-        "explicit-sandbox",
-        false,
-        "table",
-        "default",
-        &ts.tls,
-    )
-    .await
-    .expect("sandbox_get should succeed");
+            run::sandbox_get(
+                &ts.endpoint,
+                "explicit-sandbox",
+                false,
+                "table",
+                "default",
+                &ts.tls,
+            )
+            .await
+            .expect("sandbox_get should succeed");
 
-    let recorded = ts.openshell.state.last_get_name.lock().await.clone();
-    assert_eq!(
-        recorded.as_deref(),
-        Some("explicit-sandbox"),
-        "explicit name should be used, not the persisted one"
-    );
+            let recorded = ts.openshell.state.last_get_name.lock().await.clone();
+            assert_eq!(
+                recorded.as_deref(),
+                Some("explicit-sandbox"),
+                "explicit name should be used, not the persisted one"
+            );
+        })
+        .await;
 }

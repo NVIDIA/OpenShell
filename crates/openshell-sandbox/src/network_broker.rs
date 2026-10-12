@@ -15,16 +15,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::linux::seccomp_notify::{Notification, NotificationListener};
+use crate::linux::socket_registry::{
+    InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
+};
+use crate::linux::task_memory;
 use openshell_binary_identity::ProcfsIdentityResolver;
 use openshell_isolation_interface::contract::{
     BinaryIdentity, DnsTransport, NetworkSocketMetadata, ResolveError, TcpOpenDecision,
     TcpOpenDenial,
 };
-use openshell_isolation_interface::linux::seccomp_notify::{Notification, NotificationListener};
-use openshell_isolation_interface::linux::socket_registry::{
-    InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
-};
-use openshell_isolation_interface::linux::task_memory;
 use tokio::sync::{mpsc, oneshot};
 
 const SOCKET_CAPACITY: usize = 4_096;
@@ -153,9 +153,7 @@ fn register_dns_socket(
     let mut admissions = lock(admissions);
     if admissions.len() >= SOCKET_CAPACITY && !admissions.contains_key(&peer) {
         let installed =
-            openshell_isolation_interface::linux::proc_fd::installed_socket_inodes_excluding(
-                std::process::id(),
-            )?;
+            crate::linux::proc_fd::installed_socket_inodes_excluding(std::process::id())?;
         admissions.retain(|_, socket| installed.contains(&socket.inode));
         if admissions.len() >= SOCKET_CAPACITY {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
@@ -561,7 +559,7 @@ fn dispatch_notification(
         return queues.provider_files.handle_open(&listener, notification);
     }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
-        return openshell_isolation_interface::linux::process_signal::mediate_process_signal(
+        return crate::linux::process_signal::mediate_process_signal(
             &listener,
             notification,
             std::process::id(),
@@ -572,7 +570,7 @@ fn dispatch_notification(
         syscall,
         libc::SYS_tkill | libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo
     ) {
-        return openshell_isolation_interface::linux::process_signal::mediate_thread_signal(
+        return crate::linux::process_signal::mediate_thread_signal(
             &listener,
             notification,
             std::process::id(),
@@ -696,7 +694,7 @@ fn create_socket(
     // Confinement is standing kernel state that must exist before the workload
     // can observe the descriptor. Natively accepted children inherit it, so
     // local accept needs no per-connection broker inspection.
-    openshell_isolation_interface::linux::socket_confinement::confine_to_loopback(&source)?;
+    crate::linux::socket_confinement::confine_to_loopback(&source)?;
     let metadata = SocketMetadata {
         family,
         kind,
@@ -719,15 +717,9 @@ fn create_socket(
 }
 
 fn descriptor_soft_limit() -> io::Result<usize> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: limit points to writable storage for one rlimit value.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
+    let (current, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+        .map_err(io::Error::from)?;
+    Ok(usize::try_from(current).unwrap_or(usize::MAX))
 }
 
 fn open_descriptor_count() -> io::Result<usize> {
@@ -1308,10 +1300,7 @@ fn collect_closed_socket_entries(registry: &Mutex<SocketRegistry>) -> io::Result
 }
 
 fn collect_closed_socket_entries_locked(registry: &mut SocketRegistry) -> io::Result<()> {
-    let installed =
-        openshell_isolation_interface::linux::proc_fd::installed_socket_inodes_excluding(
-            std::process::id(),
-        )?;
+    let installed = crate::linux::proc_fd::installed_socket_inodes_excluding(std::process::id())?;
     registry.retain_installed(&installed);
     Ok(())
 }
@@ -1483,7 +1472,7 @@ fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
 }
 
 fn read_sendmsg_message(tid: u32, address: u64) -> io::Result<SendMessage> {
-    let header = read_task_value::<libc::msghdr>(tid, address)?;
+    let header = read_task_msghdr(tid, address)?;
     // Ancillary data can carry a per-message routing override (IP_PKTINFO).
     // Refuse it rather than continue a send the broker did not inspect; a
     // loopback destination additionally contains an override that races this
@@ -1522,12 +1511,12 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
         .collect()
 }
 
-fn read_task_value<T: Copy>(tid: u32, address: u64) -> io::Result<T> {
-    let mut bytes = vec![0_u8; size_of::<T>()];
+fn read_task_msghdr(tid: u32, address: u64) -> io::Result<libc::msghdr> {
+    let mut bytes = [0_u8; size_of::<libc::msghdr>()];
     task_memory::read_exact(tid, address, &mut bytes)?;
-    // SAFETY: `bytes` contains exactly one copied native value; unaligned read
-    // avoids imposing alignment on the task-memory scratch allocation.
-    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+    // SAFETY: msghdr contains only integer and pointer fields, so all bit
+    // patterns are valid. The scratch buffer need not be aligned to msghdr.
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::msghdr>()) })
 }
 
 fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
@@ -1733,12 +1722,12 @@ fn error_to_errno(error: &io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_isolation_interface::linux::socket_confinement;
+    use crate::linux::socket_confinement;
 
     #[test]
     fn provider_files_are_opened_on_demand_and_replaced() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start broker");
         let path = "/run/openshell/providers/acme/client.toml".to_string();
         broker
@@ -2003,8 +1992,7 @@ mod tests {
 
     #[test]
     fn metadata_reservation_preserves_other_loopback_and_rejects_udp() {
-        let (launcher, listener) =
-            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
         let _broker = NetworkBroker::start_for_test(listener).unwrap();
         let local_server = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = local_server.local_addr().unwrap();
@@ -2026,8 +2014,7 @@ mod tests {
     #[test]
     fn metadata_loopback_connect_is_relayed_to_supervisor() {
         use std::io::{Read as _, Write as _};
-        let (launcher, listener) =
-            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
         let broker = NetworkBroker::start_for_test(listener).unwrap();
         let client = std::thread::spawn(move || {
             launcher
@@ -2072,8 +2059,8 @@ mod tests {
 
     #[test]
     fn external_connect_times_out_when_supervisor_retains_the_decision() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_with_decision_timeout(
             listener,
             "127.0.0.1:0".parse().unwrap(),
@@ -2130,8 +2117,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
-            let (launcher, listener) =
-                openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
             let broker = NetworkBroker::start_for_test(listener).unwrap();
             let address = broker.dns_address();
             let child = std::thread::spawn(move || {
@@ -2209,8 +2195,7 @@ mod tests {
         let control = TcpListener::bind("127.0.0.1:0").unwrap();
         control.set_nonblocking(true).unwrap();
         let address = control.local_addr().unwrap();
-        let (launcher, listener) =
-            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
         let _broker = NetworkBroker::start_with_dns_address(
             listener,
             "127.0.0.1:0".parse().unwrap(),
@@ -2271,8 +2256,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary Unix socket directory");
         let path = directory.path().join("service.sock");
         let service = UnixListener::bind(&path).expect("bind Unix service");
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -2291,8 +2276,8 @@ mod tests {
 
     #[test]
     fn native_accept_inherits_loopback_confinement() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let workload = std::thread::spawn(move || {
@@ -2354,8 +2339,8 @@ mod tests {
 
     #[test]
     fn workload_sockets_are_bound_to_loopback_and_cannot_be_rebound() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let results = launcher
             .execute(|| -> io::Result<Vec<ConfinementObservation>> {
@@ -2388,8 +2373,8 @@ mod tests {
         let local = TcpListener::bind("127.0.0.1:0").unwrap();
         local.set_nonblocking(true).unwrap();
         let address = local.local_addr().unwrap();
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let error = launcher
             .execute(move || -> io::Result<()> {
@@ -2429,8 +2414,8 @@ mod tests {
     fn broker_refuses_socket_families_it_cannot_confine() {
         // Independent of the static workload filter: the broker continues
         // only Unix and netlink sockets and creates INET sockets itself.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let results = launcher
             .execute(|| {
@@ -2513,8 +2498,8 @@ mod tests {
         // address succeeds, unlike a native EINVAL, so a restart is safe.
         let service = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = service.local_addr().unwrap();
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (bind_again, connect_again) = launcher
             .execute(move || -> io::Result<(io::Result<()>, Option<i32>)> {
@@ -2565,10 +2550,10 @@ mod tests {
             println!("kill={kill} tgkill={tgkill}");
             return;
         }
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
-        let run_workload = |launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher| {
+        let run_workload = |launcher: &crate::linux::workload_launcher::WorkloadLauncher| {
             let output = launcher
                 .execute(|| {
                     std::process::Command::new(std::env::current_exe().unwrap())
@@ -2610,8 +2595,8 @@ mod tests {
             .unwrap();
         saturated.listen(0).unwrap();
         let address = saturated.local_addr().unwrap().as_socket().unwrap();
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let (blocking_wait, nonblocking_result) = launcher
             .execute(move || {
@@ -2652,8 +2637,8 @@ mod tests {
         // Workload sockets can only present loopback source addresses. A
         // non-loopback peer on a loopback-bound workload listener is therefore
         // a non-workload process in the same network namespace.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let errors = launcher
             .execute(|| {
@@ -2697,8 +2682,8 @@ mod tests {
 
     #[test]
     fn external_connect_waits_for_explicit_relay_decision() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -2737,8 +2722,8 @@ mod tests {
 
     #[test]
     fn denied_external_connect_keeps_socket_unconnected() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let client = std::thread::spawn(move || {
             launcher
@@ -2768,8 +2753,8 @@ mod tests {
 
     #[test]
     fn udp_dns_normalizes_wildcard_source_for_relay_attribution() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -2808,8 +2793,8 @@ mod tests {
     fn udp_dns_after_connect_sends_with_sendmmsg() {
         // glibc connects the resolver socket to the nameserver, then sends A
         // and AAAA together with sendmmsg and no destination.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -2874,8 +2859,8 @@ mod tests {
         // Ancillary data can carry a per-message routing override such as
         // IP_PKTINFO. The kernel performs mediated DNS sends, so control data
         // is refused.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let errno = launcher
@@ -2910,8 +2895,8 @@ mod tests {
 
     #[test]
     fn udp_dns_allows_repeated_destination_sends_to_the_pinned_relay() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {
@@ -2961,8 +2946,8 @@ mod tests {
 
     #[test]
     fn udp_port_zero_route_probes_are_local_and_reusable() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         launcher
             .execute(|| -> io::Result<()> {
@@ -3040,8 +3025,8 @@ mod tests {
 
     #[test]
     fn tcp_dns_preserves_length_framing() {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let dns_address = broker.dns_address();
         let client = std::thread::spawn(move || {

@@ -3,7 +3,8 @@
 
 mod helpers;
 
-use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
+use helpers::tempdir;
+use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
 use openshell_cli::{
     run,
@@ -18,7 +19,6 @@ use openshell_core::proto::{
     UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -708,13 +708,13 @@ fn write_gateway_mtls_bundle(
 fn isolated_gateway_add_env(
     config_dir: &std::path::Path,
     state_dir: &std::path::Path,
-) -> EnvVarGuard {
+) -> Environment {
     let xdg_config = config_dir.to_string_lossy().into_owned();
     let xdg_state = state_dir.to_string_lossy().into_owned();
     let local_tls_dir = state_dir.join("no-package-managed-tls");
     let local_tls = local_tls_dir.to_string_lossy().into_owned();
 
-    EnvVarGuard::set(&[
+    Environment::from_pairs(&[
         ("XDG_CONFIG_HOME", xdg_config.as_str()),
         ("XDG_STATE_HOME", xdg_state.as_str()),
         ("HOME", xdg_state.as_str()),
@@ -740,29 +740,32 @@ async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let endpoint = format!("https://localhost:{}", addr.port());
-    run::gateway_add(
-        &endpoint,
-        Some("k8s"),
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let endpoint = format!("https://localhost:{}", addr.port());
+            run::gateway_add(
+                &endpoint,
+                Some("k8s"),
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
 
-    let metadata = get_gateway_metadata("k8s").unwrap();
-    assert_eq!(metadata.name, "k8s");
-    assert_eq!(metadata.gateway_endpoint, endpoint);
-    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
-    assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
-    assert!(get_gateway_metadata("openshell").is_none());
+            let metadata = get_gateway_metadata("k8s").unwrap();
+            assert_eq!(metadata.name, "k8s");
+            assert_eq!(metadata.gateway_endpoint, endpoint);
+            assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
+            assert!(get_gateway_metadata("openshell").is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -782,28 +785,31 @@ async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let endpoint = format!("https://localhost:{}", addr.port());
-    run::gateway_add(
-        &endpoint,
-        None,
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let endpoint = format!("https://localhost:{}", addr.port());
+            run::gateway_add(
+                &endpoint,
+                None,
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
 
-    let metadata = get_gateway_metadata("openshell").unwrap();
-    assert_eq!(metadata.name, "openshell");
-    assert_eq!(metadata.gateway_endpoint, endpoint);
-    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
-    assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+            let metadata = get_gateway_metadata("openshell").unwrap();
+            assert_eq!(metadata.name, "openshell");
+            assert_eq!(metadata.gateway_endpoint, endpoint);
+            assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -821,51 +827,56 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let err = run::gateway_add(
-        "https://localhost:1",
-        Some("k8s"),
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .expect_err("explicit name should require matching named mTLS material");
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let err = run::gateway_add(
+                "https://localhost:1",
+                Some("k8s"),
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect_err("explicit name should require matching named mTLS material");
 
-    assert!(err.to_string().contains("gateway 'k8s'"));
-    assert!(get_gateway_metadata("k8s").is_none());
-    assert!(load_active_gateway().is_none());
+            assert!(err.to_string().contains("gateway 'k8s'"));
+            assert!(get_gateway_metadata("k8s").is_none());
+            assert!(load_active_gateway().is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
-    let _env = EnvVarGuard::set(&[]);
+    Environment::from_pairs(&[])
+        .run_async(async {
+            let (ca, ca_key) = build_ca();
+            let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+            let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+            let ca_cert = ca.pem();
 
-    let (ca, ca_key) = build_ca();
-    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
-    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
-    let ca_cert = ca.pem();
+            let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
 
-    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+            let dir = tempdir().unwrap();
+            let ca_path = dir.path().join("ca.crt");
+            let cert_path = dir.path().join("tls.crt");
+            let key_path = dir.path().join("tls.key");
+            std::fs::write(&ca_path, ca_cert).unwrap();
+            std::fs::write(&cert_path, client_cert).unwrap();
+            std::fs::write(&key_path, client_key).unwrap();
 
-    let dir = tempdir().unwrap();
-    let ca_path = dir.path().join("ca.crt");
-    let cert_path = dir.path().join("tls.crt");
-    let key_path = dir.path().join("tls.key");
-    std::fs::write(&ca_path, ca_cert).unwrap();
-    std::fs::write(&cert_path, client_cert).unwrap();
-    std::fs::write(&key_path, client_key).unwrap();
-
-    let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+            let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+            let response = client.health(HealthRequest {}).await.unwrap();
+            assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -880,14 +891,18 @@ async fn cli_requires_client_cert_for_https() {
     // Point XDG_CONFIG_HOME at the isolated temp dir so that default_tls_dir
     // cannot discover real client certs from the developer's machine.
     let xdg_path = dir.path().to_string_lossy();
-    let _xdg_env = EnvVarGuard::set(&[("XDG_CONFIG_HOME", &xdg_path)]);
-    let ca_path = dir.path().join("ca.crt");
-    std::fs::write(&ca_path, ca_cert).unwrap();
 
-    let tls = TlsOptions::new(Some(ca_path), None, None);
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let result = grpc_client(&endpoint, &tls).await;
-    assert!(result.is_err());
+    Environment::from_pairs(&[("XDG_CONFIG_HOME", &xdg_path)])
+        .run_async(async {
+            let ca_path = dir.path().join("ca.crt");
+            std::fs::write(&ca_path, ca_cert).unwrap();
+
+            let tls = TlsOptions::new(Some(ca_path), None, None);
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let result = grpc_client(&endpoint, &tls).await;
+            assert!(result.is_err());
+        })
+        .await;
 }
 
 async fn run_server_no_client_auth(
@@ -915,18 +930,20 @@ async fn run_server_no_client_auth(
 
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
-    let _env = EnvVarGuard::set(&[]);
+    Environment::from_pairs(&[])
+        .run_async(async {
+            let (ca, ca_key) = build_ca();
+            let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
 
-    let (ca, ca_key) = build_ca();
-    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+            let addr = run_server_no_client_auth(server_cert, server_key).await;
 
-    let addr = run_server_no_client_auth(server_cert, server_key).await;
+            let mut tls = TlsOptions::default();
+            tls.gateway_insecure = true;
 
-    let mut tls = TlsOptions::default();
-    tls.gateway_insecure = true;
-
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+            let response = client.health(HealthRequest {}).await.unwrap();
+            assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+        })
+        .await;
 }

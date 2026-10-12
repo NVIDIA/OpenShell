@@ -5,6 +5,8 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+#![forbid(unsafe_code)]
+
 // `defaults-without-telemetry` is an alias for the default feature set minus
 // `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
 // default feature, so adding it on top of the defaults would otherwise produce

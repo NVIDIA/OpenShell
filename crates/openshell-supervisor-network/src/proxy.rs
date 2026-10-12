@@ -43,8 +43,6 @@ use openshell_ocsf::{
     HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
-#[cfg(target_os = "linux")]
-use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1414,47 +1412,18 @@ fn build_transparent_tcp_allow_ocsf_event(
 
 #[cfg(target_os = "linux")]
 fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+    use nix::sys::socket::{getsockopt, sockopt};
+
     if stream.local_addr()?.is_ipv4() {
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut address: libc::sockaddr_in = std::mem::zeroed();
-            let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
-                .expect("sockaddr_in size fits socklen_t");
-            if libc::getsockopt(
-                fd,
-                libc::SOL_IP,
-                80, // SO_ORIGINAL_DST
-                std::ptr::addr_of_mut!(address).cast(),
-                std::ptr::addr_of_mut!(length),
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            return Ok(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::from(
-                    address.sin_addr.s_addr.to_ne_bytes(),
-                )),
-                u16::from_be(address.sin_port),
-            ));
-        }
-    }
-    #[allow(unsafe_code)]
-    unsafe {
-        let mut address: libc::sockaddr_in6 = std::mem::zeroed();
-        let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
-            .expect("sockaddr_in6 size fits socklen_t");
-        if libc::getsockopt(
-            fd,
-            libc::SOL_IPV6,
-            80, // IP6T_SO_ORIGINAL_DST
-            std::ptr::addr_of_mut!(address).cast(),
-            std::ptr::addr_of_mut!(length),
-        ) != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
+        let address = getsockopt(stream, sockopt::OriginalDst)?;
+        Ok(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::from(
+                address.sin_addr.s_addr.to_ne_bytes(),
+            )),
+            u16::from_be(address.sin_port),
+        ))
+    } else {
+        let address = getsockopt(stream, sockopt::Ip6tOriginalDst)?;
         Ok(SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
             u16::from_be(address.sin6_port),
@@ -14881,23 +14850,10 @@ network_policies:
     // binary causes /proc/<pid>/exe readlink to return ENOENT on
     // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
     // the same crate so it inherits the user_home_t label.
-    fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
+    fn resolve_process_identity_denies_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
-        use std::ffi::CString;
         use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
-
-        struct ChildGuard(libc::pid_t);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
-                }
-            }
-        }
 
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
@@ -14921,41 +14877,8 @@ network_policies:
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
-        let fd = stream.as_raw_fd();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            assert!(flags >= 0, "F_GETFD failed");
-            assert_eq!(
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "F_SETFD failed"
-            );
-        }
-
-        let sleep_path = CString::new("/bin/sleep").unwrap();
-        let arg0 = CString::new("sleep").unwrap();
-        let arg1 = CString::new("30").unwrap();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        let child_pid = unsafe { libc::fork() };
-        assert!(child_pid >= 0, "fork failed");
-        if child_pid == 0 {
-            // libc/syscall FFI requires unsafe
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::execl(
-                    sleep_path.as_ptr(),
-                    arg0.as_ptr(),
-                    arg1.as_ptr(),
-                    std::ptr::null::<libc::c_char>(),
-                );
-                libc::_exit(127);
-            }
-        }
-
-        let _guard = ChildGuard(child_pid);
+        let guard = crate::test_support::spawn_socket_holder(&stream, true);
+        let child_pid = guard.0.id();
         let entrypoint_pid = std::process::id();
 
         let deadline = Instant::now() + Duration::from_secs(5);

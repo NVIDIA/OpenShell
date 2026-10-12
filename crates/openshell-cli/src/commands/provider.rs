@@ -2870,7 +2870,7 @@ pub async fn provider_delete(
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
-    use crate::test_utils::EnvVarGuard;
+    use crate::test_utils::Environment;
     use std::fs;
     use std::io::Write;
 
@@ -2958,30 +2958,34 @@ mod tests {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _credential = EnvVarGuard::set("GITHUB_TOKEN", "test-private-token-value");
-        let mut profile = openshell_providers::example_profiles::load("github").to_proto();
-        profile.source = "user".to_string();
-        profile.scope = "platform".to_string();
 
-        let rendered =
-            format_provider_profile_description(&profile, "table").expect("profile details render");
-        assert!(rendered.starts_with("github (provider)\nCategory: SOURCE CONTROL\n"));
-        assert!(
-            rendered.contains("Display name: GitHub\nDescription: GitHub API and Git operations\n")
-        );
-        assert!(rendered.contains("Source: user\nScope: platform\n"));
-        assert!(rendered.contains("Environment variables: GITHUB_TOKEN, GH_TOKEN\n"));
-        assert!(rendered.contains("Authentication: bearer\n"));
-        assert!(rendered.contains("Header: authorization\n"));
-        assert!(!rendered.contains("test-private-token-value"));
-        assert!(!rendered.contains("Default URL"));
-        assert!(rendered.contains("Protocol: graphql\n"));
-        assert!(rendered.contains("Path: /graphql\n"));
-        assert_eq!(rendered.matches("Access: read-only\n").count(), 2);
-        assert!(rendered.contains("Access: custom rules\n    Rules: 4 allow, 0 deny\n"));
-        assert!(rendered.contains("Enforcement: enforce\n"));
-        assert!(rendered.contains("  /usr/bin/gh\n"));
-        assert!(rendered.contains("  /usr/local/bin/git\n"));
+        Environment::new()
+            .set("GITHUB_TOKEN", "test-private-token-value")
+            .run(|| {
+                let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+                profile.source = "user".to_string();
+                profile.scope = "platform".to_string();
+
+                let rendered = format_provider_profile_description(&profile, "table")
+                    .expect("profile details render");
+                assert!(rendered.starts_with("github (provider)\nCategory: SOURCE CONTROL\n"));
+                assert!(rendered.contains(
+                    "Display name: GitHub\nDescription: GitHub API and Git operations\n"
+                ));
+                assert!(rendered.contains("Source: user\nScope: platform\n"));
+                assert!(rendered.contains("Environment variables: GITHUB_TOKEN, GH_TOKEN\n"));
+                assert!(rendered.contains("Authentication: bearer\n"));
+                assert!(rendered.contains("Header: authorization\n"));
+                assert!(!rendered.contains("test-private-token-value"));
+                assert!(!rendered.contains("Default URL"));
+                assert!(rendered.contains("Protocol: graphql\n"));
+                assert!(rendered.contains("Path: /graphql\n"));
+                assert_eq!(rendered.matches("Access: read-only\n").count(), 2);
+                assert!(rendered.contains("Access: custom rules\n    Rules: 4 allow, 0 deny\n"));
+                assert!(rendered.contains("Enforcement: enforce\n"));
+                assert!(rendered.contains("  /usr/bin/gh\n"));
+                assert!(rendered.contains("  /usr/local/bin/git\n"));
+            });
     }
 
     #[test]
@@ -3488,15 +3492,19 @@ binaries: [/usr/bin/curl]
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "/nonexistent/path/to/adc.json",
-        );
-        let err = read_gcloud_adc().expect_err("missing file should error");
-        assert!(
-            err.to_string().contains("failed to read gcloud ADC file"),
-            "unexpected error: {err}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/nonexistent/path/to/adc.json",
+            )
+            .run(|| {
+                let err = read_gcloud_adc().expect_err("missing file should error");
+                assert!(
+                    err.to_string().contains("failed to read gcloud ADC file"),
+                    "unexpected error: {err}"
+                );
+            });
     }
 
     #[test]
@@ -3511,19 +3519,23 @@ binaries: [/usr/bin/curl]
             "private_key_id": "key123"
         });
         Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let err = read_gcloud_adc().expect_err("wrong type should error");
-        // The service_account type gets a targeted message directing the user
-        // to the real Vertex service-account credential flow instead of the
-        // generic authorized_user hint.
-        assert!(
-            err.to_string()
-                .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
-            "error should mention the service-account token key, got: {err}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let err = read_gcloud_adc().expect_err("wrong type should error");
+                // The service_account type gets a targeted message directing the user
+                // to the real Vertex service-account credential flow instead of the
+                // generic authorized_user hint.
+                assert!(
+                    err.to_string()
+                        .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+                    "error should mention the service-account token key, got: {err}"
+                );
+            });
     }
 
     #[test]
@@ -3539,15 +3551,19 @@ binaries: [/usr/bin/curl]
             "refresh_token": "test-refresh-token"
         });
         Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let (client_id, client_secret, refresh_token) =
-            read_gcloud_adc().expect("valid ADC should parse");
-        assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "test-client-secret");
-        assert_eq!(refresh_token, "test-refresh-token");
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let (client_id, client_secret, refresh_token) =
+                    read_gcloud_adc().expect("valid ADC should parse");
+                assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
+                assert_eq!(client_secret, "test-client-secret");
+                assert_eq!(refresh_token, "test-refresh-token");
+            });
     }
 
     #[test]
@@ -3564,15 +3580,17 @@ binaries: [/usr/bin/curl]
             "refresh_token": "cloudsdk-refresh-token"
         });
         fs::write(&adc_path, json.to_string()).expect("write adc file");
-        let _adc_guard = EnvVarGuard::unset("GOOGLE_APPLICATION_CREDENTIALS");
-        let _cloudsdk_guard =
-            EnvVarGuard::set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"));
 
-        let (client_id, client_secret, refresh_token) =
-            read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
-        assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "cloudsdk-client-secret");
-        assert_eq!(refresh_token, "cloudsdk-refresh-token");
+        Environment::new()
+            .remove("GOOGLE_APPLICATION_CREDENTIALS")
+            .set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"))
+            .run(|| {
+                let (client_id, client_secret, refresh_token) =
+                    read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
+                assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
+                assert_eq!(client_secret, "cloudsdk-client-secret");
+                assert_eq!(refresh_token, "cloudsdk-refresh-token");
+            });
     }
 
     #[test]
@@ -3583,25 +3601,29 @@ binaries: [/usr/bin/curl]
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         Write::write_all(&mut tmp.as_file(), b"not valid json at all {{{{")
             .expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let result = read_gcloud_adc();
-        assert!(
-            result.is_err(),
-            "malformed JSON should produce an error, got: {result:?}"
-        );
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("parse")
-                || msg.contains("JSON")
-                || msg.contains("json")
-                || msg.contains("invalid")
-                || msg.contains("failed"),
-            "error message should mention parse/JSON failure, got: {msg}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let result = read_gcloud_adc();
+                assert!(
+                    result.is_err(),
+                    "malformed JSON should produce an error, got: {result:?}"
+                );
+                let err = result.unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("parse")
+                        || msg.contains("JSON")
+                        || msg.contains("json")
+                        || msg.contains("invalid")
+                        || msg.contains("failed"),
+                    "error message should mention parse/JSON failure, got: {msg}"
+                );
+            });
     }
 
     #[test]

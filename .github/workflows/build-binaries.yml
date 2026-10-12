@@ -62,22 +62,6 @@ jobs:
           supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
           extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
 
-  conformance:
-    name: openshell-conformance (${{ matrix.triple }})
-    env:
-      PACKAGE: openshell-conformance-cli
-      BINARY: openshell-conformance
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    steps: *build_steps
-
   prover:
     name: openshell-prover (${{ matrix.triple }})
     env:

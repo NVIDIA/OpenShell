@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use nix::pty::Winsize;
+use rustix::termios::Winsize;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -254,9 +254,7 @@ impl MainSession {
     #[allow(unsafe_code)]
     pub fn terminal_size_for_test(&self) -> (u16, u16) {
         let master = self.pty_master.as_ref().expect("terminal PTY master");
-        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut winsize) };
-        assert_eq!(result, 0, "read terminal dimensions");
+        let winsize = rustix::termios::tcgetwinsize(master).expect("read terminal dimensions");
         (winsize.ws_col, winsize.ws_row)
     }
 
@@ -664,10 +662,7 @@ impl MainSession {
             ws_xpixel: u16::try_from(pixel_width).unwrap_or(u16::MAX),
             ws_ypixel: u16::try_from(pixel_height).unwrap_or(u16::MAX),
         };
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
-        }
+        let _ = rustix::termios::tcsetwinsize(master, winsize);
     }
 
     pub async fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {

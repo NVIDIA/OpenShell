@@ -11,7 +11,7 @@
 
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt as _;
 
 /// Maximum number of task-memory bytes copied by one operation.
@@ -124,32 +124,29 @@ pub fn probe_child_access() -> io::Result<()> {
     // SAFETY: mapping spans at least one aligned u64-sized region.
     unsafe { mapping.cast::<u64>().write(INITIAL) };
 
-    // SAFETY: eventfd returns independently owned descriptors on success.
-    let ready = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-    if ready < 0 {
-        // SAFETY: mapping is the live region returned above.
-        unsafe { libc::munmap(mapping, size_of::<u64>()) };
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful eventfd returned one owned descriptor.
-    let ready = unsafe { OwnedFd::from_raw_fd(ready) };
-    // SAFETY: eventfd returns independently owned descriptors on success.
-    let proceed = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-    if proceed < 0 {
-        // SAFETY: mapping is the live region returned above.
-        unsafe { libc::munmap(mapping, size_of::<u64>()) };
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful eventfd returned one owned descriptor.
-    let proceed = unsafe { OwnedFd::from_raw_fd(proceed) };
+    // Preserve descriptor creation errors across mapping cleanup.
+    let descriptors = (|| -> io::Result<_> {
+        let ready = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        let proceed = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        Ok((ready, proceed))
+    })();
+    let (ready, proceed) = match descriptors {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            // SAFETY: mapping is the live region returned above.
+            unsafe { libc::munmap(mapping, size_of::<u64>()) };
+            return Err(error);
+        }
+    };
 
     // SAFETY: the caller promises this probe process is single-threaded. The
     // child performs only raw syscalls and memory operations before `_exit`.
     let child = unsafe { libc::fork() };
     if child < 0 {
+        let error = io::Error::last_os_error();
         // SAFETY: mapping is the live region returned above.
         unsafe { libc::munmap(mapping, size_of::<u64>()) };
-        return Err(io::Error::last_os_error());
+        return Err(error);
     }
     if child == 0 {
         // The sandbox remains nondumpable, but an exec'd workload must be
@@ -159,8 +156,8 @@ pub fn probe_child_access() -> io::Result<()> {
         // arguments. No Rust cleanup runs in the child.
         unsafe {
             if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) < 0
-                || write_eventfd(ready.as_raw_fd()).is_err()
-                || read_eventfd(proceed.as_raw_fd()).is_err()
+                || write_eventfd(&ready).is_err()
+                || read_eventfd(&proceed).is_err()
             {
                 libc::_exit(1);
             }
@@ -169,7 +166,7 @@ pub fn probe_child_access() -> io::Result<()> {
     }
 
     let outcome = (|| {
-        read_eventfd(ready.as_raw_fd())?;
+        read_eventfd(&ready)?;
         let mut observed = [0_u8; size_of::<u64>()];
         read_exact(
             u32::try_from(child).map_err(|_| io::Error::other("child PID does not fit u32"))?,
@@ -181,7 +178,7 @@ pub fn probe_child_access() -> io::Result<()> {
                 "cross-child memory read returned wrong data",
             ));
         }
-        write_eventfd(proceed.as_raw_fd())?;
+        write_eventfd(&proceed)?;
         let mut status = 0;
         // SAFETY: child is a live direct child and status points to storage.
         if unsafe { libc::waitpid(child, std::ptr::addr_of_mut!(status), 0) } != child {
@@ -206,33 +203,18 @@ pub fn probe_child_access() -> io::Result<()> {
     outcome
 }
 
-fn read_eventfd(fd: libc::c_int) -> io::Result<()> {
-    let mut value = 0_u64;
-    // SAFETY: eventfd reads exactly one u64 into live storage.
-    let result = unsafe { libc::read(fd, std::ptr::addr_of_mut!(value).cast(), size_of::<u64>()) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    require_exact(
-        usize::try_from(result).map_err(|_| io::Error::other("eventfd read length invalid"))?,
-        size_of::<u64>(),
-        "eventfd read",
-    )
+fn read_eventfd(fd: impl AsFd) -> io::Result<()> {
+    let mut value = [0_u8; size_of::<u64>()];
+    let copied = rustix::io::read(fd, &mut value[..])?;
+    require_exact(copied, value.len(), "eventfd read")
 }
 
-fn write_eventfd(fd: libc::c_int) -> io::Result<()> {
-    let value = 1_u64;
-    // SAFETY: eventfd reads exactly one u64 from live storage.
-    let result = unsafe { libc::write(fd, std::ptr::addr_of!(value).cast(), size_of::<u64>()) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    require_exact(
-        usize::try_from(result).map_err(|_| io::Error::other("eventfd write length invalid"))?,
-        size_of::<u64>(),
-        "eventfd write",
-    )
+fn write_eventfd(fd: impl AsFd) -> io::Result<()> {
+    let value = 1_u64.to_ne_bytes();
+    let copied = rustix::io::write(fd, &value)?;
+    require_exact(copied, value.len(), "eventfd write")
 }
+
 fn validate_request(tid: u32, address: u64, length: usize) -> io::Result<()> {
     if tid == 0 {
         return Err(io::Error::new(
