@@ -154,6 +154,10 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     // broker is intentionally nondumpable, so that fallback is inaccessible
     // even though /proc/<dumpable-child>/mem remains available to mediation.
     let task_memory_copy = true;
+    // Check the ABI first: on an older kernel the allow/deny probe would fail
+    // with an opaque ruleset error instead of naming the ABI it needs.
+    let landlock_abi =
+        openshell_sandbox::sandbox::linux::require_landlock_abi().wrap_err("Landlock ABI probe")?;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
     let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
         .into_diagnostic()
@@ -163,14 +167,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         .into_diagnostic()
         .wrap_err("socket loopback confinement probe")?;
     probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
-    let landlock_abi = openshell_sandbox::linux::landlock::abi_version()
-        .into_diagnostic()
-        .wrap_err("Landlock ABI probe")?;
-    if landlock_abi < 3 {
-        return Err(miette::miette!(
-            "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
-        ));
-    }
 
     let groups = nix::unistd::getgroups()
         .into_diagnostic()?

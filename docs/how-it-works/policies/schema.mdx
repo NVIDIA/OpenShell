@@ -77,9 +77,10 @@ fails to enforce the policy's rules:
 | `best_effort` | The sandbox runs without the filesystem rules and logs a high-severity finding. |
 | `hard_requirement` | The sandbox fails to start. |
 
-In either mode, a sandbox requires a kernel with Landlock ABI v3 or later. The
-sandbox log's `Landlock ruleset built` event reports how many paths were applied
-and skipped.
+In either mode, a sandbox requires a kernel with Landlock ABI v3 or later. On an
+older kernel, startup fails with an error that names the required and detected
+ABI. The sandbox log's `Landlock ruleset built` event reports how many paths
+were applied and skipped.
 
 ## Process
 

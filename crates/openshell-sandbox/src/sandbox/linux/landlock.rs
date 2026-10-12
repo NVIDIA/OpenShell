@@ -54,36 +54,36 @@ impl std::fmt::Display for LandlockAvailability {
 /// This is safe to call from the parent process and does not create any file
 /// descriptors or modify process state.
 pub fn probe_availability() -> LandlockAvailability {
-    // landlock_create_ruleset syscall number (same on x86_64 and aarch64).
-    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
-    // Flag: return the highest supported ABI version instead of creating a ruleset.
-    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1 << 0;
-
-    // SAFETY: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
-    // is a read-only probe that returns the ABI version or an error code.
-    // It does not allocate file descriptors or modify process state.
-    #[allow(unsafe_code)]
-    let ret = unsafe {
-        libc::syscall(
-            SYS_LANDLOCK_CREATE_RULESET,
-            std::ptr::null::<libc::c_void>(),
-            0_usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-
-    if ret >= 0 {
-        #[allow(clippy::cast_possible_truncation)]
-        LandlockAvailability::Available { abi: ret as i32 }
-    } else {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        match errno {
+    match crate::linux::landlock::abi_version() {
+        Ok(abi) => LandlockAvailability::Available {
+            abi: i32::try_from(abi).unwrap_or(i32::MAX),
+        },
+        Err(error) => match error.raw_os_error().unwrap_or(0) {
             libc::ENOSYS => LandlockAvailability::NotImplemented,
             libc::EOPNOTSUPP => LandlockAvailability::NotEnabled,
             libc::EPERM => LandlockAvailability::Blocked,
             other => LandlockAvailability::Unknown(other),
-        }
+        },
     }
+}
+
+/// Lowest Landlock ABI the mandatory baseline accepts (matches [`ABI::V3`]).
+/// ABI v3, introduced in Linux 6.2, adds pathname truncation.
+const REQUIRED_ABI: i32 = 3;
+
+fn check_abi(availability: &LandlockAvailability) -> Result<u32> {
+    match availability {
+        LandlockAvailability::Available { abi } if *abi >= REQUIRED_ABI => Ok(abi.unsigned_abs()),
+        _ => Err(miette::miette!(
+            "Landlock ABI v{REQUIRED_ABI} or newer (Linux 6.2+) is required, but Landlock is {availability}"
+        )),
+    }
+}
+
+/// Probe the kernel and fail, naming the required and detected ABI, unless it
+/// supports the mandatory baseline. Returns the detected ABI.
+pub fn require_abi() -> Result<u32> {
+    check_abi(&probe_availability())
 }
 
 /// A prepared Landlock ruleset ready to be enforced via `restrict_self()`.
@@ -141,6 +141,7 @@ pub fn prepare_capability_free_baseline() -> Result<PreparedRuleset> {
 fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
     // Unlike optional filesystem policy, self-protection must cover pathname
     // truncation as well as opens. Never silently downgrade this ABI requirement.
+    require_abi()?;
     let abi = ABI::V3;
     let access = AccessFs::from_all(abi);
     let mut ruleset = Ruleset::default()
@@ -921,5 +922,36 @@ mod tests {
             !debug.is_empty(),
             "probe_availability Debug should produce output"
         );
+    }
+
+    #[test]
+    fn check_abi_accepts_the_required_abi_or_newer() {
+        for abi in [REQUIRED_ABI, REQUIRED_ABI + 4] {
+            let detected = check_abi(&LandlockAvailability::Available { abi }).unwrap();
+            assert_eq!(detected, abi.unsigned_abs());
+        }
+    }
+
+    #[test]
+    fn check_abi_names_the_required_and_detected_abi() {
+        let err = check_abi(&LandlockAvailability::Available { abi: 2 })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ABI v3 or newer"), "{err}");
+        assert!(err.contains("ABI v2"), "{err}");
+    }
+
+    #[test]
+    fn check_abi_rejects_unavailable_landlock() {
+        for availability in [
+            LandlockAvailability::NotImplemented,
+            LandlockAvailability::NotEnabled,
+            LandlockAvailability::Blocked,
+            LandlockAvailability::Unknown(libc::EIO),
+        ] {
+            let err = check_abi(&availability).unwrap_err().to_string();
+            assert!(err.contains("ABI v3 or newer"), "{err}");
+            assert!(err.contains(&availability.to_string()), "{err}");
+        }
     }
 }
