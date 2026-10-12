@@ -5222,6 +5222,8 @@ async fn inject_token_grant_for_forward_request(
     forward_request_bytes: Vec<u8>,
     l7_ctx: &mut crate::l7::relay::L7EvalContext,
     inspection: Option<ForwardL7Reevaluation<'_>>,
+    request_id: &str,
+    observation_context: Option<&EndpointObservationContext>,
 ) -> Result<Vec<u8>> {
     let (path, _) = crate::l7::rest::parse_target_query(upstream_target)?;
     let request = crate::l7::rest::request_from_buffered_http(
@@ -5237,6 +5239,8 @@ async fn inject_token_grant_for_forward_request(
             inspection.engine,
             inspection.config,
             inspection.request_info,
+            request_id,
+            observation_context,
         )
         .await?;
         *l7_ctx = prepared_ctx;
@@ -5245,9 +5249,14 @@ async fn inject_token_grant_for_forward_request(
 
     // L4-only forwarding keeps selector-based credentials; it has no inspected
     // endpoint owner decision. Inspected requests always use preparation above.
-    crate::l7::token_grant_injection::inject_if_needed(request, l7_ctx)
-        .await
-        .map(|req| req.raw_header)
+    Ok(crate::l7::token_grant_injection::inject_if_needed_captured(
+        request,
+        l7_ctx,
+        request_id,
+        observation_context,
+    )
+    .await?
+    .raw_header)
 }
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
@@ -6334,32 +6343,46 @@ async fn handle_forward_proxy(
                 engine,
                 request_info,
             }),
+        &request_id,
+        endpoint_observation_context.as_ref(),
     )
     .await
     {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(
-                dst_host = %host_lc,
-                dst_port = port,
-                error = %e,
-                "token grant failed in forward proxy"
-            );
+            let refusal =
+                e.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>();
+            if refusal.is_none() {
+                warn!(
+                    dst_host = %host_lc,
+                    dst_port = port,
+                    error = %e,
+                    "token grant failed in forward proxy"
+                );
+            }
             if let Some(session) = middleware_session.take() {
                 session
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
-            respond(
-                client,
-                &build_json_error_response(
-                    502,
-                    "Bad Gateway",
-                    "token_grant_failed",
-                    "dynamic token grant failed",
-                ),
-            )
-            .await?;
+            let response = refusal.map_or_else(
+                || {
+                    build_json_error_response(
+                        502,
+                        "Bad Gateway",
+                        "token_grant_failed",
+                        "dynamic token grant failed",
+                    )
+                },
+                |refusal| {
+                    // The refusal event already names the credential and request ID.
+                    if let Some(observer) = endpoint_observer.as_ref() {
+                        observer.observe_token_grant_refusal(refusal, &request_id);
+                    }
+                    build_token_grant_failure_response(&request_id)
+                },
+            );
+            respond(client, &response).await?;
             return Ok(());
         }
     };
@@ -6825,6 +6848,30 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
          {}",
         body_str.len(),
         body_str,
+    )
+    .into_bytes()
+}
+
+/// Build the forward proxy's refusal for a failed dynamic token grant.
+///
+/// The JSON body matches every other grant refusal. The request ID header lets
+/// the caller quote the exchange to an operator without learning its cause.
+fn build_token_grant_failure_response(request_id: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": "token_grant_failed",
+        "detail": "dynamic token grant failed",
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {}: {request_id}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
     )
     .into_bytes()
 }
@@ -10970,8 +11017,47 @@ network_policies:
             .map_err(|e| miette::miette!("upstream task failed: {e}"))
     }
 
+    const FORWARD_REQUEST_ID: &str = "9b8a7f6e-5d4c-4b3a-9f8e-7d6c5b4a3f2e";
+
+    #[test]
+    fn forward_grant_refusal_keeps_its_body_and_adds_only_the_request_id() {
+        let response = String::from_utf8(build_token_grant_failure_response(FORWARD_REQUEST_ID))
+            .expect("UTF-8 response");
+        let (head, body) = response.split_once("\r\n\r\n").expect("header terminator");
+        let generic = String::from_utf8(build_json_error_response(
+            502,
+            "Bad Gateway",
+            "token_grant_failed",
+            "dynamic token grant failed",
+        ))
+        .expect("UTF-8 response");
+        let (generic_head, generic_body) =
+            generic.split_once("\r\n\r\n").expect("header terminator");
+        assert_eq!(body, generic_body, "the refusal body is unchanged");
+        let mut added = head
+            .lines()
+            .filter(|line| !generic_head.lines().any(|generic| generic == *line))
+            .collect::<Vec<_>>();
+        added.sort_unstable();
+        assert_eq!(
+            added,
+            [format!("x-openshell-request-id: {FORWARD_REQUEST_ID}").as_str()]
+        );
+    }
+
+    fn forward_grant_failure() -> openshell_core::token_grant_failure::TokenGrantFailure {
+        openshell_core::token_grant_failure::TokenGrantFailure::new(
+            openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
+            openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
+        )
+        .with_upstream_status(503)
+    }
+
     fn forward_token_grant_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<
+            &str,
+            openshell_core::token_grant_failure::TokenGrantFailure,
+        >,
     ) -> (
         crate::l7::relay::L7EvalContext,
         crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
@@ -10996,7 +11082,10 @@ network_policies:
     }
 
     fn forward_token_exchange_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<
+            &str,
+            openshell_core::token_grant_failure::TokenGrantFailure,
+        >,
     ) -> (
         crate::l7::relay::L7EvalContext,
         crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
@@ -11012,7 +11101,10 @@ network_policies:
 
     fn forward_token_grant_fixture(
         provider_key: &str,
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<
+            &str,
+            openshell_core::token_grant_failure::TokenGrantFailure,
+        >,
         token_exchange: bool,
     ) -> crate::l7::token_grant_injection::test_support::TokenGrantTestFixture {
         match (resolver_response, token_exchange) {
@@ -13198,10 +13290,17 @@ network_policies:
         let (mut ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token =
-            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
-                .await
-                .expect("forward token grant should inject");
+        let with_token = inject_token_grant_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            &mut ctx,
+            None,
+            FORWARD_REQUEST_ID,
+            None,
+        )
+        .await
+        .expect("forward token grant should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13224,10 +13323,17 @@ network_policies:
         let (mut ctx, fixture) = forward_token_exchange_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token =
-            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
-                .await
-                .expect("forward token exchange should inject");
+        let with_token = inject_token_grant_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            &mut ctx,
+            None,
+            FORWARD_REQUEST_ID,
+            None,
+        )
+        .await
+        .expect("forward token exchange should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13249,29 +13355,53 @@ network_policies:
 
     #[tokio::test]
     async fn forward_proxy_token_grant_failure_returns_error_before_rewrite() {
-        let (mut ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
+        let (mut ctx, fixture) = forward_token_grant_context(Err(forward_grant_failure()));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err =
-            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
-                .await
-                .expect_err("forward token grant failure should stop request rewriting");
+        let err = inject_token_grant_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            &mut ctx,
+            None,
+            FORWARD_REQUEST_ID,
+            None,
+        )
+        .await
+        .expect_err("forward token grant failure should stop request rewriting");
 
-        assert_eq!(err.to_string(), "Token grant failed");
+        let refusal = err
+            .downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
+            .expect("typed grant refusal");
+        assert_eq!(refusal.failure(), forward_grant_failure());
+        assert_eq!(refusal.credential(), Some(("provider", "access_token")));
+        assert_eq!(err.to_string(), "dynamic token grant failed");
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
     #[tokio::test]
     async fn forward_proxy_token_exchange_failure_returns_error_before_rewrite() {
-        let (mut ctx, fixture) = forward_token_exchange_context(Err("oauth unavailable"));
+        let (mut ctx, fixture) = forward_token_exchange_context(Err(forward_grant_failure()));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err =
-            inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &mut ctx, None)
-                .await
-                .expect_err("forward token exchange failure should stop request rewriting");
+        let err = inject_token_grant_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            &mut ctx,
+            None,
+            FORWARD_REQUEST_ID,
+            None,
+        )
+        .await
+        .expect_err("forward token exchange failure should stop request rewriting");
 
-        assert_eq!(err.to_string(), "Token grant failed");
+        let refusal = err
+            .downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
+            .expect("typed grant refusal");
+        assert_eq!(refusal.failure(), forward_grant_failure());
+        assert_eq!(refusal.credential(), Some(("provider", "access_token")));
+        assert_eq!(err.to_string(), "dynamic token grant failed");
         fixture.assert_one_token_exchange_request(
             "api.example.test\t8080\t/v1/**\tprovider:access_token",
         );

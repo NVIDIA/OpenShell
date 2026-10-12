@@ -4949,10 +4949,9 @@ pub(super) async fn handle_report_policy_status(
                 |sandbox| {
                     sandbox.set_current_policy_version(version_to_set);
                     if let Some(endpoints) = &endpoint_reset {
-                        endpoint_status::reconcile_endpoint_statuses(
+                        endpoint_status::reset_endpoint_statuses(
                             sandbox,
                             endpoints,
-                            &HashSet::new(),
                             &prost_types::Timestamp::default(),
                         );
                     }

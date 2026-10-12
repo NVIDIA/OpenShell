@@ -43,6 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the build process environment.
     let mut proto_config = tonic_prost_build::Config::new();
     proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+    // Keep optional grant evidence off sandbox lifecycle futures' stacks.
+    proto_config.boxed(".openshell.v1.SandboxStatus.last_token_grant_failure");
     let proto_include = protoc_bin_vendored::include_path()?;
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);

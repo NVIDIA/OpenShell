@@ -67,6 +67,7 @@ protoc-bin-vendored = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [lints]
 workspace = true

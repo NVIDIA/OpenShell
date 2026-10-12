@@ -52,6 +52,7 @@ tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tonic = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -67,7 +68,6 @@ openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-tonic = { workspace = true }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }

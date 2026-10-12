@@ -684,9 +684,11 @@ impl SupervisorSessionRegistry {
         };
         // Status without its live observation authority is unknown. Keep the
         // configured address so a caller can still identify each endpoint.
+        status.last_token_grant_failure = None;
         for endpoint in &mut status.endpoint_statuses {
             endpoint.last_result = openshell_core::proto::EndpointResult::NoObservedExchange as i32;
             endpoint.last_reported_time = None;
+            endpoint.last_failure = None;
         }
     }
 
@@ -3263,22 +3265,42 @@ mod tests {
             host: "api.example.com".to_string(),
             ports: vec![443],
             path: "/mcp".to_string(),
-            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_result: EndpointResult::CredentialUnavailable as i32,
             last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
+            // Evidence without live authority must drop its cause with the result.
+            last_failure: Some(
+                openshell_core::endpoint_failure::EndpointFailure::token_grant(
+                    openshell_core::token_grant_failure::TokenGrantFailure::new(
+                        openshell_core::token_grant_failure::TokenGrantFailureKind::Timeout,
+                        openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
+                    ),
+                    "github",
+                    "access_token",
+                    "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9",
+                )
+                .to_proto(),
+            ),
         };
         let ready = SandboxCondition {
             r#type: "Ready".to_string(),
             status: "True".to_string(),
             ..Default::default()
         };
+        let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
+            destination_host: "api.example.com".to_string(),
+            destination_port: 443,
+            failure: endpoint.last_failure.clone(),
+        });
         sandbox.status = Some(SandboxStatus {
             endpoint_statuses: vec![endpoint.clone()],
+            last_token_grant_failure: Some(grant_failure.clone()),
             conditions: vec![ready.clone()],
             ..Default::default()
         });
         let unknown = EndpointStatus {
             last_result: EndpointResult::NoObservedExchange as i32,
             last_reported_time: None,
+            last_failure: None,
             ..endpoint.clone()
         };
 
@@ -3287,12 +3309,22 @@ mod tests {
         let projected_status = without_session.status.expect("status");
         assert_eq!(projected_status.endpoint_statuses, vec![unknown.clone()]);
         assert_eq!(projected_status.conditions, vec![ready.clone()]);
+        assert!(projected_status.last_token_grant_failure.is_none());
+
+        let mut rest_only = sandbox.clone();
+        rest_only.status.as_mut().unwrap().endpoint_statuses.clear();
+        registry.project_endpoint_status(&mut rest_only, false);
+        assert!(rest_only.status.unwrap().last_token_grant_failure.is_none());
 
         let mut remotely_owned = sandbox.clone();
         registry.project_endpoint_status(&mut remotely_owned, true);
         let remote_status = remotely_owned.status.expect("status");
         assert_eq!(remote_status.endpoint_statuses, vec![endpoint.clone()]);
         assert_eq!(remote_status.conditions, vec![ready.clone()]);
+        assert_eq!(
+            remote_status.last_token_grant_failure,
+            Some(grant_failure.clone())
+        );
 
         let (session_tx, _session_rx) = mpsc::channel(1);
         registry.register(
@@ -3306,12 +3338,17 @@ mod tests {
         let uninitialized_status = before_initialization.status.expect("status");
         assert_eq!(uninitialized_status.endpoint_statuses, vec![unknown]);
         assert_eq!(uninitialized_status.conditions, vec![ready.clone()]);
+        assert!(uninitialized_status.last_token_grant_failure.is_none());
 
         assert!(registry.initialize_endpoint_status_authority("sandbox-1", "session-1"));
         registry.project_endpoint_status(&mut sandbox, false);
         let initialized_status = sandbox.status.expect("status");
         assert_eq!(initialized_status.endpoint_statuses, vec![endpoint]);
         assert_eq!(initialized_status.conditions, vec![ready]);
+        assert_eq!(
+            initialized_status.last_token_grant_failure,
+            Some(grant_failure)
+        );
     }
 
     fn sandbox_principal(sandbox_id: &str) -> Principal {

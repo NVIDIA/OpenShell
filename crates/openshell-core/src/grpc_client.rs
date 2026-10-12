@@ -35,6 +35,7 @@ use crate::proto::{
 };
 use crate::sandbox_env;
 use crate::time::{duration_to_std, timestamp_to_millis};
+use crate::token_grant_failure::{TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
@@ -280,7 +281,7 @@ impl ClientSpanStatus {
         }
     }
 
-    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+    fn finish<T, E>(mut self, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
         self.finished = result.is_ok();
         result
     }
@@ -1349,6 +1350,12 @@ mod provider_environment_tests {
     }
 }
 
+/// Exchange a provider credential without retaining gateway diagnostics.
+///
+/// Only a verified TLS connection can establish the provenance of a precise
+/// grant classification. Plaintext responses remain safe unknown failures.
+/// A `request_id` travels as `x-request-id` metadata, which the gateway keeps
+/// on its request span and failure log line.
 #[tracing::instrument(
     name = "supervisor.gateway.exchange_provider_subject_token",
     skip_all,
@@ -1360,56 +1367,274 @@ pub async fn exchange_provider_subject_token(
     provider: &str,
     credential_key: &str,
     supervisor_jwt_svid: &str,
-) -> Result<ProviderSubjectTokenExchangeResult> {
+    request_id: Option<&str>,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
     let status = ClientSpanStatus::current();
-    debug!(
-        endpoint = %endpoint,
-        sandbox_id = %sandbox_id,
-        provider = %provider,
-        credential_key = %credential_key,
-        "Exchanging provider subject token through gateway"
-    );
+    status.finish(
+        exchange_provider_subject_token_inner(
+            endpoint,
+            sandbox_id,
+            provider,
+            credential_key,
+            supervisor_jwt_svid,
+            request_id,
+        )
+        .await,
+    )
+}
 
-    let mut client = connect(endpoint).await?;
-    let response = client
-        .exchange_provider_subject_token(ExchangeProviderSubjectTokenRequest {
+async fn exchange_provider_subject_token_inner(
+    endpoint: &str,
+    sandbox_id: &str,
+    provider: &str,
+    credential_key: &str,
+    supervisor_jwt_svid: &str,
+    request_id: Option<&str>,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+    let endpoint = token_grant_gateway_endpoint(endpoint)?;
+    if sandbox_id.is_empty() || provider.is_empty() || credential_key.is_empty() {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::Configuration,
+            TokenGrantStage::GatewayRpc,
+        ));
+    }
+    if supervisor_jwt_svid.is_empty() {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::WorkloadIdentityRejected,
+            TokenGrantStage::WorkloadIdentity,
+        ));
+    }
+    // TLS setup errors can contain paths and transport errors can contain URLs.
+    // Discard those sources at the grant boundary; never diagnose from prose.
+    let mut client = tokio::time::timeout(Duration::from_secs(35), connect(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
+    let request = provider_subject_token_exchange_request(
+        ExchangeProviderSubjectTokenRequest {
             sandbox_id: sandbox_id.to_string(),
             provider: provider.to_string(),
             credential_key: credential_key.to_string(),
             supervisor_jwt_svid: supervisor_jwt_svid.to_string(),
-        })
-        .await
-        .map_err(provider_subject_token_exchange_status)?;
-    let inner = response.into_inner();
+        },
+        request_id,
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(35),
+        client.exchange_provider_subject_token(request),
+    )
+    .await
+    .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
+    .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?;
+    provider_subject_token_exchange_result(response.into_inner())
+}
+
+/// Attach the exchange's request ID as `x-request-id` gRPC metadata.
+///
+/// A value that is not valid metadata is omitted, never rewritten.
+fn provider_subject_token_exchange_request(
+    body: ExchangeProviderSubjectTokenRequest,
+    request_id: Option<&str>,
+) -> tonic::Request<ExchangeProviderSubjectTokenRequest> {
+    let mut request = tonic::Request::new(body);
+    if let Some(request_id) = request_id.and_then(|value| value.parse().ok()) {
+        request.metadata_mut().insert("x-request-id", request_id);
+    }
+    request
+}
+
+fn gateway_grant_failure(kind: TokenGrantFailureKind) -> TokenGrantFailure {
+    TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc)
+}
+
+/// Validate a grant gateway authority before acquiring a workload assertion.
+///
+/// Rejects endpoint components that cannot be used by the gRPC transport and
+/// might otherwise carry sensitive values into connection diagnostics.
+pub fn validate_token_grant_gateway_endpoint(
+    endpoint: &str,
+) -> std::result::Result<(), TokenGrantFailure> {
+    token_grant_gateway_endpoint(endpoint).map(|_| ())
+}
+
+fn token_grant_gateway_endpoint(
+    endpoint: &str,
+) -> std::result::Result<url::Url, TokenGrantFailure> {
+    let endpoint = url::Url::parse(endpoint)
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
+    // gRPC endpoints identify an authority, not an arbitrary token-service URL.
+    // Reject sensitive URL components before shared connection code can use it.
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.path() != "/"
+    {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    Ok(endpoint)
+}
+
+fn provider_subject_token_exchange_result(
+    inner: crate::proto::ExchangeProviderSubjectTokenResponse,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
     let expires_in = inner
         .expires_after
         .as_ref()
         .map(duration_to_std)
         .transpose()
-        .into_diagnostic()?
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?
         .map_or(0, |value| {
             i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
         });
-    status.finish(Ok(ProviderSubjectTokenExchangeResult {
+    Ok(ProviderSubjectTokenExchangeResult {
         access_token: inner.access_token,
         expires_in,
         token_type: inner.token_type,
-    }))
+    })
 }
 
-fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
-    let message = status.message();
-    if message.is_empty() {
-        miette::miette!(
-            "gateway ExchangeProviderSubjectToken failed with status {}",
-            status.code()
-        )
+fn provider_subject_token_exchange_status(
+    status: &Status,
+    endpoint: &url::Url,
+) -> TokenGrantFailure {
+    // The shared connector verifies the gateway certificate for https
+    // endpoints; only that channel can vouch for a precise classification.
+    if endpoint.scheme() == "https" {
+        TokenGrantFailure::from_status(status)
     } else {
-        miette::miette!(
-            "gateway ExchangeProviderSubjectToken failed with status {}: {}",
-            status.code(),
-            message
+        // HTTP provides no authenticated server identity, even when the caller
+        // supplied a valid bearer. Structured details cannot confer that trust.
+        gateway_grant_failure(TokenGrantFailureKind::Unclassified)
+    }
+}
+
+#[cfg(test)]
+mod token_grant_exchange_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_gateway_preserves_typed_failure_and_http_downgrades_it() {
+        let failure = TokenGrantFailure::new(
+            TokenGrantFailureKind::ProviderAuthorizationRequired,
+            TokenGrantStage::IntermediateExchange,
         )
+        .with_upstream_status(409);
+        let status = failure.to_status();
+        let https = url::Url::parse("https://gateway.example:8080/").unwrap();
+        let http = url::Url::parse("http://gateway.example:8080/").unwrap();
+        assert_eq!(
+            provider_subject_token_exchange_status(&status, &https),
+            failure
+        );
+        let downgraded = provider_subject_token_exchange_status(&status, &http);
+        assert_eq!(downgraded.kind(), TokenGrantFailureKind::Unclassified);
+        assert_eq!(downgraded.stage(), TokenGrantStage::GatewayRpc);
+        assert_eq!(downgraded.upstream_status(), None);
+    }
+
+    #[test]
+    fn exchange_request_carries_only_a_valid_request_id() {
+        let body = || ExchangeProviderSubjectTokenRequest {
+            sandbox_id: "sandbox".into(),
+            provider: "provider".into(),
+            credential_key: "credential".into(),
+            supervisor_jwt_svid: "svid".into(),
+        };
+        let request_id = "5c4b3a29-1807-4f6e-8d5c-4b3a29180716";
+        let request = provider_subject_token_exchange_request(body(), Some(request_id));
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+        for absent in [None, Some("line\nbreak")] {
+            let request = provider_subject_token_exchange_request(body(), absent);
+            assert!(request.metadata().get("x-request-id").is_none());
+        }
+    }
+
+    #[test]
+    fn gateway_error_text_is_never_retained() {
+        use std::error::Error;
+
+        let status = Status::failed_precondition(
+            "SYNTHETIC_GATEWAY_SECRET https://user:secret@token.example/path?token=secret",
+        );
+        let https = url::Url::parse("https://gateway.example:8080/").unwrap();
+        let failure = provider_subject_token_exchange_status(&status, &https);
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+        assert_eq!(failure.to_string(), "dynamic token grant failed");
+        assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
+        assert!(failure.source().is_none());
+    }
+
+    #[test]
+    fn grant_gateway_endpoint_rejects_sensitive_components() {
+        for endpoint in [
+            "https://user:SECRET@localhost/",
+            "https://localhost/?token=SECRET",
+            "https://localhost/#SECRET",
+            "https://localhost/SECRET",
+            "file:///SECRET",
+            "not an endpoint SECRET",
+        ] {
+            let failure = token_grant_gateway_endpoint(endpoint).unwrap_err();
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+            assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
+        }
+        assert_eq!(
+            token_grant_gateway_endpoint("https://localhost:8443")
+                .unwrap()
+                .scheme(),
+            "https"
+        );
+        assert_eq!(
+            token_grant_gateway_endpoint("http://localhost:8080")
+                .unwrap()
+                .scheme(),
+            "http"
+        );
+    }
+
+    #[test]
+    fn malformed_gateway_duration_discards_token_and_diagnostic() {
+        let failure = provider_subject_token_exchange_result(
+            crate::proto::ExchangeProviderSubjectTokenResponse {
+                access_token: "SYNTHETIC_ACCESS_SECRET".into(),
+                token_type: "Bearer".into(),
+                expires_after: Some(prost_types::Duration {
+                    seconds: 1,
+                    nanos: -1,
+                }),
+            },
+        )
+        .err()
+        .expect("invalid duration is rejected");
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+        assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
+    }
+
+    #[test]
+    fn successful_gateway_response_preserves_cache_expiration() {
+        let result = provider_subject_token_exchange_result(
+            crate::proto::ExchangeProviderSubjectTokenResponse {
+                access_token: "valid-token".into(),
+                token_type: "Bearer".into(),
+                expires_after: Some(prost_types::Duration {
+                    seconds: 120,
+                    nanos: 0,
+                }),
+            },
+        )
+        .expect("valid response");
+        assert_eq!(result.access_token, "valid-token");
+        assert_eq!(result.expires_in, 120);
+        assert_eq!(result.token_type, "Bearer");
     }
 }
 
@@ -1555,9 +1780,15 @@ pub struct ProviderEnvironmentResult {
     pub stable_placeholder_environment_keys: Vec<String>,
 }
 
+/// Intermediate provider credential returned to the trusted supervisor.
+///
+/// Tokens deliberately have no Debug representation.
 pub struct ProviderSubjectTokenExchangeResult {
+    /// Bearer material for the final token exchange; never log this field.
     pub access_token: String,
+    /// Remaining lifetime in seconds, or zero when the gateway omitted it.
     pub expires_in: i64,
+    /// Token type declared by the service.
     pub token_type: String,
 }
 
@@ -1793,6 +2024,10 @@ impl CachedOpenShellClient {
                     EndpointResult::UpstreamRejected => ProtoEndpointResult::UpstreamRejected,
                 }
                 .into(),
+                failure: endpoint
+                    .failure
+                    .as_ref()
+                    .map(crate::endpoint_failure::EndpointFailure::to_proto),
             })
             .collect();
 
@@ -1806,6 +2041,9 @@ impl CachedOpenShellClient {
                 observed_endpoint_ids: snapshot.observed_endpoint_ids.clone(),
                 supervisor_session_id: snapshot.supervisor_session_id.clone(),
                 report_sequence: snapshot.report_sequence,
+                token_grant_status: Some(crate::proto::TokenGrantStatus {
+                    last_failure: snapshot.last_token_grant_failure.clone(),
+                }),
             })
             .await
             .into_diagnostic()?;

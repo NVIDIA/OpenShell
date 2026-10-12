@@ -658,6 +658,55 @@ Token grants require the sandbox supervisor to have access to a SPIFFE Workload 
 
 The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
 
+### Token Grant Failures
+
+When a token grant fails, OpenShell refuses the protected request before sending any of its bytes upstream. The workload receives `502 Bad Gateway` with an `x-openshell-request-id` header. L7 relays return an empty body, and the forward proxy returns the JSON body `{"error":"token_grant_failed","detail":"dynamic token grant failed"}`. The response, the supervisor's OCSF events, and `policy.local` denials never say why the grant failed, because the sandboxed agent can read them. Users authorized to read the sandbox can retrieve the cause from `Sandbox.status.last_token_grant_failure` and `openshell logs`.
+
+The request ID is a random UUID that the supervisor mints for each HTTP exchange. It names the same exchange everywhere:
+
+- The supervisor sends it to the token service in the `x-openshell-request-id` request header.
+- For `token_exchange` grants, the supervisor sends it to the gateway as gRPC `x-request-id` metadata, and the gateway forwards it to the intermediate token endpoint.
+- The supervisor's `Token grant failed` OCSF event carries it as `request_id`. In `openshell logs`, the supervisor's log line with the same message adds the failure code, stage, and upstream HTTP status.
+- When the gateway hop fails, the gateway's `dynamic token grant failed` log line carries it with the failure code, stage, and upstream HTTP status.
+
+OpenShell classifies each failure into one of these codes. The recovery action uses the same values as provider refresh status:
+
+| Code | Meaning | Recovery action |
+|---|---|---|
+| `provider_authorization_required` | The user must authorize the provider again. | `reauthorize` |
+| `workload_identity_rejected` | The SPIFFE Workload API, the gateway, or the token service rejected the sandbox's workload identity. | `fix_configuration` |
+| `configuration_error` | The grant, provider, or token-service configuration is invalid. | `fix_configuration` |
+| `timeout` | A grant step exceeded its time limit. | `retry` |
+| `unavailable` | A required service or connection was unavailable. | `retry` |
+| `unclassified` | The available evidence does not establish a more specific cause. | `investigate` |
+
+The stage names the step that observed the failure: `configuration`, `workload_identity`, `gateway_rpc`, `intermediate_exchange`, `token_endpoint`, or `injection`. OpenShell maps token-service responses as follows:
+
+- HTTP 429 and 5xx, and connection failures, are `unavailable`. A timeout, including a slow response body, is `timeout`.
+- A bare HTTP 401, 403, or 409 is `unclassified`, with its status recorded. OpenShell never infers `provider_authorization_required` from a 401.
+- For `token_exchange` grants, the gateway reports `provider_authorization_required` when the user's stored subject credential is missing or expired, and `workload_identity_rejected` when it rejects the supervisor's JWT-SVID. The supervisor accepts these causes only over its verified TLS connection to the gateway.
+
+OpenShell keeps only the code, stage, and HTTP status. It discards response descriptions, headers, endpoint diagnostics, and error chains. Success and failure response bodies are limited to 64 KiB. A successful response must contain a nonempty header-compatible `access_token`.
+
+A token service can also state a cause by adopting the `openshell.token-grant.v1` error extension. For example, a service that requires the user to authorize a provider returns HTTP 409 with:
+
+```json
+{
+  "error": "provider_authorization_required",
+  "openshell_error_contract": "openshell.token-grant.v1"
+}
+```
+
+OpenShell accepts this cause only from the configured endpoint over verified HTTPS. It verifies the server certificate and hostname and does not follow redirects. Loopback and Kubernetes-service HTTP endpoints cannot authenticate these signals. The extension recognizes these status and code pairs:
+
+- HTTP 409 with `provider_authorization_required`.
+- HTTP 401 or 403 with `workload_identity_rejected`.
+- HTTP 400 with `configuration_error`.
+
+Each response also requires the exact `openshell_error_contract` marker. Unknown versions, inconsistent status and code pairs, malformed responses, and signals received over plain HTTP are `unclassified`, except that HTTP 429 and 5xx stay `unavailable`. OpenShell does not infer identity rejection from generic OAuth errors such as `invalid_client` or `invalid_grant`, which can have more than one cause.
+
+The latest classified grant refusal is available as `last_token_grant_failure` for every destination, including REST requests and failures before an HTTP path is known. Its `destination_host` and `destination_port` identify the attempted call, and `failure` contains the bounded cause. MCP-over-HTTP endpoint status also carries the cause as `last_failure`. Refer to [Read Token Grant Failures](/how-it-works/sandboxes/overview#read-token-grant-failures) for retrieval and clearing rules. Find correlated events in `openshell logs`: the supervisor's `Token grant failed` line or, when the gateway hop failed, the gateway's `dynamic token grant failed` line. The token service receives the ID with every request. The no-bytes guarantee excludes connection setup: an inspected CONNECT path can already have completed an upstream TLS handshake before a grant fails.
+
 ## Provider Instances
 
 A provider instance stores concrete credentials and config for a profile type. `--type` accepts the ID of any imported profile, matched exactly. Creating a provider for a profile the gateway does not serve fails and names the import command.

@@ -145,12 +145,17 @@ fn credential_generation_guard(
 /// Resolve a grant from the provider installation and policy owners admitted
 /// for this request. Provider refresh is independent of tunnel lifetime: the
 /// connection's original dynamic map cannot authorize a later request.
+///
+/// A refused grant returns a [`TokenGrantInjectionError`](crate::l7::token_grant_injection::TokenGrantInjectionError)
+/// inside the report, so callers can tell it apart from other failures.
 pub(crate) async fn prepare_inspected_request(
     req: crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
     engine: &TunnelPolicyEngine,
     config: &L7EndpointConfig,
     request_info: &L7RequestInfo,
+    request_id: &str,
+    observation_context: Option<&openshell_core::endpoint_status::EndpointObservationContext>,
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
     let snapshot = ctx
@@ -201,7 +206,14 @@ pub(crate) async fn prepare_inspected_request(
         }
         let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
         crate::l7::token_grant_injection::inject_for_admitted_owners(
-            req, &scoped, snapshot, &owners,
+            req,
+            &scoped,
+            snapshot,
+            &owners,
+            request_id,
+            observation_context.filter(|context| {
+                context.matches_config(&config.policy_hash, Some(snapshot.revision))
+            }),
         )
         .await?
     } else {
@@ -659,15 +671,42 @@ where
         websocket_middleware,
         observation_context,
     } = forwarding;
-    let (request, grant_ctx) =
-        match prepare_inspected_request(request, ctx, engine, config, request_info).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
+    let (request, grant_ctx) = match prepare_inspected_request(
+        request,
+        ctx,
+        engine,
+        config,
+        request_info,
+        request_id,
+        observation_context,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(refusal) =
+                error.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
+            {
+                // The refusal event already names the credential and request
+                // ID. The provider revision is not pinned here: a revision
+                // change resets the inventory, which drops this observation.
+                if let Some(observer) = EndpointObserver::begin_captured(
+                    ctx.endpoint_observation_tx.as_ref(),
+                    config,
+                    observation_context,
+                    None,
+                    Some(engine.generation_guard()),
+                ) {
+                    observer.observe_token_grant_refusal(refusal, request_id);
+                }
+                write_token_grant_failure_response(client, request_id).await?;
+            } else {
                 warn!(error = %error, "Token grant failed before forwarding");
                 write_bad_gateway_response(client).await?;
-                return Ok(None);
             }
-        };
+            return Ok(None);
+        }
+    };
     *ctx = grant_ctx;
     let observer = EndpointObserver::begin_captured(
         ctx.endpoint_observation_tx.as_ref(),
@@ -1998,6 +2037,10 @@ where
             return Ok(());
         }
 
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         // Parse one HTTP request from client
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
@@ -2228,7 +2271,7 @@ where
                     request_id: &request_id,
                     response_chain: &response_chain,
                     websocket_middleware: middleware_session.is_some(),
-                    observation_context: None,
+                    observation_context: observation_context.as_ref(),
                 },
             )
             .await;
@@ -2688,6 +2731,10 @@ where
             return Ok(());
         }
 
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         // Validate the head, including body framing, before deciding whether
         // this endpoint can inspect the requested protocol. Upgrade refusal
         // must not wait for a body or depend on its inspection size limit.
@@ -2900,7 +2947,7 @@ where
                     request_id: &request_id,
                     response_chain: &response_chain,
                     websocket_middleware: false,
-                    observation_context: None,
+                    observation_context: observation_context.as_ref(),
                 },
             )
             .await?
@@ -3472,6 +3519,10 @@ where
             return Ok(());
         }
 
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         // Read next request from client.
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
@@ -3597,20 +3648,21 @@ where
             req
         };
 
-        let req_with_auth = match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    error = %e,
-                    "Token grant failed in passthrough relay"
-                );
-                write_bad_gateway_response(client).await?;
-                return Ok(());
-            }
+        let mut grant_ctx = ctx.clone();
+        let Ok(req_with_auth) = crate::l7::token_grant_injection::inject_if_needed_captured(
+            req,
+            &mut grant_ctx,
+            &request_id,
+            observation_context.as_ref(),
+        )
+        .await
+        else {
+            // The refusal event names the credential and request ID.
+            // The sandbox-level grant record does not require an MCP endpoint identity.
+            write_token_grant_failure_response(client, &request_id).await?;
+            return Ok(());
         };
+        let ctx = &grant_ctx;
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
@@ -3676,16 +3728,71 @@ where
     Ok(())
 }
 
+/// Refuse a request whose dynamic token grant failed.
+///
+/// The response is the generic empty `502` plus the exchange's request ID, so
+/// the caller can quote it to an operator. It never carries the cause.
+async fn write_token_grant_failure_response<W>(client: &mut W, request_id: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n{}: {request_id}\r\nConnection: close\r\n\r\n",
+        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
     use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
+    use openshell_core::token_grant_failure::{
+        TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    };
     use std::collections::HashMap as TestHashMap;
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    fn relay_grant_failure() -> TokenGrantFailure {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::ProviderAuthorizationRequired,
+            TokenGrantStage::GatewayRpc,
+        )
+        .with_upstream_status(409)
+    }
+
+    /// A refused grant returns the generic empty 502 plus a request ID, and no
+    /// part of the response reveals the classification.
+    fn assert_grant_refusal_response(response: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("Content-Length: 0\r\n"), "{response}");
+        let request_id = response
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(openshell_core::token_grant_failure::REQUEST_ID_HEADER)
+                    .and_then(|value| value.strip_prefix(": "))
+            })
+            .expect("refusal carries the request ID");
+        assert!(uuid::Uuid::parse_str(request_id).is_ok(), "{request_id}");
+        // The random ID can contain any digits; check everything else.
+        let without_id = response.replace(request_id, "");
+        let failure = relay_grant_failure();
+        for classification in [failure.code(), failure.stage().code(), "409"] {
+            assert!(!without_id.contains(classification), "{response}");
+        }
+    }
 
     #[tokio::test]
     async fn body_denial_returns_actionable_local_json() {
@@ -4311,7 +4418,7 @@ mod tests {
     }
 
     fn rest_token_grant_relay_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<&str, TokenGrantFailure>,
     ) -> (
         L7EndpointConfig,
         TunnelPolicyEngine,
@@ -4383,7 +4490,7 @@ network_policies:
     }
 
     fn rest_token_exchange_relay_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<&str, TokenGrantFailure>,
     ) -> (
         L7EndpointConfig,
         TunnelPolicyEngine,
@@ -4481,7 +4588,7 @@ network_policies:
     }
 
     fn passthrough_token_grant_relay_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<&str, TokenGrantFailure>,
     ) -> (
         PolicyGenerationGuard,
         L7EvalContext,
@@ -4837,7 +4944,7 @@ network_policies:
     }
 
     fn passthrough_token_exchange_relay_context(
-        resolver_response: std::result::Result<&str, &str>,
+        resolver_response: std::result::Result<&str, TokenGrantFailure>,
     ) -> (
         PolicyGenerationGuard,
         L7EvalContext,
@@ -5170,7 +5277,7 @@ network_policies:
 
     #[tokio::test]
     async fn l7_rest_tls_relay_second_grant_failure_forwards_nothing() {
-        assert_multiple_grants_tls_relay(Err("issuer echoed identity-secret")).await;
+        assert_multiple_grants_tls_relay(Err(relay_grant_failure())).await;
     }
 
     async fn token_grant_tls_pair() -> (
@@ -5205,7 +5312,9 @@ network_policies:
         (client.unwrap(), server.unwrap())
     }
 
-    async fn assert_multiple_grants_tls_relay(identity_result: std::result::Result<&str, &str>) {
+    async fn assert_multiple_grants_tls_relay(
+        identity_result: std::result::Result<&str, TokenGrantFailure>,
+    ) {
         let (config, tunnel_engine, mut ctx, fixture) =
             rest_token_grant_relay_context(Ok("service-token"));
         let service_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
@@ -5260,13 +5369,12 @@ network_policies:
             .unwrap()
             .unwrap();
         let response = String::from_utf8_lossy(&response[..n]);
-        assert!(response.contains(if identity_result.is_ok() {
-            "204 No Content"
+        if identity_result.is_ok() {
+            assert!(response.contains("204 No Content"));
         } else {
-            "502 Bad Gateway"
-        }));
+            assert_grant_refusal_response(&response);
+        }
         assert!(!response.contains("service-token"));
-        assert!(!response.contains("identity-secret"));
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(2), relay)
             .await
@@ -5358,7 +5466,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_relay_token_grant_failure_does_not_forward_request() {
         let (config, tunnel_engine, ctx, fixture) =
-            rest_token_grant_relay_context(Err("oauth unavailable"));
+            rest_token_grant_relay_context(Err(relay_grant_failure()));
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -5392,7 +5500,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+        assert_grant_refusal_response(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -5478,7 +5586,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_relay_token_exchange_failure_does_not_forward_request() {
         let (config, tunnel_engine, ctx, fixture) =
-            rest_token_exchange_relay_context(Err("oauth unavailable"));
+            rest_token_exchange_relay_context(Err(relay_grant_failure()));
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -5512,7 +5620,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+        assert_grant_refusal_response(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -7900,7 +8008,7 @@ network_policies:
     #[tokio::test]
     async fn passthrough_relay_token_grant_failure_returns_bad_gateway_without_forwarding() {
         let (generation_guard, ctx, fixture) =
-            passthrough_token_grant_relay_context(Err("oauth unavailable"));
+            passthrough_token_grant_relay_context(Err(relay_grant_failure()));
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -7934,7 +8042,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+        assert_grant_refusal_response(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -8017,7 +8125,7 @@ network_policies:
     #[tokio::test]
     async fn passthrough_relay_token_exchange_failure_returns_bad_gateway_without_forwarding() {
         let (generation_guard, ctx, fixture) =
-            passthrough_token_exchange_relay_context(Err("oauth unavailable"));
+            passthrough_token_exchange_relay_context(Err(relay_grant_failure()));
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -8051,7 +8159,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+        assert_grant_refusal_response(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(

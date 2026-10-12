@@ -3,6 +3,9 @@
 
 #![cfg(feature = "e2e-podman")]
 
+#[path = "provider_token_exchange/closure.rs"]
+mod closure;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -143,10 +146,14 @@ struct SpiffeWorkloadApi {
     subject: Arc<str>,
     jwks: Arc<Vec<u8>>,
     encoding_key: Arc<EncodingKey>,
+    deny_identity: Arc<AtomicBool>,
 }
 
 impl SpiffeWorkloadApi {
     fn jwt_svid(&self, audience: &[String]) -> Result<String, Status> {
+        if self.deny_identity.load(Ordering::SeqCst) {
+            return Err(Status::permission_denied("identity-secret-canary"));
+        }
         let now = unix_timestamp();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(KEY_ID.to_string());
@@ -314,6 +321,14 @@ fn jwks() -> Vec<u8> {
 }
 
 async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle {
+    start_controlled_spiffe_workload_api(path, subject, Arc::default()).await
+}
+
+async fn start_controlled_spiffe_workload_api(
+    path: &Path,
+    subject: &str,
+    deny_identity: Arc<AtomicBool>,
+) -> FixtureHandle {
     let api = SpiffeWorkloadApi {
         subject: Arc::<str>::from(subject),
         jwks: Arc::new(jwks()),
@@ -321,6 +336,7 @@ async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle 
             EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes())
                 .expect("test RSA key should parse"),
         ),
+        deny_identity,
     };
     let endpoint = path.to_string_lossy();
     if endpoint.starts_with("tcp:") {
@@ -773,7 +789,7 @@ async fn sandbox_exec_http(
     let url = format!("http://host.openshell.internal:{target_port}{path}");
     let expect_denied_python = if expect_denied { "True" } else { "False" };
     let script = format!(
-        r#"import base64, json, os, re, urllib.error, urllib.request
+        r#"import base64, json, os, re, urllib.error, urllib.request, uuid
 
 def contains_credential(value):
     if any(marker in value for marker in (
@@ -810,6 +826,10 @@ except urllib.error.HTTPError as error:
         raise RuntimeError("provider credential material reached the workload error")
     if not {expect_denied_python} or error.code != 502:
         raise RuntimeError("unexpected HTTP response") from None
+    # The refusal names the exchange with an opaque ID and nothing else.
+    request_id = error.headers.get("x-openshell-request-id", "")
+    if str(uuid.UUID(request_id)) != request_id:
+        raise RuntimeError("refusal did not carry a canonical request ID")
     print("grant-denied")
 "#
     );
@@ -1001,8 +1021,8 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
 
 // Read one whole fixture request without consuming the following keepalive
 // request. OAuth forms can arrive separately from their headers.
-async fn read_route_fixture_request(
-    stream: &mut TcpStream,
+async fn read_route_fixture_request<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
     observed_bytes: Option<&AtomicUsize>,
 ) -> Result<Option<String>, String> {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1062,6 +1082,7 @@ async fn read_route_fixture_request(
 struct RouteGrantState {
     fail_next_b: AtomicBool,
     supervisor_requests: Mutex<Vec<String>>,
+    failed_request_id: Mutex<Option<String>>,
 }
 
 async fn start_route_token_endpoint(port: u16, state: Arc<RouteGrantState>) -> FixtureHandle {
@@ -1097,6 +1118,14 @@ async fn start_route_token_endpoint(port: u16, state: Arc<RouteGrantState>) -> F
                             route == "b" && state.fail_next_b.swap(false, Ordering::SeqCst)
                         } else { false };
                         let (status, body) = if fail {
+                            let request_id = request.split_once("\r\n\r\n")
+                                .map(|(headers, _)| headers)
+                                .unwrap_or_default()
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(name, _)| name.eq_ignore_ascii_case("x-openshell-request-id"))
+                                .map(|(_, value)| value.trim().to_owned());
+                            *state.failed_request_id.lock().expect("failed grant request ID lock") = request_id;
                             ("HTTP/1.1 503 Service Unavailable", json!({"error": "temporary_failure"}).to_string())
                         } else if valid {
                             let stage = if supervisor { "final" } else { "intermediate" };
@@ -1299,7 +1328,7 @@ async fn podman_provider_routes_recover_and_select_a_b_a_on_one_connection() {
         // The supervisor mediates direct workload connections as CONNECT.
         // HTTPConnection keeps one client socket for the successful A/B/A run.
         let script = format!(
-            r#"import http.client
+            r#"import http.client, uuid
 host = 'host.openshell.internal'
 port = {target_port}
 first = http.client.HTTPConnection(host, port, timeout=10)
@@ -1307,6 +1336,9 @@ first.request('GET', '/b/failure', headers={{'Authorization': 'Bearer stale-valu
 failed = first.getresponse()
 failed.read()
 assert failed.status == 502, 'the controlled grant failure must return 502'
+request_id = failed.getheader('x-openshell-request-id', '')
+assert str(uuid.UUID(request_id)) == request_id, 'the refusal must carry a canonical request ID'
+print('failed-request-id=' + request_id)
 assert failed.will_close, 'the failed tunnel must close'
 first.close()
 recovered = http.client.HTTPConnection(host, port, timeout=10)
@@ -1345,6 +1377,15 @@ print('route-recovery-a-b-a-ok')
     let output = result.expect("gateway-configured route workload succeeds");
     target_result.expect("route target observes EOF on every accepted connection");
     assert!(output.contains("route-recovery-a-b-a-ok"));
+    let response_request_id = output
+        .lines()
+        .find_map(|line| line.strip_prefix("failed-request-id="))
+        .expect("workload prints the refused response's request ID");
+    assert_eq!(
+        grants.failed_request_id.lock().unwrap().as_deref(),
+        Some(response_request_id),
+        "the token service and refused response must identify the same exchange"
+    );
     let requests = observed.lock().expect("route target observations lock");
     assert_eq!(requests.len(), 3, "failed grant must not reach the target");
     assert_eq!(

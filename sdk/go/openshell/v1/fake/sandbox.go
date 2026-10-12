@@ -237,8 +237,26 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
+		s.EndpointStatuses[i].LastFailure = copyEndpointFailure(s.EndpointStatuses[i].LastFailure)
+	}
+	if s.LastTokenGrantFailure != nil {
+		observation := *s.LastTokenGrantFailure
+		observation.Failure = copyEndpointFailure(observation.Failure)
+		s.LastTokenGrantFailure = &observation
 	}
 	return s
+}
+
+func copyEndpointFailure(f *types.EndpointFailure) *types.EndpointFailure {
+	if f == nil {
+		return nil
+	}
+	cp := *f
+	if f.UpstreamHTTPStatus != nil {
+		status := *f.UpstreamHTTPStatus
+		cp.UpstreamHTTPStatus = &status
+	}
+	return &cp
 }
 
 // copyStringMap returns a shallow copy of a string-to-string map.

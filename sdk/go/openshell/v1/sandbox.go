@@ -42,6 +42,21 @@ const (
 	EndpointUpstreamRejected      = types.EndpointUpstreamRejected
 )
 
+// EndpointFailure explains a failed endpoint result with bounded values.
+type EndpointFailure = types.EndpointFailure
+
+// TokenGrantFailureObservation records a refused grant's destination and cause.
+type TokenGrantFailureObservation = types.TokenGrantFailureObservation
+
+// EndpointFailureDomain names the subsystem that explains an endpoint failure.
+type EndpointFailureDomain = types.EndpointFailureDomain
+
+// EndpointFailureDomain values select the closed set that Code and Stage come from.
+const (
+	EndpointFailureDomainUnspecified = types.EndpointFailureDomainUnspecified
+	EndpointFailureDomainTokenGrant  = types.EndpointFailureDomainTokenGrant
+)
+
 // AttachProviderResult holds the result of attaching a provider to a sandbox.
 type AttachProviderResult = types.AttachProviderResult
 

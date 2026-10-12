@@ -256,6 +256,148 @@ func TestSandboxFromProto_EndpointStatuses(t *testing.T) {
 	assert.Equal(t, uint32(443), input.Status.EndpointStatuses[1].Ports[0])
 }
 
+func TestSandboxFromProto_EndpointLastFailure(t *testing.T) {
+	upstreamStatus := uint32(401)
+	reportedAt := timestamppb.New(time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC))
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{EndpointStatuses: []*pb.EndpointStatus{
+		{
+			EndpointId: "endpoint-grant", Host: "tools.example.test", Ports: []uint32{443}, Path: "/mcp",
+			LastResult:       pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE,
+			LastReportedTime: reportedAt,
+			LastFailure: &pb.EndpointFailure{
+				Domain:             pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT,
+				Code:               "provider_authorization_required",
+				RecoveryAction:     pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+				Provider:           "github",
+				CredentialKey:      "token",
+				Stage:              "gateway_rpc",
+				UpstreamHttpStatus: &upstreamStatus,
+				RequestId:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+			},
+		},
+		{
+			EndpointId: "endpoint-plain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other",
+			LastResult:       pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED,
+			LastReportedTime: reportedAt,
+		},
+		{
+			EndpointId: "endpoint-unknown-domain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/future",
+			LastResult: pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE,
+			LastFailure: &pb.EndpointFailure{
+				Domain:    pb.EndpointFailureDomain(99),
+				Code:      "future_code",
+				Stage:     "future_stage",
+				RequestId: "4c1d7a2e-0f3b-4e8a-b6a1-9f2c3d4e5f60",
+			},
+		},
+	}}}
+
+	s := SandboxFromProto(input)
+	require.NotNil(t, s)
+	wantStatus := uint32(401)
+	require.Equal(t, []v1.EndpointStatus{
+		{
+			EndpointID: "endpoint-grant", Host: "tools.example.test", Ports: []uint32{443}, Path: "/mcp",
+			LastResult: v1.EndpointCredentialUnavailable, LastReportedAt: "2026-09-11T10:00:00Z",
+			LastFailure: &v1.EndpointFailure{
+				Domain:             v1.EndpointFailureDomainTokenGrant,
+				Code:               "provider_authorization_required",
+				RecoveryAction:     v1.RefreshRecoveryActionReauthorize,
+				Provider:           "github",
+				CredentialKey:      "token",
+				Stage:              "gateway_rpc",
+				UpstreamHTTPStatus: &wantStatus,
+				RequestID:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+			},
+		},
+		{
+			EndpointID: "endpoint-plain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other",
+			LastResult: v1.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z",
+		},
+		{
+			EndpointID: "endpoint-unknown-domain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/future",
+			LastResult: v1.EndpointCredentialUnavailable,
+			LastFailure: &v1.EndpointFailure{
+				Domain:    v1.EndpointFailureDomainUnspecified,
+				Code:      "future_code",
+				Stage:     "future_stage",
+				RequestID: "4c1d7a2e-0f3b-4e8a-b6a1-9f2c3d4e5f60",
+			},
+		},
+	}, s.Status.EndpointStatuses)
+	assert.Nil(t, s.Status.EndpointStatuses[1].LastFailure)
+	assert.Nil(t, s.Status.EndpointStatuses[2].LastFailure.UpstreamHTTPStatus)
+
+	// The SDK failure must not share the wire message or its optional status.
+	input.Status.EndpointStatuses[0].LastFailure.Code = "changed"
+	upstreamStatus = 500
+	assert.Equal(t, "provider_authorization_required", s.Status.EndpointStatuses[0].LastFailure.Code)
+	assert.Equal(t, uint32(401), *s.Status.EndpointStatuses[0].LastFailure.UpstreamHTTPStatus)
+	*s.Status.EndpointStatuses[0].LastFailure.UpstreamHTTPStatus = 503
+	assert.Equal(t, uint32(500), *input.Status.EndpointStatuses[0].LastFailure.UpstreamHttpStatus)
+}
+
+func TestSandboxFromProto_TokenGrantFailureOutsideEndpointInventory(t *testing.T) {
+	upstreamStatus := uint32(409)
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{
+		LastTokenGrantFailure: &pb.TokenGrantFailureObservation{
+			DestinationHost: "api.example.test",
+			DestinationPort: 8443,
+			Failure: &pb.EndpointFailure{
+				Domain:             pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT,
+				Code:               "provider_authorization_required",
+				RecoveryAction:     pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+				Provider:           "github",
+				CredentialKey:      "token",
+				Stage:              "token_endpoint",
+				UpstreamHttpStatus: &upstreamStatus,
+				RequestId:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+			},
+		},
+	}}
+	converted := SandboxFromProto(input)
+	require.Empty(t, converted.Status.EndpointStatuses)
+	wantStatus := uint32(409)
+	require.Equal(t, &v1.TokenGrantFailureObservation{
+		DestinationHost: "api.example.test",
+		DestinationPort: 8443,
+		Failure: &v1.EndpointFailure{
+			Domain:             v1.EndpointFailureDomainTokenGrant,
+			Code:               "provider_authorization_required",
+			RecoveryAction:     v1.RefreshRecoveryActionReauthorize,
+			Provider:           "github",
+			CredentialKey:      "token",
+			Stage:              "token_endpoint",
+			UpstreamHTTPStatus: &wantStatus,
+			RequestID:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+		},
+	}, converted.Status.LastTokenGrantFailure)
+	input.Status.LastTokenGrantFailure.DestinationHost = "changed.example.test"
+	input.Status.LastTokenGrantFailure.Failure.Code = "changed"
+	upstreamStatus = 500
+	assert.Equal(t, "api.example.test", converted.Status.LastTokenGrantFailure.DestinationHost)
+	assert.Equal(t, "provider_authorization_required", converted.Status.LastTokenGrantFailure.Failure.Code)
+	assert.Equal(t, uint32(409), *converted.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
+	input.Status.LastTokenGrantFailure = nil
+	assert.Nil(t, SandboxFromProto(input).Status.LastTokenGrantFailure)
+}
+
+func TestEndpointFailureDomainFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		input pb.EndpointFailureDomain
+		want  v1.EndpointFailureDomain
+	}{
+		{pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_UNSPECIFIED, v1.EndpointFailureDomainUnspecified},
+		{pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT, v1.EndpointFailureDomainTokenGrant},
+		{pb.EndpointFailureDomain(99), v1.EndpointFailureDomainUnspecified},
+	} {
+		t.Run(tc.input.String(), func(t *testing.T) {
+			assert.Equal(t, tc.want, endpointFailureDomainFromProto(tc.input))
+		})
+	}
+	assert.Nil(t, endpointFailureFromProto(nil))
+}
+
 func TestEndpointResultFromProto(t *testing.T) {
 	for _, tc := range []struct {
 		input pb.EndpointResult

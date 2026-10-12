@@ -1203,6 +1203,10 @@ message SandboxStatus {
   google.protobuf.Timestamp next_restart_time = 15;
   // Time when the current main process became ready.
   google.protobuf.Timestamp main_process_started_time = 16;
+  // Latest refused token grant across all outbound HTTP protocols, including
+  // failures before a configured endpoint or credential could be selected.
+  // Matching grant success or a policy, provider, or supervisor reset clears it.
+  TokenGrantFailureObservation last_token_grant_failure = 17;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -3804,6 +3808,9 @@ message EndpointObservation {
   string endpoint_id = 1;
   // Latest result under the reported configuration and supervisor session.
   EndpointResult result = 2;
+  // Bounded cause of result, when the supervisor classified it. Each failure
+  // domain names the results it can explain.
+  EndpointFailure failure = 3;
 }
 
 // Complete endpoint status report for the caller's current configuration.
@@ -3825,6 +3832,26 @@ message ReportEndpointStatusRequest {
   // are allowed when an inventory reset supersedes a frozen snapshot. Retrying
   // a report preserves its complete body and sequence for idempotent acknowledgement.
   uint64 report_sequence = 7;
+  // Complete latest grant state. Omission retains legacy compatibility;
+  // a present message with no last_failure explicitly clears the prior cause.
+  TokenGrantStatus token_grant_status = 8;
+}
+
+// Latest token-grant state sent by the authenticated supervisor.
+message TokenGrantStatus {
+  TokenGrantFailureObservation last_failure = 1;
+}
+
+// A refused grant and its destination, without request paths or remote text.
+// This describes the failed attempt, not the destination's current health.
+message TokenGrantFailureObservation {
+  // Canonical observed host or IP address, bounded to 253 ASCII bytes.
+  string destination_host = 1;
+  // Observed destination port in the range 1 through 65535.
+  uint32 destination_port = 2;
+  // Bounded token_grant cause. Provider and credential may be absent when
+  // selection failed; the request ID still identifies the refused exchange.
+  EndpointFailure failure = 3;
 }
 
 // Empty acknowledgement for a persisted endpoint status report.
@@ -3851,6 +3878,11 @@ message EndpointStatus {
   // time: still-valid evidence can be reaccepted after a reset. Identical
   // same-sequence retries do not advance it. Absent until a result is reported.
   google.protobuf.Timestamp last_reported_time = 106;
+  // Bounded cause of last_result, when the supervisor classified it. Each
+  // failure domain names the results it can explain. Replaced or cleared by
+  // every later observation, and cleared by the same resets that clear
+  // last_result.
+  EndpointFailure last_failure = 7;
 }
 
 // Durable provisioning attempt, independent of supervisor registration and polling.
@@ -3910,4 +3942,41 @@ enum ServiceAuthorizationMode {
   SERVICE_AUTHORIZATION_MODE_STRIP = 1;
   // Forward one syntactically valid bearer Authorization header unchanged.
   SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
+}
+
+// Subsystem whose closed code set explains an endpoint failure. Each domain
+// defines its codes, stages, recovery actions, and the endpoint results it
+// can explain. Kept at the end of the file so adding it does not renumber
+// existing generated descriptors.
+enum EndpointFailureDomain {
+  ENDPOINT_FAILURE_DOMAIN_UNSPECIFIED = 0;
+  // A dynamic token grant for a provider credential failed, so OpenShell
+  // refused the request before any of it reached the endpoint. Explains
+  // ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE.
+  ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT = 1;
+}
+
+// Bounded cause of a failed endpoint observation, including failures before
+// any request reaches the endpoint. No field carries remote
+// text: code and stage come from the domain's closed sets, provider and
+// credential_key are configured names, and request_id is an opaque random ID.
+message EndpointFailure {
+  EndpointFailureDomain domain = 1;
+  // Stable lower_snake_case code from the domain's closed set, such as
+  // provider_authorization_required.
+  string code = 2;
+  // Who can resolve the failure; always the action documented for the code.
+  ProviderCredentialRefreshRecoveryAction recovery_action = 3;
+  // Provider whose credential failed. Empty when the failure happened before
+  // a credential was selected.
+  string provider = 4;
+  // Credential name within the provider. Never a credential value.
+  string credential_key = 5;
+  // Step that observed the failure, from the domain's closed set.
+  string stage = 6;
+  // HTTP status a token service returned, when one was received.
+  optional uint32 upstream_http_status = 7;
+  // Supervisor-minted UUID of the refused exchange. The workload receives the
+  // same value in the x-openshell-request-id response header.
+  string request_id = 8;
 }

@@ -2452,6 +2452,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         // from overlapping host and path selectors.
                         ep["token_grant_owner"] = e.token_grant_owner.clone().into();
                     }
+                    // Every inspected protocol must bind grant reporting to the
+                    // policy selected before credential acquisition.
+                    ep["policy_hash"] = policy_hash.clone().into();
                     if is_mcp_protocol(&e.protocol) {
                         // Derive endpoint identity from the policy endpoint while
                         // it is still available. Request handling carries this
@@ -2459,9 +2462,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         // recomputes identity from a concrete request host.
                         ep["endpoint_id"] =
                             openshell_core::endpoint_status::endpoint_id(e).into();
-                        // The selected endpoint must retain its policy identity
-                        // so it cannot bind to a replacement observation inventory.
-                        ep["policy_hash"] = policy_hash.clone().into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();

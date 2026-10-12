@@ -11,6 +11,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 const SERVICE: &str = "api.example.com\t443\t/v1/**\trev:7\tprovider:service";
 const IDENTITY: &str = "api.example.com\t443\t/v1/**\trev:7\tprovider:identity";
+const REQUEST_ID: &str = "0d9c8b7a-6f5e-4d3c-8b2a-1f0e9d8c7b6a";
 
 fn request() -> L7Request {
     L7Request {
@@ -23,7 +24,7 @@ fn request() -> L7Request {
 }
 
 fn fixture(
-    identity_result: std::result::Result<&str, &str>,
+    identity_result: Result<&str, TokenGrantFailure>,
 ) -> (TokenGrantTestFixture, L7EvalContext) {
     let fixture = TokenGrantTestFixture::success(SERVICE, "service-token");
     let mut identity = fixture.dynamic_credentials().read().unwrap()[SERVICE].clone();
@@ -62,14 +63,14 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
             credential,
         );
     }
-    assert!(inject_if_needed(request(), &ctx).await.is_err());
+    assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
     fixture.assert_no_requests();
 }
 
 #[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
-    let rewritten = inject_if_needed(request(), &ctx).await.unwrap();
+    let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
     let bytes = String::from_utf8(rewritten.raw_header).unwrap();
     assert_eq!(
         bytes
@@ -101,7 +102,7 @@ async fn chooses_specific_binding_independently_for_each_header() {
     let mut specific = fixture.dynamic_credentials().read().unwrap()[SERVICE].clone();
     specific.token_grant.as_mut().unwrap().audience = "projects-only".into();
     fixture.add_credential(specific_key, specific, Ok("specific-service"));
-    let rewritten = inject_if_needed(request(), &ctx).await.unwrap();
+    let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
     let bytes = String::from_utf8(rewritten.raw_header).unwrap();
     assert!(bytes.contains("Authorization: Bearer specific-service\r\n"));
     assert!(bytes.contains("X-Workload-Jwt: identity-token\r\n"));
@@ -115,7 +116,7 @@ async fn audience_override_changes_only_its_own_credential() {
     let mut identity = fixture.dynamic_credentials().read().unwrap()[IDENTITY].clone();
     identity.token_grant.as_mut().unwrap().audience = "project-identity".into();
     fixture.add_credential(override_key, identity.clone(), Ok("project-identity-token"));
-    let rewritten = inject_if_needed(request(), &ctx).await.unwrap();
+    let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
     let bytes = String::from_utf8(rewritten.raw_header).unwrap();
     assert!(bytes.contains("Authorization: Bearer service-token\r\n"));
     assert!(bytes.contains("X-Workload-Jwt: project-identity-token\r\n"));
@@ -135,11 +136,12 @@ async fn rejects_tied_credentials_for_same_header_before_acquisition() {
             collision,
             Ok("collision-token"),
         );
-        let error = inject_if_needed(request(), &ctx).await.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "ambiguous dynamic token grants for one header"
-        );
+        let error = inject_if_needed(request(), &ctx, REQUEST_ID)
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure().kind(), TokenGrantFailureKind::Configuration);
+        assert_eq!(error.failure().stage(), TokenGrantStage::Injection);
+        assert!(error.credential().is_some());
         fixture.assert_no_requests();
     }
 }
@@ -150,18 +152,18 @@ async fn rejects_invalid_second_header_before_acquisition() {
     let mut identity = fixture.dynamic_credentials().read().unwrap()[IDENTITY].clone();
     identity.header_name = "Content-Length".into();
     fixture.add_credential(IDENTITY, identity, Ok("identity-token"));
-    assert!(inject_if_needed(request(), &ctx).await.is_err());
+    assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
     fixture.assert_no_requests();
 }
 
 #[tokio::test]
 async fn rejects_malformed_second_token_after_first_grant_succeeds() {
     let (fixture, ctx) = fixture(Ok("identity-token\r\nInjected: yes"));
-    let error = inject_if_needed(request(), &ctx).await.unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "token grant returned a malformed access token"
-    );
+    let error = inject_if_needed(request(), &ctx, REQUEST_ID)
+        .await
+        .unwrap_err();
+    assert_eq!(error.failure().stage(), TokenGrantStage::Injection);
+    assert_eq!(error.credential(), Some(("provider", "identity")));
     fixture.assert_requested_keys(&[SERVICE, IDENTITY]);
 }
 
@@ -202,9 +204,15 @@ async fn second_grant_failure_redacts_errors_and_emits_no_success() {
         );
         return;
     }
-    let (fixture, ctx) = fixture(Err("issuer echoed service-token and identity-secret"));
+    let failure = TokenGrantFailure::new(
+        TokenGrantFailureKind::ProviderAuthorizationRequired,
+        TokenGrantStage::GatewayRpc,
+    )
+    .with_upstream_status(409);
+    let (fixture, ctx) = fixture(Err(failure));
     let logs = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
+    let shorthand = Arc::new(Mutex::new(Vec::new()));
     let log_writer = Capture(logs.clone());
     let subscriber = tracing_subscriber::registry()
         .with(
@@ -213,20 +221,49 @@ async fn second_grant_failure_redacts_errors_and_emits_no_success() {
                 .without_time()
                 .with_writer(move || log_writer.clone()),
         )
-        .with(openshell_ocsf::OcsfJsonlLayer::new(Capture(events.clone())));
-    let error = inject_if_needed(request(), &ctx)
+        .with(openshell_ocsf::OcsfJsonlLayer::new(Capture(events.clone())))
+        .with(openshell_ocsf::OcsfShorthandLayer::new(Capture(
+            shorthand.clone(),
+        )));
+    let error = inject_if_needed(request(), &ctx, REQUEST_ID)
         .with_subscriber(subscriber)
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "Token grant failed");
+    assert_eq!(error.failure(), failure);
+    assert_eq!(error.to_string(), "dynamic token grant failed");
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     let events = String::from_utf8(events.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("Token grant failed"));
-    assert!(events.contains("Token grant failed"));
-    for output in [&logs, &events] {
+    let shorthand = String::from_utf8(shorthand.lock().unwrap().clone()).unwrap();
+    // The policy advisor serves the agent exactly these shorthand lines.
+    let denials = shorthand
+        .lines()
+        .filter(|line| line.contains(" OCSF ") && line.contains(" DENIED "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        denials.contains("Token grant failed for provider:identity"),
+        "{shorthand}"
+    );
+    // Every sink names the exchange by request ID. Only the operator log line
+    // carries the classification; agent-readable sinks never do.
+    for output in [&logs, &events, &shorthand] {
+        assert!(output.contains(REQUEST_ID), "request ID missing: {output}");
         assert!(!output.contains("service-token"));
-        assert!(!output.contains("identity-secret"));
         assert!(!output.contains("Token grant successful"));
+    }
+    assert!(logs.contains(failure.code()), "{logs}");
+    for output in [&events, &shorthand, &denials] {
+        for classification in [
+            failure.code(),
+            failure.stage().code(),
+            "upstream_http_status",
+            "REAUTHORIZE",
+        ] {
+            assert!(
+                !output.contains(classification),
+                "classification {classification} leaked: {output}"
+            );
+        }
     }
     fixture.assert_requested_keys(&[SERVICE, IDENTITY]);
 }
@@ -245,7 +282,10 @@ async fn does_not_acquire_grants_outside_endpoint_bindings() {
         req.target = path.into();
         let original = req.raw_header.clone();
         assert_eq!(
-            inject_if_needed(req, &ctx).await.unwrap().raw_header,
+            inject_if_needed(req, &ctx, REQUEST_ID)
+                .await
+                .unwrap()
+                .raw_header,
             original
         );
         fixture.assert_no_requests();
@@ -257,8 +297,8 @@ async fn concurrent_requests_keep_credential_snapshots_separate() {
     let (first, first_ctx) = fixture(Ok("first-identity"));
     let (second, second_ctx) = fixture(Ok("second-identity"));
     let (first_result, second_result) = tokio::join!(
-        inject_if_needed(request(), &first_ctx),
-        inject_if_needed(request(), &second_ctx),
+        inject_if_needed(request(), &first_ctx, REQUEST_ID),
+        inject_if_needed(request(), &second_ctx, REQUEST_ID),
     );
     for (result, expected, absent) in [
         (first_result, "first-identity", "second-identity"),
@@ -299,9 +339,16 @@ async fn admitted_owners_select_grants_independently_per_header() {
             .map(|owner| (*owner).to_string())
             .collect::<HashSet<_>>();
 
-        let rewritten = inject_for_admitted_owners(request(), &ctx, &state.snapshot(), &owners)
-            .await
-            .unwrap();
+        let rewritten = inject_for_admitted_owners(
+            request(),
+            &ctx,
+            &state.snapshot(),
+            &owners,
+            REQUEST_ID,
+            None,
+        )
+        .await
+        .unwrap();
         let bytes = String::from_utf8(rewritten.raw_header).unwrap();
 
         // A grant whose owner did not admit the request is never acquired, and its

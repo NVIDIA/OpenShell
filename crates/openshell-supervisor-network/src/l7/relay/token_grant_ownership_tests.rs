@@ -53,7 +53,17 @@ impl TokenGrantResolver for ScriptedResolver {
     fn obtain<'a>(
         &'a self,
         request: TokenGrantRequest<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        String,
+                        openshell_core::token_grant_failure::TokenGrantFailure,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             self.calls
                 .lock()
@@ -70,7 +80,10 @@ impl TokenGrantResolver for ScriptedResolver {
                     .expect("test releases the held grant");
             }
             if self.fail_once.swap(false, Ordering::SeqCst) {
-                return Err(miette!("synthetic grant service unavailable"));
+                return Err(openshell_core::token_grant_failure::TokenGrantFailure::new(
+                    openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
+                    openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
+                ));
             }
             Ok(format!("inert-{}", request.audience))
         })
@@ -154,6 +167,7 @@ struct Fixture {
     configs: Vec<L7EndpointConfig>,
     state: ProviderCredentialState,
     resolver: Arc<ScriptedResolver>,
+    observation: Option<EndpointObservationSender>,
 }
 
 impl Fixture {
@@ -224,6 +238,7 @@ impl Fixture {
                 credentials(grants),
             ),
             resolver: Arc::new(ScriptedResolver::default()),
+            observation: None,
         }
     }
 
@@ -303,6 +318,7 @@ impl Fixture {
             // state. Refresh tests require requests to use the live ownership.
             dynamic_credentials: Some(Arc::new(RwLock::new(dynamic_credentials))),
             token_grant_resolver: Some(resolver),
+            endpoint_observation_tx: self.observation.clone(),
             ..Default::default()
         };
         let (app, client) = tokio::io::duplex(16 * 1024);
@@ -679,6 +695,176 @@ async fn native_protocol_grant_failures_close_before_upstream_bytes() {
                 .assert_calls(&[(&fixture.grant_key("/native", "native"), "aud-native")]);
             assert_eq!(capture.bytes_seen, 0, "{protocol} failed before forwarding");
         }
+    }
+}
+
+/// Refuse one request through the real inspected relay with a failing
+/// grant, and return the workload response with the status commands it caused.
+async fn refused_grant(
+    protocol: &str,
+    provider_credentialed: bool,
+) -> (
+    String,
+    Vec<openshell_core::endpoint_status::EndpointStatusCommand>,
+) {
+    use openshell_core::endpoint_status::{
+        EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
+        endpoint_status_channel,
+    };
+
+    let mut fixture = if protocol == "rest" {
+        let mut endpoint = route("native", "/native");
+        endpoint.method = "POST";
+        Fixture::new(&[endpoint], &[("/native", "native", "aud-native")], 1)
+    } else {
+        native_protocol_fixture(protocol, false)
+    };
+    for config in &mut fixture.configs {
+        // The gateway derives these from policy; OPA fixtures carry none.
+        config.endpoint_id = "endpoint:v1:native".into();
+        config.policy_hash = "policy".into();
+        config.provider_credentialed = provider_credentialed;
+    }
+    let (sender, mut receiver) = endpoint_status_channel();
+    sender
+        .reset(
+            EndpointConfigVersion {
+                policy_hash: "policy".into(),
+                provider_env_revision: 1,
+            },
+            if protocol == "mcp" {
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:native".into(),
+                    uses_provider_credentials: provider_credentialed,
+                }]
+            } else {
+                Vec::new()
+            },
+        )
+        .await
+        .expect("install endpoint inventory");
+    assert!(matches!(
+        receiver.recv().await,
+        Some(EndpointStatusCommand::Reset { .. })
+    ));
+    fixture.observation = Some(sender);
+    fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+
+    let mut connection = fixture.connect();
+    let body = if protocol == "rest" {
+        Vec::new()
+    } else {
+        native_protocol_body(protocol, "echo")
+    };
+    let response = connection.exchange_body("/native", &body).await;
+    let capture = connection.finish().await;
+    assert_eq!(capture.bytes_seen, 0, "failed grant forwards nothing");
+    let mut commands = Vec::new();
+    while let Ok(command) = receiver.try_recv() {
+        commands.push(command);
+    }
+    (response, commands)
+}
+
+fn refusal_request_id(response: &str) -> String {
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    let request_id = response
+        .lines()
+        .find_map(|line| line.strip_prefix("x-openshell-request-id: "))
+        .expect("refusal carries the request ID")
+        .to_string();
+    let without_id = response.replace(&request_id, "");
+    for classification in ["unavailable", "token_endpoint", "RETRY"] {
+        assert!(!without_id.contains(classification), "{response}");
+    }
+    request_id
+}
+
+#[tokio::test]
+async fn mcp_grant_failure_reports_its_cause_to_endpoint_status_only() {
+    use openshell_core::endpoint_status::EndpointStatusCommand;
+    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction;
+
+    let (response, commands) = refused_grant("mcp", true).await;
+    // The workload sees the generic refusal and an opaque request ID.
+    let request_id = refusal_request_id(&response);
+
+    // The trusted status path receives the classified cause for that request.
+    let [
+        EndpointStatusCommand::ObserveTokenGrant {
+            result: Err(grant_failure),
+            ..
+        },
+        EndpointStatusCommand::Observe {
+            endpoint_id,
+            result,
+            failure: Some(failure),
+            ..
+        },
+    ] = commands.as_slice()
+    else {
+        panic!("one grant failure observation with a cause: {commands:?}");
+    };
+    assert_eq!(endpoint_id, "endpoint:v1:native");
+    assert_eq!(*result, EndpointResult::CredentialUnavailable);
+    let failure = failure.to_proto();
+    assert_eq!(failure.code, "unavailable");
+    assert_eq!(failure.stage, "token_endpoint");
+    assert_eq!(
+        failure.recovery_action,
+        ProviderCredentialRefreshRecoveryAction::Retry as i32
+    );
+    assert_eq!(failure.provider, "native");
+    assert_eq!(failure.credential_key, "access_token");
+    assert_eq!(failure.request_id, request_id);
+    assert_eq!(grant_failure.to_proto(), failure);
+    assert_eq!(
+        openshell_core::endpoint_failure::validate_endpoint_failure(
+            &failure,
+            openshell_core::proto::EndpointResult::CredentialUnavailable
+        ),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn grant_failure_on_uncredentialed_endpoint_reports_only_sandbox_cause() {
+    // The gateway rejects credential failures for endpoints that do not use
+    // provider credentials, so the supervisor must not report one.
+    let (response, commands) = refused_grant("mcp", false).await;
+    refusal_request_id(&response);
+    assert!(
+        matches!(
+            commands.as_slice(),
+            [openshell_core::endpoint_status::EndpointStatusCommand::ObserveTokenGrant { .. }]
+        ),
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_mcp_grant_failures_report_without_an_endpoint_inventory() {
+    for protocol in ["rest", "graphql", "json-rpc"] {
+        let (response, commands) = refused_grant(protocol, true).await;
+        let request_id = refusal_request_id(&response);
+        let [
+            openshell_core::endpoint_status::EndpointStatusCommand::ObserveTokenGrant {
+                destination_host,
+                destination_port,
+                result: Err(failure),
+                ..
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("{protocol}: bounded grant cause without MCP inventory: {commands:?}");
+        };
+        assert_eq!(destination_host, HOST);
+        assert_eq!(*destination_port, PORT);
+        let failure = failure.to_proto();
+        assert_eq!(failure.request_id, request_id);
+        assert_eq!(failure.provider, "native");
+        assert_eq!(failure.credential_key, "access_token");
+        assert_eq!(failure.code, "unavailable");
     }
 }
 
@@ -1317,7 +1503,15 @@ async fn transformed_jsonrpc_body_selects_final_operation_owner() {
     let transformed = body_request("/api/rpc", final_body);
     let (injected, _) = timeout(
         WAIT,
-        prepare_inspected_request(transformed, &ctx, &engine, &config, &info),
+        prepare_inspected_request(
+            transformed,
+            &ctx,
+            &engine,
+            &config,
+            &info,
+            "request-final-body",
+            None,
+        ),
     )
     .await
     .expect("final-body grant finishes")
