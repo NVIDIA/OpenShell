@@ -48,7 +48,7 @@ on:
         type: string
         default: ""
       kubernetes-features:
-        description: "Cargo feature list for the Kubernetes e2e crate (uses script defaults when empty)"
+        description: "Cargo feature list for Kubernetes e2e (defaults when empty; e2e-conformance-only skips Rust tests)"
         required: false
         type: string
         default: ""
