@@ -5,7 +5,6 @@ pub mod config;
 pub mod driver;
 pub mod grpc;
 pub mod isolation;
-mod kube_client;
 mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;

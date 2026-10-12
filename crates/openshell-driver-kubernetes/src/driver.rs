@@ -11,7 +11,6 @@ use crate::config::{
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
 };
-use crate::kube_client::kubernetes_client;
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
@@ -161,7 +160,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    pub(crate) fn from_kube(err: KubeError) -> Self {
+    fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -684,6 +683,23 @@ const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
+/// Build a Kubernetes client whose requests time out after `request_timeout`.
+///
+/// kube's `read_timeout` counts the time a pooled connection spent idle, so a
+/// request that reuses a connection idle for nearly that long fails with
+/// `SendRequest` before the API server can answer. A per-request timeout
+/// starts when the request is sent instead.
+fn kubernetes_request_client(
+    mut config: kube::Config,
+    request_timeout: Duration,
+) -> Result<Client, KubernetesDriverError> {
+    config.read_timeout = None;
+    Ok(kube::client::ClientBuilder::try_from(config)
+        .map_err(KubernetesDriverError::from_kube)?
+        .with_layer(&tower::timeout::TimeoutLayer::new(request_timeout))
+        .build())
+}
+
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
     client: Client,
@@ -776,15 +792,15 @@ impl KubernetesComputeDriver {
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
-        kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = kubernetes_client(kube_config)?;
+        let client = kubernetes_request_client(kube_config, KUBE_API_TIMEOUT)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client = kubernetes_client(watch_kube_config)?;
+        let watch_client =
+            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let operator_allowlist = if matches!(config.workspace_mode, WorkspaceMode::Operator) {
             let allowlist = OperatorNamespaceAllowlist::new();
@@ -7481,6 +7497,56 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve Pod GETs over one reusable HTTP/1 connection per client,
+    /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
+    async fn serve_delayed_pods() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(|request: http::Request<_>| async move {
+                        let delay = request
+                            .uri()
+                            .path()
+                            .rsplit_once("/slow-")
+                            .and_then(|(_, millis)| millis.parse().ok())
+                            .map_or(Duration::ZERO, Duration::from_millis);
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(bytes::Bytes::from_static(
+                                br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod"}}"#,
+                            )),
+                        ))
+                    }),
+                ));
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn request_timeout_ignores_pooled_connection_idle_time() {
+        let addr = serve_delayed_pods().await;
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = kubernetes_request_client(config, Duration::from_secs(1)).unwrap();
+        let pods = Api::<Pod>::namespaced(client, "default");
+
+        pods.get("warm").await.unwrap();
+        // With a connection-level read timeout, 800ms of idle time would leave
+        // this 500ms request only 200ms on the reused connection.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        pods.get("slow-500").await.unwrap();
+
+        let error = pods.get("slow-1500").await.unwrap_err();
+        assert!(
+            matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
+            "expected request timeout, got {error:?}"
+        );
+    }
 
     #[tokio::test]
     async fn admission_defaults_reject_driver_config_before_kubernetes_io_in_every_mode() {

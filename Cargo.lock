@@ -4413,7 +4413,6 @@ dependencies = [
  "http 1.4.0",
  "http-body-util",
  "hyper",
- "hyper-timeout",
  "hyper-util",
  "k8s-openapi",
  "kube",
@@ -4432,7 +4431,6 @@ dependencies = [
  "prost-types",
  "rand 0.9.4",
  "rcgen",
- "rustls",
  "serde",
  "serde_json",
  "temp-env",
@@ -4442,7 +4440,6 @@ dependencies = [
  "toml",
  "tonic",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
