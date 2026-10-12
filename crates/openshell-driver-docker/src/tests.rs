@@ -1766,7 +1766,39 @@ fn docker_identity_resolution_rejects_supplementary_group_zero_from_etc_group() 
     let message = error.message();
     assert!(message.contains("group 0 (root)"));
     assert!(message.contains("/etc/group"));
-    assert!(message.contains("run_as_group"));
+    // The user here has already set non-root `run_as_user`/`run_as_group`, yet
+    // the supplementary membership still grants GID 0. The advice must not tell
+    // them to set those fields again (doing so reproduces the error); it must
+    // explain the fields cannot drop a supplementary membership and point at a
+    // different user or image.
+    assert!(message.contains("do not drop supplementary group memberships"));
+    assert!(message.contains("user is not a member of the root group"));
+    assert!(!message.contains("descriptor error"));
+}
+
+#[test]
+fn docker_identity_resolution_rejects_primary_group_zero_with_group_scoped_advice() {
+    // A non-root user whose `/etc/passwd` primary group is 0.
+    let sandbox = test_sandbox();
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "app".to_string(),
+        working_dir: "/sandbox".to_string(),
+        volumes: Vec::new(),
+    };
+    let error = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"app:x:1001:0::/sandbox:/bin/sh\n",
+        b"root:x:0:\n",
+    )
+    .unwrap_err();
+    let message = error.message();
+    assert!(message.contains("root primary group"));
+    assert!(message.contains("GID 0"));
+    // A root primary group is remedied by `run_as_group`, not `run_as_user`.
+    assert!(message.contains("`process.run_as_group`"));
+    assert!(!message.contains("`process.run_as_user`"));
     assert!(!message.contains("descriptor error"));
 }
 
