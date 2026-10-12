@@ -21,9 +21,13 @@ pub fn parse_chunk_size_line(line: &[u8]) -> Result<usize> {
         ));
     }
 
-    // Keep the framing grammar canonical at this trust boundary. Trimming or
-    // accepting a sign would recreate a parser differential with the peer.
-    let size_token = line.split(';').next().unwrap_or_default();
+    // RFC 9112 permits bad whitespace immediately before a chunk-extension
+    // semicolon. Normalize only that suffix: leading whitespace, whitespace
+    // inside the size, and trailing whitespace without an extension remain
+    // invalid at this trust boundary.
+    let size_token = line
+        .split_once(';')
+        .map_or(line, |(size, _)| size.trim_end_matches([' ', '\t']));
     if size_token.is_empty() || !size_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(miette!("Invalid HTTP chunk size token"));
     }
@@ -305,8 +309,13 @@ mod tests {
         for line in [
             b"".as_slice(),
             b"+0",
+            b"+0 ;ext=value",
             b" 0",
+            b" 0;ext=value",
+            b"\t0;ext=value",
             b"0 ",
+            b"0\t",
+            b"0 \t1;ext=value",
             b"0\n",
             b"0\rX",
             b"0;ext=bad\nvalue",
@@ -327,6 +336,13 @@ mod tests {
         }
         validate_chunk_trailer_line(b"").unwrap();
         validate_chunk_trailer_line(b"X-Test: value").unwrap();
+    }
+
+    #[test]
+    fn chunk_size_allows_bws_before_extension() {
+        for line in [b"a ;ext=value".as_slice(), b"a\t;ext=value"] {
+            assert_eq!(parse_chunk_size_line(line).unwrap(), 10, "line {line:?}");
+        }
     }
 
     #[tokio::test]
