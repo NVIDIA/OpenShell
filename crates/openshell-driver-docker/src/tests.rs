@@ -3740,25 +3740,32 @@ fn docker_oom_kill_stays_terminal_despite_137() {
 
 #[test]
 fn supervisor_workspace_validation_exit_is_reported_explicitly() {
-    let workspace_exit = i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED);
-    for result in [
-        Ok(ContainerWaitResponse {
-            status_code: workspace_exit,
-            error: None,
-        }),
-        Err(BollardError::DockerContainerWaitError {
-            code: workspace_exit,
+    let status = workspace_validation_status();
+    assert_eq!(status.message(), WORKSPACE_VALIDATION_FAILED_MESSAGE);
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(
+        supervisor_start_failure_reason(
+            &Status::failed_precondition("provider SPIFFE socket has no parent directory"),
+            "ControlSupervisorStartFailed"
+        ),
+        "ControlSupervisorStartFailed"
+    );
+    assert_eq!(
+        supervisor_exit_reason(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+
+    let (reason, message) =
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
             error: "image workspace validation failed".into(),
-        }),
-    ] {
-        assert_eq!(
-            docker_supervisor_wait_failure(Some(result)),
-            (
-                CONDITION_WORKSPACE_VALIDATION_FAILED,
-                WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string()
-            )
-        );
-    }
+        })));
+    assert_eq!(reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+    assert!(message.contains("status 78"));
     assert_eq!(
         docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
             code: 1,
@@ -3766,23 +3773,6 @@ fn supervisor_workspace_validation_exit_is_reported_explicitly() {
         })))
         .0,
         "ControlSupervisorExited"
-    );
-
-    let failure = ControlStartFailure::workspace_validation();
-    assert_eq!(
-        failure.reason_or("ControlSupervisorStartFailed"),
-        CONDITION_WORKSPACE_VALIDATION_FAILED
-    );
-    assert_eq!(
-        failure.status.message(),
-        WORKSPACE_VALIDATION_FAILED_MESSAGE
-    );
-    assert_eq!(
-        ControlStartFailure::from(Status::failed_precondition(
-            WORKSPACE_VALIDATION_FAILED_MESSAGE
-        ))
-        .reason_or("ControlSupervisorStartFailed"),
-        "ControlSupervisorStartFailed"
     );
 }
 
@@ -3792,13 +3782,13 @@ async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspecti
         "sandbox-1".to_string(),
         DockerRuntimeFailure {
             reason: CONDITION_WORKSPACE_VALIDATION_FAILED,
-            message: WORKSPACE_VALIDATION_FAILED_MESSAGE.into(),
+            message: "Docker supervisor container exited with status 78".into(),
         },
     )])));
     // There is no Docker daemon at this address: a monitor that has removed
     // the supervisor must not need another inspection to retain the reason.
     let docker = Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap();
-    let failure = wait_for_docker_supervisor_ready(
+    let status = wait_for_docker_supervisor_ready(
         &docker,
         "removed-supervisor",
         "workload-container-1",
@@ -3808,7 +3798,7 @@ async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspecti
     .await
     .expect_err("the recorded workspace failure takes precedence over inspection");
     assert_eq!(
-        failure.reason_or("ControlSupervisorStartFailed"),
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
         CONDITION_WORKSPACE_VALIDATION_FAILED
     );
 }

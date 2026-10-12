@@ -187,9 +187,30 @@ USER app
                     create.failure_diagnostic("sandbox creation fails before the command runs")
                 );
             }
-            if !printed(WORKSPACE_VALIDATION_FAILED) {
-                return Err(create.failure_diagnostic(&format!(
-                    "sandbox creation fails with {WORKSPACE_VALIDATION_FAILED}"
+            // Require the condition reason, so another provisioning failure
+            // cannot pass as a workspace rejection.
+            let sandbox = runner
+                .step("uw/get")
+                .description("rejected sandbox reports the workspace validation reason")
+                .with_timeout(COMMAND_TIMEOUT)
+                .run(&["sandbox", "get", &name, "--output", "json"])
+                .await
+                .map_err(|error| error.to_string())?;
+            sandbox.require_success()?;
+            let reasons: Vec<String> = sandbox
+                .json::<serde_json::Value>()
+                .map_err(|error| error.to_string())?["conditions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|condition| condition["reason"].as_str().map(str::to_string))
+                .collect();
+            if !reasons
+                .iter()
+                .any(|reason| reason == WORKSPACE_VALIDATION_FAILED)
+            {
+                return Err(sandbox.failure_diagnostic(&format!(
+                    "sandbox condition reason is {WORKSPACE_VALIDATION_FAILED}, got {reasons:?}"
                 )));
             }
         }

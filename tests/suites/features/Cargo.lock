@@ -923,6 +923,7 @@ name = "openshell-test-feature-oci-image"
 version = "0.0.0"
 dependencies = [
  "openshell-conformance",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
