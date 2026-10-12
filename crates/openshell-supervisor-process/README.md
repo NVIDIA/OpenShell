@@ -5,26 +5,32 @@ isolation backend.
 
 ## Bounded streaming uploads
 
-The CLI's built-in uploads use the `openshell-upload-v1` SSH subsystem. The
-gateway relays its SSH channel without interpreting upload frames. The
-supervisor launches the extractor through the ordinary `BoundaryExec` path,
-with the same workload identity, environment, working directory, and
-filesystem policy as other SSH children.
+The CLI's built-in uploads use the `openshell-upload-v1` SSH subsystem. Russh
+returns SSH receive credit before the supervisor consumes channel data, so this
+subsystem returns its own credit and uses SSH for everything else. The gateway
+relays the channel without interpreting it.
 
-The upload protocol reserves stdout for control frames and the final result.
-Extractor output is drained into bounded diagnostics. The supervisor grants a
-1 MiB application window, and data frames carry at most 64 KiB. The CLI stops
-sending archive data when outstanding bytes reach the window. A cumulative
-acknowledgment returns credit only after `InputTask` successfully writes those
-bytes through `BoundaryInput::write_all` and clears them from its in-flight
-budget. The existing 4 MiB pending-input guard remains active.
+The client sends one JSON plan line with the destination, then the raw tar
+stream, then SSH EOF. When the plan arrives, the supervisor starts the
+extractor through the ordinary `BoundaryExec` path, with the same workload
+identity, environment, working directory and filesystem policy as other SSH
+children. Startup runs inline, like an exec request.
 
-The end frame carries the archive byte count and SHA-256 digest. A successful
-result requires a matching stream, drained accepted writes, and a successful
-extractor exit. Protocol failure, extractor failure, or channel cancellation
-terminates the upload process and stops granting credit. Extraction writes
-directly to the destination, so failures can leave partially extracted files;
-the protocol does not provide rollback or atomic replacement.
+Stdout carries only big-endian `u64` totals of archive bytes that `InputTask`
+has written through `BoundaryInput::write_all`. The first total, zero, means
+extraction started. Extractor stdout and stderr are both sent as SSH stderr,
+so extractor output cannot forge credit. The client keeps at most 1 MiB beyond
+the last total outstanding; the supervisor rejects input beyond that window.
+The existing 4 MiB pending-input guard remains active.
+
+After the extractor exits successfully and stdin has drained, the supervisor
+sends the final total, then the exit status. The client succeeds only when the
+status is zero and the final total equals the bytes it sent. A malformed plan,
+credit violation, extended data or EOF before the plan fails the upload with
+exit status 74. Whichever happens first, the exit or the rejection, decides the
+reported result. Rejection, channel close or disconnect terminates the
+extractor. Extraction writes directly to the destination, so failures can
+leave partially extracted files; there is no rollback or atomic replacement.
 
 The CLI requires supervisor support for this subsystem before sending archive
 data. It does not fall back to the previous unpaced exec-stdin upload path.

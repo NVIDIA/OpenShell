@@ -8,20 +8,19 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use miette::Diagnostic;
-use openshell_core::upload::{
-    Frame, MAX_DIAGNOSTIC_BYTES, ProtocolError, UploadPlan, UploadSummary, read_frame, write_frame,
-};
-use sha2::{Digest, Sha256};
+use openshell_core::upload::{DESTINATION_CHANGED_EXIT_CODE, UploadPlan, WINDOW_BYTES};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command as TokioCommand};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CHUNK_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 /// The producer can hold at most two chunks in addition to its current buffer
-/// and the chunk held by the driver. It cannot build an entire archive in RAM.
+/// and the chunk held by the sender. It cannot build an entire archive in RAM.
 const PRODUCER_QUEUE_CHUNKS: usize = 2;
 
 #[derive(Debug, Error, Diagnostic)]
@@ -92,7 +91,23 @@ impl Drop for AbortTasks {
     }
 }
 
-/// Start the producer only after the subsystem has accepted the destination.
+/// How a transfer ended before every archive byte was acknowledged.
+#[derive(Debug)]
+enum Stopped {
+    /// The SSH stream closed or failed; the exit status explains why.
+    Stream(String),
+    /// A local or protocol failure; the SSH child must be terminated.
+    Local(UploadError),
+}
+
+/// Archive bytes sent and the final total the supervisor acknowledged.
+#[derive(Debug)]
+struct Sent {
+    bytes: u64,
+    acknowledged: u64,
+}
+
+/// Start the producer only after the subsystem has started extraction.
 /// The archive callback uses the existing tar builder unchanged.
 pub(super) async fn run<P>(
     mut command: Command,
@@ -102,7 +117,8 @@ pub(super) async fn run<P>(
 where
     P: FnOnce(&mut dyn Write) -> miette::Result<()> + Send + 'static,
 {
-    plan.validate()
+    let plan = plan
+        .encode()
         .map_err(|error| UploadError::Protocol(error.to_string()))?;
     command
         .stdin(Stdio::piped())
@@ -113,54 +129,66 @@ where
         .spawn()
         .map_err(|error| UploadError::Transport(error.to_string()))?;
     let mut child = ChildGuard(Some(child));
-    let stdin = child.child().stdin.take().expect("piped SSH stdin");
+    // EOF marks the end of the archive, so a failed transfer must stop SSH
+    // before its stdin closes. The transfer closes stdin only on success.
+    let mut stdin = Some(child.child().stdin.take().expect("piped SSH stdin"));
     let stdout = child.child().stdout.take().expect("piped SSH stdout");
     let stderr = child.child().stderr.take().expect("piped SSH stderr");
     let diagnostics = tokio::spawn(read_diagnostic(stderr));
     let diagnostic_guard = AbortTasks(vec![diagnostics.abort_handle()]);
 
-    let result = transfer(stdout, stdin, plan, producer).await;
-
-    let status = if result.is_err() {
-        child.finish(true).await
-    } else if let Ok(status) = tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.finish(false)).await {
-        status
-    } else {
+    let transfer = match transfer(stdout, &mut stdin, plan, producer).await {
+        Ok(sent) => Ok(sent),
+        Err(Stopped::Stream(message)) => Err(message),
+        Err(Stopped::Local(error)) => {
+            let _ = child.finish(true).await;
+            return Err(error);
+        }
+    };
+    drop(stdin);
+    let Ok(status) = tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.finish(false)).await else {
         let _ = child.finish(true).await;
-        return Err(UploadError::Protocol(
-            "SSH did not exit after the upload result".to_string(),
+        return Err(UploadError::Transport(
+            "SSH did not exit after the upload stream ended".to_string(),
         ));
     };
+    let status = status.map_err(|error| UploadError::Transport(error.to_string()))?;
     let diagnostic = tokio::time::timeout(CHILD_EXIT_TIMEOUT, diagnostics)
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
     drop(diagnostic_guard);
-    // OpenSSH reports subsystem rejection as status 255, like other SSH
-    // failures. Its explicit request diagnostic distinguishes an old server
-    // from a transient connection failure, without sending any archive bytes.
-    if matches!(result, Err(UploadError::Transport(_)))
-        && diagnostic.contains("subsystem request failed")
-    {
-        return Err(UploadError::Unsupported);
-    }
-    match result {
-        Err(UploadError::Transport(message)) if !diagnostic.trim().is_empty() => {
-            return Err(UploadError::Transport(format!("{message}: {diagnostic}")));
+    let diagnostic = diagnostic.trim();
+    match status.code() {
+        Some(0) => match transfer {
+            Ok(sent) if sent.acknowledged == sent.bytes => Ok(()),
+            Ok(sent) => Err(UploadError::Protocol(format!(
+                "sandbox acknowledged {} of {} upload bytes",
+                sent.acknowledged, sent.bytes
+            ))),
+            Err(message) => Err(UploadError::Protocol(format!(
+                "upload stream ended before completion: {message}"
+            ))),
+        },
+        // OpenSSH reports subsystem rejection as status 255, like other SSH
+        // failures. Its explicit request diagnostic distinguishes an old server
+        // from a transient connection failure, without sending any archive bytes.
+        Some(super::SSH_TRANSPORT_FAILURE_EXIT_CODE)
+            if diagnostic.contains("subsystem request failed") =>
+        {
+            Err(UploadError::Unsupported)
         }
-        result => result?,
+        Some(super::SSH_TRANSPORT_FAILURE_EXIT_CODE) | None => Err(UploadError::Transport(
+            format!("SSH exited with {status}: {diagnostic}"),
+        )),
+        Some(DESTINATION_CHANGED_EXIT_CODE) => Err(UploadError::Remote(format!(
+            "upload destination changed type before extraction; retry the upload: {diagnostic}"
+        ))),
+        Some(code) => Err(UploadError::Remote(format!(
+            "extraction exited with status {code}: {diagnostic}"
+        ))),
     }
-    let status = status.map_err(|error| UploadError::Transport(error.to_string()))?;
-    if !status.success() {
-        if status.code() == Some(super::SSH_TRANSPORT_FAILURE_EXIT_CODE) {
-            return Err(UploadError::Transport(format!("{status}: {diagnostic}")));
-        }
-        return Err(UploadError::Protocol(format!(
-            "SSH exited with {status} after a successful result: {diagnostic}"
-        )));
-    }
-    Ok(())
 }
 
 async fn read_diagnostic<R: AsyncRead + Unpin>(mut reader: R) -> String {
@@ -180,45 +208,6 @@ async fn read_diagnostic<R: AsyncRead + Unpin>(mut reader: R) -> String {
     String::from_utf8_lossy(&diagnostic).into_owned()
 }
 
-fn protocol_error(error: ProtocolError) -> UploadError {
-    // ProtocolError preserves I/O errors separately from invalid frames.
-    match error {
-        ProtocolError::Io(error) => UploadError::Transport(error.to_string()),
-        error => UploadError::Protocol(error.to_string()),
-    }
-}
-
-async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut R,
-    writer: &mut W,
-    plan: UploadPlan,
-) -> Result<(u64, usize), UploadError> {
-    let hello = read_frame(reader).await.map_err(protocol_error)?;
-    let Frame::Hello {
-        window_bytes,
-        max_data_bytes,
-    } = hello
-    else {
-        return Err(server_failure(hello, "expected HELLO"));
-    };
-    write_frame(writer, &Frame::Begin(plan))
-        .await
-        .map_err(protocol_error)?;
-    match read_frame(reader).await.map_err(protocol_error)? {
-        Frame::Ready => Ok((u64::from(window_bytes), max_data_bytes as usize)),
-        frame => Err(server_failure(frame, "expected READY")),
-    }
-}
-
-fn server_failure(frame: Frame, expected: &str) -> UploadError {
-    match frame {
-        Frame::Error(failure) => {
-            UploadError::Remote(format!("{:?}: {}", failure.code, failure.message))
-        }
-        _ => UploadError::Protocol(expected.to_string()),
-    }
-}
-
 enum ProducerEvent {
     Data(Vec<u8>),
     Finished(Result<(), UploadError>),
@@ -227,13 +216,12 @@ enum ProducerEvent {
 struct ChunkWriter {
     sender: mpsc::Sender<ProducerEvent>,
     buffer: Vec<u8>,
-    max_chunk: usize,
 }
 
 impl ChunkWriter {
     fn flush_chunk(&mut self) -> io::Result<()> {
         if !self.buffer.is_empty() {
-            let buffer = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.max_chunk));
+            let buffer = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK_BYTES));
             self.sender
                 .blocking_send(ProducerEvent::Data(buffer))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped"))?;
@@ -246,10 +234,10 @@ impl Write for ChunkWriter {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let original_len = bytes.len();
         while !bytes.is_empty() {
-            let length = bytes.len().min(self.max_chunk - self.buffer.len());
+            let length = bytes.len().min(CHUNK_BYTES - self.buffer.len());
             self.buffer.extend_from_slice(&bytes[..length]);
             bytes = &bytes[length..];
-            if self.buffer.len() == self.max_chunk {
+            if self.buffer.len() == CHUNK_BYTES {
                 self.flush_chunk()?;
             }
         }
@@ -261,7 +249,7 @@ impl Write for ChunkWriter {
     }
 }
 
-fn spawn_producer<P>(producer: P, max_chunk: usize) -> mpsc::Receiver<ProducerEvent>
+fn spawn_producer<P>(producer: P) -> mpsc::Receiver<ProducerEvent>
 where
     P: FnOnce(&mut dyn Write) -> miette::Result<()> + Send + 'static,
 {
@@ -269,8 +257,7 @@ where
     tokio::task::spawn_blocking(move || {
         let mut writer = ChunkWriter {
             sender: sender.clone(),
-            buffer: Vec::with_capacity(max_chunk),
-            max_chunk,
+            buffer: Vec::with_capacity(CHUNK_BYTES),
         };
         let result = producer(&mut writer)
             .map_err(|error| UploadError::Archive(error.to_string()))
@@ -284,138 +271,117 @@ where
     receiver
 }
 
-/// Dedicated readers and writers let remote failure interrupt a blocked local
-/// SSH pipe write. The frame reader is never cancelled between partial reads.
+/// Send the plan, wait for extraction to start, then stream the archive while
+/// at most `WINDOW_BYTES` remain unacknowledged. Takes `stdin` only after the
+/// archive is complete, so failures leave the caller to stop SSH first.
 async fn transfer<R, W, P>(
     mut reader: R,
-    mut writer: W,
-    plan: UploadPlan,
+    stdin: &mut Option<W>,
+    plan: Vec<u8>,
     producer: P,
-) -> Result<(), UploadError>
+) -> Result<Sent, Stopped>
 where
     R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send,
     P: FnOnce(&mut dyn Write) -> miette::Result<()> + Send + 'static,
 {
-    let (window, max_chunk) = tokio::time::timeout(
-        NEGOTIATION_TIMEOUT,
-        negotiate(&mut reader, &mut writer, plan),
-    )
-    .await
-    .map_err(|_| UploadError::Transport("upload negotiation timed out".to_string()))??;
-    let mut events = spawn_producer(producer, max_chunk);
-    let (incoming, mut frames) = mpsc::channel(4);
-    let reader_task = tokio::spawn(async move {
-        loop {
-            let frame = read_frame(&mut reader).await.map_err(protocol_error);
-            let terminal = frame.is_err();
-            if incoming.send(frame).await.is_err() || terminal {
-                break;
-            }
+    let stream = |error: io::Error| Stopped::Stream(error.to_string());
+    let writer = stdin.as_mut().expect("upload stdin is open");
+    writer.write_all(&plan).await.map_err(stream)?;
+    writer.flush().await.map_err(stream)?;
+    match tokio::time::timeout(NEGOTIATION_TIMEOUT, reader.read_u64()).await {
+        Err(_) => {
+            return Err(Stopped::Local(UploadError::Transport(
+                "upload negotiation timed out".to_string(),
+            )));
         }
-    });
-    let (outgoing, mut queued) = mpsc::channel::<Frame>(1);
-    let (completed, mut completions) = mpsc::channel(1);
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = queued.recv().await {
-            let is_end = matches!(frame, Frame::End(_));
-            let result = write_frame(&mut writer, &frame)
-                .await
-                .map_err(protocol_error);
-            let result = if result.is_ok() && is_end {
-                writer
-                    .shutdown()
-                    .await
-                    .map_err(|error| UploadError::Transport(error.to_string()))
-            } else {
-                result
-            };
-            let terminal = result.is_err() || is_end;
-            if completed.send(result).await.is_err() || terminal {
-                break;
-            }
-        }
-    });
-    let _tasks = AbortTasks(vec![reader_task.abort_handle(), writer_task.abort_handle()]);
-    let mut sent = 0_u64;
-    let mut acknowledged = 0_u64;
-    let mut digest = Sha256::new();
-    let mut pending = None;
-    let mut producer_finished = false;
-    let mut writing = false;
-    let mut end = None;
-    loop {
-        if !writing && end.is_none() {
-            if pending.as_ref().is_some_and(|data: &Vec<u8>| {
-                (sent - acknowledged)
-                    .checked_add(data.len() as u64)
-                    .is_some_and(|pending| pending <= window)
-            }) {
-                let data = pending.take().expect("pending upload data");
-                sent = sent.checked_add(data.len() as u64).ok_or_else(|| {
-                    UploadError::Protocol("upload byte count overflow".to_string())
-                })?;
-                digest.update(&data);
-                outgoing
-                    .send(Frame::Data(data))
-                    .await
-                    .map_err(|_| UploadError::Transport("upload writer stopped".to_string()))?;
-                writing = true;
-            } else if producer_finished && pending.is_none() {
-                let summary = UploadSummary {
-                    bytes: sent,
-                    sha256: digest.clone().finalize().into(),
-                };
-                outgoing
-                    .send(Frame::End(summary))
-                    .await
-                    .map_err(|_| UploadError::Transport("upload writer stopped".to_string()))?;
-                end = Some(summary);
-                writing = true;
-            }
-        }
-        tokio::select! {
-            frame = frames.recv() => {
-                match frame.ok_or_else(|| UploadError::Transport("upload reader stopped".to_string()))?? {
-                    Frame::Ack(bytes) => {
-                        if bytes < acknowledged || bytes > sent {
-                            return Err(UploadError::Protocol("invalid cumulative upload ACK".to_string()));
-                        }
-                        acknowledged = bytes;
-                    }
-                    Frame::Result(summary) => {
-                        if end != Some(summary) {
-                            return Err(UploadError::Protocol("upload result count or digest does not match END".to_string()));
-                        }
-                        return Ok(());
-                    }
-                    frame => return Err(server_failure(frame, "unexpected frame during upload")),
-                }
-            }
-            result = completions.recv(), if writing => {
-                result.ok_or_else(|| UploadError::Transport("upload writer stopped".to_string()))??;
-                writing = false;
-            }
-            event = events.recv(), if pending.is_none() && !producer_finished => {
-                match event.ok_or_else(|| UploadError::Archive("archive producer stopped".to_string()))? {
-                    ProducerEvent::Data(data) => pending = Some(data),
-                    ProducerEvent::Finished(result) => {
-                        result?;
-                        producer_finished = true;
-                    }
-                }
-            }
+        Ok(Err(error)) => return Err(stream(error)),
+        Ok(Ok(0)) => {}
+        Ok(Ok(_)) => {
+            return Err(Stopped::Local(UploadError::Protocol(
+                "upload did not start at offset zero".to_string(),
+            )));
         }
     }
+    // The reader is never cancelled between partial records.
+    let (totals, mut acknowledged) = watch::channel(0_u64);
+    let acks = tokio::spawn(async move {
+        while let Ok(total) = reader.read_u64().await {
+            if total < *totals.borrow() {
+                return Err(UploadError::Protocol(
+                    "upload acknowledgment moved backwards".to_string(),
+                ));
+            }
+            totals.send_replace(total);
+        }
+        Ok(())
+    });
+    let _acks = AbortTasks(vec![acks.abort_handle()]);
+    let mut chunks = spawn_producer(producer);
+    let mut sent = 0_u64;
+    loop {
+        let chunk = match chunks.recv().await {
+            Some(ProducerEvent::Data(chunk)) => chunk,
+            Some(ProducerEvent::Finished(result)) => {
+                result.map_err(Stopped::Local)?;
+                break;
+            }
+            None => {
+                return Err(Stopped::Local(UploadError::Archive(
+                    "archive producer stopped".to_string(),
+                )));
+            }
+        };
+        let length = chunk.len() as u64;
+        loop {
+            let total = *acknowledged.borrow_and_update();
+            if total > sent {
+                return Err(Stopped::Local(UploadError::Protocol(
+                    "upload acknowledged unsent bytes".to_string(),
+                )));
+            }
+            if sent + length - total <= WINDOW_BYTES {
+                break;
+            }
+            if acknowledged.changed().await.is_err() {
+                return Err(match acks.await {
+                    Ok(Err(error)) => Stopped::Local(error),
+                    _ => Stopped::Stream("upload acknowledgments ended".to_string()),
+                });
+            }
+        }
+        // Count bytes before writing: the supervisor may acknowledge part of
+        // a chunk while the pipe write is still in progress.
+        sent += length;
+        writer.write_all(&chunk).await.map_err(stream)?;
+    }
+    // Closing stdin sends SSH EOF; the final total arrives before exit status.
+    writer.shutdown().await.map_err(stream)?;
+    stdin.take();
+    if let Ok(Err(error)) = acks.await {
+        return Err(Stopped::Local(error));
+    }
+    let acknowledged = *acknowledged.borrow();
+    if acknowledged > sent {
+        return Err(Stopped::Local(UploadError::Protocol(
+            "upload acknowledged unsent bytes".to_string(),
+        )));
+    }
+    Ok(Sent {
+        bytes: sent,
+        acknowledged,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::upload::{FailureCode, MAX_DATA_BYTES, UploadFailure, WINDOW_BYTES};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+    use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
+
+    const WINDOW: usize = 1024 * 1024;
+    type Check = fn(&Result<(), UploadError>) -> bool;
 
     fn plan() -> UploadPlan {
         UploadPlan {
@@ -424,22 +390,30 @@ mod tests {
         }
     }
 
-    async fn accept(stream: DuplexStream) -> (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>) {
-        let (mut read, mut write) = tokio::io::split(stream);
-        write_frame(
-            &mut write,
-            &Frame::Hello {
-                window_bytes: WINDOW_BYTES,
-                max_data_bytes: u32::try_from(MAX_DATA_BYTES).unwrap(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame(&mut read).await.unwrap(),
-            Frame::Begin(_)
-        ));
-        write_frame(&mut write, &Frame::Ready).await.unwrap();
+    fn start(
+        producer: impl FnOnce(&mut dyn Write) -> miette::Result<()> + Send + 'static,
+        buffer: usize,
+    ) -> (tokio::task::JoinHandle<Result<Sent, Stopped>>, DuplexStream) {
+        let (client, server) = tokio::io::duplex(buffer);
+        let (read, write) = tokio::io::split(client);
+        let plan = plan().encode().unwrap();
+        let transfer = tokio::spawn(async move {
+            let mut write = Some(write);
+            transfer(read, &mut write, plan, producer).await
+        });
+        (transfer, server)
+    }
+
+    /// Read the plan line and grant the zero acknowledgment.
+    async fn accept(
+        server: DuplexStream,
+    ) -> (BufReader<ReadHalf<DuplexStream>>, WriteHalf<DuplexStream>) {
+        let (read, mut write) = tokio::io::split(server);
+        let mut read = BufReader::new(read);
+        let mut line = Vec::new();
+        read.read_until(b'\n', &mut line).await.unwrap();
+        assert_eq!(line, plan().encode().unwrap());
+        write.write_u64(0).await.unwrap();
         (read, write)
     }
 
@@ -449,62 +423,39 @@ mod tests {
             .collect()
     }
 
-    async fn complete(
-        read: &mut ReadHalf<DuplexStream>,
-        write: &mut WriteHalf<DuplexStream>,
-        mut received: Vec<u8>,
-    ) -> Vec<u8> {
-        loop {
-            match read_frame(read).await.unwrap() {
-                Frame::Data(data) => {
-                    assert!(data.len() <= MAX_DATA_BYTES);
-                    received.extend_from_slice(&data);
-                    write_frame(write, &Frame::Ack(received.len() as u64))
-                        .await
-                        .unwrap();
-                }
-                Frame::End(summary) => {
-                    assert_eq!(summary.bytes, received.len() as u64);
-                    assert_eq!(summary.sha256, <[u8; 32]>::from(Sha256::digest(&received)));
-                    write_frame(write, &Frame::Result(summary)).await.unwrap();
-                    return received;
-                }
-                frame => panic!("unexpected client frame: {frame:?}"),
-            }
-        }
+    fn produce(bytes: Vec<u8>) -> impl FnOnce(&mut dyn Write) -> miette::Result<()> {
+        move |writer| writer.write_all(&bytes).map_err(miette::Report::from_err)
     }
 
     #[tokio::test]
     async fn stalled_consumer_blocks_at_credit_limit_then_resumes_with_exact_data() {
-        let expected = payload(6 * WINDOW_BYTES as usize + 123);
-        let bytes = expected.clone();
-        let (client, server) = tokio::io::duplex(4096);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), move |writer| {
-            writer.write_all(&bytes).map_err(miette::Report::from_err)?;
-            Ok(())
-        }));
+        let expected = payload(6 * WINDOW + 123);
+        let (client, server) = start(produce(expected.clone()), 4096);
         let (mut read, mut write) = accept(server).await;
-        let mut received = Vec::new();
-        while received.len() < WINDOW_BYTES as usize {
-            match read_frame(&mut read).await.unwrap() {
-                Frame::Data(data) => received.extend_from_slice(&data),
-                frame => panic!("unexpected client frame: {frame:?}"),
-            }
-        }
-        assert_eq!(received.len(), WINDOW_BYTES as usize);
+        let mut received = vec![0; WINDOW];
+        read.read_exact(&mut received).await.unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), read_frame(&mut read))
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
                 .await
                 .is_err(),
             "client exceeded credit while the extractor was stalled"
         );
         assert!(!client.is_finished());
-        write_frame(&mut write, &Frame::Ack(received.len() as u64))
-            .await
-            .unwrap();
-        assert_eq!(complete(&mut read, &mut write, received).await, expected);
-        client.await.unwrap().unwrap();
+        // Acknowledge in ordinary-sized steps until the client sends EOF.
+        let mut chunk = vec![0; 256 * 1024];
+        loop {
+            write.write_u64(received.len() as u64).await.unwrap();
+            let size = read.read(&mut chunk).await.unwrap();
+            if size == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..size]);
+        }
+        write.shutdown().await.unwrap();
+        let sent = client.await.unwrap().unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(sent.bytes, expected.len() as u64);
+        assert_eq!(sent.acknowledged, sent.bytes);
     }
 
     #[tokio::test]
@@ -517,24 +468,18 @@ mod tests {
         }
         let finished = Arc::new(AtomicBool::new(false));
         let producer_finished = finished.clone();
-        let (client, server) = tokio::io::duplex(4096);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), move |writer| {
-            let _finished = ProducerExit(producer_finished);
-            writer
-                .write_all(&payload(8 * WINDOW_BYTES as usize))
-                .map_err(miette::Report::from_err)?;
-            Ok(())
-        }));
+        let (client, server) = start(
+            move |writer| {
+                let _finished = ProducerExit(producer_finished);
+                writer
+                    .write_all(&payload(8 * WINDOW))
+                    .map_err(miette::Report::from_err)
+            },
+            4096,
+        );
         let (mut read, _write) = accept(server).await;
-        let mut received = 0;
-        while received < WINDOW_BYTES as usize {
-            let Frame::Data(data) = read_frame(&mut read).await.unwrap() else {
-                panic!("expected data before credit is exhausted");
-            };
-            received += data.len();
-        }
-        assert_eq!(received, WINDOW_BYTES as usize);
+        let mut received = vec![0; WINDOW];
+        read.read_exact(&mut received).await.unwrap();
         assert!(!finished.load(Ordering::SeqCst));
         client.abort();
         assert!(client.await.unwrap_err().is_cancelled());
@@ -556,150 +501,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn impossible_ack_is_rejected_without_retry() {
-        let (client, server) = tokio::io::duplex(4096);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), |writer| {
-            writer
-                .write_all(&payload(2 * WINDOW_BYTES as usize))
-                .map_err(miette::Report::from_err)?;
-            Ok(())
-        }));
-        let (_read, mut write) = accept(server).await;
-        write_frame(&mut write, &Frame::Ack(u64::MAX))
-            .await
-            .unwrap();
-        let error = client.await.unwrap().unwrap_err();
-        assert!(matches!(error, UploadError::Protocol(_)));
-        assert!(!error.is_retryable());
+    async fn impossible_and_regressing_acks_are_rejected_without_retry() {
+        for regress in [false, true] {
+            let (client, server) = start(produce(payload(4 * WINDOW)), 4096);
+            let (mut read, mut write) = accept(server).await;
+            if regress {
+                let mut chunk = vec![0; CHUNK_BYTES];
+                read.read_exact(&mut chunk).await.unwrap();
+                write.write_u64(CHUNK_BYTES as u64).await.unwrap();
+                write.write_u64(CHUNK_BYTES as u64 - 1).await.unwrap();
+            } else {
+                write.write_u64(u64::MAX).await.unwrap();
+            }
+            // Keep consuming so the client reaches its next credit decision.
+            let drain = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut read, &mut tokio::io::sink()).await;
+            });
+            let Err(Stopped::Local(error)) = client.await.unwrap() else {
+                panic!("invalid acknowledgment was accepted");
+            };
+            assert!(matches!(error, UploadError::Protocol(_)));
+            assert!(!error.is_retryable());
+            drop(write);
+            drain.await.unwrap();
+        }
     }
 
     #[tokio::test]
-    async fn regressing_ack_is_rejected() {
+    async fn failed_archive_leaves_stdin_open_for_the_caller_to_stop_ssh() {
         let (client, server) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), |writer| {
+        let mut stdin = Some(write);
+        let server = tokio::spawn(async move {
+            let (mut read, write) = accept(server).await;
+            let mut partial = [0; 7];
+            read.read_exact(&mut partial).await.unwrap();
+            (read, write)
+        });
+        let result = transfer(read, &mut stdin, plan().encode().unwrap(), |writer| {
             writer
-                .write_all(&payload(2 * WINDOW_BYTES as usize))
+                .write_all(b"partial")
                 .map_err(miette::Report::from_err)?;
-            Ok(())
-        }));
-        let (mut read, mut write) = accept(server).await;
-        let Frame::Data(data) = read_frame(&mut read).await.unwrap() else {
-            panic!("expected data");
-        };
-        write_frame(&mut write, &Frame::Ack(data.len() as u64))
-            .await
-            .unwrap();
-        write_frame(&mut write, &Frame::Ack(data.len() as u64 - 1))
-            .await
-            .unwrap();
+            writer.flush().map_err(miette::Report::from_err)?;
+            Err(miette::miette!("source file vanished"))
+        })
+        .await;
         assert!(matches!(
-            client.await.unwrap().unwrap_err(),
-            UploadError::Protocol(_)
+            result,
+            Err(Stopped::Local(UploadError::Archive(_)))
         ));
+        // EOF would mark a truncated archive as complete.
+        assert!(stdin.is_some());
+        let (mut read, _write) = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn terminal_error_interrupts_blocked_pipe_write() {
-        let (client, server) = tokio::io::duplex(64);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), |writer| {
+    async fn closed_stream_interrupts_blocked_pipe_write() {
+        let (client, server) = start(produce(payload(2 * WINDOW)), 64);
+        let (read, write) = accept(server).await;
+        drop((read, write));
+        let result = tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .expect("remote closure must interrupt a blocked writer")
+            .unwrap();
+        assert!(matches!(result, Err(Stopped::Stream(_))));
+    }
+
+    #[cfg(unix)]
+    async fn run_script(script: &str, started: Arc<AtomicBool>) -> Result<(), UploadError> {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        run(command, plan(), move |writer| {
+            started.store(true, Ordering::SeqCst);
             writer
-                .write_all(&payload(2 * WINDOW_BYTES as usize))
-                .map_err(miette::Report::from_err)?;
-            Ok(())
-        }));
-        let (_read, mut write) = accept(server).await;
-        write_frame(
-            &mut write,
-            &Frame::Error(UploadFailure {
-                code: FailureCode::InputWrite,
-                message: "extractor closed stdin: connection is unavailable".to_string(),
+                .write_all(b"archive")
+                .map_err(miette::Report::from_err)
+        })
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_status_and_final_total_decide_the_result() {
+        // Each script reads the plan line, grants zero credit, then drains the
+        // archive before reporting. `\0\0\0\0\0\0\0\a` is a total of seven bytes.
+        const ZERO: &str = r"printf '\0\0\0\0\0\0\0\0'";
+        const SEVEN: &str = r"printf '\0\0\0\0\0\0\0\a'";
+        assert_eq!(WINDOW as u64, WINDOW_BYTES);
+        let cases: [(String, Check); 4] = [
+            (
+                format!("read -r plan; {ZERO}; cat >/dev/null; {SEVEN}"),
+                |result| result.is_ok(),
+            ),
+            (format!("read -r plan; {ZERO}; cat >/dev/null"), |result| {
+                matches!(result, Err(UploadError::Protocol(_)))
             }),
-        )
-        .await
-        .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), client)
-            .await
-            .expect("remote failure must interrupt a blocked writer")
-            .unwrap()
-            .unwrap_err();
-        assert!(matches!(error, UploadError::Remote(_)));
-        assert!(!error.is_retryable());
-    }
-
-    #[tokio::test]
-    async fn successful_exit_cannot_replace_terminal_result() {
-        let (client, server) = tokio::io::duplex(4096);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), |_| Ok(())));
-        let (mut read, write) = accept(server).await;
-        assert!(matches!(
-            read_frame(&mut read).await.unwrap(),
-            Frame::End(_)
-        ));
-        drop(write);
-        drop(read);
-        assert!(client.await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn mismatched_terminal_digest_is_rejected() {
-        let (client, server) = tokio::io::duplex(4096);
-        let (read, write) = tokio::io::split(client);
-        let client = tokio::spawn(transfer(read, write, plan(), |_| Ok(())));
-        let (mut read, mut write) = accept(server).await;
-        let Frame::End(mut summary) = read_frame(&mut read).await.unwrap() else {
-            panic!("expected end");
-        };
-        summary.sha256[0] ^= 1;
-        write_frame(&mut write, &Frame::Result(summary))
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.await.unwrap().unwrap_err(),
-            UploadError::Protocol(_)
-        ));
+            (
+                format!("read -r plan; {ZERO}; cat >/dev/null; echo 'tar: boom' >&2; exit 2"),
+                |result| matches!(result, Err(UploadError::Remote(message)) if message.contains("tar: boom")),
+            ),
+            (
+                format!("read -r plan; {ZERO}; cat >/dev/null; exit 73"),
+                |result| matches!(result, Err(UploadError::Remote(message)) if message.contains("retry the upload")),
+            ),
+        ];
+        for (script, check) in cases {
+            let started = Arc::new(AtomicBool::new(false));
+            let result = run_script(&script, started.clone()).await;
+            assert!(check(&result), "{script}: {result:?}");
+            assert!(started.load(Ordering::SeqCst));
+            if let Err(error) = result {
+                assert!(!error.is_retryable());
+            }
+        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unavailable_subsystem_never_starts_archive_producer() {
-        let started = Arc::new(AtomicBool::new(false));
-        let producer_started = started.clone();
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "printf 'subsystem request failed on channel 0\\n' >&2; exit 255",
-        ]);
-        let error = run(command, plan(), move |_| {
-            producer_started.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .await
-        .unwrap_err();
-        assert!(matches!(error, UploadError::Unsupported));
-        assert!(!started.load(Ordering::SeqCst));
-        assert!(!error.is_retryable());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn early_ssh_exit_never_starts_archive_producer() {
-        let started = Arc::new(AtomicBool::new(false));
-        let producer_started = started.clone();
-        let mut command = Command::new("sh");
-        command.args(["-c", "exit 255"]);
-        let error = run(command, plan(), move |_| {
-            producer_started.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .await
-        .unwrap_err();
-        assert!(matches!(error, UploadError::Transport(_)));
-        assert!(!started.load(Ordering::SeqCst));
-        assert!(error.is_retryable());
+    async fn failure_before_extraction_starts_never_starts_archive_producer() {
+        for (script, retryable) in [
+            (
+                "printf 'subsystem request failed on channel 0\\n' >&2; exit 255",
+                false,
+            ),
+            ("exit 255", true),
+            ("read -r plan; echo 'mkdir: denied' >&2; exit 1", false),
+        ] {
+            let started = Arc::new(AtomicBool::new(false));
+            let error = run_script(script, started.clone()).await.unwrap_err();
+            assert!(!started.load(Ordering::SeqCst), "{script}");
+            assert_eq!(error.is_retryable(), retryable, "{script}: {error:?}");
+            if script.contains("subsystem") {
+                assert!(matches!(error, UploadError::Unsupported));
+            }
+        }
     }
 
     #[cfg(unix)]

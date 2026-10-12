@@ -3,16 +3,13 @@
 
 //! Exercise the production upload handler over a real SSH session.
 
-use super::tests::{AcceptAnyServerKey, test_client};
-use openshell_core::upload::{
-    Decoder, FailureCode, Frame, MAX_DATA_BYTES, SUBSYSTEM, UploadPlan, UploadSummary, WINDOW_BYTES,
-};
+use super::tests::{AcceptAnyServerKey, RejectingExec, test_client};
+use openshell_core::upload::{SUBSYSTEM, UploadPlan, WINDOW_BYTES};
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryExec, BoundaryExitStatus, BoundaryProcess, BoundarySignal, ExecSession,
     ExecSpec,
 };
 use russh::ChannelMsg;
-use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const CHUNK: usize = 64 * 1024;
+const WINDOW: usize = 1024 * 1024;
 
 struct Process {
     status: watch::Sender<Option<BoundaryExitStatus>>,
@@ -78,6 +77,16 @@ struct Control {
     signals: mpsc::UnboundedReceiver<BoundarySignal>,
 }
 
+impl Process {
+    async fn terminated(&self) {
+        self.terminated
+            .subscribe()
+            .wait_for(|terminated| *terminated)
+            .await
+            .unwrap();
+    }
+}
+
 fn exec_session() -> (ExecSession, Control) {
     let (stdin, reader) = tokio::io::duplex(1024);
     let (stdout, writer) = tokio::io::duplex(4096);
@@ -108,100 +117,100 @@ fn exec_session() -> (ExecSession, Control) {
     )
 }
 
+async fn client_for(sessions: Vec<ExecSession>) -> russh::client::Handle<AcceptAnyServerKey> {
+    test_client(
+        None,
+        Arc::new(Exec(Mutex::new(sessions.into()))),
+        russh::client::Config::default(),
+    )
+    .await
+}
+
 type Channel = russh::Channel<russh::client::Msg>;
 
+/// Collects acknowledgment totals from stdout, stderr and exit statuses.
+#[derive(Default)]
 struct Reader {
-    decoder: Decoder,
-    frames: VecDeque<Frame>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
     statuses: Vec<u32>,
 }
 
 impl Reader {
-    fn new() -> Self {
-        Self {
-            decoder: Decoder::default(),
-            frames: VecDeque::new(),
-            statuses: Vec::new(),
-        }
-    }
-
-    async fn frame(&mut self, channel: &mut Channel) -> Frame {
+    /// Next acknowledged total, or `None` once the channel closes.
+    async fn next(&mut self, channel: &mut Channel) -> Option<u64> {
         loop {
-            if let Some(frame) = self.frames.pop_front() {
-                return frame;
+            if self.stdout.len() >= 8 {
+                let total = self.stdout.drain(..8).collect::<Vec<_>>();
+                return Some(u64::from_be_bytes(total.try_into().unwrap()));
             }
-            match channel.wait().await.expect("channel closed before frame") {
-                ChannelMsg::Data { data } => {
-                    let mut bytes = data.as_ref();
-                    while !bytes.is_empty() {
-                        if let Some(frame) = self.decoder.decode(&mut bytes).unwrap() {
-                            self.frames.push_back(frame);
-                        }
-                    }
-                }
+            match channel.wait().await? {
+                ChannelMsg::Data { data } => self.stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => self.stderr.extend_from_slice(&data),
                 ChannelMsg::ExitStatus { exit_status } => self.statuses.push(exit_status),
+                ChannelMsg::Close => return None,
                 ChannelMsg::WindowAdjusted { .. } | ChannelMsg::Success | ChannelMsg::Eof => {}
                 message => panic!("unexpected SSH message: {message:?}"),
             }
         }
     }
+
+    /// Remaining totals through channel close; no partial total may remain.
+    async fn close(&mut self, channel: &mut Channel) -> Vec<u64> {
+        let mut totals = Vec::new();
+        while let Some(total) = self.next(channel).await {
+            totals.push(total);
+        }
+        assert!(self.stdout.is_empty(), "partial acknowledgment");
+        totals
+    }
 }
 
-async fn send(channel: &Channel, frame: Frame) {
-    channel
-        .data(frame.encode().unwrap().as_slice())
-        .await
-        .unwrap();
+fn plan_line() -> Vec<u8> {
+    UploadPlan {
+        destination_directory: "/tmp/upload".to_string(),
+        expected_destination: None,
+    }
+    .encode()
+    .unwrap()
 }
 
-async fn start(client: &russh::client::Handle<AcceptAnyServerKey>) -> (Channel, Reader) {
+async fn open(client: &russh::client::Handle<AcceptAnyServerKey>) -> Channel {
     let mut channel = client.channel_open_session().await.unwrap();
     channel.request_subsystem(true, SUBSYSTEM).await.unwrap();
     assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
-    let mut reader = Reader::new();
-    assert_eq!(
-        reader.frame(&mut channel).await,
-        Frame::Hello {
-            window_bytes: WINDOW_BYTES,
-            max_data_bytes: u32::try_from(MAX_DATA_BYTES).unwrap(),
-        }
-    );
-    send(
-        &channel,
-        Frame::Begin(UploadPlan {
-            destination_directory: "/tmp/upload".to_string(),
-            expected_destination: None,
-        }),
-    )
-    .await;
-    assert_eq!(reader.frame(&mut channel).await, Frame::Ready);
+    channel
+}
+
+async fn start(client: &russh::client::Handle<AcceptAnyServerKey>) -> (Channel, Reader) {
+    let mut channel = open(client).await;
+    channel.data(plan_line().as_slice()).await.unwrap();
+    let mut reader = Reader::default();
+    assert_eq!(reader.next(&mut channel).await, Some(0));
     (channel, reader)
 }
 
 #[tokio::test]
 async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
+    assert_eq!(WINDOW as u64, WINDOW_BYTES);
     tokio::time::timeout(DEADLINE, async {
         let (upload, mut control) = exec_session();
         let (sibling, mut other) = exec_session();
-        let client = test_client(
-            None,
-            Arc::new(Exec(Mutex::new([upload, sibling].into()))),
-            russh::client::Config::default(),
-        )
-        .await;
+        let client = client_for(vec![upload, sibling]).await;
         let (mut channel, mut reader) = start(&client).await;
-        let payload = vec![42; MAX_DATA_BYTES];
-        let mut sent = 0_u64;
-        while sent < u64::from(WINDOW_BYTES) {
-            send(&channel, Frame::Data(payload.clone())).await;
-            sent += payload.len() as u64;
+        let chunk = vec![42; CHUNK];
+        let mut sent = 0;
+        while sent < WINDOW {
+            channel.data(chunk.as_slice()).await.unwrap();
+            sent += CHUNK;
         }
         channel.signal(russh::Sig::INT).await.unwrap();
         assert_eq!(control.signals.recv().await, Some(BoundarySignal::Int));
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), reader.frame(&mut channel))
+            tokio::time::timeout(Duration::from_millis(50), reader.next(&mut channel))
                 .await
-                .is_err()
+                .is_err(),
+            "credit returned before the extractor consumed input"
         );
         // Stalled upload input must leave sibling channel requests responsive.
         let mut sibling = client.channel_open_session().await.unwrap();
@@ -213,9 +222,8 @@ async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
         other.stdin.read_to_end(&mut sibling_input).await.unwrap();
         assert_eq!(sibling_input, b"sibling");
         sibling.close().await.unwrap();
-        // Output is drained into a bounded diagnostic, never exposed as forged
-        // protocol stdout or allowed to block extraction on a full pipe.
-        let forged = Frame::Ack(u64::MAX).encode().unwrap();
+        // Extractor stdout is delivered as stderr, so it cannot forge credit.
+        let forged = u64::MAX.to_be_bytes();
         control.stdout.write_all(&forged).await.unwrap();
         let noisy = tokio::spawn(async move {
             control
@@ -223,123 +231,118 @@ async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
                 .write_all(&vec![9; 1024 * 1024])
                 .await
                 .unwrap();
-            drop(control.stderr);
         });
         let consumed = tokio::spawn(async move {
             let mut bytes = Vec::new();
             control.stdin.read_to_end(&mut bytes).await.unwrap();
-            assert_eq!(bytes, vec![42; 5 * 1024 * 1024]);
+            assert_eq!(bytes, vec![42; 5 * WINDOW]);
             drop(control.stdout);
             control
                 .process
                 .status
                 .send_replace(Some(BoundaryExitStatus::Exited(0)));
         });
-        let mut ack = 0;
-        while sent < 5 * 1024 * 1024 {
-            if sent + MAX_DATA_BYTES as u64 > ack + u64::from(WINDOW_BYTES) {
-                match reader.frame(&mut channel).await {
-                    Frame::Ack(consumed) => {
-                        assert!(consumed >= ack && consumed <= sent);
-                        ack = consumed;
-                    }
-                    frame => panic!("unexpected transfer reply: {frame:?}"),
-                }
+        let mut acknowledged = 0;
+        while sent < 5 * WINDOW {
+            if sent + CHUNK > acknowledged + WINDOW {
+                let total = reader.next(&mut channel).await.unwrap();
+                assert!(total >= acknowledged as u64 && total <= sent as u64);
+                acknowledged = usize::try_from(total).unwrap();
             } else {
-                send(&channel, Frame::Data(payload.clone())).await;
-                sent += payload.len() as u64;
+                channel.data(chunk.as_slice()).await.unwrap();
+                sent += CHUNK;
             }
         }
-        let summary = UploadSummary {
-            bytes: sent,
-            sha256: Sha256::digest(vec![42; usize::try_from(sent).unwrap()]).into(),
-        };
-        send(&channel, Frame::End(summary)).await;
         channel.eof().await.unwrap();
-        loop {
-            match reader.frame(&mut channel).await {
-                Frame::Ack(consumed) => assert!(consumed <= sent),
-                Frame::Result(actual) => {
-                    assert_eq!(actual, summary);
-                    break;
-                }
-                frame => panic!("unexpected terminal reply: {frame:?}"),
-            }
-        }
-        let mut statuses = Vec::new();
-        while let Some(message) = channel.wait().await {
-            match message {
-                ChannelMsg::ExitStatus { exit_status } => statuses.push(exit_status),
-                ChannelMsg::Close => break,
-                _ => {}
-            }
-        }
-        assert_eq!(statuses, [0]);
-        consumed.await.unwrap();
         noisy.await.unwrap();
+        let totals = reader.close(&mut channel).await;
+        assert_eq!(totals.last(), Some(&(sent as u64)));
+        assert_eq!(reader.statuses, [0]);
+        assert_eq!(reader.stderr.len(), forged.len() + 1024 * 1024);
+        assert!(reader.stderr.windows(8).any(|bytes| bytes == forged));
+        consumed.await.unwrap();
     })
     .await
     .expect("upload did not resume or blocked SSH control traffic");
 }
 
 #[tokio::test]
-async fn credit_violation_and_truncated_eof_are_typed_and_terminate() {
-    for truncated in [false, true] {
+async fn invalid_plans_and_credit_violations_exit_74() {
+    for case in ["credit", "eof", "plan"] {
         tokio::time::timeout(DEADLINE, async {
             let (session, control) = exec_session();
-            let client = test_client(
-                None,
-                Arc::new(Exec(Mutex::new([session].into()))),
-                russh::client::Config::default(),
-            )
-            .await;
-            let (mut channel, mut reader) = start(&client).await;
-            if truncated {
-                channel.eof().await.unwrap();
+            let client = client_for(vec![session]).await;
+            let (mut channel, mut reader) = if case == "credit" {
+                start(&client).await
             } else {
-                for _ in 0..=WINDOW_BYTES as usize / MAX_DATA_BYTES {
-                    send(&channel, Frame::Data(vec![7; MAX_DATA_BYTES])).await;
+                (open(&client).await, Reader::default())
+            };
+            match case {
+                "credit" => {
+                    for _ in 0..=WINDOW / CHUNK {
+                        channel.data(vec![7; CHUNK].as_slice()).await.unwrap();
+                    }
+                }
+                "eof" => {
+                    channel.data(&b"{"[..]).await.unwrap();
+                    channel.eof().await.unwrap();
+                }
+                _ => {
+                    let plan = br#"{"destination_directory":"/tmp","expected_destination":null,"command":"id"}
+"#;
+                    channel.data(&plan[..]).await.unwrap();
                 }
             }
-            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(error) if error.code == FailureCode::Protocol));
-            control.process.terminated.subscribe().wait_for(|terminated| *terminated).await.unwrap();
-            let mut eof = Vec::new();
-            let _ = control.stdin.take(2).read_to_end(&mut eof).await;
+            reader.close(&mut channel).await;
+            assert_eq!(reader.statuses, [74]);
+            if case == "credit" {
+                control.process.terminated().await;
+            } else {
+                let stderr = String::from_utf8_lossy(&reader.stderr);
+                assert!(stderr.contains("openshell: "), "{stderr}");
+                assert!(!*control.process.terminated.borrow());
+            }
         })
         .await
-        .expect("protocol failure retained a stalled input or process");
+        .expect("rejected upload did not close");
     }
 }
 
 #[tokio::test]
-async fn broken_stdin_and_early_exit_wake_credit_waiter() {
-    for early_exit in [false, true] {
+async fn extractor_failures_report_status_and_output() {
+    for early_exit in [true, false] {
         tokio::time::timeout(DEADLINE, async {
             let (session, mut control) = exec_session();
-            let client = test_client(
-                None,
-                Arc::new(Exec(Mutex::new([session].into()))),
-                russh::client::Config::default(),
-            )
-            .await;
+            let client = client_for(vec![session]).await;
             let (mut channel, mut reader) = start(&client).await;
             let diagnostic = "mkdir: /tmp/existing-file/child: Not a directory";
-            let mut stderr = diagnostic.as_bytes().to_vec();
-            stderr.resize(8192, b' ');
-            // Filling more than the pipe holds proves the drain captured the cause.
-            control.stderr.write_all(&stderr).await.unwrap();
             if early_exit {
-                control.process.status.send_replace(Some(BoundaryExitStatus::Exited(1)));
+                control
+                    .stderr
+                    .write_all(diagnostic.as_bytes())
+                    .await
+                    .unwrap();
+                control
+                    .process
+                    .status
+                    .send_replace(Some(BoundaryExitStatus::Exited(2)));
             } else {
+                // Broken stdin wakes no credit; the extractor is stopped.
                 drop(control.stdin);
-                send(&channel, Frame::Data(vec![7; MAX_DATA_BYTES])).await;
+                channel.data(vec![7; CHUNK].as_slice()).await.unwrap();
+                control.process.terminated().await;
             }
-            let expected = if early_exit { FailureCode::Extract } else { FailureCode::InputWrite };
-            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(error) if error.code == expected && error.message.contains(diagnostic)));
-            control.process.terminated.subscribe().wait_for(|terminated| *terminated).await.unwrap();
+            drop((control.stdout, control.stderr));
+            reader.close(&mut channel).await;
+            if early_exit {
+                assert_eq!(reader.statuses, [2]);
+                assert_eq!(reader.stderr, diagnostic.as_bytes());
+            } else {
+                assert_eq!(reader.statuses, [74]);
+            }
         })
         .await
-        .expect("terminal failure did not wake upload sender");
+        .expect("extractor failure did not close the upload");
     }
 }
 
@@ -348,14 +351,9 @@ async fn close_and_disconnect_cancel_stalled_boundary_input() {
     for disconnect in [false, true] {
         tokio::time::timeout(DEADLINE, async {
             let (session, mut control) = exec_session();
-            let client = test_client(
-                None,
-                Arc::new(Exec(Mutex::new([session].into()))),
-                russh::client::Config::default(),
-            )
-            .await;
+            let client = client_for(vec![session]).await;
             let (channel, _) = start(&client).await;
-            send(&channel, Frame::Data(vec![7; MAX_DATA_BYTES])).await;
+            channel.data(vec![7; CHUNK].as_slice()).await.unwrap();
             channel.signal(russh::Sig::INT).await.unwrap();
             control.signals.recv().await.unwrap();
             if disconnect {
@@ -366,13 +364,7 @@ async fn close_and_disconnect_cancel_stalled_boundary_input() {
             } else {
                 channel.close().await.unwrap();
             }
-            control
-                .process
-                .terminated
-                .subscribe()
-                .wait_for(|terminated| *terminated)
-                .await
-                .unwrap();
+            control.process.terminated().await;
             let mut received = Vec::new();
             control.stdin.read_to_end(&mut received).await.unwrap();
             assert!(received.len() <= 1024);
@@ -387,7 +379,7 @@ async fn upload_rejects_pty_and_duplicate_channel_requests() {
     tokio::time::timeout(DEADLINE, async {
         let client = test_client(
             None,
-            Arc::new(super::tests::RejectingExec),
+            Arc::new(RejectingExec),
             russh::client::Config::default(),
         )
         .await;
@@ -398,14 +390,7 @@ async fn upload_rejects_pty_and_duplicate_channel_requests() {
         assert!(matches!(pty.wait().await, Some(ChannelMsg::Success)));
         pty.request_subsystem(true, SUBSYSTEM).await.unwrap();
         assert!(matches!(pty.wait().await, Some(ChannelMsg::Failure)));
-        let mut upload = client.channel_open_session().await.unwrap();
-        upload.request_subsystem(true, SUBSYSTEM).await.unwrap();
-        assert!(matches!(upload.wait().await, Some(ChannelMsg::Success)));
-        let mut reader = Reader::new();
-        assert!(matches!(
-            reader.frame(&mut upload).await,
-            Frame::Hello { .. }
-        ));
+        let mut upload = open(&client).await;
         upload.exec(true, "cat").await.unwrap();
         assert!(matches!(upload.wait().await, Some(ChannelMsg::Failure)));
         upload.request_shell(true).await.unwrap();
@@ -456,27 +441,15 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
                 russh::client::Config::default(),
             )
             .await;
-            let mut channel = client.channel_open_session().await.unwrap();
-            channel.request_subsystem(true, SUBSYSTEM).await.unwrap();
-            assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
-            let mut reader = Reader::new();
-            assert!(matches!(
-                reader.frame(&mut channel).await,
-                Frame::Hello { .. }
-            ));
-            send(
-                &channel,
-                Frame::Begin(UploadPlan {
-                    destination_directory: "/tmp/upload".into(),
-                    expected_destination: None,
-                }),
-            )
-            .await;
+            let channel = open(&client).await;
+            channel.data(plan_line().as_slice()).await.unwrap();
             started
                 .subscribe()
                 .wait_for(|started| *started)
                 .await
                 .unwrap();
+            // Startup holds the session loop, as for exec requests, so the
+            // close or disconnect is handled after the process is registered.
             if disconnect {
                 client
                     .disconnect(russh::Disconnect::ByApplication, "test", "")
@@ -485,27 +458,8 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
             } else {
                 channel.close().await.unwrap();
             }
-            // A signal on another channel is a session-loop barrier proving
-            // that the close was handled while startup is still pending.
-            // Disconnect has no surviving channel, so wait for client closure.
-            if disconnect {
-                let _ = client.await;
-            } else {
-                let mut sibling = client.channel_open_session().await.unwrap();
-                sibling
-                    .request_subsystem(true, "unsupported")
-                    .await
-                    .unwrap();
-                assert!(matches!(sibling.wait().await, Some(ChannelMsg::Failure)));
-            }
             release.send(()).unwrap();
-            control
-                .process
-                .terminated
-                .subscribe()
-                .wait_for(|terminated| *terminated)
-                .await
-                .unwrap();
+            control.process.terminated().await;
         })
         .await
         .expect("cancelled startup stranded a late extractor");
@@ -513,65 +467,56 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
 }
 
 #[tokio::test]
-async fn mismatched_end_and_extended_data_fail_without_result() {
-    for (extended, after_exit, pending_output_status) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false),
-        (true, true, true),
-    ] {
+async fn late_rejection_wins_until_the_result_is_reported() {
+    for (after_exit, pending_output_status) in [(false, false), (true, false), (true, true)] {
         tokio::time::timeout(DEADLINE, async {
             let (mut session, mut control) = exec_session();
             let (output_status, receiver) = oneshot::channel();
             if pending_output_status {
                 session.output_status = Some(receiver);
             }
-            let client = test_client(None, Arc::new(Exec(Mutex::new([session].into()))), russh::client::Config::default()).await;
+            let client = client_for(vec![session]).await;
             let (mut channel, mut reader) = start(&client).await;
             if after_exit {
-                let summary = UploadSummary { bytes: 1, sha256: Sha256::digest(b"x").into() };
-                send(&channel, Frame::Data(b"x".to_vec())).await;
-                send(&channel, Frame::End(summary)).await;
+                channel.data(&b"x"[..]).await.unwrap();
+                channel.eof().await.unwrap();
                 let mut bytes = Vec::new();
                 control.stdin.read_to_end(&mut bytes).await.unwrap();
                 assert_eq!(bytes, b"x");
-                assert_eq!(reader.frame(&mut channel).await, Frame::Ack(1));
-                control.process.status.send_replace(Some(BoundaryExitStatus::Exited(0)));
-                control.process.waited.subscribe().wait_for(|waited| *waited).await.unwrap();
                 if pending_output_status {
+                    // Output EOF leaves the exit task waiting for the backend's
+                    // final status; dropped readers prove both drains finished.
                     control.stdout.shutdown().await.unwrap();
                     control.stderr.shutdown().await.unwrap();
                     assert_eq!(control.stdout.read(&mut [0]).await.unwrap(), 0);
                     assert_eq!(control.stderr.read(&mut [0]).await.unwrap(), 0);
-                    tokio::task::yield_now().await;
+                } else {
+                    control
+                        .process
+                        .status
+                        .send_replace(Some(BoundaryExitStatus::Exited(0)));
+                    control
+                        .process
+                        .waited
+                        .subscribe()
+                        .wait_for(|waited| *waited)
+                        .await
+                        .unwrap();
                 }
             }
-            if extended {
-                channel.extended_data(1, b"unexpected".as_slice()).await.unwrap();
-            } else {
-                send(&channel, Frame::End(UploadSummary {bytes: 1, sha256: [0;32]})).await;
-            }
-            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(failure) if failure.code == FailureCode::Protocol));
-            control.process.terminated.subscribe().wait_for(|terminated| *terminated).await.unwrap();
-            // Error and cleanup must arrive while output EOF/status is still held.
-            if after_exit && !pending_output_status {
-                assert_eq!(control.stdout.read(&mut [0]).await.unwrap(), 0);
-                assert_eq!(control.stderr.read(&mut [0]).await.unwrap(), 0);
-            }
-            if pending_output_status {
-                assert!(output_status.is_closed());
-            }
-            assert!(reader.frames.is_empty());
-            while let Some(message) = channel.wait().await {
-                match message {
-                    ChannelMsg::ExitStatus { exit_status } => reader.statuses.push(exit_status),
-                    ChannelMsg::Data { .. } => panic!("unexpected upload frame after ERROR"),
-                    ChannelMsg::Close => break,
-                    _ => {}
-                }
-            }
+            // The exit task is still waiting for output EOF or its final
+            // status, so the rejection must report without waiting for it.
+            channel
+                .extended_data(1, b"unexpected".as_slice())
+                .await
+                .unwrap();
+            assert!(reader.close(&mut channel).await.is_empty());
             assert_eq!(reader.statuses, [74]);
-        }).await.expect("invalid upload input did not terminate");
+            control.process.terminated().await;
+            drop((control.stdout, control.stderr, output_status));
+        })
+        .await
+        .expect("invalid upload input did not terminate");
     }
 }
 
@@ -606,20 +551,12 @@ async fn upload_preserves_login_shell_selection() {
             }
             channel.request_subsystem(true, SUBSYSTEM).await.unwrap();
             assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
-            let mut reader = Reader::new();
-            assert!(matches!(
-                reader.frame(&mut channel).await,
-                Frame::Hello { .. }
-            ));
-            send(
-                &channel,
-                Frame::Begin(UploadPlan {
-                    destination_directory: "/tmp/upload".into(),
-                    expected_destination: None,
-                }),
-            )
-            .await;
-            assert!(matches!(reader.frame(&mut channel).await, Frame::Error(_)));
+            channel.data(plan_line().as_slice()).await.unwrap();
+            let mut reader = Reader::default();
+            assert!(reader.close(&mut channel).await.is_empty());
+            assert_eq!(reader.statuses, [74]);
+            let stderr = String::from_utf8_lossy(&reader.stderr);
+            assert!(stderr.contains("login selection observed"), "{stderr}");
             assert_eq!(*login.borrow(), Some(!no_login));
         })
         .await

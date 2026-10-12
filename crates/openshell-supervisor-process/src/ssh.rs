@@ -375,7 +375,7 @@ async fn handle_connection(
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
-    upload: Option<upload::UploadChannel>,
+    upload: Option<upload::Upload>,
     command_started: bool,
     input_sender: Option<InputSender>,
     input_task: Option<input::InputTask>,
@@ -737,12 +737,8 @@ impl russh::server::Handler for SshHandler {
                 session.channel_failure(channel)?;
                 return Ok(());
             }
-            state.upload = Some(upload::UploadChannel::spawn(
-                channel,
-                session.handle(),
-                self.boundary_exec.clone(),
-                !state.no_login_shell,
-            ));
+            // Extraction starts once the plan line arrives on stdin.
+            state.upload = Some(upload::Upload::new());
             session.channel_success(channel)?;
             return Ok(());
         }
@@ -929,13 +925,12 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(upload) = self
+        if self
             .channels
-            .get_mut(&channel)
-            .and_then(|state| state.upload.as_mut())
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some())
         {
-            upload.data(data);
-            return Ok(());
+            return self.upload_data(channel, data, session).await;
         }
         let Some(state) = self.channels.get_mut(&channel) else {
             warn!("data on unknown channel {channel:?}");
@@ -948,7 +943,7 @@ impl russh::server::Handler for SshHandler {
             if let Some(InputSender::Process(sender)) = &state.input_sender
                 && sender.send(data) == Err(input::SendError::Full)
             {
-                self.reject_exec_input(channel, session)?;
+                self.reject_exec_input(channel, session, "process stdin buffer is full")?;
             }
             return Ok(());
         }
@@ -1001,16 +996,20 @@ impl russh::server::Handler for SshHandler {
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.upload.as_ref())
+            .is_some_and(upload::Upload::awaiting_plan)
+        {
+            return self.reject_upload(channel, session, Some("upload ended before its plan"));
+        }
         // Drop only the sender: the writer drains accepted bytes and then
         // closes stdin. Commands such as `cat | tar xf -` need this half-close
         // to finish while their output remains available to the SSH client.
         if let Some(state) = self.channels.get_mut(&channel) {
-            if let Some(upload) = state.upload.as_mut() {
-                upload.eof();
-                return Ok(());
-            }
             if state.main_attached
                 && let Some(owner) = state.main_input_owner.take()
                 && let Some(main_session) = self.main_session.as_ref()
@@ -1034,14 +1033,14 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         _ext: u32,
         _data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(upload) = self
+        if self
             .channels
-            .get_mut(&channel)
-            .and_then(|state| state.upload.as_mut())
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some())
         {
-            upload.reject_extended_data();
+            return self.reject_upload(channel, session, None);
         }
         Ok(())
     }
@@ -1072,12 +1071,11 @@ impl russh::server::Handler for SshHandler {
             }
             return Ok(());
         }
-        let Some(process) = self.channels.get(&channel).and_then(|state| {
-            state
-                .process
-                .clone()
-                .or_else(|| state.upload.as_ref()?.process())
-        }) else {
+        let Some(process) = self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.process.clone())
+        else {
             return Ok(());
         };
         let signal = match signal {
@@ -1097,10 +1095,100 @@ impl russh::server::Handler for SshHandler {
 }
 
 impl SshHandler {
+    /// Read the plan, start extraction, then admit archive bytes within credit.
+    async fn upload_data(
+        &mut self,
+        channel: ChannelId,
+        mut data: &[u8],
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
+        let Some(state) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        let Some(upload) = state.upload.as_mut() else {
+            return Ok(());
+        };
+        if upload.awaiting_plan() {
+            let command = match upload.read_plan(&mut data).and_then(|plan| {
+                plan.map(|plan| openshell_core::upload::build_extract_command(&plan))
+                    .transpose()
+            }) {
+                Ok(None) => return Ok(()),
+                Ok(Some(command)) => command,
+                Err(error) => {
+                    return self.reject_upload(channel, session, Some(&error.to_string()));
+                }
+            };
+            let spec = openshell_isolation_interface::contract::ExecSpec {
+                program: String::new(),
+                args: Vec::new(),
+                shell: Some(openshell_isolation_interface::contract::ShellSpec {
+                    command: Some(command),
+                    login: !state.no_login_shell,
+                }),
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            };
+            // Like exec requests, start inline: a close is handled only after
+            // the process is registered with this channel.
+            if let Err(error) = self.start_exec_spec(channel, session.handle(), spec).await {
+                let message = format!("failed to start upload extraction: {error}");
+                return self.reject_upload(channel, session, Some(&message));
+            }
+            if data.is_empty() {
+                return Ok(());
+            }
+        }
+        let Some(state) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        let (Some(upload), Some(InputSender::Process(sender))) =
+            (state.upload.as_mut(), state.input_sender.as_ref())
+        else {
+            return Ok(());
+        };
+        if !upload.admits(data.len()) {
+            return self.reject_upload(channel, session, None);
+        }
+        match sender.send(data) {
+            Ok(()) => upload.record(data.len()),
+            Err(input::SendError::Full) => return self.reject_upload(channel, session, None),
+            // The extractor closed stdin; its exit status reports the failure.
+            Err(input::SendError::Closed) => {}
+        }
+        Ok(())
+    }
+
+    /// Fail an upload with exit status 74 unless its result was reported.
+    fn reject_upload(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.upload.as_ref())
+            .is_some_and(upload::Upload::reject)
+        {
+            return Ok(());
+        }
+        // Only startup failures carry a message; the client's output window is
+        // still open then. Later rejections must not queue output.
+        if let Some(message) = message {
+            session.extended_data(channel, 1, format!("openshell: {message}\n").into_bytes())?;
+        }
+        self.reject_exec_input(channel, session, "invalid upload stream")
+    }
+
     fn reject_exec_input(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
+        reason: &str,
     ) -> anyhow::Result<()> {
         if let Some(mut state) = self.channels.remove(&channel) {
             // A locally initiated close may never call channel_close. Release
@@ -1117,7 +1205,7 @@ impl SshHandler {
         // Session methods enqueue directly. Do not add stderr data here: with
         // no output credit, russh would retain it and stop draining Handle
         // messages for other channels. Exit status needs no output credit.
-        warn!(?channel, "process stdin buffer is full; terminating exec");
+        warn!(?channel, "{reason}; terminating exec");
         session.exit_status_request(channel, 74)?;
         session.eof(channel)?;
         session.close(channel)?;
@@ -1189,13 +1277,28 @@ impl SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
+        if state.upload.is_some() && exec.stdin.is_none() {
+            let process = exec.process.clone();
+            tokio::spawn(async move {
+                let _ = process.terminate().await;
+            });
+            anyhow::bail!("extraction process has no stdin");
+        }
         state.process = Some(exec.process.clone());
         state.command_started = true;
         state.terminal = exec.terminal.take();
         let output_status = exec.output_status.take();
 
+        let mut finisher = None;
         if let Some(stdin) = exec.stdin.take() {
-            let (sender, task) = input::InputTask::spawn(stdin);
+            let (sender, task) = if let Some(upload) = state.upload.as_mut() {
+                let (sender, task, progress) = input::InputTask::spawn_with_progress(stdin);
+                finisher =
+                    Some(upload.start(channel, handle.clone(), progress, exec.process.clone()));
+                (sender, task)
+            } else {
+                input::InputTask::spawn(stdin)
+            };
             state.input_sender = Some(InputSender::Process(sender));
             state.input_task = Some(task);
         }
@@ -1204,6 +1307,8 @@ impl SshHandler {
             .as_ref()
             .map(input::InputTask::abort_handle);
 
+        // Upload stdout carries only credit, so extraction output uses stderr.
+        let stdout_extended = finisher.is_some();
         let mut stdout = exec.stdout;
         let stdout_handle = handle.clone();
         let stdout_task = tokio::spawn(async move {
@@ -1212,7 +1317,12 @@ impl SshHandler {
                 match stdout.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
                     Ok(size) => {
-                        let _ = stdout_handle.data(channel, buffer[..size].to_vec()).await;
+                        let data = buffer[..size].to_vec();
+                        let _ = if stdout_extended {
+                            stdout_handle.extended_data(channel, 1, data).await
+                        } else {
+                            stdout_handle.data(channel, data).await
+                        };
                     }
                 }
             }
@@ -1250,9 +1360,6 @@ impl SshHandler {
                 }
                 status
             };
-            if let Some(input_abort) = input_abort {
-                input_abort.abort();
-            }
             let code = match status {
                 Some(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
                     code.max(0).cast_unsigned()
@@ -1261,6 +1368,16 @@ impl SshHandler {
                     signal,
                 )) => (128_i32.saturating_add(signal)).max(0).cast_unsigned(),
                 None => 74,
+            };
+            let code = match finisher {
+                Some(finisher) => finisher.finish(&handle, code).await,
+                None => Some(code),
+            };
+            if let Some(input_abort) = input_abort {
+                input_abort.abort();
+            }
+            let Some(code) = code else {
+                return;
             };
             let _ = handle.eof(channel).await;
             let _ = handle.exit_status_request(channel, code).await;

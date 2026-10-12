@@ -65,7 +65,6 @@ anyhow = { workspace = true }
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
 tempfile = "3"
-sha2 = { workspace = true }
 
 # OIDC/Auth
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
