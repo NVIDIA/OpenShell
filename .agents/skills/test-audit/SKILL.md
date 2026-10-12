@@ -34,7 +34,10 @@ mode:
 - **`e2e/rust/tests/`** — a real gateway + real driver (Docker, Podman,
   Kubernetes, VM), feature-gated per driver (`e2e-docker`, `e2e-podman`,
   `e2e-kubernetes*`), driven by shell scripts (`e2e-*.sh`) that stand up the
-  actual stack.
+  actual stack. RFC 0016 is sorting these into conformance, feature, driver,
+  and disruption suites under `e2e/suites/`; check where a test lives now
+  before judging it, and use the RFC's test families and e2e types as the
+  vocabulary.
 - **The CLI conformance suite** — the reusable scenario library
   (`crates/openshell-conformance/`) plus the separately compiled
   installed-artifact workspace (`tests/suites/conformance/`). Use
@@ -165,7 +168,8 @@ that matches one, and audits hunt for existing tests that do.
 - private predicate or call-shape tests duplicated at real boundaries;
 - duplicate invocations of the same contract across unit, e2e, and
   conformance layers with no distinct failure mode at each layer;
-- provider-local (per-driver) replays of a shared conformance-level contract;
+- provider-local (per-driver) replays of a portable, public contract that the
+  conformance suite already owns;
 - tests whose only purpose is preserving test-only exports, globals, or
   wrappers;
 - dead production code whose only callers are tests;
@@ -191,7 +195,21 @@ that matches one, and audits hunt for existing tests that do.
   environment it's asserting against was never actually reached;
 - names or fixtures that promise more than the input exercises, such as a
   "verifies rootful parity" test that only runs under rootless because a
-  service-user assertion silently skipped it.
+  service-user assertion silently skipped it;
+- a test that returns early or skips and still reports a pass, because an
+  environment variable, driver, or launcher-set file is missing. It should
+  fail with a clear message, or be excluded or waived with a rationale and a
+  tracking issue, so a green result never hides a check that did not run;
+- a conformance test that changes deployment configuration, depends on
+  launcher-set environment variables or one provisioning tool, or reaches a
+  public internet service at test time (RFC 0016). It belongs in a driver,
+  feature, or disruption suite, or its dependencies should be supplied by
+  target preparation;
+- assertions that match human-formatted CLI output (substrings, table text)
+  where the command offers structured output such as `--output json`;
+- retry loops inside a test that hide a product race. Waiting for an expected
+  eventual state (a created sandbox becoming available, a deleted one
+  disappearing) is fine; retrying a failed assertion until it passes is not.
 
 ## Value bar
 
@@ -224,7 +242,11 @@ run parallel discovery lanes when available, one per surface:
   `.github/workflows/branch-e2e.yml` and `tasks/test.toml` to confirm the
   feature actually gets exercised in CI (it may not — see the Podman `E2E_FEATURES`
   empty-string wiring bug found in #3663, where a real, well-written test was
-  silently skipped by an env var default);
+  silently skipped by an env var default). Also check the tmachine archive's
+  exclusion list in `tests/artifacts.nix` and the wrapper lane's test list in
+  `e2e/rust/e2e-podman.sh`: a test can run in one lane and be excluded from the
+  other, and a nextest archive can only include or exclude whole test
+  binaries;
 - conformance suite: `crates/openshell-conformance/src/scenarios/` and
   `tests/suites/conformance/` — see `tests/suites/conformance/README.md` for
   the verification commands for each;
@@ -273,6 +295,9 @@ is not ready for deletion:
 - whether it currently runs in CI at all (check the workflow, not just the
   feature gate — see Discovery above) and what happens if you delete it
   versus if you fix its wiring instead;
+- if the test is excluded, skipped, or ignored, the recorded rationale and
+  tracking issue (none is itself a finding; RFC 0016 asks for a rationale and
+  tracking issue for every waived failure);
 - relevant history and the reason the test or seam exists;
 - production or test-support deletion unlocked;
 - risk and the focused validation command.
@@ -283,9 +308,14 @@ Choose one coherent owner-boundary batch, scoped to one crate, one SDK, or one
 driver's `e2e/rust/tests/` files at a time. Delete obsolete test-only exports,
 globals, wrappers, and dead production paths instead of preserving aliases.
 Move retained regressions to their canonical owners (conformance suite if the
-contract is driver-agnostic; the driver-specific file if it's genuinely
-driver-local). Consolidate repeated per-driver assertions of the same
-`ComputeDriver` contract into one conformance scenario.
+contract is portable and publicly observable, per
+`tests/suites/conformance/README.md`; the driver-specific file if it's
+genuinely driver-local). Consolidate repeated per-driver assertions of the same
+contract into one conformance scenario only when it meets that README's
+criteria; an internal `ComputeDriver` contract stays with the driver.
+Coordinate with open migration issues (for example #3954 and #3712) so an audit
+does not delete or rewrite a test already queued to move; RFC 0016 asks
+migrations to preserve coverage.
 
 Prefer net-negative production LOC. Do not add replacement tests that restate
 the same implementation, and do not convert uncertain candidates into cleanup
