@@ -6,10 +6,11 @@
 //! Each test builds a small image with the container engine that backs the
 //! target gateway, creates a sandbox from it through the candidate CLI, and
 //! checks the process identity, privileges, workspace, and image content seen
-//! by both the sandbox main process and `sandbox exec`.
+//! by both the sandbox main process and `sandbox exec`. One scenario also
+//! inspects the containers the driver created, through the same engine.
 //!
 //! `OPENSHELL_BIN` names the candidate CLI. `OPENSHELL_TEST_CONTAINER_ENGINE`
-//! is the command that builds images into the gateway's image store, such as
+//! is the command for the gateway's container engine and image store, such as
 //! `docker`, `podman`, or `sudo -n podman`.
 
 use std::process::Command;
@@ -44,8 +45,8 @@ network_policies: {}
 async fn custom_workdir_with_named_user() {
     run(
         "oci-image/custom-workdir-named-user",
-        async |runner, images| {
-            let image = images.build(
+        async |runner, engine| {
+            let image = engine.build_image(
                 "named-workdir",
                 &format!(
                     "FROM {BASE_IMAGE}
@@ -73,12 +74,14 @@ USER app
 /// A numeric image user without passwd entries can reach a custom `WORKDIR`
 /// whose parent directories are private to that user. The sandbox policy omits
 /// `process`, so the image `USER` is the only source of the sandbox identity.
+/// The driver's containers launch the inspected image and keep the
+/// supervisor separate from the workload.
 #[tokio::test]
 async fn custom_workdir_with_numeric_user_and_private_parents() {
     run(
         "oci-image/custom-workdir-numeric-user",
-        async |runner, images| {
-            let image = images.build(
+        async |runner, engine| {
+            let image = engine.build_image(
                 "numeric-workdir",
                 &format!(
                     "FROM {BASE_IMAGE}
@@ -100,9 +103,8 @@ USER 2345:2346
                 .to_str()
                 .ok_or("policy path is not UTF-8")?;
             let checks = workspace_checks("2345:2346", "/home/app/project", true);
-            create_sandbox(runner, "pu", &image, Some(policy), &checks)
-                .await
-                .map(drop)
+            let sandbox = create_sandbox(runner, "pu", &image, Some(policy), &checks).await?;
+            container_checks(engine, &sandbox, &image, "2345:2346")
         },
     )
     .await;
@@ -112,8 +114,8 @@ USER 2345:2346
 /// by the image user, even when the image does not contain `/sandbox`.
 #[tokio::test]
 async fn default_workdir_uses_managed_workspace() {
-    run("oci-image/default-workdir", async |runner, images| {
-        let image = images.build(
+    run("oci-image/default-workdir", async |runner, engine| {
+        let image = engine.build_image(
             "default-workdir",
             &format!("FROM {BASE_IMAGE}\nUSER 2345:2346\n"),
         )?;
@@ -130,11 +132,11 @@ async fn default_workdir_uses_managed_workspace() {
 /// rather than a generic startup failure.
 #[tokio::test]
 async fn unwritable_custom_workdir_is_rejected() {
-    run("oci-image/unwritable-workdir", async |runner, images| {
+    run("oci-image/unwritable-workdir", async |runner, engine| {
         // First prove that this user, workspace and command can run. Only the
         // directory owner differs between the control and rejected image.
         for (suffix, owner, writable) in [("wc", "3234:3235", true), ("uw", "0:0", false)] {
-            let image = images.build(
+            let image = engine.build_image(
                 suffix,
                 &format!(
                     "FROM {BASE_IMAGE}
@@ -198,21 +200,21 @@ USER app
 
 async fn run(
     scenario: &str,
-    test: impl AsyncFnOnce(&mut OpenShellRunner, &mut TestImages) -> Result<(), String>,
+    test: impl AsyncFnOnce(&mut OpenShellRunner, &mut Engine) -> Result<(), String>,
 ) {
     let mut runner =
         OpenShellRunner::from_env(scenario).expect("candidate openshell CLI is available");
-    let mut images = TestImages::from_env();
+    let mut engine = Engine::from_env();
     let result = async {
         runner.check_gateway_status().await?;
-        test(&mut runner, &mut images).await
+        test(&mut runner, &mut engine).await
     }
     .await;
     // Delete sandboxes before their images. Non-forced image removal must
     // report remaining users rather than deleting workloads behind the
     // gateway's back. Keep functional and sandbox failures first.
     let mut errors: Vec<_> = runner.finish(result).await.err().into_iter().collect();
-    errors.extend(images.remove_all());
+    errors.extend(engine.remove_images());
     if !errors.is_empty() {
         panic!("{scenario} failed:\n{}", errors.join("\n"));
     }
@@ -393,6 +395,59 @@ async fn file_transfer_uses_workspace(
     .await
 }
 
+/// Check the containers the driver created for `sandbox`. The workload runs
+/// the image ID inspected before creation, so retagging cannot swap it, and
+/// starts directly as the sandbox `identity` without a network or the
+/// supervisor's credentials. The supervisor runs in a separate non-root
+/// container.
+fn container_checks(
+    engine: &Engine,
+    sandbox: &str,
+    image: &str,
+    identity: &str,
+) -> Result<(), String> {
+    let workload = engine.container_for_role(sandbox, "sandbox")?;
+    let supervisor = engine.container_for_role(sandbox, "supervisor")?;
+    if workload == supervisor {
+        return Err(format!("{sandbox} has no separate supervisor container"));
+    }
+    let image_id = engine.output(&["image", "inspect", "--format", "{{.Id}}", image])?;
+    let launched = engine.inspect_container(&workload, "{{.Image}}")?;
+    let digest = |id: &str| id.trim_start_matches("sha256:").to_string();
+    if digest(&launched) != digest(&image_id) {
+        return Err(format!(
+            "workload launched image {launched}, expected the inspected {image_id}"
+        ));
+    }
+    let user = engine.inspect_container(&workload, "{{.Config.User}}")?;
+    if user != identity {
+        return Err(format!("workload starts as {user:?}, expected {identity}"));
+    }
+    let network = engine.inspect_container(&workload, "{{.HostConfig.NetworkMode}}")?;
+    if network != "none" {
+        return Err(format!(
+            "workload network mode is {network:?}, expected none"
+        ));
+    }
+    let mounts = engine.inspect_container(
+        &workload,
+        "{{range .Mounts}}{{println .Destination}}{{end}}",
+    )?;
+    if let Some(mount) = mounts.lines().find(|mount| {
+        mount.starts_with("/etc/openshell/tls") || mount.starts_with("/.openshell/supervisor")
+    }) {
+        return Err(format!("workload mounts supervisor credentials at {mount}"));
+    }
+    let supervisor_user = engine.inspect_container(&supervisor, "{{.Config.User}}")?;
+    if matches!(
+        supervisor_user.split(':').next(),
+        None | Some("" | "0" | "root")
+    ) {
+        return Err(format!("supervisor runs as root ({supervisor_user:?})"));
+    }
+    Ok(())
+}
+
 /// Run a CLI step that must succeed.
 async fn run_ok(
     runner: &OpenShellRunner,
@@ -431,34 +486,35 @@ async fn exec(
     .await
 }
 
-/// Images built for one scenario, removed by `run` after sandbox cleanup.
-struct TestImages {
-    engine: Vec<String>,
-    tags: Vec<String>,
+/// The gateway's container engine. Images it builds for a scenario are
+/// removed by `run` after sandbox cleanup.
+struct Engine {
+    command: Vec<String>,
+    images: Vec<String>,
 }
 
-impl TestImages {
+impl Engine {
     fn from_env() -> Self {
-        let engine: Vec<String> = std::env::var(ENGINE_ENV)
+        let command: Vec<String> = std::env::var(ENGINE_ENV)
             .unwrap_or_else(|_| panic!("{ENGINE_ENV} must name the gateway's container engine"))
             .split_whitespace()
             .map(str::to_string)
             .collect();
-        assert!(!engine.is_empty(), "{ENGINE_ENV} is empty");
+        assert!(!command.is_empty(), "{ENGINE_ENV} is empty");
         Self {
-            engine,
-            tags: Vec::new(),
+            command,
+            images: Vec::new(),
         }
     }
 
     /// Build `containerfile` and return the image tag.
-    fn build(&mut self, name: &str, containerfile: &str) -> Result<String, String> {
+    fn build_image(&mut self, name: &str, containerfile: &str) -> Result<String, String> {
         let context = tempfile::tempdir().map_err(|error| format!("create context: {error}"))?;
         let file = context.path().join("Containerfile");
         std::fs::write(&file, containerfile)
             .map_err(|error| format!("write Containerfile: {error}"))?;
         let tag = format!("localhost/openshell-test-oci-{name}:{}", std::process::id());
-        self.engine_command(&[
+        self.output(&[
             "build",
             "--file",
             file.to_str().ok_or("Containerfile path is not UTF-8")?,
@@ -467,23 +523,47 @@ impl TestImages {
             context.path().to_str().ok_or("context path is not UTF-8")?,
         ])?;
         // A failed build leaves no tag to remove.
-        self.tags.push(tag.clone());
+        self.images.push(tag.clone());
         Ok(tag)
     }
 
     /// Remove every built image, returning one error per failed removal.
-    fn remove_all(&self) -> Vec<String> {
-        self.tags
+    fn remove_images(&self) -> Vec<String> {
+        self.images
             .iter()
-            .filter_map(|tag| self.engine_command(&["image", "rm", tag]).err())
+            .filter_map(|tag| self.output(&["image", "rm", tag]).err())
             .map(|error| format!("image cleanup failed: {error}"))
             .collect()
     }
 
-    fn engine_command(&self, args: &[&str]) -> Result<(), String> {
-        let command = format!("{} {}", self.engine.join(" "), args.join(" "));
-        let output = Command::new(&self.engine[0])
-            .args(&self.engine[1..])
+    /// The one container with isolation `role` for `sandbox`. Docker and
+    /// Podman label sandbox containers the same way.
+    fn container_for_role(&self, sandbox: &str, role: &str) -> Result<String, String> {
+        let ids = self.output(&[
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=openshell.ai/sandbox-name={sandbox}"),
+            "--filter",
+            &format!("label=openshell.ai/isolation-role={role}"),
+        ])?;
+        match ids.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [id] => Ok((*id).to_string()),
+            ids => Err(format!(
+                "expected one {role} container for {sandbox}, found {ids:?}"
+            )),
+        }
+    }
+
+    fn inspect_container(&self, id: &str, format: &str) -> Result<String, String> {
+        self.output(&["container", "inspect", "--format", format, id])
+    }
+
+    /// Run the engine and return its trimmed standard output.
+    fn output(&self, args: &[&str]) -> Result<String, String> {
+        let command = format!("{} {}", self.command.join(" "), args.join(" "));
+        let output = Command::new(&self.command[0])
+            .args(&self.command[1..])
             .args(args)
             .output()
             .map_err(|error| format!("failed to run {command}: {error}"))?;
@@ -495,6 +575,6 @@ impl TestImages {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 }

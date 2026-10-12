@@ -3,17 +3,15 @@
 
 #![cfg(feature = "e2e-podman")]
 
-//! Podman-specific E2E coverage for immutable-image launch and the isolated
-//! workload/supervisor container pair.
+//! Podman-specific E2E coverage for the supervisor companion container.
 //!
-//! The test builds an image through the selected Podman engine, creates a
-//! sandbox from its mutable tag, and inspects the real Podman containers: the
-//! image ID recorded on the workload, each container's user, the supervisor's
-//! capabilities, networking, and mounts. This exercises the Podman API
-//! inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries. The sandbox identity, privileges, and workspace
-//! seen by the main process and `sandbox exec` are shared with Docker and
-//! covered by the `oci-image` feature suite in `tests/suites/features`.
+//! Podman runs the supervisor as the resolved OCI workload identity with no
+//! effective capabilities; Docker runs it as a fixed unprivileged user. The
+//! test builds an image through the selected Podman engine, creates a sandbox
+//! from it, and inspects the real supervisor container. The workload's image
+//! ID, identity, network, and mounts, and what the main process and
+//! `sandbox exec` see, are shared with Docker and covered by the `oci-image`
+//! feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
@@ -39,7 +37,6 @@ network_policies: {}
 struct ImageGuard {
     engine: ContainerEngine,
     tag: String,
-    id: String,
 }
 
 impl ImageGuard {
@@ -90,7 +87,6 @@ USER {OCI_UID}:{OCI_GID}
                     .ok_or_else(|| "build context path is not UTF-8".to_string())?,
             ],
         )?;
-        let id = run_engine(&engine, &["image", "inspect", "--format", "{{.Id}}", &tag])?;
         let user = run_engine(
             &engine,
             &["image", "inspect", "--format", "{{.Config.User}}", &tag],
@@ -101,7 +97,7 @@ USER {OCI_UID}:{OCI_GID}
             ));
         }
 
-        Ok(Self { engine, tag, id })
+        Ok(Self { engine, tag })
     }
 }
 
@@ -136,10 +132,6 @@ fn run_engine(engine: &ContainerEngine, args: &[&str]) -> Result<String, String>
         ));
     }
     Ok(stdout.trim().to_string())
-}
-
-fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<String, String> {
-    container_id_for_role(engine, sandbox_name, "sandbox")
 }
 
 fn container_id_for_role(
@@ -178,15 +170,8 @@ fn container_id_for_role(
     }
 }
 
-fn normalized_image_id(image_id: &str) -> &str {
-    image_id
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or(image_id.trim())
-}
-
 #[tokio::test]
-async fn podman_uses_oci_identity_and_inspected_image_id() {
+async fn podman_supervisor_runs_as_oci_identity_without_capabilities() {
     if !is_e2e_driver("podman") {
         eprintln!("Skipping Podman OCI identity test: e2e driver is not podman");
         return;
@@ -207,43 +192,8 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     .await
     .expect("create sandbox from Podman-built OCI identity image");
 
-    let container_id =
-        sandbox_container_id(&image.engine, &sandbox.name).expect("find Podman sandbox container");
-    let launched_image_id = run_engine(
-        &image.engine,
-        &[
-            "container",
-            "inspect",
-            "--format",
-            "{{.Image}}",
-            &container_id,
-        ],
-    )
-    .expect("inspect Podman sandbox container image");
-    assert_eq!(
-        normalized_image_id(&launched_image_id),
-        normalized_image_id(&image.id),
-        "Podman sandbox must launch the immutable image ID inspected before creation"
-    );
-
-    assert_isolated_pair(&image, &sandbox, &container_id);
-    sandbox.cleanup().await;
-}
-
-fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id: &str) {
     let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
         .expect("find separate supervisor companion");
-    assert_ne!(supervisor_id, container_id);
-    let workload_user = run_engine(
-        &image.engine,
-        &["inspect", "--format", "{{.Config.User}}", container_id],
-    )
-    .unwrap();
-    assert_eq!(
-        workload_user,
-        format!("{OCI_UID}:{OCI_GID}"),
-        "a custom OCI workspace must start directly as the final identity"
-    );
     let supervisor_user = run_engine(
         &image.engine,
         &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
@@ -259,27 +209,5 @@ fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id
         supervisor_caps, "[]",
         "the supervisor companion may not have effective capabilities"
     );
-    let network = run_engine(
-        &image.engine,
-        &[
-            "inspect",
-            "--format",
-            "{{.HostConfig.NetworkMode}}",
-            container_id,
-        ],
-    )
-    .unwrap();
-    assert_eq!(network, "none");
-    let mounts = run_engine(
-        &image.engine,
-        &[
-            "inspect",
-            "--format",
-            "{{range .Mounts}}{{println .Destination}}{{end}}",
-            container_id,
-        ],
-    )
-    .unwrap();
-    assert!(!mounts.contains("/etc/openshell/tls"));
-    assert!(!mounts.contains("/.openshell/supervisor"));
+    sandbox.cleanup().await;
 }
