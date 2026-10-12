@@ -83,6 +83,22 @@ describe('sandbox SSH host identity', () => {
   });
 });
 
+describe('sandbox creation time', () => {
+  it('maps created_time from get and list and leaves it absent when omitted', async () => {
+    let createdTime: { seconds: bigint; nanos: number } | undefined = { seconds: 1_700_000_000n, nanos: 123_000_000 };
+    const sandbox = client({
+      getSandbox: () => ({ sandbox: { metadata: { id: 'id', name: 'work', createdTime } } }),
+      listSandboxes: () => ({ sandboxes: [{ metadata: { id: 'id', name: 'work', createdTime } }] }),
+    });
+    expect((await sandbox.get('work')).createdAtMs).toBe(1_700_000_000_123);
+    expect((await sandbox.list().all())[0]?.createdAtMs).toBe(1_700_000_000_123);
+    createdTime = undefined;
+    expect((await sandbox.get('work')).createdAtMs).toBeUndefined();
+    createdTime = { seconds: 0n, nanos: 0 };
+    expect((await sandbox.list().all())[0]?.createdAtMs).toBeUndefined();
+  });
+});
+
 describe('deletion outcomes', () => {
   it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
     const flags: boolean[] = [];
