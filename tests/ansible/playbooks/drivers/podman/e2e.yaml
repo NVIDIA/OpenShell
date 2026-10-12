@@ -58,6 +58,14 @@
       ansible.builtin.command:
         argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
 
+    # The e2e tests that attach a PTY to `openshell sandbox create` spawn
+    # `script` (see `openshell_tty_cmd`).
+    - name: Install guest tools used by the E2E archive
+      become: true
+      ansible.builtin.dnf:
+        name: util-linux-script
+        state: present
+
     - name: Run Podman E2E archive tests
       ansible.builtin.command:
         argv:
