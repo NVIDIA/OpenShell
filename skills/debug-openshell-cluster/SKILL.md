@@ -1117,6 +1117,14 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its authenticated gateway session.
 
+For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
+
+- `[openshell.drivers.vm]` sets `allow_driver_config = true` and `enable_bind_mounts = true`; an external VM driver needs `--enable-bind-mounts` and `allow_driver_config` in `--admission-config-json`.
+- `[openshell.drivers.vm.resource_admission]` sets `enabled = false`; bind mounts are rejected while resource admission is on.
+- The libkrun runtime exports `krun_add_virtiofs4`; otherwise the driver reports "VM bind mounts need a libkrun runtime with virtiofs support". The driver extracts its runtime under `$XDG_DATA_HOME/openshell/vm-runtime/<version>/` (default `~/.local/share`). Check with `nm -D <dir>/libkrun.so | grep krun_add_virtiofs4` on Linux or `nm -gU <dir>/libkrun.dylib | grep krun_add_virtiofs4` on macOS.
+- The sandbox launches on libkrun. GPU sandboxes and QEMU launches do not support VM mounts.
+- On Linux with a non-root gateway, file creation in a read-write mount fails unless `sandbox_uid`/`sandbox_gid` match the gateway user's UID/GID. Compare `id -u`/`id -g` of the gateway user with the configured values.
+
 Then run:
 
 ```bash
