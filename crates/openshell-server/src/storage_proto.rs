@@ -155,7 +155,7 @@ mod tests {
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "10fce7e572f1513551d6b7abec7dcc8fc2cb40c92fb394f8321232f5b9921fd4";
+        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
     const DURABLE_SCHEMA_SHA256: &str =
         "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
