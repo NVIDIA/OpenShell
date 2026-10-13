@@ -62,8 +62,8 @@ jobs:
       - name: Check out review tooling and release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Branch reviews run target-side tooling, never candidate-side code.
-          ref: ${{ inputs.base_ref || github.workflow_sha }}
+          # Keep the tooling and workflow argument interface at the same revision.
+          ref: ${{ github.workflow_sha }}
           path: review-tools
           fetch-depth: 0
           persist-credentials: false

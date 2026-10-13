@@ -76,7 +76,7 @@ so Windows failures do not fail the workflow.
 
 `Codex Compatibility Review` runs in Branch Checks and alongside tagged release
 qualification. Branch checks compare the prospective merge tree with its target,
-using target-side review tooling and the target's tag-derived train policy.
+using workflow-revision review tooling and the target's tag-derived train policy.
 Release qualification reviews the cumulative diff from the previous reachable
 stable release to the exact candidate commit, using the same tag-derived
 patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
