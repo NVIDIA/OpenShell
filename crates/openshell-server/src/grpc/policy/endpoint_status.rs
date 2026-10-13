@@ -580,7 +580,7 @@ async fn has_fresh_shared_owner(
         .map_err(|error| Status::unavailable(format!("resolve supervisor owner failed: {error}")))
 }
 
-fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
+pub fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
@@ -647,7 +647,7 @@ fn validate_endpoint_snapshot(
             ));
         }
         if let Some(failure) = endpoint.failure.as_ref() {
-            validate_reported_failure(result, failure, attached_providers)?;
+            validate_reported_failure("observations.failure", result, failure, attached_providers)?;
         }
         if validated
             .insert(
@@ -700,13 +700,13 @@ fn validate_endpoint_snapshot(
 /// The credential name is checked for shape only. It is a name the sandbox's
 /// supervisor received with its provider environment, never a credential value.
 fn validate_reported_failure(
+    field: &str,
     result: EndpointResult,
     failure: &openshell_core::proto::EndpointFailure,
     attached_providers: &[String],
 ) -> Result<(), Status> {
-    validate_endpoint_failure(failure, result).map_err(|invalid| {
-        openshell_core::rpc_error::invalid_argument("observations.failure", invalid.message())
-    })?;
+    validate_endpoint_failure(failure, result)
+        .map_err(|invalid| openshell_core::rpc_error::invalid_argument(field, invalid.message()))?;
     if !failure.provider.is_empty() && !attached_providers.contains(&failure.provider) {
         return Err(openshell_core::rpc_error::failed_precondition(
             "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED",
@@ -744,6 +744,7 @@ fn validate_token_grant_status(
         ));
     }
     validate_reported_failure(
+        "token_grant_status.last_failure.failure",
         EndpointResult::CredentialUnavailable,
         failure,
         attached_providers,

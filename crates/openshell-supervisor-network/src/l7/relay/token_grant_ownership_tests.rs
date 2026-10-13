@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
@@ -290,23 +290,6 @@ impl Fixture {
             .engine
             .clone_engine_for_tunnel(self.generation)
             .expect("tunnel policy snapshot");
-        let snapshot = self.state.snapshot();
-        // Mirror the proxy cache identity. Same-revision replacements remain
-        // distinct because the installation ID precedes the provider segment.
-        let dynamic_credentials = snapshot
-            .dynamic_credentials
-            .iter()
-            .map(|(key, credential)| {
-                let (selector, owner) = key.rsplit_once('\t').expect("endpoint-bound fixture key");
-                (
-                    format!(
-                        "{selector}\trev:{}\tinstallation:{}\t{owner}",
-                        snapshot.revision, snapshot.installation_id
-                    ),
-                    credential.clone(),
-                )
-            })
-            .collect();
         let ctx = L7EvalContext {
             host: HOST.into(),
             port: PORT,
@@ -314,9 +297,6 @@ impl Fixture {
             policy_name: "fixture".into(),
             binary_path: "/usr/bin/curl".into(),
             provider_credentials: Some(self.state.clone()),
-            // Match the initial tunnel snapshot while retaining live provider
-            // state. Refresh tests require requests to use the live ownership.
-            dynamic_credentials: Some(Arc::new(RwLock::new(dynamic_credentials))),
             token_grant_resolver: Some(resolver),
             endpoint_observation_tx: self.observation.clone(),
             ..Default::default()
@@ -767,17 +747,13 @@ async fn refused_grant(
 }
 
 fn refusal_request_id(response: &str) -> String {
-    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-    let request_id = response
-        .lines()
-        .find_map(|line| line.strip_prefix("x-openshell-request-id: "))
-        .expect("refusal carries the request ID")
-        .to_string();
-    let without_id = response.replace(&request_id, "");
-    for classification in ["unavailable", "token_endpoint", "RETRY"] {
-        assert!(!without_id.contains(classification), "{response}");
-    }
-    request_id
+    tests::assert_grant_refusal_response(
+        response,
+        openshell_core::token_grant_failure::TokenGrantFailure::new(
+            openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
+            openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
+        ),
+    )
 }
 
 #[tokio::test]

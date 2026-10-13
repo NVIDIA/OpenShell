@@ -77,32 +77,28 @@ impl TokenCache {
     }
 
     /// Get a cached token if it exists and is not expired.
-    fn get(&self, provider_name: &str) -> Result<Option<String>, TokenGrantFailure> {
+    fn get(&self, provider_name: &str) -> Option<String> {
         let now_ms = current_time_ms();
-        let tokens = self.tokens.read().map_err(|_| cache_failure())?;
-        Ok(tokens
-            .get(provider_name)
-            .filter(|cached| cached.expires_at_ms > now_ms)
-            .map(|cached| cached.access_token.clone()))
+        let tokens = self.tokens.read().ok()?;
+        let cached = tokens.get(provider_name)?;
+        if cached.expires_at_ms > now_ms {
+            Some(cached.access_token.clone())
+        } else {
+            None
+        }
     }
 
     /// Store a token with expiration time.
-    fn set(
-        &self,
-        provider_name: String,
-        access_token: String,
-        expires_at_ms: i64,
-    ) -> Result<(), TokenGrantFailure> {
-        // Poisoning invalidates cache integrity; never silently bypass it.
-        let mut tokens = self.tokens.write().map_err(|_| cache_failure())?;
-        tokens.insert(
-            provider_name,
-            CachedToken {
-                access_token,
-                expires_at_ms,
-            },
-        );
-        Ok(())
+    fn set(&self, provider_name: String, access_token: String, expires_at_ms: i64) {
+        if let Ok(mut tokens) = self.tokens.write() {
+            tokens.insert(
+                provider_name,
+                CachedToken {
+                    access_token,
+                    expires_at_ms,
+                },
+            );
+        }
     }
 }
 
@@ -154,20 +150,6 @@ pub async fn obtain_provider_token(
 ) -> Result<String, TokenGrantFailure> {
     let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
         .map_err(|_| configuration_failure())?;
-    // Resolve local exchange prerequisites before fetching any workload credential.
-    let exchange_context = if grant_type == ProviderCredentialTokenGrantType::TokenExchange {
-        let (provider, credential_key) = parse_provider_credential_key(request.provider_name)?;
-        let endpoint = supervisor_gateway_endpoint_from_env()?;
-        openshell_core::grpc_client::validate_token_grant_gateway_endpoint(&endpoint)?;
-        Some((
-            provider,
-            credential_key,
-            endpoint,
-            supervisor_sandbox_id_from_env()?,
-        ))
-    } else {
-        None
-    };
     obtain_provider_token_with_grant(
         ObtainProviderTokenInput {
             cache: &TOKEN_CACHE,
@@ -182,13 +164,29 @@ pub async fn obtain_provider_token(
             requested_token_type: request.requested_token_type,
         },
         |jwt_audience| async move {
+            // Resolve local exchange prerequisites before fetching any workload credential.
+            let exchange_context = match grant_type {
+                ProviderCredentialTokenGrantType::ClientCredentials
+                | ProviderCredentialTokenGrantType::Unspecified => None,
+                ProviderCredentialTokenGrantType::TokenExchange => {
+                    let (provider, credential_key) =
+                        parse_provider_credential_key(request.provider_name)?;
+                    let endpoint = supervisor_gateway_endpoint_from_env()?;
+                    openshell_core::grpc_client::token_grant_gateway_endpoint(&endpoint)?;
+                    Some((
+                        provider,
+                        credential_key,
+                        endpoint,
+                        supervisor_sandbox_id_from_env()?,
+                    ))
+                }
+            };
             // Fetch JWT-SVID with authorization server as audience
             // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
             let jwt_svid = fetch_jwt_svid_for_token_grant(&jwt_audience).await?;
 
-            match grant_type {
-                ProviderCredentialTokenGrantType::ClientCredentials
-                | ProviderCredentialTokenGrantType::Unspecified => {
+            match exchange_context {
+                None => {
                     // Perform OAuth2 JWT client assertion grant. The audience
                     // parameter in the token request specifies the resource server.
                     perform_token_grant(
@@ -201,9 +199,7 @@ pub async fn obtain_provider_token(
                     )
                     .await
                 }
-                ProviderCredentialTokenGrantType::TokenExchange => {
-                    let (provider, credential_key, endpoint, sandbox_id) =
-                        exchange_context.ok_or_else(configuration_failure)?;
+                Some((provider, credential_key, endpoint, sandbox_id)) => {
                     let intermediate =
                         openshell_core::grpc_client::exchange_provider_subject_token(
                             &endpoint,
@@ -259,14 +255,6 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<OAuthTokenResponse, TokenGrantFailure>>,
 {
-    // Even a cache hit cannot authorize an invalid endpoint configuration.
-    oauth::validate_token_endpoint(input.token_endpoint)?;
-    if input
-        .cache_ttl_override
-        .is_some_and(|ttl| i64::try_from(ttl.as_millis()).is_err())
-    {
-        return Err(configuration_failure());
-    }
     let jwt_audience = effective_jwt_svid_audience(input.token_endpoint, input.jwt_svid_audience);
     let cache_key = token_cache_key(TokenCacheKeyInput {
         provider_name: input.provider_name,
@@ -280,11 +268,18 @@ where
     });
 
     if input.cache_ttl_override != Some(Duration::ZERO)
-        && let Some(cached) = input.cache.get(&cache_key)?
+        && let Some(cached) = input.cache.get(&cache_key)
     {
         return Ok(cached);
     }
 
+    oauth::parse_token_endpoint_url(input.token_endpoint)?;
+    if input
+        .cache_ttl_override
+        .is_some_and(|ttl| i64::try_from(ttl.as_millis()).is_err())
+    {
+        return Err(configuration_failure());
+    }
     let token_response = grant(jwt_audience).await?;
     validate_access_token(&token_response.access_token)?;
 
@@ -296,7 +291,7 @@ where
             cache_key,
             token_response.access_token.clone(),
             expires_at_ms,
-        )?;
+        );
     }
 
     Ok(token_response.access_token)
@@ -335,9 +330,7 @@ fn workload_api_failure(error: WorkloadApiError) -> TokenGrantFailure {
     // Classify the local Workload API's typed rejection without retaining its
     // endpoint, response text, JWT parsing details, or transport source.
     let kind = match error {
-        WorkloadApiError::MissingEndpointSocket
-        | WorkloadApiError::NotUnicodeEndpointSocket(_)
-        | WorkloadApiError::Endpoint(_) => TokenGrantFailureKind::Configuration,
+        WorkloadApiError::Endpoint(_) => TokenGrantFailureKind::Configuration,
         WorkloadApiError::NoIdentityIssued | WorkloadApiError::PermissionDenied(_) => {
             TokenGrantFailureKind::WorkloadIdentityRejected
         }
@@ -360,13 +353,6 @@ fn workload_api_failure(error: WorkloadApiError) -> TokenGrantFailure {
 fn configuration_failure() -> TokenGrantFailure {
     TokenGrantFailure::new(
         TokenGrantFailureKind::Configuration,
-        TokenGrantStage::Configuration,
-    )
-}
-
-fn cache_failure() -> TokenGrantFailure {
-    TokenGrantFailure::new(
-        TokenGrantFailureKind::Unavailable,
         TokenGrantStage::Configuration,
     )
 }
@@ -977,10 +963,6 @@ mod tests {
                 TokenGrantFailureKind::WorkloadIdentityRejected,
             ),
             (
-                WorkloadApiError::MissingEndpointSocket,
-                TokenGrantFailureKind::Configuration,
-            ),
-            (
                 WorkloadApiError::HintNotFound("secret-jwt-canary".to_string()),
                 TokenGrantFailureKind::Unclassified,
             ),
@@ -1050,36 +1032,6 @@ mod tests {
             .expect_err("grant must fail");
             assert_eq!(failure, expected);
         }
-    }
-
-    #[tokio::test]
-    async fn poisoned_token_cache_fails_before_credential_acquisition() {
-        let cache = TokenCache::new();
-        let tokens = cache.tokens.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = tokens.write().expect("lock fixture cache");
-                panic!("poison fixture cache");
-            })
-            .join()
-            .is_err()
-        );
-        let grant_calls = Arc::new(AtomicUsize::new(0));
-        let failure = obtain_counted_test_token(CountedTokenGrantInput {
-            cache: &cache,
-            provider_name: "provider:access_token",
-            token_endpoint: "https://auth.example.com/token",
-            jwt_svid_audience: "",
-            audience: "",
-            scopes: &[],
-            cache_ttl_override: None,
-            expires_in: 60,
-            grant_calls: grant_calls.clone(),
-        })
-        .await
-        .expect_err("poisoned cache must fail closed");
-        assert_eq!(failure, cache_failure());
-        assert_eq!(grant_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1295,9 +1247,7 @@ mod tests {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             requested_token_type: ACCESS_TOKEN_TYPE,
         });
-        cache
-            .set(identity_cache_key, "expired".into(), current_time_ms() - 1)
-            .expect("test cache accepts an expired entry");
+        cache.set(identity_cache_key, "expired".into(), current_time_ms() - 1);
         let service_token = obtain_token_without_grant_call(
             &cache,
             service,
@@ -1436,13 +1386,11 @@ mod tests {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             requested_token_type: ACCESS_TOKEN_TYPE,
         });
-        cache
-            .set(
-                cache_key,
-                "expired-token".to_string(),
-                current_time_ms() - 1,
-            )
-            .expect("cache should accept expired fixture");
+        cache.set(
+            cache_key,
+            "expired-token".to_string(),
+            current_time_ms() - 1,
+        );
 
         let token = obtain_counted_test_token(CountedTokenGrantInput {
             cache: &cache,

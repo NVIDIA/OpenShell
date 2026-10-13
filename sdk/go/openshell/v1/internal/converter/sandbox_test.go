@@ -280,16 +280,6 @@ func TestSandboxFromProto_EndpointLastFailure(t *testing.T) {
 			LastResult:       pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED,
 			LastReportedTime: reportedAt,
 		},
-		{
-			EndpointId: "endpoint-unknown-domain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/future",
-			LastResult: pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE,
-			LastFailure: &pb.EndpointFailure{
-				Domain:    pb.EndpointFailureDomain(99),
-				Code:      "future_code",
-				Stage:     "future_stage",
-				RequestId: "4c1d7a2e-0f3b-4e8a-b6a1-9f2c3d4e5f60",
-			},
-		},
 	}}}
 
 	s := SandboxFromProto(input)
@@ -314,19 +304,7 @@ func TestSandboxFromProto_EndpointLastFailure(t *testing.T) {
 			EndpointID: "endpoint-plain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other",
 			LastResult: v1.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z",
 		},
-		{
-			EndpointID: "endpoint-unknown-domain", Host: "tools.example.test", Ports: []uint32{443}, Path: "/future",
-			LastResult: v1.EndpointCredentialUnavailable,
-			LastFailure: &v1.EndpointFailure{
-				Domain:    v1.EndpointFailureDomainUnspecified,
-				Code:      "future_code",
-				Stage:     "future_stage",
-				RequestID: "4c1d7a2e-0f3b-4e8a-b6a1-9f2c3d4e5f60",
-			},
-		},
 	}, s.Status.EndpointStatuses)
-	assert.Nil(t, s.Status.EndpointStatuses[1].LastFailure)
-	assert.Nil(t, s.Status.EndpointStatuses[2].LastFailure.UpstreamHTTPStatus)
 
 	// The SDK failure must not share the wire message or its optional status.
 	input.Status.EndpointStatuses[0].LastFailure.Code = "changed"

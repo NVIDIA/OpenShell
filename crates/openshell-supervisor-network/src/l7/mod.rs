@@ -250,17 +250,9 @@ impl EndpointObserver {
         if !self.uses_provider_credentials {
             return;
         }
-        let (provider, credential_key) = refusal.credential().unwrap_or_default();
         self.observe_with_failure(
             EndpointResult::CredentialUnavailable,
-            Some(
-                openshell_core::endpoint_failure::EndpointFailure::token_grant(
-                    refusal.failure(),
-                    provider,
-                    credential_key,
-                    request_id,
-                ),
-            ),
+            Some(refusal.endpoint_failure(request_id)),
         );
     }
 

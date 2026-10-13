@@ -20,7 +20,8 @@ pub(super) use endpoint_status::{
     handle_peer_report_endpoint_status, handle_report_endpoint_status,
 };
 pub use endpoint_status::{
-    invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
+    invalidate_endpoint_status_on_startup, invalidate_endpoint_status_without_session,
+    reset_endpoint_status_for_supervisor_session,
     retry_endpoint_status_after_supervisor_disconnect,
 };
 

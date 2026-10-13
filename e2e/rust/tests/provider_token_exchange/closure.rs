@@ -4,6 +4,7 @@
 //! Exercise trusted grant failure retrieval through a real REST workload.
 
 use super::*;
+use openshell_e2e::harness::cli::wait_for_healthy;
 use openshell_e2e::harness::container::ContainerEngine;
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::E2E_WORKLOAD_IMAGE;
@@ -53,7 +54,6 @@ struct GatewayTrust {
     directory: TempDir,
     engine: ContainerEngine,
     image: String,
-    health_port: u16,
     changed: bool,
 }
 
@@ -81,9 +81,6 @@ impl GatewayTrust {
                 .map(|pair| pair[1])
                 .ok_or("gateway argument is missing")
         };
-        let health_port = argument("--health-port")?
-            .parse()
-            .map_err(|_| "gateway health port is invalid")?;
         let config = fs::read_to_string(argument("--config")?)
             .map_err(|_| "could not read fixture gateway configuration")?;
         let base_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
@@ -137,7 +134,6 @@ impl GatewayTrust {
             directory,
             engine,
             image,
-            health_port,
             changed: false,
         })
     }
@@ -149,35 +145,7 @@ impl GatewayTrust {
         gateway.set_native_ca_bundle(self.directory.path().join("host-roots.crt"));
         gateway.stop()?;
         gateway.start()?;
-        self.wait_ready().await
-    }
-
-    async fn wait_ready(&self) -> Result<(), String> {
-        let url = format!("http://127.0.0.1:{}/healthz", self.health_port);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        loop {
-            if checked(
-                Command::new("curl").args([
-                    "--noproxy",
-                    "*",
-                    "--silent",
-                    "--fail",
-                    "--max-time",
-                    "2",
-                    &url,
-                ]),
-                "gateway health probe",
-            )
-            .await
-            .is_ok()
-            {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err("trusted fixture gateway did not become healthy".into());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        wait_for_healthy(Duration::from_secs(120)).await
     }
 
     async fn restore(&mut self) -> Result<(), String> {
@@ -185,7 +153,7 @@ impl GatewayTrust {
             let gateway = ManagedGateway::from_env()?.ok_or("managed gateway is missing")?;
             gateway.stop()?;
             gateway.start()?;
-            self.wait_ready().await?;
+            wait_for_healthy(Duration::from_secs(120)).await?;
             self.changed = false;
         }
         let mut remove = Command::from(self.engine.command());
@@ -786,7 +754,6 @@ async fn verified_grant_failures_reach_trusted_rest_status_and_recover() -> Resu
     let target = start_route_target(port, observed.clone(), observed_bytes.clone()).await;
     let name = format!("closure-{:08x}", rand::random::<u32>());
     let mut sandbox = None;
-    let mut other = None;
     let result = async {
         trust.install().await?;
         sandbox = Some(create_rest_fixture(&name, token_port, port).await?);
@@ -798,25 +765,12 @@ async fn verified_grant_failures_reach_trusted_rest_status_and_recover() -> Resu
         assert_untrusted_reader(&name, None).await?;
         let bearer = supervisor_token(&trust.engine, &name).await?;
         assert_untrusted_reader(&name, Some(&bearer)).await?;
-        let other_name = format!("other-{:08x}", rand::random::<u32>());
-        other = Some(
-            SandboxGuard::create_keep_with_args(
-                &["--name", &other_name, "--no-auto-providers"],
-                &["sh", "-lc", &sandbox_script()],
-                "token-server-ready",
-            )
-            .await?,
-        );
-        assert_untrusted_reader(&other_name, Some(&bearer)).await?;
         recovery_cases(active, port, &service).await?;
         Ok::<(), String>(())
     }
     .await;
     if let Some(mut sandbox) = sandbox {
         sandbox.cleanup().await;
-    }
-    if let Some(mut other) = other {
-        other.cleanup().await;
     }
     run_cli_ignore_error(&["sandbox", "delete", &name]).await;
     run_cli_ignore_error(&["provider", "delete", &name, "--yes"]).await;

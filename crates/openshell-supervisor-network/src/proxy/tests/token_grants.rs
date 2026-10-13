@@ -44,7 +44,6 @@ fn forward_inspection_fixture() -> (
         Ok("grant-token"),
         false,
     );
-    ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
     ctx.provider_credentials = Some(fixture.provider_credentials());
     ctx.token_grant_resolver = Some(fixture.resolver());
     (config, engine, ctx, fixture)

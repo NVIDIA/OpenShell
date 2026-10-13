@@ -13,7 +13,7 @@ use prost::Message;
 use tonic::{Code, Status};
 
 use crate::proto::ProviderCredentialRefreshRecoveryAction;
-use crate::rpc_error::ERROR_DOMAIN;
+use crate::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 
 /// Header that carries the supervisor-minted request ID of an HTTP exchange.
 ///
@@ -24,7 +24,6 @@ pub const REQUEST_ID_HEADER: &str = "x-openshell-request-id";
 
 const FAILURE_MESSAGE: &str = "dynamic token grant failed";
 const FAILURE_REASON: &str = "TOKEN_GRANT_FAILURE";
-const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
 const MAX_DETAILS_BYTES: usize = 1024;
 
 /// An allowlisted cause of a dynamic token-grant failure.
@@ -45,6 +44,15 @@ pub enum TokenGrantFailureKind {
 }
 
 impl TokenGrantFailureKind {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::ProviderAuthorizationRequired,
+        Self::WorkloadIdentityRejected,
+        Self::Configuration,
+        Self::Timeout,
+        Self::Unavailable,
+        Self::Unclassified,
+    ];
+
     const fn code(self) -> &'static str {
         match self {
             Self::ProviderAuthorizationRequired => "provider_authorization_required",
@@ -57,15 +65,7 @@ impl TokenGrantFailureKind {
     }
 
     pub(crate) fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "provider_authorization_required" => Some(Self::ProviderAuthorizationRequired),
-            "workload_identity_rejected" => Some(Self::WorkloadIdentityRejected),
-            "configuration_error" => Some(Self::Configuration),
-            "timeout" => Some(Self::Timeout),
-            "unavailable" => Some(Self::Unavailable),
-            "unclassified" => Some(Self::Unclassified),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|kind| kind.code() == code)
     }
 
     pub(crate) const fn recovery(self) -> ProviderCredentialRefreshRecoveryAction {
@@ -110,6 +110,15 @@ pub enum TokenGrantStage {
 }
 
 impl TokenGrantStage {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Configuration,
+        Self::WorkloadIdentity,
+        Self::GatewayRpc,
+        Self::IntermediateExchange,
+        Self::TokenEndpoint,
+        Self::Injection,
+    ];
+
     /// Return the stable stage code for trusted local consumers.
     pub const fn code(self) -> &'static str {
         match self {
@@ -123,15 +132,7 @@ impl TokenGrantStage {
     }
 
     pub(crate) fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "configuration" => Some(Self::Configuration),
-            "workload_identity" => Some(Self::WorkloadIdentity),
-            "gateway_rpc" => Some(Self::GatewayRpc),
-            "intermediate_exchange" => Some(Self::IntermediateExchange),
-            "token_endpoint" => Some(Self::TokenEndpoint),
-            "injection" => Some(Self::Injection),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|stage| stage.code() == code)
     }
 }
 
@@ -218,20 +219,11 @@ impl TokenGrantFailure {
         if let Some(status) = self.upstream_status {
             metadata.insert("upstream_http_status".to_owned(), status.to_string());
         }
-        let info = tonic_types::pb::ErrorInfo {
-            reason: FAILURE_REASON.to_owned(),
-            domain: ERROR_DOMAIN.to_owned(),
-            metadata,
-        };
-        let envelope = tonic_types::pb::Status {
-            code: code as i32,
-            message: FAILURE_MESSAGE.to_owned(),
-            details: vec![prost_types::Any {
-                type_url: ERROR_INFO_TYPE_URL.to_owned(),
-                value: info.encode_to_vec(),
-            }],
-        };
-        Status::with_details(code, FAILURE_MESSAGE, envelope.encode_to_vec().into())
+        Status::with_error_details(
+            code,
+            FAILURE_MESSAGE,
+            ErrorDetails::with_error_info(FAILURE_REASON, ERROR_DOMAIN, metadata),
+        )
     }
 
     /// Decode strictly bounded internal details, discarding all other diagnostics.
@@ -263,7 +255,7 @@ impl TokenGrantFailure {
         let [detail] = envelope.details.as_slice() else {
             return None;
         };
-        if detail.type_url != ERROR_INFO_TYPE_URL {
+        if detail.type_url != tonic_types::ErrorInfo::TYPE_URL {
             return None;
         }
         let info = tonic_types::pb::ErrorInfo::decode(detail.value.as_slice()).ok()?;
@@ -320,27 +312,10 @@ impl miette::Diagnostic for TokenGrantFailure {}
 mod tests {
     use super::*;
 
-    const KINDS: [TokenGrantFailureKind; 6] = [
-        TokenGrantFailureKind::ProviderAuthorizationRequired,
-        TokenGrantFailureKind::WorkloadIdentityRejected,
-        TokenGrantFailureKind::Configuration,
-        TokenGrantFailureKind::Timeout,
-        TokenGrantFailureKind::Unavailable,
-        TokenGrantFailureKind::Unclassified,
-    ];
-    const STAGES: [TokenGrantStage; 6] = [
-        TokenGrantStage::Configuration,
-        TokenGrantStage::WorkloadIdentity,
-        TokenGrantStage::GatewayRpc,
-        TokenGrantStage::IntermediateExchange,
-        TokenGrantStage::TokenEndpoint,
-        TokenGrantStage::Injection,
-    ];
-
     #[test]
     fn every_kind_has_a_documented_code_and_recovery_action() {
         use ProviderCredentialRefreshRecoveryAction as Recovery;
-        let table = KINDS.map(|kind| {
+        let table = TokenGrantFailureKind::ALL.map(|kind| {
             let failure = TokenGrantFailure::new(kind, TokenGrantStage::TokenEndpoint);
             (failure.code(), failure.recovery())
         });
@@ -437,8 +412,8 @@ mod tests {
 
     #[test]
     fn all_classifications_and_stages_round_trip_without_printable_detail() {
-        for kind in KINDS {
-            for stage in STAGES {
+        for kind in TokenGrantFailureKind::ALL {
+            for stage in TokenGrantStage::ALL {
                 for upstream in [None, Some(100), Some(409), Some(599)] {
                     let mut failure = TokenGrantFailure::new(kind, stage);
                     if let Some(status) = upstream {
@@ -468,7 +443,7 @@ mod tests {
             Code::Unavailable,
             Code::Unknown,
         ];
-        for (kind, code) in KINDS.into_iter().zip(expected) {
+        for (kind, code) in TokenGrantFailureKind::ALL.into_iter().zip(expected) {
             let failure = TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc);
             assert_eq!(failure.to_status().code(), code);
             for override_code in [

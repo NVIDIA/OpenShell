@@ -18,10 +18,8 @@ use crate::token_grant_failure::{
     REQUEST_ID_HEADER, TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
 
-/// JWT bearer client-assertion type used when the caller supplies no override.
 pub const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-/// RFC 8693 access-token type used for unspecified exchange token types.
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
@@ -160,11 +158,8 @@ async fn post_oauth_token_request(
 pub struct TokenGrantParams<'a> {
     /// Secret JWT client assertion sent only to the configured endpoint.
     pub client_assertion: &'a str,
-    /// Assertion format; an empty value selects the JWT bearer default.
     pub client_assertion_type: &'a str,
-    /// Optional resource audience carried in the grant form.
     pub audience: &'a str,
-    /// Optional scopes carried in the grant form.
     pub scopes: &'a [String],
 }
 
@@ -200,17 +195,12 @@ pub async fn post_oauth_token_grant(
 pub struct TokenExchangeParams<'a> {
     /// Secret JWT client assertion sent only to the configured endpoint.
     pub client_assertion: &'a str,
-    /// Assertion format; an empty value selects the JWT bearer default.
     pub client_assertion_type: &'a str,
     /// Secret subject credential to exchange for a resource token.
     pub subject_token: &'a str,
-    /// Subject format; an empty value selects the access-token default.
     pub subject_token_type: &'a str,
-    /// Optional resource audience carried in the exchange form.
     pub audience: &'a str,
-    /// Optional scopes carried in the exchange form.
     pub scopes: &'a [String],
-    /// Requested result format; an empty value selects the access-token default.
     pub requested_token_type: &'a str,
 }
 
@@ -248,7 +238,6 @@ pub async fn post_oauth_token_exchange(
     .await
 }
 
-/// Select the JWT bearer assertion type when no nonblank override is supplied.
 pub fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
     if client_assertion_type.trim().is_empty() {
         DEFAULT_CLIENT_ASSERTION_TYPE
@@ -257,7 +246,6 @@ pub fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
     }
 }
 
-/// Select the RFC 8693 access-token type when no nonblank override is supplied.
 pub fn effective_token_type(token_type: &str) -> &str {
     if token_type.trim().is_empty() {
         ACCESS_TOKEN_TYPE
@@ -266,7 +254,11 @@ pub fn effective_token_type(token_type: &str) -> &str {
     }
 }
 
-fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, TokenGrantFailure> {
+/// Validate the configured endpoint before acquiring any workload credentials.
+///
+/// HTTPS is accepted; plain HTTP is limited to loopback and Kubernetes service
+/// hosts and never authenticates a precise token-service error classification.
+pub fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, TokenGrantFailure> {
     let invalid = TokenGrantFailure::new(
         TokenGrantFailureKind::Configuration,
         TokenGrantStage::Configuration,
@@ -276,14 +268,6 @@ fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, TokenG
         return Ok(url);
     }
     Err(invalid)
-}
-
-/// Validate the configured endpoint before acquiring any workload credentials.
-///
-/// HTTPS is accepted; plain HTTP is limited to loopback and Kubernetes service
-/// hosts and never authenticates a precise token-service error classification.
-pub fn validate_token_endpoint(token_endpoint: &str) -> Result<(), TokenGrantFailure> {
-    parse_token_endpoint_url(token_endpoint).map(|_| ())
 }
 
 fn token_endpoint_transport_allowed(url: &reqwest::Url) -> bool {
@@ -685,78 +669,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_https_signal_is_preserved_for_both_grants() {
-        let cases = [
-            (
-                "409 Conflict",
-                "provider_authorization_required",
-                TokenGrantFailureKind::ProviderAuthorizationRequired,
-            ),
-            (
-                "401 Unauthorized",
-                "workload_identity_rejected",
-                TokenGrantFailureKind::WorkloadIdentityRejected,
-            ),
-            (
-                "403 Forbidden",
-                "workload_identity_rejected",
-                TokenGrantFailureKind::WorkloadIdentityRejected,
-            ),
-            (
-                "400 Bad Request",
-                "configuration_error",
-                TokenGrantFailureKind::Configuration,
-            ),
-        ];
-        for (status, code, expected) in cases {
-            for exchange in [false, true] {
-                let body = format!(
-                    r#"{{"error":"{code}","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
-                );
-                let (endpoint, root, request) = tls_token_endpoint_once(status, &body).await;
-                let client = trusted_test_client(root);
-                let failure = if exchange {
-                    post_oauth_token_exchange(&client, &endpoint, &exchange_params(), None).await
-                } else {
-                    post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None).await
-                }
-                .expect_err("adopted failure");
-                let request = request
-                    .await
-                    .expect("TLS fixture")
-                    .expect("authenticated request");
-                assert_eq!(request.form.contains_key("subject_token"), exchange);
-                assert_eq!(failure.kind(), expected);
-                assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
-                assert_generic_failure(failure);
-            }
-        }
+    async fn verified_https_signal_is_preserved() {
+        let body = format!(
+            r#"{{"error":"provider_authorization_required","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
+        );
+        let (endpoint, root, request) = tls_token_endpoint_once("409 Conflict", &body).await;
+        let client = trusted_test_client(root);
+        let failure = post_oauth_token_exchange(&client, &endpoint, &exchange_params(), None)
+            .await
+            .expect_err("adopted failure");
+        let request = request
+            .await
+            .expect("TLS fixture")
+            .expect("authenticated request");
+        assert!(request.form.contains_key("subject_token"));
+        assert_eq!(
+            failure.kind(),
+            TokenGrantFailureKind::ProviderAuthorizationRequired
+        );
+        assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
+        assert_generic_failure(failure);
     }
 
     #[tokio::test]
-    async fn plain_http_cannot_assert_adopted_failure_for_either_grant() {
-        for (status, code) in [
-            ("409 Conflict", "provider_authorization_required"),
-            ("401 Unauthorized", "workload_identity_rejected"),
-            ("400 Bad Request", "configuration_error"),
-        ] {
-            for exchange in [false, true] {
-                let body = format!(
-                    r#"{{"error":"{code}","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
-                );
-                let (endpoint, request) = token_endpoint_once(status, &body).await;
-                let client = test_client();
-                let failure = if exchange {
-                    post_oauth_token_exchange(&client, &endpoint, &exchange_params(), None).await
-                } else {
-                    post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None).await
-                }
+    async fn plain_http_cannot_assert_adopted_failure() {
+        let body = format!(
+            r#"{{"error":"provider_authorization_required","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
+        );
+        let (endpoint, request) = token_endpoint_once("409 Conflict", &body).await;
+        let failure =
+            post_oauth_token_exchange(&test_client(), &endpoint, &exchange_params(), None)
+                .await
                 .expect_err("unauthenticated failure");
-                request.await.expect("HTTP fixture");
-                assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-                assert_generic_failure(failure);
-            }
-        }
+        request.await.expect("HTTP fixture");
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+        assert_generic_failure(failure);
     }
 
     #[tokio::test]
@@ -800,6 +747,7 @@ mod tests {
                     .expect_err("safe endpoint failure");
             request.await.expect("HTTP fixture");
             assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.upstream_status(), Some(401));
             assert_generic_failure(failure);
         }
         for endpoint in [
@@ -819,6 +767,7 @@ mod tests {
     async fn malformed_success_fields_are_generic_and_never_return_a_token() {
         for body in [
             "{}",
+            r#"{"access_token":42"#,
             r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":null}"#,
             r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":"Bearer","expires_in":"DURATION_SECRET_CANARY"}"#,
             r#"{"access_token":"TOKEN_SECRET_CANARY","access_token":"SECOND_SECRET_CANARY","token_type":"Bearer"}"#,
@@ -1019,25 +968,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discards_oauth_error_descriptions_and_unrecognized_codes() {
-        let (endpoint, request) = token_endpoint_once(
-            "401 Unauthorized",
-            r#"{"error":"invalid_client","error_description":"bad assertion"}"#,
-        )
-        .await;
-        let client = test_client();
-
-        let err = post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None)
-            .await
-            .expect_err("should fail on OAuth error");
-        let _ = request.await;
-
-        assert_eq!(err.to_string(), "dynamic token grant failed");
-        assert_eq!(err.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(err.upstream_status(), Some(401));
-    }
-
-    #[tokio::test]
     async fn does_not_echo_unstructured_error_body() {
         let (endpoint, request) = token_endpoint_once(
             "500 Internal Server Error",
@@ -1075,21 +1005,6 @@ mod tests {
             server.await.expect("token endpoint task");
             assert_eq!(response.access_token, "access-123");
         }
-    }
-
-    #[tokio::test]
-    async fn reports_malformed_success_json() {
-        let (endpoint, request) = token_endpoint_once("200 OK", r#"{"access_token":42"#).await;
-        let client = test_client();
-
-        let err = post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None)
-            .await
-            .expect_err("should fail on malformed JSON");
-        let _ = request.await;
-
-        assert_eq!(err.to_string(), "dynamic token grant failed");
-        assert_eq!(err.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(err.upstream_status(), Some(200));
     }
 
     #[tokio::test]

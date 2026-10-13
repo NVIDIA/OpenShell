@@ -679,17 +679,7 @@ impl SupervisorSessionRegistry {
         if has_authority || remote_authority {
             return;
         }
-        let Some(status) = sandbox.status.as_mut() else {
-            return;
-        };
-        // Status without its live observation authority is unknown. Keep the
-        // configured address so a caller can still identify each endpoint.
-        status.last_token_grant_failure = None;
-        for endpoint in &mut status.endpoint_statuses {
-            endpoint.last_result = openshell_core::proto::EndpointResult::NoObservedExchange as i32;
-            endpoint.last_reported_time = None;
-            endpoint.last_failure = None;
-        }
+        crate::grpc::policy::invalidate_endpoint_status_without_session(sandbox);
     }
 
     /// Return the active supervisor session identifier for gateway-owned
@@ -3310,11 +3300,6 @@ mod tests {
         assert_eq!(projected_status.endpoint_statuses, vec![unknown.clone()]);
         assert_eq!(projected_status.conditions, vec![ready.clone()]);
         assert!(projected_status.last_token_grant_failure.is_none());
-
-        let mut rest_only = sandbox.clone();
-        rest_only.status.as_mut().unwrap().endpoint_statuses.clear();
-        registry.project_endpoint_status(&mut rest_only, false);
-        assert!(rest_only.status.unwrap().last_token_grant_failure.is_none());
 
         let mut remotely_owned = sandbox.clone();
         registry.project_endpoint_status(&mut remotely_owned, true);

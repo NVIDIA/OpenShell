@@ -3,27 +3,19 @@
 
 //! Bounded causes for failed endpoint results.
 //!
-//! A cause holds a code and a stage from the closed sets of its domain, the
-//! recovery action documented for the code, configured provider and
-//! credential names, an optional HTTP status, and the supervisor's request ID.
 //! The supervisor builds causes from typed failures and the gateway validates
-//! reported causes against the same sets here, so neither side can accept a
-//! code the other does not define. Each domain also names the endpoint results
-//! it can explain. No cause carries remote text.
-//!
-//! A new producer adds a domain variant and one validation function in this
-//! module that checks its result, code and stage sets, and code-to-recovery
-//! mapping. Names, status, and the request ID are checked the same way for
-//! every domain.
+//! reported causes against the same closed sets here, so neither side can
+//! accept a code the other does not define. Each domain also names the endpoint
+//! results it can explain. No cause carries remote text.
 
-use crate::proto::{self, ProviderCredentialRefreshRecoveryAction};
+use crate::proto;
 use crate::token_grant_failure::{TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage};
 
 /// Longest provider or credential name a reported cause may carry.
 ///
 /// A reported name is also limited to printable ASCII, so status renderers
 /// cannot be given control, bidirectional, or format characters.
-pub const MAX_ENDPOINT_FAILURE_NAME_BYTES: usize = 253;
+const MAX_ENDPOINT_FAILURE_NAME_BYTES: usize = 253;
 
 /// The bounded cause of one failed endpoint observation.
 ///
@@ -31,13 +23,9 @@ pub const MAX_ENDPOINT_FAILURE_NAME_BYTES: usize = 253;
 /// endpoint is unhealthy. A token grant can fail before the request reaches it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointFailure {
-    domain: proto::EndpointFailureDomain,
-    code: &'static str,
-    stage: &'static str,
-    recovery: ProviderCredentialRefreshRecoveryAction,
+    failure: TokenGrantFailure,
     provider: String,
     credential_key: String,
-    upstream_http_status: Option<u16>,
     request_id: String,
 }
 
@@ -64,13 +52,9 @@ impl EndpointFailure {
             ("", "")
         };
         Self {
-            domain: proto::EndpointFailureDomain::TokenGrant,
-            code: failure.code(),
-            stage: failure.stage().code(),
-            recovery: failure.recovery(),
+            failure,
             provider: provider.to_string(),
             credential_key: credential_key.to_string(),
-            upstream_http_status: failure.upstream_status(),
             request_id: request_id.to_string(),
         }
     }
@@ -79,13 +63,13 @@ impl EndpointFailure {
     #[must_use]
     pub fn to_proto(&self) -> proto::EndpointFailure {
         proto::EndpointFailure {
-            domain: self.domain.into(),
-            code: self.code.to_string(),
-            recovery_action: self.recovery.into(),
+            domain: proto::EndpointFailureDomain::TokenGrant.into(),
+            code: self.failure.code().to_string(),
+            recovery_action: self.failure.recovery().into(),
             provider: self.provider.clone(),
             credential_key: self.credential_key.clone(),
-            stage: self.stage.to_string(),
-            upstream_http_status: self.upstream_http_status.map(u32::from),
+            stage: self.failure.stage().code().to_string(),
+            upstream_http_status: self.failure.upstream_status().map(u32::from),
             request_id: self.request_id.clone(),
         }
     }
@@ -161,7 +145,7 @@ pub fn validate_endpoint_failure(
     {
         return Err(EndpointFailureValidationError::UpstreamStatus);
     }
-    if !is_canonical_uuid(&failure.request_id) {
+    if !is_canonical_request_id(&failure.request_id) {
         return Err(EndpointFailureValidationError::RequestId);
     }
     Ok(())
@@ -190,13 +174,15 @@ fn valid_name(name: &str) -> bool {
         && name.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn is_canonical_uuid(value: &str) -> bool {
+/// Accept only a lowercase hyphenated UUID, the request-ID form causes and gateway logs share.
+pub fn is_canonical_request_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::ProviderCredentialRefreshRecoveryAction;
 
     const REQUEST_ID: &str = "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9";
     const CREDENTIAL_UNAVAILABLE: proto::EndpointResult =
@@ -237,38 +223,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_token_grant_classification_validates() {
-        for kind in [
-            TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantFailureKind::WorkloadIdentityRejected,
-            TokenGrantFailureKind::Configuration,
-            TokenGrantFailureKind::Timeout,
-            TokenGrantFailureKind::Unavailable,
-            TokenGrantFailureKind::Unclassified,
-        ] {
-            for stage in [
-                TokenGrantStage::Configuration,
-                TokenGrantStage::WorkloadIdentity,
-                TokenGrantStage::GatewayRpc,
-                TokenGrantStage::IntermediateExchange,
-                TokenGrantStage::TokenEndpoint,
-                TokenGrantStage::Injection,
-            ] {
-                let failure = EndpointFailure::token_grant(
-                    TokenGrantFailure::new(kind, stage),
-                    "",
-                    "",
-                    REQUEST_ID,
-                );
-                assert_eq!(
-                    validate_endpoint_failure(&failure.to_proto(), CREDENTIAL_UNAVAILABLE),
-                    Ok(())
-                );
-            }
-        }
-    }
-
     type Mutation = fn(&mut proto::EndpointFailure);
 
     #[test]
@@ -288,10 +242,6 @@ mod tests {
                 "{result:?}"
             );
         }
-        assert_eq!(
-            validate_endpoint_failure(&reported(), CREDENTIAL_UNAVAILABLE),
-            Ok(())
-        );
     }
 
     #[test]

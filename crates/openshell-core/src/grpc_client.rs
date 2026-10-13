@@ -1370,33 +1370,9 @@ pub async fn exchange_provider_subject_token(
     request_id: Option<&str>,
 ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
     let status = ClientSpanStatus::current();
-    status.finish(
-        exchange_provider_subject_token_inner(
-            endpoint,
-            sandbox_id,
-            provider,
-            credential_key,
-            supervisor_jwt_svid,
-            request_id,
-        )
-        .await,
-    )
-}
-
-async fn exchange_provider_subject_token_inner(
-    endpoint: &str,
-    sandbox_id: &str,
-    provider: &str,
-    credential_key: &str,
-    supervisor_jwt_svid: &str,
-    request_id: Option<&str>,
-) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
     let endpoint = token_grant_gateway_endpoint(endpoint)?;
     if sandbox_id.is_empty() || provider.is_empty() || credential_key.is_empty() {
-        return Err(TokenGrantFailure::new(
-            TokenGrantFailureKind::Configuration,
-            TokenGrantStage::GatewayRpc,
-        ));
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
     }
     if supervisor_jwt_svid.is_empty() {
         return Err(TokenGrantFailure::new(
@@ -1426,7 +1402,9 @@ async fn exchange_provider_subject_token_inner(
     .await
     .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
     .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?;
-    provider_subject_token_exchange_result(response.into_inner())
+    status.finish(provider_subject_token_exchange_result(
+        response.into_inner(),
+    ))
 }
 
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
@@ -1448,16 +1426,7 @@ fn gateway_grant_failure(kind: TokenGrantFailureKind) -> TokenGrantFailure {
 }
 
 /// Validate a grant gateway authority before acquiring a workload assertion.
-///
-/// Rejects endpoint components that cannot be used by the gRPC transport and
-/// might otherwise carry sensitive values into connection diagnostics.
-pub fn validate_token_grant_gateway_endpoint(
-    endpoint: &str,
-) -> std::result::Result<(), TokenGrantFailure> {
-    token_grant_gateway_endpoint(endpoint).map(|_| ())
-}
-
-fn token_grant_gateway_endpoint(
+pub fn token_grant_gateway_endpoint(
     endpoint: &str,
 ) -> std::result::Result<url::Url, TokenGrantFailure> {
     let endpoint = url::Url::parse(endpoint)
@@ -1556,21 +1525,6 @@ mod token_grant_exchange_tests {
             let request = provider_subject_token_exchange_request(body(), absent);
             assert!(request.metadata().get("x-request-id").is_none());
         }
-    }
-
-    #[test]
-    fn gateway_error_text_is_never_retained() {
-        use std::error::Error;
-
-        let status = Status::failed_precondition(
-            "SYNTHETIC_GATEWAY_SECRET https://user:secret@token.example/path?token=secret",
-        );
-        let https = url::Url::parse("https://gateway.example:8080/").unwrap();
-        let failure = provider_subject_token_exchange_status(&status, &https);
-        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(failure.to_string(), "dynamic token grant failed");
-        assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
-        assert!(failure.source().is_none());
     }
 
     #[test]
@@ -1788,7 +1742,6 @@ pub struct ProviderSubjectTokenExchangeResult {
     pub access_token: String,
     /// Remaining lifetime in seconds, or zero when the gateway omitted it.
     pub expires_in: i64,
-    /// Token type declared by the service.
     pub token_type: String,
 }
 

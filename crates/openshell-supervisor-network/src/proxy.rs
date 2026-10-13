@@ -30,7 +30,7 @@ use openshell_core::net::{
     set_tcp_nodelay_best_effort,
 };
 use openshell_core::policy::ProxyPolicy;
-use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 #[cfg(test)]
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
@@ -213,16 +213,6 @@ pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.containers.internal",
     "host.docker.internal",
 ];
-
-fn revision_scoped_dynamic_credentials(
-    snapshot: &ProviderCredentialSnapshot,
-) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
-    snapshot
-        .dynamic_credentials
-        .iter()
-        .map(|(key, credential)| (snapshot.scoped_key(key), credential.clone()))
-        .collect()
-}
 
 /// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
 /// even when they coincidentally match a host-gateway alias resolution.
@@ -493,11 +483,6 @@ impl ProxyHandle {
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
-                        let dynamic_credentials = provider_credentials.as_ref().map(|state| {
-                            Arc::new(std::sync::RwLock::new(revision_scoped_dynamic_credentials(
-                                &state.snapshot(),
-                            )))
-                        });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
@@ -520,7 +505,6 @@ impl ProxyHandle {
                                 up_proxy,
                                 credentials,
                                 resolver,
-                                dynamic_credentials,
                                 dtx,
                                 atx,
                                 endpoint_observations,
@@ -1229,7 +1213,6 @@ async fn handle_transparent_tcp_connection(
         })?;
     let mut ctx = relay::http_context(
         &decision,
-        None,
         None,
         None,
         agent_proposals,
@@ -2313,13 +2296,6 @@ async fn handle_tcp_connection(
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    dynamic_credentials: Option<
-        Arc<
-            std::sync::RwLock<
-                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
-            >,
-        >,
-    >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
@@ -2343,7 +2319,6 @@ async fn handle_tcp_connection(
         upstream_proxy,
         provider_credentials,
         secret_resolver,
-        dynamic_credentials,
         denial_tx,
         activity_tx,
         endpoint_observation_tx,
@@ -2408,13 +2383,6 @@ async fn handle_mediated_connection(
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    dynamic_credentials: Option<
-        Arc<
-            std::sync::RwLock<
-                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
-            >,
-        >,
-    >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
@@ -2581,7 +2549,6 @@ async fn handle_mediated_connection(
             trusted_host_gateway,
             provider_credentials,
             secret_resolver,
-            dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
             endpoint_observation_tx,
@@ -3000,7 +2967,6 @@ async fn handle_mediated_connection(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        dynamic_credentials.clone(),
         agent_proposals,
         workspace,
         relay::RelaySignals {
@@ -5285,13 +5251,6 @@ async fn handle_forward_proxy(
     trusted_host_gateway: Arc<Option<IpAddr>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    dynamic_credentials: Option<
-        Arc<
-            std::sync::RwLock<
-                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
-            >,
-        >,
-    >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
@@ -5623,7 +5582,6 @@ async fn handle_forward_proxy(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        dynamic_credentials.clone(),
         agent_proposals,
         workspace,
         relay::RelaySignals {
@@ -6854,26 +6812,25 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
 
 /// Build the forward proxy's refusal for a failed dynamic token grant.
 ///
-/// The JSON body matches every other grant refusal. The request ID header lets
-/// the caller quote the exchange to an operator without learning its cause.
+/// This is the generic grant refusal plus a request ID header, which lets the
+/// caller quote the exchange to an operator without learning its cause.
 fn build_token_grant_failure_response(request_id: &str) -> Vec<u8> {
-    let body = serde_json::json!({
-        "error": "token_grant_failed",
-        "detail": "dynamic token grant failed",
-    })
-    .to_string();
-    format!(
-        "HTTP/1.1 502 Bad Gateway\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         {}: {request_id}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-    )
-    .into_bytes()
+    let generic = build_json_error_response(
+        502,
+        "Bad Gateway",
+        "token_grant_failed",
+        "dynamic token grant failed",
+    );
+    String::from_utf8_lossy(&generic)
+        .replacen(
+            "\r\nConnection: close\r\n",
+            &format!(
+                "\r\n{}: {request_id}\r\nConnection: close\r\n",
+                openshell_core::token_grant_failure::REQUEST_ID_HEADER
+            ),
+            1,
+        )
+        .into_bytes()
 }
 
 fn build_json_error_response_with_reason(
@@ -7634,7 +7591,6 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 None,
                 None,
                 None,
-                None,
             ))
             .await
             .unwrap();
@@ -8054,7 +8010,6 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             None,
             None,
             None,
-            None,
         ));
         workload
             .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
@@ -8177,7 +8132,6 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             Arc::new(None),
-            None,
             None,
             None,
             None,
@@ -8756,7 +8710,6 @@ network_policies: {}
             None,
             None,
             None,
-            None,
         ))
         .await
         .expect("malformed request should be handled");
@@ -8994,7 +8947,6 @@ network_policies:
                     None,
                     None,
                     None,
-                    None,
                 )),
             ))
             .await
@@ -9126,7 +9078,6 @@ network_policies:
                 None,
                 None,
                 None,
-                None,
             )),
         )
         .await
@@ -9240,7 +9191,6 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
-                None,
                 None,
                 None,
                 None,
@@ -9368,7 +9318,6 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
-                None,
                 None,
                 None,
                 None,
@@ -9511,7 +9460,6 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
-                None,
                 None,
                 None,
                 None,
@@ -10297,30 +10245,6 @@ network_policies:
     }
 
     #[test]
-    fn revision_scoped_dynamic_credentials_preserves_endpoint_selector_and_adds_revision() {
-        let mut dynamic_credentials = std::collections::HashMap::new();
-        dynamic_credentials.insert(
-            "api.example.test\t443\t/v1/**\tprovider:access_token".to_string(),
-            openshell_core::proto::ProviderProfileCredential {
-                name: "access_token".to_string(),
-                ..Default::default()
-            },
-        );
-        let snapshot = ProviderCredentialSnapshot {
-            installation_id: "fixture-installation".to_string(),
-            revision: 42,
-            child_env: std::collections::HashMap::new(),
-            dynamic_credentials,
-        };
-
-        let scoped = revision_scoped_dynamic_credentials(&snapshot);
-
-        assert!(
-            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tinstallation:fixture-installation\tprovider:access_token")
-        );
-    }
-
-    #[test]
     fn connect_activity_is_skipped_when_l7_will_count_the_request() {
         let (tx, mut rx) = mpsc::channel(4);
         let activity_tx = Some(tx);
@@ -11020,29 +10944,11 @@ network_policies:
     const FORWARD_REQUEST_ID: &str = "9b8a7f6e-5d4c-4b3a-9f8e-7d6c5b4a3f2e";
 
     #[test]
-    fn forward_grant_refusal_keeps_its_body_and_adds_only_the_request_id() {
-        let response = String::from_utf8(build_token_grant_failure_response(FORWARD_REQUEST_ID))
-            .expect("UTF-8 response");
-        let (head, body) = response.split_once("\r\n\r\n").expect("header terminator");
-        let generic = String::from_utf8(build_json_error_response(
-            502,
-            "Bad Gateway",
-            "token_grant_failed",
-            "dynamic token grant failed",
-        ))
-        .expect("UTF-8 response");
-        let (generic_head, generic_body) =
-            generic.split_once("\r\n\r\n").expect("header terminator");
-        assert_eq!(body, generic_body, "the refusal body is unchanged");
-        let mut added = head
-            .lines()
-            .filter(|line| !generic_head.lines().any(|generic| generic == *line))
-            .collect::<Vec<_>>();
-        added.sort_unstable();
-        assert_eq!(
-            added,
-            [format!("x-openshell-request-id: {FORWARD_REQUEST_ID}").as_str()]
-        );
+    fn forward_grant_refusal_adds_the_request_id_header() {
+        let response = build_token_grant_failure_response(FORWARD_REQUEST_ID);
+        let header =
+            format!("\r\nx-openshell-request-id: {FORWARD_REQUEST_ID}\r\nConnection: close\r\n");
+        assert!(String::from_utf8_lossy(&response).contains(&header));
     }
 
     fn forward_grant_failure() -> openshell_core::token_grant_failure::TokenGrantFailure {
@@ -11073,7 +10979,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -11093,7 +10999,7 @@ network_policies:
         let (mut ctx, _) = forward_token_grant_context(Ok("unused-token"));
         let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
         let fixture = forward_token_grant_fixture(provider_key, resolver_response, true);
-        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         ctx.token_grant_resolver = Some(fixture.resolver());
 
         (ctx, fixture)
@@ -13384,7 +13290,7 @@ network_policies:
         let (mut ctx, fixture) = forward_token_exchange_context(Err(forward_grant_failure()));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err = inject_token_grant_for_forward_request(
+        inject_token_grant_for_forward_request(
             "GET",
             "/v1/projects",
             raw,
@@ -13396,12 +13302,6 @@ network_policies:
         .await
         .expect_err("forward token exchange failure should stop request rewriting");
 
-        let refusal = err
-            .downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
-            .expect("typed grant refusal");
-        assert_eq!(refusal.failure(), forward_grant_failure());
-        assert_eq!(refusal.credential(), Some(("provider", "access_token")));
-        assert_eq!(err.to_string(), "dynamic token grant failed");
         fixture.assert_one_token_exchange_request(
             "api.example.test\t8080\t/v1/**\tprovider:access_token",
         );
@@ -14537,7 +14437,6 @@ network_policies:
                 Arc::new(None),            // upstream_proxy
                 None,                      // provider_credentials
                 None,                      // secret_resolver
-                None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
                 None,                      // activity_tx
                 None,                      // endpoint_observation_tx
@@ -14605,7 +14504,6 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             Arc::new(None),
-            None,
             None,
             None,
             Some(denial_tx),

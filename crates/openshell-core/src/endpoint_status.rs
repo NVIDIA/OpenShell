@@ -195,9 +195,7 @@ impl EndpointObservationContext {
     #[must_use]
     pub fn matches_config(&self, policy_hash: &str, provider_env_revision: Option<u64>) -> bool {
         self.inventory.config_version.policy_hash == policy_hash
-            && provider_env_revision.is_none_or(|revision| {
-                revision == self.inventory.config_version.provider_env_revision
-            })
+            && self.matches_provider_revision(provider_env_revision)
     }
 
     /// Check a provider snapshot when forwarding has no L7 endpoint selection.
@@ -347,11 +345,7 @@ impl EndpointObservationSender {
         policy_hash: &str,
         provider_env_revision: Option<u64>,
     ) -> Option<EndpointObservationHandle> {
-        let config = &context.inventory.config_version;
-        if config.policy_hash != policy_hash
-            || provider_env_revision
-                .is_some_and(|revision| revision != config.provider_env_revision)
-        {
+        if !context.matches_config(policy_hash, provider_env_revision) {
             // Runtime activation and inventory publication are separate. Reject
             // observations during that gap instead of assigning another policy's result.
             return None;
@@ -366,7 +360,7 @@ impl EndpointObservationSender {
             return None;
         }
         Some(EndpointObservationHandle {
-            config_version: config.clone(),
+            config_version: context.inventory.config_version.clone(),
             endpoint_id,
             inventory_generation: context.inventory.generation.clone(),
             authority_generation: context.authority_generation.clone(),
@@ -592,17 +586,11 @@ impl EndpointStatusTracker {
                 inventory_generation,
                 authority_generation,
             } => {
-                if self.config_version.as_ref() != Some(&config_version)
-                    || !self
-                        .inventory_generation
-                        .as_ref()
-                        .is_some_and(|current| current.matches(&inventory_generation))
-                    || !self
-                        .current
-                        .borrow()
-                        .authority_generation
-                        .matches(&authority_generation)
-                {
+                if !self.is_current(
+                    &config_version,
+                    &inventory_generation,
+                    &authority_generation,
+                ) {
                     // Stale evidence must not change results or freshness.
                     return false;
                 }
@@ -621,17 +609,11 @@ impl EndpointStatusTracker {
                 destination_port,
                 result,
             } => {
-                if self.config_version.as_ref() != Some(&context.inventory.config_version)
-                    || !self
-                        .inventory_generation
-                        .as_ref()
-                        .is_some_and(|generation| generation.matches(&context.inventory.generation))
-                    || !self
-                        .current
-                        .borrow()
-                        .authority_generation
-                        .matches(&context.authority_generation)
-                {
+                if !self.is_current(
+                    &context.inventory.config_version,
+                    &context.inventory.generation,
+                    &context.authority_generation,
+                ) {
                     return false;
                 }
                 match result {
@@ -750,6 +732,24 @@ impl EndpointStatusTracker {
             })
             .collect();
         self.config_version = Some(config_version);
+    }
+
+    fn is_current(
+        &self,
+        config_version: &EndpointConfigVersion,
+        inventory_generation: &EndpointObservationGeneration,
+        authority_generation: &EndpointObservationGeneration,
+    ) -> bool {
+        self.config_version.as_ref() == Some(config_version)
+            && self
+                .inventory_generation
+                .as_ref()
+                .is_some_and(|current| current.matches(inventory_generation))
+            && self
+                .current
+                .borrow()
+                .authority_generation
+                .matches(authority_generation)
     }
 }
 

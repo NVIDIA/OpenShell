@@ -3185,15 +3185,6 @@ fn endpoint_failure_domain_name(domain: i32) -> &'static str {
     }
 }
 
-fn endpoint_failure_recovery(
-    failure: &openshell_core::proto::EndpointFailure,
-) -> openshell_core::proto::ProviderCredentialRefreshRecoveryAction {
-    openshell_core::proto::ProviderCredentialRefreshRecoveryAction::try_from(
-        failure.recovery_action,
-    )
-    .unwrap_or(openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Unspecified)
-}
-
 fn endpoint_failure_recovery_name(
     action: openshell_core::proto::ProviderCredentialRefreshRecoveryAction,
 ) -> &'static str {
@@ -3210,7 +3201,7 @@ fn endpoint_failure_to_json(failure: &openshell_core::proto::EndpointFailure) ->
     serde_json::json!({
         "domain": endpoint_failure_domain_name(failure.domain),
         "code": failure.code,
-        "recovery_action": endpoint_failure_recovery_name(endpoint_failure_recovery(failure)),
+        "recovery_action": endpoint_failure_recovery_name(failure.recovery_action()),
         "provider": failure.provider,
         "credential_key": failure.credential_key,
         "stage": failure.stage,
@@ -3225,7 +3216,7 @@ fn endpoint_failure_display_lines(failure: &openshell_core::proto::EndpointFailu
         .upstream_http_status
         .map(|status| format!(", upstream HTTP {status}"))
         .unwrap_or_default();
-    let recovery = match endpoint_failure_recovery(failure) {
+    let recovery = match failure.recovery_action() {
         Recovery::Retry => "Retry later; the failure can be temporary.",
         Recovery::Reauthorize => "Reauthorize the provider credential.",
         Recovery::FixConfiguration => {

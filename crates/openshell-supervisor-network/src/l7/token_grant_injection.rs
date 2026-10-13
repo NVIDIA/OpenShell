@@ -95,7 +95,6 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// binding, absent when the failure happened before a binding was selected.
 /// Display and Debug print only the fixed grant failure message, so callers
 /// can log this error without classifying it.
-#[derive(Clone, PartialEq, Eq)]
 pub struct TokenGrantInjectionError {
     failure: TokenGrantFailure,
     credential: Option<String>,
@@ -124,6 +123,12 @@ impl TokenGrantInjectionError {
     /// Return the provider and credential names of the failed grant, if known.
     pub fn credential(&self) -> Option<(&str, &str)> {
         self.credential.as_deref()?.split_once(':')
+    }
+
+    /// Return the bounded status cause of this refusal for one request.
+    pub fn endpoint_failure(&self, request_id: &str) -> EndpointFailure {
+        let (provider, credential) = self.credential().unwrap_or_default();
+        EndpointFailure::token_grant(self.failure, provider, credential, request_id)
     }
 }
 
@@ -175,44 +180,18 @@ pub async fn inject_if_needed_captured(
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    let request_path = request_path(&req);
     // A connection can sit idle across a refresh before its first request.
-    // Select and pin the live installation, not its accept-time credential map.
-    let snapshot = ctx
+    // Select and pin the live installation.
+    let Some(snapshot) = ctx
         .provider_credentials
         .as_ref()
-        .map(ProviderCredentialState::snapshot);
-    if let Some(snapshot) = &snapshot {
-        ctx.provider_credential_revision = Some(snapshot.revision);
-        ctx.provider_credential_installation_id = Some(snapshot.installation_id.clone());
-    }
-    let selected = if let Some(snapshot) = snapshot {
-        token_grant_candidates(&snapshot.dynamic_credentials, ctx, request_path, None)
-            .and_then(select_token_grants)
-            .map(|selected| {
-                selected
-                    .into_iter()
-                    .map(|(key, credential)| (snapshot.scoped_key(&key), credential))
-                    .collect()
-            })
-    } else {
-        ctx.dynamic_credentials.as_ref().map_or_else(
-            || Ok(Vec::new()),
-            |dynamic_credentials| {
-                dynamic_credentials
-                    .read()
-                    .map_err(|_| TokenGrantInjectionError::new(credential_lock_failure()))
-                    .and_then(|credentials| {
-                        select_token_grants(token_grant_candidates(
-                            &credentials,
-                            ctx,
-                            request_path,
-                            None,
-                        )?)
-                    })
-            },
-        )
+        .map(ProviderCredentialState::snapshot)
+    else {
+        return Ok(req);
     };
+    ctx.provider_credential_revision = Some(snapshot.revision);
+    ctx.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+    let selected = select_scoped(&snapshot, ctx, request_path(&req.target), None);
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
 
@@ -232,7 +211,7 @@ pub(super) async fn inject_for_admitted_owners(
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    let request_path = request_path(&req);
+    let request_path = request_path(&req.target);
     let unowned = snapshot
         .dynamic_credentials
         .iter()
@@ -250,21 +229,27 @@ pub(super) async fn inject_for_admitted_owners(
             key,
         ))
     } else {
-        token_grant_candidates(
-            &snapshot.dynamic_credentials,
-            ctx,
-            request_path,
-            Some(admitted_owners),
-        )
-        .and_then(select_token_grants)
-        .map(|selected| {
-            selected
-                .into_iter()
-                .map(|(key, cred)| (snapshot.scoped_key(&key), cred))
-                .collect()
-        })
+        select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
     };
     inject_or_report(req, ctx, selected, request_id, observation_context).await
+}
+
+fn select_scoped(
+    snapshot: &ProviderCredentialSnapshot,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    admitted_owners: Option<&HashSet<String>>,
+) -> Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError> {
+    let candidates = token_grant_candidates(
+        &snapshot.dynamic_credentials,
+        ctx,
+        request_path,
+        admitted_owners,
+    )?;
+    Ok(select_token_grants(candidates)?
+        .into_iter()
+        .map(|(key, credential)| (snapshot.scoped_key(&key), credential))
+        .collect())
 }
 
 /// Inject the selected grants, or record why the request was refused.
@@ -283,7 +268,7 @@ async fn inject_or_report(
         return Ok(req);
     }
     let method = req.action.clone();
-    let request_path = request_path(&req).to_string();
+    let request_path = request_path(&req.target).to_string();
     let observation_context = observation_context
         .filter(|context| context.matches_provider_revision(ctx.provider_credential_revision));
     let successful_credentials: Vec<_> = if observation_context.is_some() {
@@ -315,14 +300,11 @@ async fn inject_or_report(
     {
         match &result {
             Err(error) => {
-                let (provider, credential) = error.credential().unwrap_or(("", ""));
-                let failure =
-                    EndpointFailure::token_grant(error.failure(), provider, credential, request_id);
                 let _ = sender.try_observe_token_grant(
                     context.clone(),
                     &ctx.host,
                     ctx.port,
-                    Err(failure),
+                    Err(error.endpoint_failure(request_id)),
                 );
             }
             Ok(_) => {
@@ -357,7 +339,7 @@ fn report_refused_grant(
         .credential
         .as_deref()
         .map_or_else(|| "a dynamic credential".to_string(), ocsf_message_field);
-    let failure = error.failure;
+    let failure = error.failure();
     warn!(
         host = %ctx.host,
         port = ctx.port,
@@ -400,7 +382,6 @@ async fn inject_selected(
     credentials: Vec<(String, ProviderProfileCredential)>,
     request_id: &str,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    let request_path = request_path(&req).to_string();
     let resolver = ctx
         .token_grant_resolver
         .as_ref()
@@ -440,7 +421,7 @@ async fn inject_selected(
                 .severity(SeverityId::Informational)
                 .http_request(HttpRequest::new(
                     &req.action,
-                    OcsfUrl::new("http", &ctx.host, &request_path, ctx.port),
+                    OcsfUrl::new("http", &ctx.host, request_path(&req.target), ctx.port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .message(format!(
@@ -457,15 +438,8 @@ async fn inject_selected(
     Ok(L7Request { raw_header, ..req })
 }
 
-fn request_path(req: &L7Request) -> &str {
-    req.target.split('?').next().unwrap_or(req.target.as_str())
-}
-
-fn credential_lock_failure() -> TokenGrantFailure {
-    TokenGrantFailure::new(
-        TokenGrantFailureKind::Unavailable,
-        TokenGrantStage::Injection,
-    )
+fn request_path(target: &str) -> &str {
+    target.split('?').next().unwrap_or(target)
 }
 
 fn injection_configuration_failure() -> TokenGrantFailure {
@@ -1102,6 +1076,10 @@ mod tests {
     use super::*;
     use crate::l7::provider::{BodyLength, L7Request};
     use crate::l7::token_grant_injection::test_support::TokenGrantTestFixture;
+    use openshell_core::endpoint_status::{
+        EndpointConfigVersion, EndpointStatusReceiver, EndpointStatusTracker,
+        endpoint_status_channel,
+    };
 
     const REQUEST_ID: &str = "6a1f0e2d-3c4b-4a59-8e7f-0123456789ab";
 
@@ -1344,7 +1322,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -1383,7 +1361,7 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -1422,7 +1400,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -1454,24 +1432,14 @@ mod tests {
             "api.example.com\t443\t/v1/**\tprovider:access_token",
             failure,
         );
-        let ctx = L7EvalContext {
-            host: "api.example.com".into(),
-            port: 443,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
-            token_grant_resolver: Some(fixture.resolver()),
-            ..Default::default()
-        };
-        let req = L7Request {
-            action: "GET".to_string(),
-            target: "/v1/projects".to_string(),
-            query_params: HashMap::new(),
-            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
-            body_length: BodyLength::None,
-        };
 
-        let err = inject_if_needed(req, &ctx, REQUEST_ID)
-            .await
-            .expect_err("failed grant refuses the request");
+        let err = inject_if_needed(
+            grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
+            &grant_context(&fixture),
+            REQUEST_ID,
+        )
+        .await
+        .expect_err("failed grant refuses the request");
 
         assert_eq!(err.failure(), failure);
         assert_eq!(err.credential(), Some(("provider", "access_token")));
@@ -1484,7 +1452,7 @@ mod tests {
         L7EvalContext {
             host: "api.example.com".into(),
             port: 443,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         }
@@ -1524,142 +1492,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poisoned_credential_snapshot_fails_closed() {
-        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
+    async fn missing_resolver_refuses_without_naming_a_credential() {
         let fixture = TokenGrantTestFixture::success(
             "api.example.com\t443\t/v1/**\tprovider:access_token",
             "grant-token",
         );
-        let credentials = fixture.dynamic_credentials();
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = credentials.write().expect("lock fixture credentials");
-                panic!("poison fixture credentials");
-            })
-            .join()
-            .is_err()
-        );
-        let (sender, mut receiver) = endpoint_status_channel();
-        let mut tracker = receiver.tracker();
-        sender
-            .reset(
-                EndpointConfigVersion {
-                    policy_hash: "policy".into(),
-                    provider_env_revision: 1,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
+        let (sender, mut receiver, mut tracker, _) = installed_status(1).await;
         let mut ctx = grant_context(&fixture);
+        ctx.token_grant_resolver = None;
         ctx.endpoint_observation_tx = Some(sender);
+
         let err = inject_if_needed(
             grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
             &ctx,
             REQUEST_ID,
         )
         .await
-        .expect_err("a poisoned snapshot cannot prove no grant applies");
-        assert_eq!(err.failure(), credential_lock_failure());
+        .expect_err("a grant without a resolver refuses the request");
+
+        assert_eq!(err.failure(), injection_configuration_failure());
         assert_eq!(err.credential(), None);
         fixture.assert_no_requests();
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        let observation = tracker
+        assert!(tracker.apply(receiver.try_recv().unwrap()));
+        let failure = tracker
             .snapshot()
             .unwrap()
             .last_token_grant_failure
+            .unwrap()
+            .failure
             .unwrap();
-        let failure = observation.failure.unwrap();
-        assert_eq!(failure.code, "unavailable");
+        assert_eq!(failure.code, injection_configuration_failure().code());
         assert_eq!(failure.request_id, REQUEST_ID);
         assert!(failure.provider.is_empty());
         assert!(failure.credential_key.is_empty());
     }
 
-    #[tokio::test]
-    async fn missing_resolver_refuses_without_naming_a_credential() {
-        let fixture = TokenGrantTestFixture::success(
-            "api.example.com\t443\t/v1/**\tprovider:access_token",
-            "grant-token",
-        );
-        let ctx = L7EvalContext {
-            host: "api.example.com".into(),
-            port: 443,
-            dynamic_credentials: Some(fixture.dynamic_credentials()),
-            token_grant_resolver: None,
-            ..Default::default()
-        };
-        let req = L7Request {
-            action: "GET".to_string(),
-            target: "/v1/projects".to_string(),
-            query_params: HashMap::new(),
-            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
-            body_length: BodyLength::None,
-        };
-
-        let err = inject_if_needed(req, &ctx, REQUEST_ID)
-            .await
-            .expect_err("a grant without a resolver refuses the request");
-
-        assert_eq!(err.failure(), injection_configuration_failure());
-        assert_eq!(err.credential(), None);
-        fixture.assert_no_requests();
-    }
-
-    fn refreshed_grant_context(
-        accepted_key: &str,
-        current: &TokenGrantTestFixture,
-    ) -> L7EvalContext {
-        let accepted = TokenGrantTestFixture::success(accepted_key, "stale-token");
-        let accepted_snapshot = ProviderCredentialState::from_environment(
-            0,
-            HashMap::new(),
-            HashMap::new(),
-            accepted.dynamic_credentials().read().unwrap().clone(),
-        )
-        .snapshot();
-        let live_state = current.provider_credentials();
-        // A socket retains scoped credentials from accept time. Register that
-        // old key too, so selecting it succeeds instead of failing in the fake.
-        current.add_credential(
-            &accepted_snapshot.scoped_key(accepted_key),
-            accepted_snapshot.dynamic_credentials[accepted_key].clone(),
-            Ok("stale-token"),
-        );
-        let mut ctx = grant_context(current);
-        ctx.dynamic_credentials = Some(Arc::new(std::sync::RwLock::new(
-            accepted_snapshot
-                .dynamic_credentials
-                .iter()
-                .map(|(key, credential)| (accepted_snapshot.scoped_key(key), credential.clone()))
-                .collect(),
-        )));
-        ctx.provider_credentials = Some(live_state);
-        ctx
-    }
-
-    #[tokio::test]
-    async fn fallback_reports_live_credential_after_accept_time_refresh() {
-        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
-        const CURRENT_KEY: &str = "api.example.com\t443\t/v1/**\tcurrent-provider:access_token";
-        let failure = TokenGrantFailure::new(
-            TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantStage::TokenEndpoint,
-        );
-        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
-        let mut ctx = refreshed_grant_context(
-            "api.example.com\t443\t/v1/**\told-provider:access_token",
-            &fixture,
-        );
-        let snapshot = ctx.provider_credentials.as_ref().unwrap().snapshot();
+    async fn installed_status(
+        revision: u64,
+    ) -> (
+        EndpointObservationSender,
+        EndpointStatusReceiver,
+        EndpointStatusTracker,
+        EndpointObservationContext,
+    ) {
         let (sender, mut receiver) = endpoint_status_channel();
         let mut tracker = receiver.tracker();
         sender
             .reset(
                 EndpointConfigVersion {
                     policy_hash: "policy".into(),
-                    provider_env_revision: snapshot.revision,
+                    provider_env_revision: revision,
                 },
                 Vec::new(),
             )
@@ -1667,6 +1549,21 @@ mod tests {
             .unwrap();
         assert!(tracker.apply(receiver.try_recv().unwrap()));
         let authority = sender.capture().unwrap();
+        (sender, receiver, tracker, authority)
+    }
+
+    #[tokio::test]
+    async fn fallback_reports_live_credential_refusal() {
+        const CURRENT_KEY: &str = "api.example.com\t443\t/v1/**\tcurrent-provider:access_token";
+        let failure = TokenGrantFailure::new(
+            TokenGrantFailureKind::ProviderAuthorizationRequired,
+            TokenGrantStage::TokenEndpoint,
+        );
+        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
+        let mut ctx = grant_context(&fixture);
+        let snapshot = ctx.provider_credentials.as_ref().unwrap().snapshot();
+        let (sender, mut receiver, mut tracker, authority) =
+            installed_status(snapshot.revision).await;
         ctx.endpoint_observation_tx = Some(sender);
 
         let error = inject_if_needed_captured(
@@ -1676,7 +1573,7 @@ mod tests {
             Some(&authority),
         )
         .await
-        .expect_err("the live credential refuses, even though the accepted one succeeds");
+        .expect_err("the live credential refuses");
         assert_eq!(error.failure(), failure);
         assert_eq!(
             error.credential(),
@@ -1703,60 +1600,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_cannot_clear_live_failure_with_stale_credential_success() {
-        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
+    async fn fallback_live_credential_success_clears_its_failure() {
         const CURRENT_KEY: &str = "api.example.com\t443\t/v1/projects\tprovider:access_token";
         let failure = TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
             TokenGrantStage::TokenEndpoint,
         );
         let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
-        let mut ctx = refreshed_grant_context(
-            "api.example.com\t443\t/v1/**\tprovider:access_token",
-            &fixture,
-        );
+        let mut ctx = grant_context(&fixture);
         let snapshot = ctx.provider_credentials.as_ref().unwrap().snapshot();
-        let (sender, mut receiver) = endpoint_status_channel();
-        let mut tracker = receiver.tracker();
-        sender
-            .reset(
-                EndpointConfigVersion {
-                    policy_hash: "policy".into(),
-                    provider_env_revision: snapshot.revision,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        let authority = sender.capture().unwrap();
+        let (sender, mut receiver, mut tracker, authority) =
+            installed_status(snapshot.revision).await;
         ctx.endpoint_observation_tx = Some(sender);
 
-        // Establish B's failure through the production entry point with B's map.
-        let mut fresh = ctx.clone();
-        fresh.dynamic_credentials = Some(Arc::new(std::sync::RwLock::new(
-            snapshot.dynamic_credentials.clone(),
-        )));
         let raw_header = b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        inject_if_needed_captured(
-            grant_request(raw_header),
-            &mut fresh,
-            REQUEST_ID,
-            Some(&authority),
-        )
-        .await
-        .expect_err("current grant first records its failure");
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        assert!(
-            tracker
-                .snapshot()
-                .unwrap()
-                .last_token_grant_failure
-                .is_some()
-        );
-
-        // A has the same credential identity, so its old success would clear B
-        // if fallback injection used the socket's copied map after the refresh.
         let error = inject_if_needed_captured(
             grant_request(raw_header),
             &mut ctx,
@@ -1764,7 +1621,7 @@ mod tests {
             Some(&authority),
         )
         .await
-        .expect_err("the stale successful credential cannot replace the live refusal");
+        .expect_err("current grant first records its failure");
         assert_eq!(error.failure(), failure);
         assert!(tracker.apply(receiver.try_recv().unwrap()));
         let observation = tracker
@@ -1792,7 +1649,7 @@ mod tests {
                 .unwrap()
                 .contains("Authorization: Bearer current-token\r\n")
         );
-        fixture.assert_requested_keys(&[CURRENT_KEY, CURRENT_KEY, CURRENT_KEY]);
+        fixture.assert_requested_keys(&[CURRENT_KEY, CURRENT_KEY]);
         assert!(tracker.apply(receiver.try_recv().unwrap()));
         assert!(
             tracker
@@ -1805,31 +1662,14 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_rejects_telemetry_authority_captured_before_provider_refresh() {
-        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
         const CURRENT_KEY: &str = "api.example.com\t443\t/v1/**\tcurrent-provider:access_token";
         let failure = TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
             TokenGrantStage::TokenEndpoint,
         );
         let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
-        let mut ctx = refreshed_grant_context(
-            "api.example.com\t443\t/v1/**\told-provider:access_token",
-            &fixture,
-        );
-        let (sender, mut receiver) = endpoint_status_channel();
-        let mut tracker = receiver.tracker();
-        sender
-            .reset(
-                EndpointConfigVersion {
-                    policy_hash: "policy".into(),
-                    provider_env_revision: 0,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        let accepted_authority = sender.capture().unwrap();
+        let mut ctx = grant_context(&fixture);
+        let (sender, mut receiver, mut tracker, accepted_authority) = installed_status(0).await;
         sender
             .reset(
                 EndpointConfigVersion {

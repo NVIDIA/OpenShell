@@ -44,7 +44,7 @@ fn fixture(
     let ctx = L7EvalContext {
         host: "api.example.com".into(),
         port: 443,
-        dynamic_credentials: Some(fixture.dynamic_credentials()),
+        provider_credentials: Some(fixture.provider_credentials()),
         token_grant_resolver: Some(fixture.resolver()),
         ..Default::default()
     };
@@ -53,7 +53,7 @@ fn fixture(
 
 #[tokio::test]
 async fn malformed_endpoint_key_fails_before_acquisition() {
-    let (fixture, ctx) = fixture(Ok("identity-token"));
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
     {
         let credentials = fixture.dynamic_credentials();
         let mut credentials = credentials.write().unwrap();
@@ -63,6 +63,7 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
             credential,
         );
     }
+    ctx.provider_credentials = Some(fixture.provider_credentials());
     assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
     fixture.assert_no_requests();
 }
@@ -97,11 +98,12 @@ async fn injects_independent_grants_and_replaces_all_protected_headers() {
 
 #[tokio::test]
 async fn chooses_specific_binding_independently_for_each_header() {
-    let (fixture, ctx) = fixture(Ok("identity-token"));
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
     let specific_key = "api.example.com\t443\t/v1/projects\trev:7\tother:service";
     let mut specific = fixture.dynamic_credentials().read().unwrap()[SERVICE].clone();
     specific.token_grant.as_mut().unwrap().audience = "projects-only".into();
     fixture.add_credential(specific_key, specific, Ok("specific-service"));
+    ctx.provider_credentials = Some(fixture.provider_credentials());
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
     let bytes = String::from_utf8(rewritten.raw_header).unwrap();
     assert!(bytes.contains("Authorization: Bearer specific-service\r\n"));
@@ -111,11 +113,12 @@ async fn chooses_specific_binding_independently_for_each_header() {
 
 #[tokio::test]
 async fn audience_override_changes_only_its_own_credential() {
-    let (fixture, ctx) = fixture(Ok("identity-token"));
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
     let override_key = "api.example.com\t443\t/v1/projects\trev:7\tprovider:identity";
     let mut identity = fixture.dynamic_credentials().read().unwrap()[IDENTITY].clone();
     identity.token_grant.as_mut().unwrap().audience = "project-identity".into();
     fixture.add_credential(override_key, identity.clone(), Ok("project-identity-token"));
+    ctx.provider_credentials = Some(fixture.provider_credentials());
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
     let bytes = String::from_utf8(rewritten.raw_header).unwrap();
     assert!(bytes.contains("Authorization: Bearer service-token\r\n"));
@@ -127,7 +130,7 @@ async fn audience_override_changes_only_its_own_credential() {
 #[tokio::test]
 async fn rejects_tied_credentials_for_same_header_before_acquisition() {
     for header in ["Authorization", " authorization ", ""] {
-        let (fixture, ctx) = fixture(Ok("identity-token"));
+        let (fixture, mut ctx) = fixture(Ok("identity-token"));
         let mut collision = fixture.dynamic_credentials().read().unwrap()[SERVICE].clone();
         collision.name = "collision".into();
         collision.header_name = header.into();
@@ -136,6 +139,7 @@ async fn rejects_tied_credentials_for_same_header_before_acquisition() {
             collision,
             Ok("collision-token"),
         );
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         let error = inject_if_needed(request(), &ctx, REQUEST_ID)
             .await
             .unwrap_err();
@@ -148,10 +152,11 @@ async fn rejects_tied_credentials_for_same_header_before_acquisition() {
 
 #[tokio::test]
 async fn rejects_invalid_second_header_before_acquisition() {
-    let (fixture, ctx) = fixture(Ok("identity-token"));
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
     let mut identity = fixture.dynamic_credentials().read().unwrap()[IDENTITY].clone();
     identity.header_name = "Content-Length".into();
     fixture.add_credential(IDENTITY, identity, Ok("identity-token"));
+    ctx.provider_credentials = Some(fixture.provider_credentials());
     assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
     fixture.assert_no_requests();
 }

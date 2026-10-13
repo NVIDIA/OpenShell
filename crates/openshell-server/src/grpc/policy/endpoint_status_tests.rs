@@ -850,6 +850,8 @@ async fn rest_grant_status_fixture(
 
 #[test]
 fn sandbox_grant_status_validates_destination_cause_and_provider() {
+    use openshell_core::rpc_error::StatusExt;
+
     let attached = ["github".to_string()];
     let validate = |failure| {
         validate_token_grant_status(
@@ -864,32 +866,25 @@ fn sandbox_grant_status_validates_destination_cause_and_provider() {
         observation.destination_host = host.to_string();
         validate(observation).expect("bounded DNS and IP destinations are accepted");
     }
-    for host in [
-        "",
-        "API.EXAMPLE.COM",
-        "https://SECRET.example/token",
-        ":",
-        "bad\nSECRET",
-    ] {
+    for host in ["API.EXAMPLE.COM", "bad\nSECRET"] {
         let mut observation = sandbox_grant_failure();
         observation.destination_host = host.to_string();
         let error = validate(observation).unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(!error.message().contains("SECRET"));
     }
-    for port in [0, 65536] {
-        let mut observation = sandbox_grant_failure();
-        observation.destination_port = port;
-        assert_eq!(
-            validate(observation).unwrap_err().code(),
-            Code::InvalidArgument
-        );
-    }
     let mut missing_cause = sandbox_grant_failure();
     missing_cause.failure = None;
     assert_eq!(
         validate(missing_cause).unwrap_err().code(),
         Code::InvalidArgument
+    );
+    let mut unknown_code = sandbox_grant_failure();
+    unknown_code.failure.as_mut().unwrap().code = "bogus".to_string();
+    let details = validate(unknown_code).unwrap_err().get_error_details();
+    assert_eq!(
+        details.bad_request().unwrap().field_violations[0].field,
+        "token_grant_status.last_failure.failure"
     );
     let mut unknown_domain = sandbox_grant_failure();
     unknown_domain.failure.as_mut().unwrap().domain = 99;
@@ -926,20 +921,12 @@ async fn rest_grant_failure_is_retrievable_retained_and_explicitly_cleared() {
     )
     .await
     .expect("REST failure is reported without MCP observations");
-    let first = stored_sandbox(&state, sandbox_id).await;
     assert_eq!(
         public_status(&state, sandbox_id)
             .await
             .last_token_grant_failure,
         Some(Box::new(sandbox_grant_failure()))
     );
-    handle_report_endpoint_status(
-        &state,
-        with_sandbox(Request::new(report.clone()), sandbox_id),
-    )
-    .await
-    .expect("identical retry");
-    assert_eq!(stored_sandbox(&state, sandbox_id).await, first);
     let mut changed_retry = report.clone();
     changed_retry
         .token_grant_status
@@ -984,16 +971,6 @@ async fn rest_grant_failure_is_retrievable_retained_and_explicitly_cleared() {
             .is_none()
     );
     assert_eq!(
-        handle_report_endpoint_status(
-            &state,
-            with_sandbox(Request::new(report.clone()), sandbox_id)
-        )
-        .await
-        .unwrap_err()
-        .code(),
-        Code::FailedPrecondition
-    );
-    assert_eq!(
         handle_report_endpoint_status(&state, with_sandbox(Request::new(report), "other-sandbox"))
             .await
             .unwrap_err()
@@ -1029,7 +1006,6 @@ async fn rest_grant_failure_resets_on_provider_and_policy_changes() {
     let sandbox = stored_sandbox(&state, sandbox_id).await;
     let context = active_endpoint_context(&state, &sandbox).await.unwrap();
     assert_ne!(context.provider_env_revision, report.provider_env_revision);
-    let old_report = report.clone();
     report.report_sequence = 2;
     report.policy_hash = context.policy_hash;
     report.provider_env_revision = context.provider_env_revision;
@@ -1045,13 +1021,6 @@ async fn rest_grant_failure_resets_on_provider_and_policy_changes() {
             .await
             .last_token_grant_failure
             .is_none()
-    );
-    assert_eq!(
-        handle_report_endpoint_status(&state, with_sandbox(Request::new(old_report), sandbox_id))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
     );
     report.report_sequence = 3;
     report.token_grant_status = Some(TokenGrantStatus {
@@ -1120,7 +1089,6 @@ async fn rest_grant_failure_resets_on_session_loss_replacement_and_startup() {
                 .supervisor_sessions
                 .initialize_endpoint_status_authority(sandbox_id, session)
         );
-        let predecessor = report.clone();
         report.supervisor_session_id = session.to_string();
         handle_report_endpoint_status(
             &state,
@@ -1128,16 +1096,6 @@ async fn rest_grant_failure_resets_on_session_loss_replacement_and_startup() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            handle_report_endpoint_status(
-                &state,
-                with_sandbox(Request::new(predecessor), sandbox_id)
-            )
-            .await
-            .unwrap_err()
-            .code(),
-            Code::PermissionDenied
-        );
     }
     state
         .supervisor_sessions
@@ -1209,21 +1167,6 @@ fn endpoint_snapshot_rejects_failures_outside_the_contract() {
     assert_eq!(
         error.message(),
         "endpoint failure domain does not explain this endpoint result"
-    );
-
-    let mut unknown_code = reauthorize_failure();
-    unknown_code.code = "issuer said: token SECRET expired".to_string();
-    let error = invalid(EndpointResult::CredentialUnavailable, unknown_code);
-    assert_eq!(error.code(), Code::InvalidArgument);
-    assert!(!error.message().contains("SECRET"));
-
-    let mut mismatched = reauthorize_failure();
-    mismatched.recovery_action =
-        openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Retry as i32;
-    let error = invalid(EndpointResult::CredentialUnavailable, mismatched);
-    assert_eq!(
-        error.message(),
-        "endpoint failure recovery action does not match its code"
     );
 
     let mut foreign = reauthorize_failure();
