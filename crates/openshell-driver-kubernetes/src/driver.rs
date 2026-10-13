@@ -6849,7 +6849,8 @@ fn validate_pod_annotations(
         return Ok(());
     }
     Err(format!(
-        "pod annotations not permitted by the gateway's allowed_pod_annotations: {}",
+        "pod annotations not permitted by the gateway's allowed_pod_annotations \
+         (Helm: gatewayConfig.openshell.drivers.kubernetes.allowed_pod_annotations): {}",
         rejected.join(", ")
     ))
 }
@@ -9762,9 +9763,24 @@ mod tests {
             "other.example.net/owner",
         ]);
         let err = validate_pod_annotations(&template, &config).unwrap_err();
-        assert!(err.contains("sub.example.com/owner"), "{err}");
-        assert!(err.contains("other.example.net/owner"), "{err}");
-        assert!(!err.contains("example.com/owner,"), "{err}");
+        let (_, rejected) = err.rsplit_once(": ").unwrap();
+        assert_eq!(rejected, "other.example.net/owner, sub.example.com/owner");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_disallowed_pod_annotations() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(template_with_pod_annotations(&["example.com/owner"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Box::pin(driver.create_sandbox_inner(&sandbox)).await,
+            Err(KubernetesDriverError::InvalidArgument(message)) if message.contains("example.com/owner")
+        ));
     }
 
     #[test]
