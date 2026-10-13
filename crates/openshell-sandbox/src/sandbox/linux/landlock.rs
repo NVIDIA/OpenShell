@@ -665,32 +665,53 @@ mod tests {
     }
 
     #[test]
-    fn capability_free_baseline_drops_each_root_entry_before_opening_the_next() {
+    fn capability_free_baseline_streams_root_entries_under_a_low_fd_limit() {
+        const CHILD_MARKER: &str = "OPENSHELL_LANDLOCK_FD_LIMIT_CHILD";
+        const ENTRIES: u64 = 128;
+        const FD_LIMIT: u64 = 64;
+        const { assert!(ENTRIES > FD_LIMIT) };
+
+        if require_abi().is_err() {
+            return;
+        }
+        // RLIMIT_NOFILE is process-wide, so lower it in a fresh copy of the
+        // test binary where no other test opens descriptors.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::linux::landlock::tests::capability_free_baseline_streams_root_entries_under_a_low_fd_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .expect("run isolated descriptor limit test");
+            assert!(status.success(), "isolated descriptor limit test failed");
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
-        for index in 0..128 {
+        for index in 0..ENTRIES {
             std::fs::write(root.path().join(format!("entry-{index:03}")), b"public").unwrap();
         }
         std::fs::create_dir(root.path().join(".openshell")).unwrap();
 
-        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let mut visited = 0;
-        let mut peak = baseline;
-        for entry in capability_free_baseline_entries(root.path()).unwrap() {
-            let _entry = entry.unwrap();
-            visited += 1;
-            peak = peak.max(std::fs::read_dir("/proc/self/fd").unwrap().count());
-        }
-
-        assert_eq!(visited, 128);
-        assert!(
-            peak <= baseline + 16,
-            "streamed baseline preparation retained too many descriptors: baseline={baseline} peak={peak}"
-        );
+        // Retaining every entry descriptor would exhaust this limit.
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(FD_LIMIT),
+                maximum: limit.maximum,
+            },
+        )
+        .unwrap();
+        prepare_capability_free_baseline_at(root.path()).unwrap();
     }
 
     #[test]
     fn capability_free_baseline_denies_alias_reads_and_path_truncation() {
-        if !matches!(probe_availability(), LandlockAvailability::Available { abi } if abi >= 3) {
+        if require_abi().is_err() {
             return;
         }
         let root = tempfile::tempdir().unwrap();
