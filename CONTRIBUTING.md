@@ -110,6 +110,8 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
+| Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
