@@ -96,6 +96,16 @@ generated server-trait changes reachable through `raw::proto`, identifying
 mock/server implementers as affected consumers and distinguishing them from
 unaffected client callers.
 
+For `go-sdk`, adopt the [Go struct-literal compatibility convention](https://go.dev/doc/go1compat):
+adding fields to exported structs is additive when existing keyed literals remain
+valid and omitted fields preserve existing behavior. Do not report a break solely
+because unkeyed (positional) literals need updating, unless the baseline explicitly
+guarantees that construction form. Still inspect existing field names and types,
+zero-value behavior, comparability (equality and map keys), and serialization
+contracts; a field addition can break those independently. Follow the
+[Go module compatibility guidance](https://go.dev/blog/module-compatibility#maintaining-struct-compatibility)
+for these limits. This exception applies only to Go struct-field additions.
+
 Check exported signatures/types, generated and handwritten SDK behavior,
 serialization and error contracts, command flags and documented machine-readable
 output, config/default semantics, policy formats, chart values, and persisted
