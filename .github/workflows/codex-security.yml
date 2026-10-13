@@ -24,6 +24,10 @@ on:
         description: Fail on HIGH/CRITICAL security findings
         default: false
         type: boolean
+      advisory:
+        description: Keep findings and execution failures non-blocking
+        default: false
+        type: boolean
       upload_sarif:
         description: Upload results to Code Scanning when called from a manual workflow
         default: true
@@ -87,6 +91,7 @@ jobs:
     # so its preflight never scopes the diff and it seals no draft.
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    continue-on-error: ${{ inputs.advisory || false }}
     outputs:
       base_sha: ${{ steps.range.outputs.base_sha }}
       candidate_sha: ${{ steps.range.outputs.candidate_sha }}
@@ -313,7 +318,7 @@ jobs:
           fi
 
   result:
-    name: ${{ inputs.fail-on-findings && 'OpenShell / Codex Security' || 'OpenShell / Codex Security (informational)' }}
+    name: ${{ inputs.advisory && 'OpenShell / Codex Security (advisory)' || inputs.fail-on-findings && 'OpenShell / Codex Security' || 'OpenShell / Codex Security (informational)' }}
     if: ${{ always() }}
     needs: analyze
     runs-on: ubuntu-latest
@@ -322,8 +327,14 @@ jobs:
       - name: Evaluate scanner execution
         env:
           ANALYZE_RESULT: ${{ needs.analyze.result }}
+          ADVISORY: ${{ inputs.advisory || false }}
         run: |
           set -euo pipefail
+          if [ "$ADVISORY" = "true" ]; then
+            echo "::warning::Codex Security is advisory; findings and execution failures do not block release qualification."
+            echo "Codex Security is advisory. Inspect the scan job and execution diagnostics for its actual outcome." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "$ANALYZE_RESULT" != "success" ]; then
             echo "::error::Codex Security release qualification did not complete successfully."
             exit 1

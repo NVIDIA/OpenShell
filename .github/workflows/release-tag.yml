@@ -141,6 +141,8 @@ jobs:
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
       fail-on-codex-findings: true
+      # Temporary (#4466): retain Codex evidence while reliability is investigated.
+      codex-advisory: true
       fail-on-static-findings: false
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}

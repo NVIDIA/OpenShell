@@ -125,6 +125,12 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+`Release Tag` temporarily enables `codex-advisory`: Codex findings, incomplete
+coverage, and execution failures do not block release qualification. The
+`OpenShell / Codex Security (advisory)` check reports this exception; inspect
+the scan job and diagnostics for the actual outcome. Manual scans remain strict
+about execution failures, and other qualification suites keep their existing gates.
+
 For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
 scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
 the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on

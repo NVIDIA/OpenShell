@@ -36,6 +36,10 @@ on:
         type: string
   workflow_call:
     inputs:
+      codex-advisory:
+        description: Keep Codex findings and execution failures non-blocking
+        default: false
+        type: boolean
       candidate_ref:
         description: Release tag to scan; Codex runs only for pre-release tags
         required: true
@@ -73,7 +77,7 @@ on:
 permissions:
   contents: read
 
-# Only the finding threshold is overridable; execution failures remain fatal.
+# Execution failures remain fatal unless the caller opts into Codex advisory mode.
 jobs:
   codex:
     name: Codex Security
@@ -88,6 +92,7 @@ jobs:
       stable_ref: ${{ inputs.stable_ref }}
       allow_full_bootstrap: ${{ inputs.allow_full_bootstrap }}
       fail-on-findings: ${{ inputs.fail-on-codex-findings }}
+      advisory: ${{ inputs.codex-advisory || false }}
       upload_sarif: true
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}

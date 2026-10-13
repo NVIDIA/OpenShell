@@ -238,12 +238,17 @@ Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat Cargo Deny and Codex Security findings as failures of the
-currently implemented qualification profile. A profile failure prevents both
-pre-release and stable publication. CodeQL, Trivy, and Zizmor findings are
-temporarily informational for tagged releases: the existing findings were
+Tagged releases treat Cargo Deny findings as failures of the currently
+implemented qualification profile. Codex Security is temporarily advisory:
+findings, incomplete coverage, and execution failures do not block publication.
+The scan still runs and retains its existing reports and public execution
+diagnostics; its advisory check does not assert a successful scan. Restore
+Codex enforcement by removing `codex-advisory: true` from `Release Tag`.
+A profile failure prevents both pre-release and stable publication.
+CodeQL, Trivy, and Zizmor findings are temporarily informational for tagged
+releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
-Scanner failures still fail qualification.
+Other scanner failures still fail qualification.
 
 Failed pre-release builds send notifications via Slack using a webhook and
 at-mentioning the triage engineer with a link to the failure. The webhook is
@@ -315,7 +320,10 @@ on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
 `fail-on-static-findings` is `true`. Both inputs default to `true`. Set either
 input to `false` to make only that finding class informational. Scanner setup,
 execution, and report publication errors still fail. Reports are published
-before the finding threshold is enforced.
+before the finding threshold is enforced. Reusable callers can explicitly set
+`codex-advisory: true` to tolerate all Codex job failures; `Release Tag`
+temporarily enables this exception. It defaults to `false` and is not exposed
+on manual dispatches.
 
 Codex uses each finding's severity; CodeQL uses the rule's security score
 (at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
