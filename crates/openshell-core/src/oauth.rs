@@ -769,8 +769,12 @@ mod tests {
             assert_eq!(failure.upstream_status(), Some(503));
         }
 
-        let token = r#"{"access_token":"access-token"}"#;
-        let body = format!("{token:<width$}", width = MAX_TOKEN_RESPONSE_BYTES);
+        // Pad to the exact bound. A format width cannot exceed u16::MAX.
+        let mut body = r#"{"access_token":"access-token"}"#.to_string();
+        body.extend(std::iter::repeat_n(
+            ' ',
+            MAX_TOKEN_RESPONSE_BYTES - body.len(),
+        ));
         let (endpoint, server) = token_endpoint_once("200 OK", &body).await;
         post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
             .await
