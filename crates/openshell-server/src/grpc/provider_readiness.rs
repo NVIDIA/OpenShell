@@ -259,8 +259,11 @@ async fn load_current_snapshot(
 ) -> Result<(ProviderDesiredIdentity, ProviderReadinessReason), Status> {
     let mut desired = current_target_identity(state, sandbox, provider_name).await?;
     let config = super::policy::load_sandbox_config(state, sandbox).await?;
+    // This is the desired gateway snapshot, not a supervisor delivery. Include
+    // all supported credential forms; the supervisor's applied report proves
+    // whether it installed that snapshot with its negotiated capabilities.
     let environment =
-        super::policy::load_sandbox_provider_environment(state, sandbox, true).await?;
+        super::policy::load_sandbox_provider_environment(state, sandbox, true, true).await?;
     let current = state
         .store
         .get_message::<Sandbox>(sandbox.object_id())

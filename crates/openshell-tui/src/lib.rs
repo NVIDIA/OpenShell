@@ -978,9 +978,13 @@ async fn handle_shell_connect(
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -1001,16 +1005,7 @@ async fn handle_shell_connect(
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+        .args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1114,9 +1109,13 @@ async fn handle_exec_command(
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1139,16 +1138,7 @@ async fn handle_exec_command(
     // remote shell parses it correctly.
     let command_str = build_exec_command(command);
     let mut ssh = std::process::Command::new("ssh");
-    ssh.arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+    ssh.args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1209,7 +1199,7 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
     validate_ssh_session_response,
 };
 
@@ -1577,9 +1567,13 @@ async fn start_port_forwards(
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {
@@ -1606,16 +1600,7 @@ async fn start_port_forwards(
 
         let mut command = std::process::Command::new("ssh");
         command
-            .arg("-o")
-            .arg(format!("ProxyCommand={proxy_command}"))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("GlobalKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
+            .args(sandbox_ssh_args(&proxy_command, "ERROR"))
             .arg("-o")
             .arg("ConnectTimeout=15")
             .arg("-N")

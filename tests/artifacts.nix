@@ -79,7 +79,7 @@ let
       '';
     };
 
-  conformanceCliArchive = mkTestArchive {
+  conformanceTestArchive = mkTestArchive {
     name = "openshell-conformance";
     workspacePath = "tests/suites/conformance";
     manifestPath = "tests/suites/conformance/Cargo.toml";
@@ -94,6 +94,14 @@ let
     package = "openshell-test-feature-provider-refresh-keycloak";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
+  };
+  ociImageArchive = mkTestArchive {
+    name = "oci-image";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-oci-image";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
   };
 
   # Follow-up: migrate these wrapper-coupled tests once tmachine provides their
@@ -196,8 +204,9 @@ let
 in
 rec {
   inherit
-    conformanceCliArchive
+    conformanceTestArchive
     providerRefreshKeycloakArchive
+    ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -244,14 +253,16 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceCliArchive
+      conformanceTestArchive
       providerRefreshKeycloakArchive
+      ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';

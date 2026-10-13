@@ -52,6 +52,7 @@ const (
 	OpenShell_ExecSandboxInteractive_FullMethodName        = "/openshell.v1.OpenShell/ExecSandboxInteractive"
 	OpenShell_CreateProvider_FullMethodName                = "/openshell.v1.OpenShell/CreateProvider"
 	OpenShell_GetProvider_FullMethodName                   = "/openshell.v1.OpenShell/GetProvider"
+	OpenShell_GetProviderCredentials_FullMethodName        = "/openshell.v1.OpenShell/GetProviderCredentials"
 	OpenShell_ListProviders_FullMethodName                 = "/openshell.v1.OpenShell/ListProviders"
 	OpenShell_ListProviderProfiles_FullMethodName          = "/openshell.v1.OpenShell/ListProviderProfiles"
 	OpenShell_GetProviderProfile_FullMethodName            = "/openshell.v1.OpenShell/GetProviderProfile"
@@ -187,6 +188,9 @@ type OpenShellClient interface {
 	CreateProvider(ctx context.Context, in *CreateProviderRequest, opts ...grpc.CallOption) (*ProviderResponse, error)
 	// Fetch a provider by name.
 	GetProvider(ctx context.Context, in *GetProviderRequest, opts ...grpc.CallOption) (*ProviderResponse, error)
+	// Export selected usable runtime credentials. Only directly authenticated
+	// mTLS operators may call this method; refresh material is never returned.
+	GetProviderCredentials(ctx context.Context, in *GetProviderCredentialsRequest, opts ...grpc.CallOption) (*GetProviderCredentialsResponse, error)
 	// List providers.
 	ListProviders(ctx context.Context, in *ListProvidersRequest, opts ...grpc.CallOption) (*ListProvidersResponse, error)
 	// List available provider type profiles.
@@ -644,6 +648,16 @@ func (c *openShellClient) GetProvider(ctx context.Context, in *GetProviderReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProviderResponse)
 	err := c.cc.Invoke(ctx, OpenShell_GetProvider_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetProviderCredentials(ctx context.Context, in *GetProviderCredentialsRequest, opts ...grpc.CallOption) (*GetProviderCredentialsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetProviderCredentialsResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetProviderCredentials_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1281,6 +1295,9 @@ type OpenShellServer interface {
 	CreateProvider(context.Context, *CreateProviderRequest) (*ProviderResponse, error)
 	// Fetch a provider by name.
 	GetProvider(context.Context, *GetProviderRequest) (*ProviderResponse, error)
+	// Export selected usable runtime credentials. Only directly authenticated
+	// mTLS operators may call this method; refresh material is never returned.
+	GetProviderCredentials(context.Context, *GetProviderCredentialsRequest) (*GetProviderCredentialsResponse, error)
 	// List providers.
 	ListProviders(context.Context, *ListProvidersRequest) (*ListProvidersResponse, error)
 	// List available provider type profiles.
@@ -1525,6 +1542,9 @@ func (UnimplementedOpenShellServer) CreateProvider(context.Context, *CreateProvi
 }
 func (UnimplementedOpenShellServer) GetProvider(context.Context, *GetProviderRequest) (*ProviderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProvider not implemented")
+}
+func (UnimplementedOpenShellServer) GetProviderCredentials(context.Context, *GetProviderCredentialsRequest) (*GetProviderCredentialsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetProviderCredentials not implemented")
 }
 func (UnimplementedOpenShellServer) ListProviders(context.Context, *ListProvidersRequest) (*ListProvidersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListProviders not implemented")
@@ -2195,6 +2215,24 @@ func _OpenShell_GetProvider_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).GetProvider(ctx, req.(*GetProviderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetProviderCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProviderCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetProviderCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetProviderCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetProviderCredentials(ctx, req.(*GetProviderCredentialsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3212,6 +3250,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProvider",
 			Handler:    _OpenShell_GetProvider_Handler,
+		},
+		{
+			MethodName: "GetProviderCredentials",
+			Handler:    _OpenShell_GetProviderCredentials_Handler,
 		},
 		{
 			MethodName: "ListProviders",

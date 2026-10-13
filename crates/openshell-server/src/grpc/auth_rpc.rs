@@ -34,13 +34,12 @@ pub async fn handle_get_current_user(
     request: Request<GetCurrentUserRequest>,
 ) -> Result<Response<GetCurrentUserResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let Principal::User(user) = principal else {
+    let Some(identity) = principal.user_identity().cloned() else {
         return Err(Status::permission_denied(
             "GetCurrentUser requires a user principal",
         ));
     };
 
-    let identity = user.identity;
     Ok(Response::new(GetCurrentUserResponse {
         subject: identity.subject,
         display_name: identity.display_name.unwrap_or_default(),
@@ -200,7 +199,7 @@ pub async fn handle_refresh_sandbox_token(
     let gateway_token = authorization
         .to_str()
         .ok()
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(openshell_core::auth::strip_bearer_scheme)
         .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
     let principal = session_authority.verify_gateway_token(gateway_token)?;
     if principal.sandbox_id.as_str() != sandbox.sandbox_id {

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! The `OpenShell` **Isolation Backend** runtime contract (RFC 0012).
 //!
 //! An isolation backend establishes and enforces a workload's isolation boundary;
@@ -49,7 +51,3 @@ pub struct AgentSpec {
 }
 
 pub mod contract;
-
-/// Linux-only primitives shared by capability-free sandbox implementations.
-#[cfg(target_os = "linux")]
-pub mod linux;

@@ -45,6 +45,10 @@ The launcher:
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
+  Patch identity uses fetched merge-base/head trees in a temporary bare Git
+  repository, avoiding GitHub's full-diff size limit without checking out PR
+  code. If those trees cannot be fetched, the ledger retains feedback and
+  exact-SHA history but disables rebase-equivalence shortcuts.
 - Installs `gator/bin/resolve-gator-review-threads` so a follow-up commit that
   demonstrably fixes a Gator inline finding can resolve the corresponding
   Gator-owned GitHub review thread without touching human review threads.

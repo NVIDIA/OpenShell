@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Collect whatever applies to the installed gateway before the VM exits.
+- name: Read OpenShell gateway logs
+  become: true
+  ansible.builtin.command:
+    argv:
+      - journalctl
+      - --no-pager
+      - --lines
+      - "500"
+      - _SYSTEMD_UNIT=openshell-gateway.service
+      - "+"
+      - _SYSTEMD_USER_UNIT=openshell-gateway.service
+  register: openshell_gateway_logs
+  changed_when: false
+  failed_when: false
+
+- name: Show OpenShell gateway logs
+  ansible.builtin.debug:
+    var: openshell_gateway_logs.stdout_lines
+
+- name: Check for K3s
+  become: true
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_diagnostics_binary
+  failed_when: false
+
+- name: Preserve K3s diagnostics
+  when: k3s_diagnostics_binary.stat.exists | default(false)
+  become: true
+  block:
+    - name: Collect bounded K3s diagnostics
+      ansible.builtin.script: collect-k3s.sh
+      register: k3s_diagnostics_collection
+      changed_when: false
+      failed_when: false
+
+    - name: Show K3s diagnostics
+      ansible.builtin.debug:
+        var: k3s_diagnostics_collection.stdout_lines
+
+    - name: Fetch K3s diagnostics
+      ansible.builtin.fetch:
+        src: /var/lib/openshell/diagnostics/k3s.txt
+        dest: "{{ role_path }}/../../../../artifacts/tmachine-diagnostics/{{ inventory_hostname }}/k3s.txt"
+        flat: true
+      failed_when: false

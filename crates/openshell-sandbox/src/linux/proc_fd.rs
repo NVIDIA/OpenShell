@@ -3,8 +3,6 @@
 
 //! Strict `/proc/<tid>/fd` socket identity helpers.
 
-#![allow(unsafe_code)]
-
 use std::fs;
 use std::io;
 use std::os::fd::RawFd;
@@ -100,27 +98,14 @@ pub fn socket_inode(tid: u32, fd: RawFd) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
 
     use super::*;
 
     #[test]
     fn identifies_socket_and_rejects_regular_file() {
-        let mut pair = [-1; 2];
-        // SAFETY: pair points to storage for exactly two returned descriptors.
-        let result = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                pair.as_mut_ptr(),
-            )
-        };
-        assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
-        // SAFETY: successful socketpair returned two independently owned FDs.
-        let left = unsafe { OwnedFd::from_raw_fd(pair[0]) };
-        // SAFETY: successful socketpair returned two independently owned FDs.
-        let _right = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let (left, _right) = UnixStream::pair().expect("socketpair");
         assert!(socket_inode(std::process::id(), left.as_raw_fd()).unwrap() > 0);
 
         let file = File::open("/dev/null").expect("open regular descriptor");
@@ -134,21 +119,7 @@ mod tests {
 
     #[test]
     fn installed_socket_snapshot_can_exclude_the_broker() {
-        let mut pair = [-1; 2];
-        // SAFETY: pair points to storage for exactly two returned descriptors.
-        let result = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                pair.as_mut_ptr(),
-            )
-        };
-        assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
-        // SAFETY: successful socketpair returned two independently owned FDs.
-        let left = unsafe { OwnedFd::from_raw_fd(pair[0]) };
-        // SAFETY: successful socketpair returned two independently owned FDs.
-        let _right = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let (left, _right) = UnixStream::pair().expect("socketpair");
         let inode = socket_inode(std::process::id(), left.as_raw_fd()).unwrap();
 
         assert!(

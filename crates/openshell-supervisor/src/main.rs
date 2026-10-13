@@ -3,6 +3,8 @@
 
 //! `OpenShell` supervisor executable.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -10,11 +12,12 @@ use std::sync::atomic::AtomicBool;
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
-use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+mod logging;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -133,32 +136,21 @@ struct Args {
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
 
-    /// Read end of a driver-owned pipe. EOF means the owning driver exited.
+    /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
-    parent_liveness_fd: Option<i32>,
+    parent_liveness_stdin: bool,
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
-fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
+fn arm_parent_liveness(enabled: bool) -> Result<()> {
     use std::io::Read as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-
-    let Some(raw_fd) = raw_fd else {
+    if !enabled {
         return Ok(());
-    };
-    if raw_fd <= 2 {
-        return Err(miette::miette!("parent liveness descriptor is invalid"));
     }
-    nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFD)
-        .map_err(|error| miette::miette!("parent liveness descriptor is not open: {error}"))?;
-    // SAFETY: the driver transfers this inherited descriptor to the
-    // supervisor exactly once through the private command line.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     std::thread::Builder::new()
         .name("supervisor-parent-liveness".to_string())
         .spawn(move || {
-            let mut stream = std::fs::File::from(fd);
+            let mut stream = std::io::stdin().lock();
             let mut byte = [0_u8; 1];
             loop {
                 match stream.read(&mut byte) {
@@ -172,10 +164,10 @@ fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
-    if raw_fd.is_some() {
+fn arm_parent_liveness(enabled: bool) -> Result<()> {
+    if enabled {
         return Err(miette::miette!(
-            "parent liveness descriptors are unsupported on this platform"
+            "parent liveness stdin is unsupported on this platform"
         ));
     }
     Ok(())
@@ -245,7 +237,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                 || args.health_socket_path.is_some()
                 || args.health_port.is_some()
                 || args.main_exit_marker.is_some()
-                || args.parent_liveness_fd.is_some()
+                || args.parent_liveness_stdin
             {
                 return Err(miette::miette!(
                     "--role=network-proxy does not use sandbox identity, gateway, runtime, or process-control arguments"
@@ -301,7 +293,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     validate_role_arguments(&args)?;
-    arm_parent_liveness(args.parent_liveness_fd)?;
+    arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let descriptor = backend_descriptor(&args)?;
@@ -315,17 +307,6 @@ fn main() -> Result<()> {
         None
     };
 
-    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openshell")
-        .filename_suffix("log")
-        .max_log_files(3)
-        .build("/var/log")
-        .ok()
-        .map(|roller| {
-            let (writer, guard) = tracing_appender::non_blocking(roller);
-            (writer, guard)
-        });
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -369,62 +350,26 @@ fn main() -> Result<()> {
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
         let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
-        let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer)
-                        .with_enabled_flag(ocsf_enabled.clone())
-                        .with_target_version(ocsf_schema_version.clone());
-                    (layer, guard)
-                });
-            let (jsonl_layer, jsonl_guard) =
-                jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(
-                    OcsfShorthandLayer::new(file_writer)
-                        .with_non_ocsf(true)
-                        .with_filter(EnvFilter::new("info")),
-                )
-                .with(jsonl_layer.with_filter(LevelFilter::INFO))
-                .with(push_layer.clone())
-                .with(
-                    otlp_layer_provider
-                        .as_ref()
-                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                        .with_filter(otlp_span_filter(&args.log_level)),
-                )
-                .init();
-            (Some(file_guard), jsonl_guard)
-        } else {
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(push_layer)
-                .with(
-                    otlp_layer_provider
-                        .as_ref()
-                        .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                        .with_filter(otlp_span_filter(&args.log_level)),
-                )
-                .init();
+        let (logging_layers, _logging_guards, file_available) = logging::layers(
+            std::io::stderr(),
+            Path::new("/var/log"),
+            console_filter,
+            ocsf_enabled.clone(),
+            ocsf_schema_version.clone(),
+        );
+        tracing_subscriber::registry()
+            .with(logging_layers)
+            .with(push_layer)
+            .with(
+                otlp_layer_provider
+                    .as_ref()
+                    .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
+                    .with_filter(otlp_span_filter(&args.log_level)),
+            )
+            .init();
+        if !file_available {
             warn!("Could not open /var/log for log rotation; using stderr-only logging");
-            (None, None)
-        };
+        }
         if let Some(error) = otlp_setup_error {
             warn!(%error, "OTLP exporting could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_endpoint {
@@ -469,7 +414,7 @@ fn main() -> Result<()> {
                 };
                 let admitted_isolation_backend =
                     std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                Box::pin(openshell_supervisor::run_sandbox(
+                let result = Box::pin(openshell_supervisor::run_sandbox(
                     command,
                     workdir,
                     args.timeout,
@@ -491,7 +436,8 @@ fn main() -> Result<()> {
                     admitted_isolation_backend,
                     args.main_exit_marker,
                 ))
-                .await
+                .await;
+                supervisor_exit(result)
             }
             SupervisorRole::NetworkProxy => {
                 let listen = args.listen.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
@@ -532,8 +478,106 @@ fn otlp_span_filter(log_level: &str) -> EnvFilter {
     EnvFilter::new(format!("info,openshell={level}"))
 }
 
+/// Choose the supervisor's exit status for a sandbox run.
+///
+/// The reserved status tells the compute driver that the sandbox rejected the
+/// image working directory. After the workload exits, the supervisor exits
+/// with the workload's status, so a workload that itself exits with the
+/// reserved status is reported as 1 instead. The gateway receives the
+/// workload's exact status separately.
+fn supervisor_exit(result: Result<i32>) -> Result<i32> {
+    use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
+    match result {
+        Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) => Ok(1),
+        Err(error)
+            if error
+                .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
+                .is_some() =>
+        {
+            error!(error = ?error, "Image workspace validation failed");
+            Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_liveness_stdin_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_LIVENESS_TEST_MARKER") else {
+            return;
+        };
+        arm_parent_liveness(true).unwrap();
+        std::fs::write(marker, "ready").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("liveness EOF did not terminate the supervisor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_liveness_exits_only_after_writer_closes() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
+        let (read, write) = nix::unistd::pipe().unwrap();
+        for fd in [&read, &write] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let mut writer = std::fs::File::from(write);
+        let mut probe = Probe(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::parent_liveness_stdin_child",
+                    "--nocapture",
+                ])
+                .env("OPENSHELL_LIVENESS_TEST_MARKER", &marker)
+                .stdin(Stdio::from(read))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(probe.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "liveness probe did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        writer.write_all(&[1]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            probe.0.try_wait().unwrap().is_none(),
+            "data must not terminate supervisor"
+        );
+        drop(writer);
+        loop {
+            if let Some(status) = probe.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(1));
+                break;
+            }
+            assert!(Instant::now() < deadline, "liveness EOF was not observed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -543,6 +587,50 @@ mod tests {
         assert_eq!(directives("info"), "openshell=info,info");
         assert_eq!(directives("debug"), "openshell=debug,info");
         assert_eq!(directives("info,h2=debug"), "openshell=info,info");
+    }
+
+    #[test]
+    fn only_workspace_validation_failure_exits_with_reserved_status() {
+        use miette::WrapErr as _;
+        use openshell_core::driver_utils::{
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
+        };
+        // Mirror how the sandbox reports the rejection across the boundary.
+        let sandbox_error = Err::<(), _>(miette::miette!(
+            "workspace path component '/workspace/project' is not writable by the sandbox \
+             identity in the image: Permission denied (os error 13)"
+        ))
+        .wrap_err(WORKSPACE_VALIDATION_ERROR_CONTEXT)
+        .unwrap_err();
+        let error = openshell_supervisor::start_agent_error(format!(
+            "process error: boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
+        ));
+        assert_eq!(
+            supervisor_exit(Err(error)).expect("reserved exit status"),
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
+        );
+        assert!(
+            supervisor_exit(Err(openshell_supervisor::start_agent_error(
+                "connect failed".into()
+            )))
+            .is_err()
+        );
+        // Only an agent start failure carries the rejection, even when another
+        // error's text contains the same words.
+        assert!(
+            supervisor_exit(Err(miette::miette!(
+                "policy sync failed: {WORKSPACE_VALIDATION_ERROR_CONTEXT}"
+            )))
+            .is_err()
+        );
+
+        // A workload's own exit with the reserved status is not a rejection.
+        assert_eq!(
+            supervisor_exit(Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)).unwrap(),
+            1
+        );
+        assert_eq!(supervisor_exit(Ok(0)).unwrap(), 0);
+        assert_eq!(supervisor_exit(Ok(143)).unwrap(), 143);
     }
 
     #[test]

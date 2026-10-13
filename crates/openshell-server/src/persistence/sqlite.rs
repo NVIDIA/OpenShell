@@ -423,12 +423,12 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .await
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
-                // Update with version check
-                let result = sqlx::query(
+                let row = sqlx::query(
                     r#"
 UPDATE "objects"
 SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
 WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -437,37 +437,28 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                 .bind(payload)
                 .bind(labels.unwrap_or("{}"))
                 .bind(now_ms)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                if result.rows_affected() == 0 {
-                    // The version-matched UPDATE matched no row. Distinguish a
-                    // version mismatch (row present, different version) from an
-                    // absent row (deleted / never existed). Both are CAS
-                    // precondition failures, so report them as typed `Conflict`
-                    // rather than a backend-dependent error string: absent rows
-                    // carry `current_resource_version: None`.
-                    let existing = self.get(object_type, id).await?;
-                    return Err(PersistenceError::Conflict {
-                        current_resource_version: existing.map(|record| record.resource_version),
-                    });
+                if let Some(row) = row {
+                    return Ok(write_result_from_row(&row));
                 }
 
-                // Fetch the updated record to get the new resource_version
-                let updated = self.get(object_type, id).await?.ok_or_else(|| {
-                    PersistenceError::Database("object disappeared after update".to_string())
-                })?;
-
-                Ok(WriteResult {
-                    resource_version: updated.resource_version,
-                    created_at_ms: updated.created_at_ms,
-                    updated_at_ms: updated.updated_at_ms,
+                // The version-matched UPDATE matched no row. Distinguish a
+                // version mismatch (row present, different version) from an
+                // absent row (deleted / never existed). Both are CAS
+                // precondition failures, so report them as typed `Conflict`
+                // rather than a backend-dependent error string: absent rows
+                // carry `current_resource_version: None`.
+                let existing = self.get(object_type, id).await?;
+                Err(PersistenceError::Conflict {
+                    current_resource_version: existing.map(|record| record.resource_version),
                 })
             }
             WriteCondition::Unconditional => {
                 // Unconditional upsert by name
-                sqlx::query(
+                let row = sqlx::query(
                     r#"
 INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
@@ -476,6 +467,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
     "updated_at_ms" = excluded."updated_at_ms",
     "labels" = excluded."labels",
     "resource_version" = "objects"."resource_version" + 1
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -485,23 +477,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .bind(payload)
                 .bind(now_ms)
                 .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                // Fetch the result to get the resource_version
-                let record = self
-                    .get_by_name(object_type, workspace, name)
-                    .await?
-                    .ok_or_else(|| {
-                        PersistenceError::Database("object disappeared after upsert".to_string())
-                    })?;
-
-                Ok(WriteResult {
-                    resource_version: record.resource_version,
-                    created_at_ms: record.created_at_ms,
-                    updated_at_ms: record.updated_at_ms,
-                })
+                Ok(write_result_from_row(&row))
             }
         }
     }
@@ -1913,8 +1893,22 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [with_suffix("-wal"), with_suffix("-shm")]
 }
 
+/// Read the `RETURNING` columns of a write, so the result describes that write
+/// and not whichever one landed last.
+fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
+    WriteResult {
+        resource_version: row_resource_version(row),
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+    }
+}
+
+fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
+    let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+    resource_version.max(1).cast_unsigned()
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -1924,7 +1918,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(&row),
     }
 }
 

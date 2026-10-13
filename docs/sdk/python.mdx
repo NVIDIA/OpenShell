@@ -68,6 +68,47 @@ with SandboxClient.from_active_cluster(client_credentials=auth) as client:
     print(client.health().version)
 ```
 
+## Retrieve Provider Credentials
+
+Connect directly with a trusted `OU=operator` client certificate after enabling
+[operator authentication](/how-it-works/gateways/authentication#mtls-operators).
+Do not supply a bearer token or use an OIDC login for this connection. No sandbox
+creation or provider attachment is required.
+
+```python
+from datetime import timedelta
+from pathlib import Path
+
+from openshell import SandboxClient, TlsConfig
+
+tls = TlsConfig(
+    ca_path=Path("ca.crt"),
+    cert_path=Path("operator.crt"),
+    key_path=Path("operator.key"),
+)
+with SandboxClient("gateway.example.com:443", tls=tls) as client:
+    credentials = client.providers().get_credentials(
+        "my-graph",
+        ["MS_GRAPH_ACCESS_TOKEN"],
+        workspace="production",
+        minimum_remaining_lifetime=timedelta(minutes=5),
+    )
+    token = credentials["MS_GRAPH_ACCESS_TOKEN"].value
+```
+
+`ProviderClient` also accepts an existing `grpc.Channel`. Its
+`get_credentials()` method requires an explicit workspace and key selection.
+It returns a dictionary of `ProviderCredentialValue` objects with `value` and
+optional `expiration_time`, a UTC `datetime`. Pass a `timedelta` for
+`minimum_remaining_lifetime`; omission or zero uses the gateway default.
+The helper uses the connection's timeout and does not retry or cache exports.
+Gateway failures raise `GatewayError`; invalid local selections raise `ValueError`.
+
+The value is excluded from the object's `repr`, but serialization still exposes
+it. Keep exported secrets out of logs and shared output. See
+[Retrieve Runtime Credentials](/how-it-works/providers/overview#retrieve-runtime-credentials)
+for freshness, supported credentials, and the export security boundary.
+
 ## Create and Use a Sandbox
 
 Python SDK methods take an explicit workspace. This example creates a sandbox,

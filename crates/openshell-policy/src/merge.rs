@@ -54,10 +54,11 @@ pub fn canonicalize_advisor_add_rule(
         .cloned()
         .map(|mut endpoint| {
             // Provenance does not change the endpoint contract. The gateway
-            // derives the credential marker, and the advisor marker records
-            // where a persisted endpoint came from.
+            // derives credential markers and token owners; the advisor marker
+            // records where a persisted endpoint came from.
             endpoint.provider_credentialed = false;
             endpoint.advisor_proposed = false;
+            endpoint.token_grant_owner.clear();
             // A denial observes one binary-to-port authorization. Preserve the
             // existing inspection contract, but never copy sibling ports from
             // a multi-port endpoint into the proposal.
@@ -93,6 +94,7 @@ pub fn canonicalize_advisor_add_rule(
                 let mut normalized = endpoint.clone();
                 normalized.provider_credentialed = false;
                 normalized.advisor_proposed = false;
+                normalized.token_grant_owner.clear();
                 normalize_endpoint(&mut normalized);
                 normalized == contract
             }) && incoming_rule
@@ -114,6 +116,7 @@ pub fn canonicalize_advisor_add_rule(
                     let mut normalized = (*endpoint).clone();
                     normalized.provider_credentialed = false;
                     normalized.advisor_proposed = false;
+                    normalized.token_grant_owner.clear();
                     normalize_endpoint(&mut normalized);
                     normalized == contract
                 })
@@ -2611,6 +2614,7 @@ mod tests {
     fn canonicalize_advisor_preserves_existing_advisor_endpoint_provenance() {
         let mut advisor_endpoint = endpoint("index.crates.io", 443);
         advisor_endpoint.advisor_proposed = true;
+        advisor_endpoint.token_grant_owner = "copied-advisor-owner".to_string();
         let mut base = SandboxPolicy::default();
         base.network_policies.insert(
             "advisor_index".to_string(),
@@ -2637,6 +2641,7 @@ mod tests {
 
         assert_eq!(rule_name, "advisor_index");
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
     }
 
     #[test]
@@ -2647,6 +2652,7 @@ mod tests {
         provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
+        provider_endpoint.token_grant_owner = "derived-provider-owner".to_string();
         let mut effective = SandboxPolicy::default();
         effective.network_policies.insert(
             "_provider_example".to_string(),
@@ -2678,6 +2684,7 @@ mod tests {
         );
         assert!(!canonical.endpoints[0].provider_credentialed);
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint
@@ -2691,10 +2698,12 @@ mod tests {
         provider_endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
         provider_endpoint.access = NetworkAccessPreset::ReadOnly as i32;
         provider_endpoint.provider_credentialed = true;
+        provider_endpoint.token_grant_owner = "derived-provider-owner".to_string();
 
         let mut advisor_endpoint = provider_endpoint.clone();
         advisor_endpoint.provider_credentialed = false;
         advisor_endpoint.advisor_proposed = true;
+        advisor_endpoint.token_grant_owner = "copied-advisor-owner".to_string();
 
         let mut base = SandboxPolicy::default();
         base.network_policies.insert(
@@ -2738,6 +2747,7 @@ mod tests {
             NetworkAccessPreset::ReadOnly as i32
         );
         assert!(canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].token_grant_owner.is_empty());
     }
 
     #[test]

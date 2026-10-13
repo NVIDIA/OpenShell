@@ -2200,6 +2200,83 @@ async fn cas_concurrent_updates_one_succeeds() {
     assert_eq!(record.resource_version, 2);
 }
 
+/// Write `payload` to the shared `sandbox-1` row under `condition`.
+async fn put_sandbox_1(
+    store: &Store,
+    payload: &str,
+    condition: super::WriteCondition,
+) -> Result<super::WriteResult, PersistenceError> {
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            "default",
+            payload.as_bytes(),
+            None,
+            condition,
+        )
+        .await
+}
+
+/// Each write must report the version it produced, even while other writers
+/// race on the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_writes_return_their_own_resource_version() {
+    use super::WriteCondition;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    const WRITERS: u64 = 8;
+    const WRITES: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = on_disk_store_url(&tmp.path().join("openshell.db"));
+    let store = Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
+    put_sandbox_1(&store, "initial", WriteCondition::MustCreate)
+        .await
+        .unwrap();
+
+    let writers = (0..WRITERS).map(|writer| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut versions = Vec::new();
+            for write in 0..WRITES {
+                let payload = format!("{writer}-{write}");
+                let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
+                    .await
+                    .unwrap();
+                versions.push(unconditional.resource_version);
+
+                // Retry the version-checked update until it wins a race.
+                loop {
+                    let current = store.get("sandbox", "id-1").await.unwrap().unwrap();
+                    let condition = WriteCondition::MatchResourceVersion(current.resource_version);
+                    match put_sandbox_1(&store, &payload, condition).await {
+                        Ok(result) => {
+                            versions.push(result.resource_version);
+                            break;
+                        }
+                        Err(PersistenceError::Conflict { .. }) => {}
+                        Err(err) => panic!("unexpected error: {err}"),
+                    }
+                }
+            }
+            versions
+        })
+    });
+
+    let mut seen = BTreeSet::new();
+    for handle in futures::future::join_all(writers).await {
+        for version in handle.unwrap() {
+            assert!(seen.insert(version), "version {version} returned twice");
+        }
+    }
+
+    let total = WRITERS * WRITES * 2;
+    assert_eq!(seen, (2..=total + 1).collect::<BTreeSet<_>>());
+}
+
 #[tokio::test]
 async fn cas_update_message_cas_succeeds() {
     use openshell_core::proto::Sandbox;

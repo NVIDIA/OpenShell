@@ -236,8 +236,9 @@ cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
-`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+`values-gateway.yaml` creates the `openshell` `Gateway` (listener on port 80,
+class `eg`) and an `openshell` `GRPCRoute` in the `openshell` namespace. The
+`high-availability` profile
 installs the Envoy Gateway Helm chart and layers both
 `values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
 release.

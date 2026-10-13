@@ -124,6 +124,7 @@ impl DescriptorAuthTable {
                     "bearer" => AuthMode::Bearer,
                     "dual" => AuthMode::Dual,
                     "peer" => AuthMode::Peer,
+                    "operator" => AuthMode::Operator,
                     other => {
                         return Err(format!("method {path}: unknown auth_mode '{other}'"));
                     }
