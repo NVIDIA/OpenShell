@@ -157,9 +157,9 @@ fn provisioning_span(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DockerSupervisorNetworkMode {
-    /// Use bridge for Sysbox/ECI workloads, otherwise use host networking.
-    #[default]
+    /// Use the default host networking mode.
     Auto,
+    #[default]
     Host,
     Bridge,
 }
@@ -295,7 +295,7 @@ impl Default for DockerComputeConfig {
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
-            supervisor_network_mode: DockerSupervisorNetworkMode::Auto,
+            supervisor_network_mode: DockerSupervisorNetworkMode::Host,
             sandbox_runtime_image: None,
             supervisor_bin: None,
             supervisor_image: None,
@@ -5091,16 +5091,7 @@ async fn spawn_docker_control_process(
     config: &DockerDriverRuntimeConfig,
     failure_context: DockerRuntimeFailureContext,
 ) -> Result<DockerControlProcess, Status> {
-    // Inspect the existing workload on every supervisor launch, including restart.
-    // This adds no diagnostic container and observes the actual selected runtime.
-    let (network_mode, supervisor_endpoint) = Box::pin(async {
-        let workload = docker
-            .inspect_container(&failure_context.container_id, None)
-            .await
-            .map_err(|error| internal_status("inspect Docker workload runtime", error))?;
-        docker_supervisor_networking(config, &workload)
-    })
-    .await?;
+    let (network_mode, supervisor_endpoint) = docker_supervisor_networking(config)?;
     info!(sandbox_id = %sandbox.id, ?network_mode, endpoint = %supervisor_endpoint,
         "Selected Docker supervisor networking");
     let directory = docker_boundary_state_dir(sandbox, config)?;
@@ -6639,15 +6630,8 @@ fn default_docker_bridge_endpoint(
 
 fn docker_supervisor_networking(
     config: &DockerDriverRuntimeConfig,
-    workload: &bollard::models::ContainerInspectResponse,
 ) -> Result<(DockerSupervisorNetworkMode, String), Status> {
-    let sysbox = workload
-        .host_config
-        .as_ref()
-        .and_then(|host| host.runtime.as_deref())
-        .is_some_and(|runtime| runtime == "sysbox-runc");
     let mode = match config.supervisor_network_mode {
-        DockerSupervisorNetworkMode::Auto if sysbox => DockerSupervisorNetworkMode::Bridge,
         DockerSupervisorNetworkMode::Auto => DockerSupervisorNetworkMode::Host,
         mode => mode,
     };

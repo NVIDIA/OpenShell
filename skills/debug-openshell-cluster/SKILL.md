@@ -311,17 +311,16 @@ Common findings:
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean the supervisor's selected network mode cannot reach the gateway.
   Check the gateway's `Selected Docker supervisor networking` log. The default
-  `supervisor_network_mode = "auto"` selects bridge for inspected `sysbox-runc`
-  workloads (ECI), and host otherwise. Host mode requires Desktop host
-  networking enabled and ECI disabled; set `bridge` explicitly when neither
-  feature is enabled. Bridge mode uses `host.docker.internal` for the Desktop
-  host and requires a bridge-reachable listener on native Linux. Explicit
+  `supervisor_network_mode = "host"` uses host networking; `auto` also selects
+  host. Host mode requires Desktop host networking enabled; set `bridge`
+  explicitly to use the bridge network. Bridge mode uses `host.docker.internal`
+  for the Desktop host and requires a bridge-reachable listener on native Linux. Explicit
   `grpc_endpoint` values must be reachable in the selected mode, including any
   remapped published port, with matching TLS certificate names. The local
   `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
-  supplies an override. Mode selection
-  does not bypass Landlock/seccomp qualification. A gateway container under ECI
-  also needs an administrator-approved Docker socket exception. See the
+  supplies an override. The OTLP collector endpoint must also be reachable
+  from the supervisor's selected network. Mode selection does not bypass
+  Landlock/seccomp qualification. See the
   published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
   for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.

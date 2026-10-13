@@ -212,7 +212,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         supervisor_otlp_endpoint: None,
-        supervisor_network_mode: DockerSupervisorNetworkMode::Auto,
+        supervisor_network_mode: DockerSupervisorNetworkMode::Host,
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
@@ -3100,30 +3100,17 @@ fn docker_supervisor_defaults_to_the_primary_loopback_endpoint() {
 }
 
 #[test]
-fn docker_supervisor_selects_bridge_for_sysbox_and_honors_operator_mode() {
-    for (runtime, requested, expected) in [
+fn docker_supervisor_honors_operator_network_mode() {
+    for (requested, expected) in [
         (
-            Some("sysbox-runc"),
-            DockerSupervisorNetworkMode::Auto,
-            DockerSupervisorNetworkMode::Bridge,
-        ),
-        (
-            Some("runc"),
             DockerSupervisorNetworkMode::Auto,
             DockerSupervisorNetworkMode::Host,
         ),
         (
-            None,
-            DockerSupervisorNetworkMode::Auto,
-            DockerSupervisorNetworkMode::Host,
-        ),
-        (
-            Some("sysbox-runc"),
             DockerSupervisorNetworkMode::Host,
             DockerSupervisorNetworkMode::Host,
         ),
         (
-            Some("runc"),
             DockerSupervisorNetworkMode::Bridge,
             DockerSupervisorNetworkMode::Bridge,
         ),
@@ -3132,14 +3119,7 @@ fn docker_supervisor_selects_bridge_for_sysbox_and_honors_operator_mode() {
         config.supervisor_network_mode = requested;
         config.supervisor_endpoint_explicit = false;
         config.supervisor_grpc_endpoint = "https://127.0.0.1:8443".into();
-        let inspected = bollard::models::ContainerInspectResponse {
-            host_config: Some(HostConfig {
-                runtime: runtime.map(str::to_string),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let (mode, endpoint) = docker_supervisor_networking(&config, &inspected).unwrap();
+        let (mode, endpoint) = docker_supervisor_networking(&config).unwrap();
         assert_eq!(mode, expected);
         assert_eq!(
             endpoint,
@@ -3162,11 +3142,7 @@ fn docker_bridge_preserves_explicit_endpoints_and_rejects_loopback() {
         "https://[fd00::2]:9443",
     ] {
         config.supervisor_grpc_endpoint = endpoint.into();
-        let (_, selected) = docker_supervisor_networking(
-            &config,
-            &bollard::models::ContainerInspectResponse::default(),
-        )
-        .unwrap();
+        let (_, selected) = docker_supervisor_networking(&config).unwrap();
         assert_eq!(selected, endpoint);
     }
     for endpoint in [
@@ -3177,11 +3153,7 @@ fn docker_bridge_preserves_explicit_endpoints_and_rejects_loopback() {
         "http://[::]:8080",
     ] {
         config.supervisor_grpc_endpoint = endpoint.into();
-        let error = docker_supervisor_networking(
-            &config,
-            &bollard::models::ContainerInspectResponse::default(),
-        )
-        .unwrap_err();
+        let error = docker_supervisor_networking(&config).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("grpc_endpoint"));
     }
@@ -3212,11 +3184,7 @@ fn docker_bridge_defaults_respect_desktop_and_linux_listener_reachability() {
     config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
     config.supervisor_endpoint_explicit = false;
     config.bridge_default_endpoint = None;
-    let error = docker_supervisor_networking(
-        &config,
-        &bollard::models::ContainerInspectResponse::default(),
-    )
-    .unwrap_err();
+    let error = docker_supervisor_networking(&config).unwrap_err();
     assert!(error.message().contains("bind_address"));
 }
 
@@ -3258,7 +3226,7 @@ fn docker_supervisor_network_mode_is_an_operator_config_enum() {
         toml::from_str::<DockerComputeConfig>("")
             .unwrap()
             .supervisor_network_mode,
-        DockerSupervisorNetworkMode::Auto
+        DockerSupervisorNetworkMode::Host
     );
     for (value, expected) in [
         ("auto", DockerSupervisorNetworkMode::Auto),

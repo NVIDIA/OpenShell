@@ -42,10 +42,8 @@ binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
 bypassed. The trusted supervisor companion originates approved egress. Its
-operator-owned `supervisor_network_mode` defaults to `auto`: each launch
-inspects the existing workload container and chooses bridge for `sysbox-runc`
-(the Docker Desktop ECI runtime), or host for other runtimes. Explicit `host`
-and `bridge` values override this heuristic. No probe container is created.
+operator-owned `supervisor_network_mode` defaults to `host`. Set `bridge` to
+run the supervisor on Docker's bridge network; `auto` also selects host.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
@@ -183,8 +181,8 @@ For HTTPS endpoints, the supervisor receives only the gateway CA and
 uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
-Host mode on Docker Desktop requires host networking enabled in Settings and
-ECI disabled. Bridge mode uses Docker-resolved `host-gateway` entries for both
+Host mode on Docker Desktop requires host networking enabled in Settings.
+Bridge mode uses Docker-resolved `host-gateway` entries for both
 host aliases. The supervisor's `--host-gateway-from-hosts` option pins the
 numeric address from its own driver-owned `/etc/hosts` into the runtime
 descriptor before attaching the workload; workload DNS and hosts files cannot
@@ -200,9 +198,8 @@ Explicit endpoints retain TLS verification and are never rewritten; bridge
 rejects loopback/unspecified endpoint addresses. Host services bound only to
 loopback are also unreachable from a native Linux bridge supervisor.
 
-Selecting bridge does not qualify full ECI support. Landlock and seccomp probes
-remain mandatory, and a gateway container under ECI needs an administrator's
-Docker socket exception.
+The selected network mode does not change the sandbox's mandatory Landlock
+and seccomp qualification.
 
 The supervisor owns these security-critical variables:
 
