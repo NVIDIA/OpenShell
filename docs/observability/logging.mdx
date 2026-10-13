@@ -266,12 +266,9 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 Each format rotates daily with an independent three-file limit.
 
 Update supervisor OCSF collectors from `openshell-ocsf.*.log` to
-`openshell-ocsf.*.jsonl`. On startup, the supervisor migrates existing
-`openshell-ocsf.*.log` files to `.jsonl` before initializing either appender.
-It does not overwrite an existing destination. If migration fails, including
-when both extensions exist for the same date, file logging falls back to stderr
-without running retention cleanup. Collect and resolve conflicting files before
-restarting. Shorthand filenames and Windows MXC gateway filenames are unchanged.
+`openshell-ocsf.*.jsonl`. Existing OCSF `.log` files are not migrated or protected
+from shorthand retention cleanup. Collect any needed legacy history before
+upgrading. Shorthand filenames and Windows MXC gateway filenames are unchanged.
 
 File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output.
 
