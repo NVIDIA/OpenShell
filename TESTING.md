@@ -336,6 +336,12 @@ mise run e2e:kubernetes:credential-drivers
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 
+The `e2e-kubernetes` nextest profile temporarily excludes only
+`canonical_main_connect_recovers_its_ssh_transport` while
+[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+input-owner release through port-forwarding. The test remains available to other
+driver profiles; the remaining Kubernetes tests stay enabled.
+
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
 via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
 reaches the gateway through `kubectl port-forward`; on OpenShift it instead uses a
