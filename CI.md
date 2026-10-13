@@ -105,8 +105,10 @@ runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
 existing Nix devShell; the SDK is not an OpenShell package dependency.
 It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
 repository; candidate-side agent configuration and instructions are not loaded.
-Its permission profile keeps files read-only and enables network access for
-GitHub lookups. Only the GitHub token and tool/certificate paths are passed to
+Its permission profile keeps files read-only and routes shell network access
+through the Codex network proxy, allowing only `api.github.com` for GitHub
+lookups. Upstream proxy chaining and SOCKS access are disabled.
+Only the GitHub token and tool/certificate paths are passed to
 agent shell commands; the inference credential is excluded.
 It does not run candidate builds or tests. The review has a 30-minute execution
 limit inside a 40-minute job timeout.
