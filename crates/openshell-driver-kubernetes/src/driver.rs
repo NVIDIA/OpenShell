@@ -724,16 +724,23 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    /// Environment that lets a supervisor export spans and join the current trace.
-    fn supervisor_tracing_environment(&self) -> Vec<(&'static str, String)> {
-        let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() else {
-            return Vec::new();
-        };
-        let mut environment = vec![(
-            openshell_core::sandbox_env::OTLP_ENDPOINT,
-            endpoint.to_string(),
-        )];
-        environment.extend(openshell_otel::current_trace_context_environment());
+    /// Environment that lets a supervisor export spans, joining the current
+    /// trace, and OCSF events, identifying the gateway that launched it.
+    fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
+        let mut environment = Vec::new();
+        if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
+            environment.push((
+                openshell_core::sandbox_env::OTLP_ENDPOINT,
+                endpoint.to_string(),
+            ));
+            environment.extend(openshell_otel::current_trace_context_environment());
+        }
+        if let Some(export) = &self.config.supervisor_ocsf_export {
+            environment.extend(export.environment());
+        }
+        if let Some(name) = &self.config.supervisor_gateway_name {
+            environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+        }
         environment
     }
 
@@ -2519,7 +2526,7 @@ impl KubernetesComputeDriver {
                             .as_str(),
                     ),
                     dependent_owner.clone(),
-                    &self.supervisor_tracing_environment(),
+                    &self.supervisor_otlp_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -3341,7 +3348,7 @@ impl KubernetesComputeDriver {
                         &sandbox_api.resource.api_version,
                         false,
                     ),
-                    &self.supervisor_tracing_environment(),
+                    &self.supervisor_otlp_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -7637,6 +7644,57 @@ mod tests {
         assert!(
             matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
             "expected request timeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_otlp_environment_carries_only_configured_signals() {
+        use openshell_core::sandbox_env::{
+            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+        };
+
+        let names = |config: KubernetesComputeConfig| {
+            KubernetesComputeDriver::new_for_test(config)
+                .supervisor_otlp_environment()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(KubernetesComputeConfig::default()).is_empty());
+        assert_eq!(
+            names(KubernetesComputeConfig {
+                supervisor_otlp_endpoint: Some("http://traces:4317".into()),
+                ..Default::default()
+            })
+            .first(),
+            Some(&OTLP_ENDPOINT)
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_ocsf_export: Some(OcsfOtlpExport {
+                endpoint: "http://siem:4317".into(),
+                schema_version: Some("1.1".into()),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
+                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
+            ]
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_gateway_name: Some("prod-west".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [(
+                openshell_core::sandbox_env::GATEWAY_NAME,
+                "prod-west".to_string()
+            )]
         );
     }
 

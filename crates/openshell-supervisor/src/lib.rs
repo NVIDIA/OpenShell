@@ -5190,6 +5190,7 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         };
         let error = run_sandbox(
             vec!["true".to_string()],

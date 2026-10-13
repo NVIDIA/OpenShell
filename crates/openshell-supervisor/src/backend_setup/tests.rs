@@ -66,6 +66,7 @@ impl TestSetup {
                 sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
                 sandbox_expires_at: 0,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             sandbox_id: "sandbox-1".to_string(),
             selected_name: TEST_BACKEND,

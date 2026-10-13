@@ -248,6 +248,15 @@ pub struct KubernetesComputeConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
@@ -370,6 +379,8 @@ impl Default for KubernetesComputeConfig {
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),

@@ -729,6 +729,7 @@ pub struct ComputeRuntime {
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
+    supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -821,6 +822,7 @@ impl ComputeRuntime {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
+            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
         })
     }
 
@@ -834,6 +836,17 @@ impl ComputeRuntime {
                 self.store.clone(),
                 credentials,
             ));
+    }
+
+    /// Collector headers that launch bundles carry to supervisors for OCSF
+    /// export.
+    pub(crate) fn configure_supervisor_ocsf_headers(
+        &self,
+        headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
+    ) {
+        if let Some(headers) = headers {
+            let _ = self.supervisor_ocsf_headers.set(headers);
+        }
     }
 
     pub(crate) async fn prepare_ssh_identity(
@@ -862,6 +875,7 @@ impl ComputeRuntime {
         let mut with_identity = sandbox.clone();
         self.prepare_ssh_identity(&mut with_identity, &mut authentication)
             .await?;
+        authentication.supervisor.ocsf_otlp_headers = self.supervisor_ocsf_headers.get().cloned();
         serialize_launch_authentication(authentication)
     }
 
@@ -7600,6 +7614,7 @@ pub fn new_test_runtime_with_driver(
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
+        supervisor_ocsf_headers: Arc::new(OnceLock::new()),
     }
 }
 
@@ -8711,6 +8726,7 @@ mod tests {
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
+            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
         }
     }
 
@@ -12376,6 +12392,44 @@ mod tests {
             sandbox_resource_version(&after_retry),
             sandbox_resource_version(&stored) + 2,
             "Starting retry claims and settles another operation without rotating identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_bundles_carry_supervisor_ocsf_headers() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        runtime.configure_supervisor_ocsf_headers(Some(
+            openshell_core::jwt::SecretOtlpHeaders::new(
+                "authorization=Bearer%20secret".to_string(),
+            ),
+        ));
+        let sandbox = sandbox_record(
+            "sb-ocsf-headers",
+            "sandbox-ocsf-headers",
+            SandboxPhase::Stopped,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&test_session_authority()),
+            )
+            .await
+            .unwrap();
+
+        let authentications = driver.start_authentications();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        assert_eq!(
+            authentication
+                .supervisor
+                .ocsf_otlp_headers
+                .as_ref()
+                .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret),
+            Some("authorization=Bearer%20secret")
         );
     }
 

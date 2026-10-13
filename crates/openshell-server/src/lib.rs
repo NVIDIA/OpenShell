@@ -664,6 +664,11 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
+    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {

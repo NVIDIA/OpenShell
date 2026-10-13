@@ -23,6 +23,7 @@
 //! Diagnostic logs and metrics are not exported over OTLP. They have their own
 //! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
 
+use openshell_core::jwt::SecretOtlpHeaders;
 use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
@@ -210,6 +211,25 @@ impl OtlpExport {
             ocsf.exporter.shutdown().await;
         }
     }
+}
+
+/// Collector headers for supervisors to send with their OCSF exports: the
+/// headers the gateway's own OCSF exporter reads from its environment, with the
+/// same precedence. Supervisors receive them in their launch bundle because
+/// they do not inherit the gateway's environment.
+pub fn supervisor_ocsf_headers(otlp: Option<&OtlpConfig>) -> Option<SecretOtlpHeaders> {
+    ocsf_headers_from(otlp, |name| std::env::var(name).ok())
+}
+
+fn ocsf_headers_from(
+    otlp: Option<&OtlpConfig>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<SecretOtlpHeaders> {
+    otlp?.ocsf.as_ref()?;
+    var("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+        .or_else(|| var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .filter(|headers| !headers.trim().is_empty())
+        .map(SecretOtlpHeaders::new)
 }
 
 /// Build the `tracing` layer that forwards spans to `provider`.
@@ -568,6 +588,43 @@ mod tests {
         build_resource(cfg, GatewayResourceAttributes::default())
     }
 
+    #[test]
+    fn supervisors_receive_the_gateway_ocsf_headers() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        let headers = |otlp: &OtlpConfig, vars| {
+            ocsf_headers_from(Some(otlp), env(vars)).map(|h| h.expose_secret().to_string())
+        };
+        let mut otlp = config();
+        let both: &[(&str, &str)] = &[
+            ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "authorization=logs"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all"),
+        ];
+        assert_eq!(headers(&otlp, both), None, "OCSF export is not enabled");
+
+        otlp.ocsf = Some(ocsf_config("http://127.0.0.1:4317"));
+        assert_eq!(headers(&otlp, both).as_deref(), Some("authorization=logs"));
+        assert_eq!(
+            headers(
+                &otlp,
+                &[("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all")]
+            )
+            .as_deref(),
+            Some("authorization=all")
+        );
+        assert_eq!(
+            headers(&otlp, &[("OTEL_EXPORTER_OTLP_LOGS_HEADERS", " ")]),
+            None
+        );
+        assert_eq!(headers(&otlp, &[]), None);
+        assert!(ocsf_headers_from(None, env(both)).is_none());
+    }
+
     #[tokio::test]
     async fn each_signal_exports_only_when_configured() {
         let (export, error) =
@@ -630,6 +687,41 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&received.log_bodies[0]).unwrap(),
             expected
         );
+    }
+
+    /// Supervisors authenticate to the collector with the headers from their
+    /// launch bundle.
+    #[tokio::test]
+    async fn ocsf_export_sends_explicit_collector_headers() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use tracing_subscriber::prelude::*;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let target = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: collector.endpoint(),
+            service_name: ServiceName::Fixed("openshell-supervisor"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap();
+        let export = OcsfOtlp::start(
+            target
+                .log_exporter_with_headers(Some("authorization=Bearer%20collector-token"))
+                .unwrap(),
+            target.resource().clone(),
+            None,
+        );
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .message("policy approved")
+                .build();
+        let subscriber = tracing_subscriber::registry().with(export.layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.log_bodies.len(), 1);
+        assert_eq!(received.log_authorizations, ["Bearer collector-token"]);
     }
 
     #[test]

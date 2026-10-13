@@ -77,18 +77,36 @@ fn select_grpc_endpoint(
     )
 }
 
-/// Point a loopback collector endpoint at the desktop host on Podman Machine,
-/// where supervisor loopback is the VM's.
 fn select_supervisor_otlp_endpoint(
     config: &PodmanComputeConfig,
     environment: PodmanEndpointEnvironment,
 ) -> Option<String> {
-    let endpoint = config.supervisor_otlp_endpoint.as_deref()?;
+    config
+        .supervisor_otlp_endpoint
+        .as_deref()
+        .map(|endpoint| supervisor_collector_endpoint(endpoint, environment))
+}
+
+fn select_supervisor_ocsf_export(
+    config: &PodmanComputeConfig,
+    environment: PodmanEndpointEnvironment,
+) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
+    config.supervisor_ocsf_export.clone().map(|export| {
+        openshell_core::sandbox_env::OcsfOtlpExport {
+            endpoint: supervisor_collector_endpoint(&export.endpoint, environment),
+            ..export
+        }
+    })
+}
+
+/// Point a loopback collector endpoint at the desktop host on Podman Machine,
+/// where supervisor loopback is the VM's.
+fn supervisor_collector_endpoint(endpoint: &str, environment: PodmanEndpointEnvironment) -> String {
     if environment == PodmanEndpointEnvironment::LinuxHost {
-        return Some(endpoint.to_string());
+        return endpoint.to_string();
     }
     let Ok(mut url) = url::Url::parse(endpoint) else {
-        return Some(endpoint.to_string());
+        return endpoint.to_string();
     };
     let loopback = match url.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
@@ -97,13 +115,13 @@ fn select_supervisor_otlp_endpoint(
         None => false,
     };
     if !loopback || url.set_host(Some(environment.gateway_host())).is_err() {
-        return Some(endpoint.to_string());
+        return endpoint.to_string();
     }
     let rewritten = String::from(url);
     if endpoint.ends_with('/') {
-        Some(rewritten)
+        rewritten
     } else {
-        Some(rewritten.trim_end_matches('/').to_string())
+        rewritten.trim_end_matches('/').to_string()
     }
 }
 
@@ -541,6 +559,8 @@ impl PodmanComputeDriver {
         config.grpc_endpoint = select_grpc_endpoint(&config, PodmanEndpointEnvironment::current());
         config.supervisor_otlp_endpoint =
             select_supervisor_otlp_endpoint(&config, PodmanEndpointEnvironment::current());
+        config.supervisor_ocsf_export =
+            select_supervisor_ocsf_export(&config, PodmanEndpointEnvironment::current());
         if endpoint_was_selected {
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -2106,6 +2126,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway-test".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -2782,6 +2803,29 @@ mod tests {
                 "{endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_ocsf_endpoint_uses_host_alias_for_loopback_on_podman_machine() {
+        let export = |endpoint: &str| openshell_core::sandbox_env::OcsfOtlpExport {
+            endpoint: endpoint.to_string(),
+            schema_version: Some("1.3".to_string()),
+        };
+        let config = PodmanComputeConfig {
+            supervisor_ocsf_export: Some(export("http://127.0.0.1:4317")),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(
+            select_supervisor_ocsf_export(&config, PodmanEndpointEnvironment::PodmanMachine),
+            Some(export("http://host.containers.internal:4317"))
+        );
+        assert_eq!(
+            select_supervisor_ocsf_export(
+                &PodmanComputeConfig::default(),
+                PodmanEndpointEnvironment::PodmanMachine
+            ),
+            None
+        );
     }
 
     #[test]
