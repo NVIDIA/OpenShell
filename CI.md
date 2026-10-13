@@ -201,9 +201,10 @@ scanners upload results directly:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
-- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
-  candidate against the previous stable release. Every candidate in a release
-  train therefore rescans the cumulative stable-to-candidate diff. It calls
+- `Codex Security Release Qualification` can manually analyze a `vX.Y.Z-pre.N`
+  candidate against the previous stable release. It is temporarily excluded
+  from tagged-release qualification. Each scan reviews the cumulative
+  stable-to-candidate diff. It calls
   `https://inference-api.nvidia.com/v1` with
   `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
   `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
@@ -232,23 +233,18 @@ nix develop --command zizmor --offline --persona=regular --min-severity=high --n
 
 `Security Scan` (`.github/workflows/security-scan.yml`) calls CodeQL, Trivy,
 Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in parallel for a
-release tag. It additionally calls Codex Security for `vX.Y.Z-pre.N` tags, which
-Codex compares with the previous stable release. Run the parent manually from
+release tag. Codex Security is temporarily excluded; its standalone workflow
+remains available for manual investigation. Run the parent manually from
 Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat Cargo Deny findings as failures of the currently
-implemented qualification profile. Codex Security is temporarily advisory:
-findings, incomplete coverage, and execution failures do not block publication.
-The scan still runs and retains its existing reports and public execution
-diagnostics; its advisory check does not assert a successful scan. Restore
-Codex enforcement by removing `codex-advisory: true` from `Release Tag`.
-A profile failure prevents both pre-release and stable publication.
-CodeQL, Trivy, and Zizmor findings are temporarily informational for tagged
-releases: the existing findings were
+Tagged releases treat Cargo Deny findings as failures of the
+currently implemented qualification profile. A profile failure prevents both
+pre-release and stable publication. CodeQL, Trivy, and Zizmor findings are
+temporarily informational for tagged releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
-Other scanner failures still fail qualification.
+Scanner failures still fail qualification.
 
 Failed pre-release builds send notifications via Slack using a webhook and
 at-mentioning the triage engineer with a link to the failure. The webhook is
@@ -260,7 +256,6 @@ webhook skips sending; an unset mention sends without a mention.
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
-  -F fail-on-codex-findings=false \
   -F fail-on-static-findings=false
 ```
 
@@ -282,15 +277,12 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ needs.build.outputs.candidate_tag }}
-      stable_ref: v0.1.0 # Optional; otherwise resolved automatically.
       images: |
         ${{ needs.build.outputs.gateway_image }}
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
-      fail-on-codex-findings: true
       fail-on-static-findings: true
     secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 ```
 
@@ -310,32 +302,28 @@ The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-`CODEX_SECURITY_API_KEY` is required; `CACHIX_AUTH_TOKEN` is optional. The parent
-publishes SARIF, including Codex results for manual parent runs. Codex keeps its
-release-train category on `main`; CodeQL, Trivy, and workflow reports publish
-against the candidate tag and commit. Existing standalone triggers stay active.
+`CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
+and workflow reports against the candidate tag and commit. Existing standalone
+triggers stay active.
 
-The parent fails on Codex findings when `fail-on-codex-findings` is `true` and
-on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
-`fail-on-static-findings` is `true`. Both inputs default to `true`. Set either
-input to `false` to make only that finding class informational. Scanner setup,
+The parent fails on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
+`fail-on-static-findings` is `true`, which is the default. Set it to `false`
+to make those findings informational. Scanner setup,
 execution, and report publication errors still fail. Reports are published
-before the finding threshold is enforced. Reusable callers can explicitly set
-`codex-advisory: true` to tolerate all Codex job failures; `Release Tag`
-temporarily enables this exception. It defaults to `false` and is not exposed
-on manual dispatches.
+before the finding threshold is enforced.
 
-Codex uses each finding's severity; CodeQL uses the rule's security score
+CodeQL uses the rule's security score
 (at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
 upstream fix; Zizmor uses its High severity. Actionlint remains informational.
 Existing scanner exceptions still apply.
 
 Cargo Deny runs only `cargo deny check advisories` in the parent. It keeps its
-native failure behavior and configured exceptions regardless of either finding
+native failure behavior and configured exceptions regardless of the finding
 threshold input; it has no HIGH/CRITICAL filter. Its standalone runs still check
 all dependency policies.
 
-Codex scans the cumulative diff from `stable_ref` to `candidate_ref`. Both inputs
+The standalone Codex workflow scans the cumulative diff from `stable_ref` to
+`candidate_ref`. Both inputs
 are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
 stable automatically; set `allow_full_bootstrap: true` to permit a full scan when
 no previous stable exists.

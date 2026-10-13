@@ -140,16 +140,12 @@ jobs:
     uses: ./.github/workflows/security-scan.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
-      fail-on-codex-findings: true
-      # Temporary (#4466): retain Codex evidence while reliability is investigated.
-      codex-advisory: true
       fail-on-static-findings: false
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.source_sha }}
     secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:

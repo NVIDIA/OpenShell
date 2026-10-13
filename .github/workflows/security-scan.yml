@@ -7,21 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       candidate_ref:
-        description: Release tag to scan; Codex runs only for pre-release tags
+        description: Release tag to scan
         required: true
         type: string
-      stable_ref:
-        description: Optional previous stable tag override for Codex
-        default: ""
-        type: string
-      allow_full_bootstrap:
-        description: Allow a full Codex scan when no previous stable tag exists
-        default: false
-        type: boolean
-      fail-on-codex-findings:
-        description: Fail when Codex Security reports findings
-        default: true
-        type: boolean
       fail-on-static-findings:
         description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
         default: true
@@ -36,26 +24,10 @@ on:
         type: string
   workflow_call:
     inputs:
-      codex-advisory:
-        description: Keep Codex findings and execution failures non-blocking
-        default: false
-        type: boolean
       candidate_ref:
-        description: Release tag to scan; Codex runs only for pre-release tags
+        description: Release tag to scan
         required: true
         type: string
-      stable_ref:
-        description: Optional previous stable tag override for Codex
-        default: ""
-        type: string
-      allow_full_bootstrap:
-        description: Allow a full Codex scan when no previous stable tag exists
-        default: false
-        type: boolean
-      fail-on-codex-findings:
-        description: Fail when Codex Security reports findings
-        default: true
-        type: boolean
       fail-on-static-findings:
         description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
         default: true
@@ -69,34 +41,14 @@ on:
         default: ""
         type: string
     secrets:
-      CODEX_SECURITY_API_KEY:
-        required: true
       CACHIX_AUTH_TOKEN:
         required: false
 
 permissions:
   contents: read
 
-# Execution failures remain fatal unless the caller opts into Codex advisory mode.
+# Only the finding threshold is overridable; execution failures remain fatal.
 jobs:
-  codex:
-    name: Codex Security
-    if: contains(inputs.candidate_ref, '-pre.')
-    uses: ./.github/workflows/codex-security.yml
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    with:
-      candidate_ref: ${{ inputs.candidate_ref }}
-      stable_ref: ${{ inputs.stable_ref }}
-      allow_full_bootstrap: ${{ inputs.allow_full_bootstrap }}
-      fail-on-findings: ${{ inputs.fail-on-codex-findings }}
-      advisory: ${{ inputs.codex-advisory || false }}
-      upload_sarif: true
-    secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-
   codeql:
     name: CodeQL
     uses: ./.github/workflows/codeql.yml
