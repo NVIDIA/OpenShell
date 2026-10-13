@@ -246,3 +246,6 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# Local triage-duty reports, checkpoint, actions, and inbox
+/.agents/triage-duty/
