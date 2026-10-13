@@ -291,7 +291,6 @@ openshell sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --upload .:/workspace \
   --label team=agents \
   -- claude
 ```
