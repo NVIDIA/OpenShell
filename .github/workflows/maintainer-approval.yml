@@ -53,22 +53,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Review events can arrive while queued or after the PR has closed.
-          # Query current state; API errors must fail rather than bypass approval.
-          should_check=$(gh api graphql \
-            -F owner="${GH_REPO%%/*}" -F name="${GH_REPO#*/}" \
-            -F number="$PR_NUMBER" \
-            -f query='query($owner: String!, $name: String!, $number: Int!) {
-              repository(owner: $owner, name: $name) {
-                pullRequest(number: $number) { state mergeQueueEntry { id } }
-              }
-            }' \
-            --jq '.data.repository.pullRequest | if . == null then error("Pull request not found") else (.state == "OPEN" and .mergeQueueEntry == null) end')
-          if [ "$should_check" = "false" ]; then
-            echo "Skipping maintainer approval: PR is queued or closed."
-            exit 0
-          fi
-
           gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" --jq '.[]' \
             | jq -s '.' > reviews.json
 
