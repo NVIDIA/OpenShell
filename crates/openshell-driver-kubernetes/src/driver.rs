@@ -6849,8 +6849,7 @@ fn validate_pod_annotations(
         return Ok(());
     }
     Err(format!(
-        "pod annotations not permitted by the gateway's allowed_pod_annotations \
-         (Helm: gatewayConfig.openshell.drivers.kubernetes.allowed_pod_annotations): {}",
+        "pod annotations not permitted by the gateway's allowed_pod_annotations: {}",
         rejected.join(", ")
     ))
 }
