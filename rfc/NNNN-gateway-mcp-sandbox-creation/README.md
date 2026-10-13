@@ -18,13 +18,16 @@ limited by a grant that the user sets once when starting the tree's first
 sandbox, and recorded in a lineage so that stopping a parent stops its children
 first.
 
-Agents inside a sandbox reach the endpoint through a door in their own
-supervisor at `http://openshell.local/mcp`. The supervisor checks the calling
+The contract is a gRPC API for child sandboxes, exposed through the SDKs, the
+CLI and an MCP endpoint, so a harness can integrate at whichever level suits it.
+Agents inside a sandbox reach the gateway through a door in their own
+supervisor at `http://openshell.local`. The supervisor checks the calling
 program against a network rule that the gateway writes from the grant, attaches
 a token bound to the sandbox, and forwards the call; the agent never holds a
-credential. Harnesses running on the host call the same endpoint with the
-user's login. In both cases the gateway makes every decision, and a sandbox
-without a grant cannot create sandboxes at all.
+credential. Agents and tools running on the host call the same endpoint with the
+user's login and create sandboxes as the user would with the CLI. In every case
+the gateway makes every decision, and a sandbox without a grant cannot create
+sandboxes at all.
 
 ## Motivation
 
@@ -57,6 +60,14 @@ what a delegated agent receives.
 - **There is no lineage.** OpenShell records no parent, creator or tree for a
   sandbox. A crashed lead leaves its workers running, and there is no limit on
   how many sandboxes one delegated task can create.
+
+- **Sandboxes from sandboxes is a general need.** Sub-agents are one use.
+  Reinforcement learning environments such as Hugging Face's OpenEnv and
+  NVIDIA NeMo Gym run an agent in one environment and start isolated
+  environments for it to act in, evaluate or score; an agent on a developer's
+  machine asks for a sandbox to try something safely. Each of these needs a
+  sandbox to start other sandboxes, within limits, without holding a user
+  credential.
 
 - **Harness limits are suggestions.** Claude Code, Qwen Code, Gemini CLI and Pi
   each cap sub-agent depth or concurrency, but those limits are enforced by the
@@ -92,12 +103,13 @@ sandbox, for whom, and was it allowed".
 
 ### Overview
 
-The gateway gains an MCP endpoint, `/mcp`, served on the existing gateway port
-next to the gRPC API. It is a thin adapter: tool calls are translated into the
-same create logic the gRPC `CreateSandbox` handler uses, so an MCP caller and a
-gRPC caller get identical validation and security checks. Four new pieces sit
-behind it: grants, lineage, the boundary proof, and lifecycle management for
-trees. Two kinds of caller reach the endpoint.
+The gateway gains a child-sandbox API and an MCP endpoint, `/mcp`, served on
+the existing gateway port. The MCP endpoint is a thin adapter over the API, and
+both use the same create logic as the gRPC `CreateSandbox` handler, so every
+caller gets identical validation and security checks (see
+[Interfaces](#interfaces-api-sdk-cli-and-mcp)). Four new pieces sit behind
+them: grants, lineage, the boundary proof, and lifecycle management for trees.
+Two kinds of caller reach the gateway.
 
 **Harness inside a sandbox.** This is the main case. The user starts a lead
 sandbox with a grant. The lead's harness connects to `http://openshell.local/mcp`,
@@ -138,17 +150,19 @@ flowchart LR
   classDef user fill:#f1e6ff,stroke:#8a4fd1,stroke-width:2px,color:#18202e
 ```
 
-**Harness on the host.** A harness running on the user's machine calls the same
-endpoint directly with the user's login (OIDC bearer or mTLS client
-certificate). There is no supervisor and no door. The gateway applies the same
-checks, using a grant attached to the user's host session; its ceiling is the
-boundary the user approves for that session. The host harness itself is not
-contained by OpenShell, only the sandboxes it creates are.
+**Agent or tool on the host.** An agent on the user's machine, such as Codex,
+Claude Code or a host harness, calls the same endpoint with the user's login
+(OIDC bearer or mTLS client certificate). There is no supervisor and no door.
+The caller is the user, so it creates top-level sandboxes exactly as the user
+could with the CLI, subject to the same workspace roles; no grant is needed. If
+it gives a new sandbox a grant, that sandbox can create children as described
+below. The host agent itself is not contained by OpenShell, only the sandboxes
+it creates are.
 
 ```mermaid
 flowchart LR
-  U["User: set a grant for the host session"]:::user
-  H["Host harness, e.g. Pi or OpenWorker (uses the user's login)"]:::untrusted
+  U["User's login"]:::user
+  H["Agent on the host, e.g. Codex, Claude Code or a harness"]:::untrusted
   subgraph GW["OpenShell gateway"]
     M["MCP endpoint /mcp"]:::new
     C["Create logic"]:::changed
@@ -156,11 +170,11 @@ flowchart LR
     L[("Grants and lineage")]:::new
   end
   K["Child sandbox"]:::trusted
-  U -- "grant" --> L
-  H -- "create_sandbox with the user's login" --> M
+  U -. "acts as" .-> H
+  H -- "create_sandbox as the user" --> M
   M --> C
   C -- "prove" --> P
-  C <--> L
+  C -- "record grant if given" --> L
   C -- "launch" --> K
   classDef untrusted fill:#ffe6df,stroke:#d9472b,stroke-width:2px,color:#18202e
   classDef trusted fill:#e3edff,stroke:#2a63c9,stroke-width:2px,color:#18202e
@@ -170,7 +184,7 @@ flowchart LR
 ```
 
 The endpoint lives in the gateway rather than in each supervisor for three
-reasons. Host harnesses have no supervisor, so a supervisor-hosted server would
+reasons. Host agents have no supervisor, so a supervisor-hosted server would
 need a second path for them. Keeping the decision in one component means there
 is one implementation of the security checks and no second copy to drift. And
 MCP revisions change quickly; a gateway-hosted server is upgraded once, while a
@@ -179,6 +193,50 @@ MCP's sessionless revision also fits gateway high availability, since any
 replica can serve any request. The split follows the zero-trust pattern of
 deciding centrally and enforcing at the workload: the gateway decides, the
 supervisor enforces reachability next to the sandbox.
+
+### Interfaces: API, SDK, CLI and MCP
+
+The contract is a gRPC service. The SDKs, the CLI and the MCP endpoint are
+surfaces over it, and each MCP tool maps to one RPC. A harness that wants deep
+integration calls the SDK from its own code and decides itself when to create a
+child; a harness or agent that already speaks MCP needs only a configuration
+entry. Nothing about the security model depends on which surface is used.
+
+```proto
+service SandboxChildren {
+  rpc CreateChildSandbox(CreateChildSandboxRequest) returns (CreateChildSandboxResponse) {
+    option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:write" };
+  }
+  rpc WaitChildSandbox(WaitChildSandboxRequest) returns (WaitChildSandboxResponse) {
+    option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
+  }
+  rpc StopChildSandbox(StopChildSandboxRequest) returns (StopChildSandboxResponse) {
+    option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:write" };
+  }
+  rpc ListChildSandboxes(ListChildSandboxesRequest) returns (ListChildSandboxesResponse) {
+    option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
+  }
+  rpc GetSandboxLimits(GetSandboxLimitsRequest) returns (GetSandboxLimitsResponse) {
+    option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
+  }
+}
+```
+
+`auth_mode: "dual"` admits both user and sandbox principals. For sandbox
+principals each handler applies a child-scope guard, in the style of
+`ensure_sandbox_principal_scope`: a sandbox may create children only under its
+grant and act only on its own descendants. `exec` and `get_file` use the
+existing `ExecSandbox` RPC with the same guard.
+
+| Surface | Used by | How it reaches the gateway |
+|---------|---------|----------------------------|
+| gRPC / SDK (Rust, Python, TypeScript, Go) | Harnesses integrating in code; services such as RL environment runners | From a sandbox: through the door at `openshell.local`. From the host: the user's login. |
+| CLI | Users and scripts | The user's login |
+| MCP `/mcp` | Any MCP-capable agent or harness | From a sandbox: through the door. From the host: the user's login. |
+
+The door forwards both the MCP endpoint and the `SandboxChildren` service, so
+SDK code inside a sandbox connects to `openshell.local` with no credential in
+the same way an MCP client does.
 
 ### Grants
 
@@ -216,6 +274,9 @@ message SandboxGrantSpec {
   // Absolute path of the executable allowed to use the door,
   // for example /usr/local/bin/node for a Node-based harness.
   string program = 5;
+  // NARROW (default): agents write their children's network rules within the
+  // ceiling. INHERIT: every child receives its parent's ceiling unchanged.
+  ChildPolicyMode child_policy = 6;
 }
 
 message CreateSandboxRequest {
@@ -346,12 +407,36 @@ of a sandbox that has a lineage, whatever the source: `UpdateConfig`, policy
 sync from the supervisor, or an approved proposal. A sandbox in a tree can
 never be widened past its ceiling after it starts.
 
-**Global policy.** While a gateway-global policy is active, it replaces every
-sandbox's policy rather than limiting it, and provider layers are switched off.
-A child created with a narrow policy would silently receive the global one
-instead. `create_sandbox` with a policy is therefore refused with
-`GLOBAL_POLICY_ACTIVE`, so the agent learns that delegation is unavailable
-instead of receiving a child with unexpected access.
+**Global policy as a maximum.** A gateway-global policy is meant to state what
+no sandbox on the gateway may exceed. Today it does that by replacing every
+sandbox's policy, which also removes every narrower one, so trees of sandboxes
+with least privilege cannot exist under it. This RFC adds a second mode in which
+the global policy is the gateway's outermost ceiling:
+
+```toml
+[openshell.gateway]
+# "replace" (current behavior) or "maximum"
+global_policy_mode = "maximum"
+```
+
+In `maximum` mode each sandbox keeps its own policy, provider layers stay
+active, and the gateway proves that every policy fits inside the global one: a
+grant's ceiling when the holder is created, every child policy, and every later
+policy write. A policy that does not fit is refused with
+`EXCEEDS_GLOBAL_POLICY` and the prover's counterexample. Children are then
+proved against both their ceiling and the global policy.
+
+In `replace` mode a child created with a narrow policy would silently receive
+the global one instead, so `create_sandbox` with a policy is refused with
+`GLOBAL_POLICY_ACTIVE`, and the agent learns that delegation is unavailable
+rather than receiving a child with unexpected access.
+
+**Whether a parent may set its child's policy.** A grant states whether agents
+in the tree may write their children's network rules (`child_policy: narrow`,
+the default) or whether every child receives its parent's ceiling unchanged
+(`child_policy: inherit`). In `inherit` mode a `create_sandbox` request that
+includes a policy is refused. Either way a child never receives more than the
+ceiling and the global maximum allow.
 
 **Layers the gateway adds.** The door rule and provider layers are added after
 the proof. Both come from trusted sources, the grant and admin-imported provider
@@ -483,7 +568,7 @@ such calls, and pushing list-changed notifications is future work.
 
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
-| `create_sandbox` | sandboxes with a grant and depth left | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s` | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `GLOBAL_POLICY_ACTIVE` |
+| `create_sandbox` | users; sandboxes with a grant and depth left | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `GLOBAL_POLICY_ACTIVE` |
 | `wait` | sandboxes | `handle`, `timeout_s` | `phase`, `exit_code` | `NOT_YOUR_CHILD` |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
@@ -492,7 +577,9 @@ such calls, and pushing list-changed notifications is future work.
 | `get_limits` | sandboxes | none | depth, children and total used and allowed | none |
 
 A sandbox acts only on its own descendants; `handle` is the child's sandbox name
-within the caller's workspace. `inputs` lists paths in the parent that are
+within the caller's workspace. A user caller creates top-level sandboxes with
+the same rules as `openshell sandbox create`, may attach a grant to them, and
+acts on any sandbox its workspace role allows. `inputs` lists paths in the parent that are
 copied read-only into the child at start. `exec` and `get_file` run through the
 existing `ExecSandbox` path, acting for the tree's root user.
 
@@ -592,16 +679,27 @@ while lineage records which sandbox asked.
 | List grants | own workspace | no | no | no |
 | Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
 | Reach the door | not applicable | named program only | no route | no route |
-| `create_sandbox` | with a host-session grant | within limits | hidden and refused | hidden and refused |
+| `create_sandbox` | top-level sandboxes, as with the CLI | within limits | hidden and refused | hidden and refused |
 | `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | own descendants |
 
 ### Gateway configuration
 
-The feature is off by default and enabled per gateway:
+The MCP endpoint is on by default. It is a route on the existing gateway port
+rather than a separate process, so it costs nothing until it is called, and it
+lets any agent that can reach the gateway start sandboxes, whether or not
+sub-agents are involved. Turning it on does not let any sandbox create
+children: that still requires a grant on the sandbox. Operators who do not want
+it turn it off in configuration or from the CLI:
+
+```shell
+openshell gateway mcp status
+openshell gateway mcp disable
+openshell gateway mcp enable
+```
 
 ```toml
 [openshell.gateway.sandbox_mcp]
-enabled = true
+enabled = true                # default
 # Operator caps; the effective limit is the lowest of these, the grant and the harness.
 max_depth = 3
 max_breadth = 8
@@ -610,8 +708,8 @@ max_total = 20
 tool_idle_timeout = "10m"
 ```
 
-When disabled, `/mcp` is not routed, `--grant` is rejected and the supervisor
-door answers 404.
+When disabled, `/mcp` is not routed and the supervisor door answers 404 for
+MCP requests; the gRPC child-sandbox API, the SDKs and the CLI keep working.
 
 ### CLI surface
 
@@ -651,34 +749,37 @@ did it run" from the same log stream they already ship to their SIEM.
 ### Compatibility
 
 The change is additive. Sandboxes created without `--grant` behave exactly as
-today. Existing gRPC clients are unaffected; the new `grant` field is optional.
+today, and the default `global_policy_mode` remains `replace`. Existing gRPC clients are unaffected; the new `grant` field is optional.
 Supervisors without the door ignore `openshell.local`, so a newer gateway with
 an older supervisor image simply cannot serve in-sandbox callers until the image
-is updated. Host harnesses can use the endpoint as soon as the gateway supports
-it.
+is updated. Host agents can use the endpoint as soon as the gateway supports it.
 
 ## Implementation plan
 
 The work is phased so that each phase is usable and testable on its own:
 
-- **Phase 1: Grants, lineage and the boundary proof behind gRPC.** Add the
+- **Phase 1: The child-sandbox API, grants, lineage and the boundary proof.**
+  Add the `SandboxChildren` gRPC service and its SDK functions, the
   `sandbox_grant` and `sandbox_lineage` object types, atomic counter
   reservation, `SandboxGrantSpec` on `CreateSandboxRequest`, the grant RPCs and
   CLI, and the prover call at create time and on every later policy write to a
   sandbox with a lineage. Validate with the existing Pi and OpenWorker
   prototypes by replacing their host creation services with these RPCs.
-- **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` with
-  authentication, per-caller `tools/list`, `create_sandbox`, `wait`,
-  `get_file`, `stop_sandbox`, `list_children` and `get_limits`. Add the door at
-  `openshell.local`, the door rule written from the grant, and the
-  `urn:openshell:gateway-mcp` token. Ship host harness support first, then
-  in-sandbox callers.
+- **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` over the
+  same API, with authentication and per-caller `tools/list`, and the
+  `openshell gateway mcp` commands. Add the door at `openshell.local` for both
+  MCP and the gRPC service, the door rule written from the grant, and the
+  `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
+  callers.
 - **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
   idle timeout.
-- **Phase 4: Lifecycle.** Cascade stop on every way a parent ends, the orphan
+- **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
+  proof of every ceiling, child policy and policy write against the global
+  policy in `maximum` mode.
+- **Phase 5: Lifecycle.** Cascade stop on every way a parent ends, the orphan
   reaper, and idle and maximum lifetime for agent children with the "a parent
   with running children is not idle" rule.
-- **Phase 5: Documentation.** A tutorial in which a Pi lead creates a Pi worker,
+- **Phase 6: Documentation.** A tutorial in which a Pi lead creates a Pi worker,
   reference pages for grants and the MCP tools, and a configuration entry for
   `[openshell.gateway.sandbox_mcp]`.
 
@@ -725,10 +826,26 @@ dedicated token.
   quickly. Atomic counters, `max_total`, operator caps, retry deduplication and
   the token rate limit bound the damage.
 
-- **Host mode is weaker.** A host harness is not contained, only its children
+- **Host mode is weaker.** An agent on the host is not contained, only its children
   are. This is a property of host mode and must be documented, not hidden.
 
 ## Future work
+
+### Returning results to the parent
+
+`get_file` lets a parent read a running child's files, but a child's standard
+output does not reach the logs and a child that exits loses its files. A native
+channel would let a child publish a result that the gateway keeps until the
+parent reads it, so `wait` can return the result itself.
+
+### Agent-to-agent communication through the gateway
+
+Teams and swarms of agents need to find each other and exchange messages and
+context, and in a swarm there may be no parent at all. Routing that traffic
+through the gateway gives one place to check that two sandboxes may talk, to
+offer discovery of other agents in a tree or workspace, and to monitor what
+passes between them. The lineage and identity introduced here are the basis
+for that work, which needs its own proposal.
 
 ### Interactive approval
 
@@ -803,13 +920,26 @@ cannot count ("at most three children"), and the decision would be split
 between policy and grant. The grant decides; the door rule controls only
 reachability.
 
-### Global policy as the limit
+### SDK or CLI only, without MCP
 
-Children would all run under a gateway-global policy.
+Harnesses would create children by calling the SDK from their own code, or by
+running the CLI.
 
-This was rejected because a global policy replaces every sandbox's policy, so
-no child could have less access than another, and least privilege per child is
-the point of the proposal.
+These are not alternatives to the proposal but parts of it: the gRPC API is the
+contract, and the SDK and CLI are surfaces over it. MCP is added as one more
+surface because most harnesses and coding agents already speak it, so they can
+create sandboxes with a configuration entry and no code change. Offering only
+the SDK would make every harness change its code before it could use the
+feature.
+
+### Global policy as a fixed policy
+
+Children would all run under the gateway-global policy as it works today, which
+replaces each sandbox's policy.
+
+This was rejected because no child could then have less access than another,
+and least privilege per child is the point of the proposal. The global policy
+is instead offered as a maximum that every sandbox must fit inside.
 
 ## Prior art
 
@@ -849,6 +979,10 @@ the point of the proposal.
 - Should a parent be able to read the result of a child that has exited, for
   example through a result file the gateway keeps until the parent reads it?
 - When interactive approval is added, where should pending requests appear?
+- Should `global_policy_mode = "maximum"` become the default, and how do
+  operators who run shared gateways use the global policy today?
+- Is the MCP endpoint's cost when idle small enough to keep it on by default on
+  every gateway?
 
 ## Appendix: End-to-End Walkthrough
 
