@@ -6912,12 +6912,11 @@ mod tests {
         format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
         has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
-        policy_revision_list_json,
-        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
-        ready_false_condition_message, relay_local_socket, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
+        provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
+        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
+        sandbox_upload_plan, service_endpoint_to_json, service_status_error,
+        service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -7184,48 +7183,53 @@ mod tests {
 
     #[test]
     fn parse_env_from_pairs_reads_named_and_same_name_environment_variables() {
-        let _named = EnvVarGuard::set("NAV_PARSE_ENV_FROM_NAMED", "named-value");
-        let _same_name = EnvVarGuard::set("NAV_PARSE_ENV_FROM_SAME", "same-name-value");
-
-        let parsed = parse_env_from_pairs(&[
-            "SANDBOX_NAMED=NAV_PARSE_ENV_FROM_NAMED".to_string(),
-            "NAV_PARSE_ENV_FROM_SAME".to_string(),
-        ])
-        .expect("parse");
-        assert_eq!(
-            parsed.get("SANDBOX_NAMED"),
-            Some(&"named-value".to_string())
-        );
-        assert_eq!(
-            parsed.get("NAV_PARSE_ENV_FROM_SAME"),
-            Some(&"same-name-value".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_ENV_FROM_NAMED", "named-value")
+            .set("NAV_PARSE_ENV_FROM_SAME", "same-name-value")
+            .run(|| {
+                let parsed = parse_env_from_pairs(&[
+                    "SANDBOX_NAMED=NAV_PARSE_ENV_FROM_NAMED".to_string(),
+                    "NAV_PARSE_ENV_FROM_SAME".to_string(),
+                ])
+                .expect("parse");
+                assert_eq!(
+                    parsed.get("SANDBOX_NAMED"),
+                    Some(&"named-value".to_string())
+                );
+                assert_eq!(
+                    parsed.get("NAV_PARSE_ENV_FROM_SAME"),
+                    Some(&"same-name-value".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_env_from_pairs_rejects_missing_invalid_reserved_and_duplicate_keys() {
-        let _missing = EnvVarGuard::unset("NAV_PARSE_ENV_FROM_MISSING");
-        let _present = EnvVarGuard::set("NAV_PARSE_ENV_FROM_PRESENT", "value");
+        Environment::new()
+            .remove("NAV_PARSE_ENV_FROM_MISSING")
+            .set("NAV_PARSE_ENV_FROM_PRESENT", "value")
+            .run(|| {
+                for (input, expected) in [
+                    ("TARGET=NAV_PARSE_ENV_FROM_MISSING", "is not set"),
+                    ("1BAD=NAV_PARSE_ENV_FROM_PRESENT", "key must match"),
+                    ("TARGET=BAD-NAME", "source must match"),
+                    ("OPENSHELL_RESERVED=NAV_PARSE_ENV_FROM_PRESENT", "reserved"),
+                ] {
+                    let error =
+                        parse_env_from_pairs(&[input.to_string()]).expect_err("must reject");
+                    assert!(
+                        error.to_string().contains(expected),
+                        "unexpected error: {error}"
+                    );
+                }
 
-        for (input, expected) in [
-            ("TARGET=NAV_PARSE_ENV_FROM_MISSING", "is not set"),
-            ("1BAD=NAV_PARSE_ENV_FROM_PRESENT", "key must match"),
-            ("TARGET=BAD-NAME", "source must match"),
-            ("OPENSHELL_RESERVED=NAV_PARSE_ENV_FROM_PRESENT", "reserved"),
-        ] {
-            let error = parse_env_from_pairs(&[input.to_string()]).expect_err("must reject");
-            assert!(
-                error.to_string().contains(expected),
-                "unexpected error: {error}"
-            );
-        }
-
-        let error = parse_env_from_pairs(&[
-            "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
-            "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
-        ])
-        .expect_err("duplicate must reject");
-        assert!(error.to_string().contains("duplicate --env-from"));
+                let error = parse_env_from_pairs(&[
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                    "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+                ])
+                .expect_err("duplicate must reject");
+                assert!(error.to_string().contains("duplicate --env-from"));
+            });
     }
 
     #[test]

@@ -3505,7 +3505,7 @@ async fn run_cli_sandbox_create_with_env(
     extra_args: &[&str],
     environment: &[(&str, &str)],
 ) -> std::process::Output {
-    let xdg_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
     prepare_cli_xdg(server, &xdg_dir);
     run_cli_sandbox_create_with_xdg_and_env(server, &xdg_dir, name, extra_args, environment).await
 }

@@ -1192,6 +1192,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_sandbox_with_runtime_inputs(
         &self,
         sandbox: Sandbox,
@@ -2578,6 +2579,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn delete_sandbox_with_preconditions(
         &self,
         workspace: &str,

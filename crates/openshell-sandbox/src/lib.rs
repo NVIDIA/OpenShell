@@ -23,7 +23,7 @@ pub mod managed_children;
 mod network_broker;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
