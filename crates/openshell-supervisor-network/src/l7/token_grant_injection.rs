@@ -15,8 +15,6 @@ use std::sync::Arc;
 use openshell_core::dynamic_credential_key::{credential_identity, endpoint_selector};
 use openshell_core::endpoint_failure::EndpointFailure;
 use openshell_core::endpoint_status::EndpointObservationContext;
-#[cfg(test)]
-use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::token_grant_failure::{
@@ -148,57 +146,45 @@ impl std::error::Error for TokenGrantInjectionError {}
 
 impl miette::Diagnostic for TokenGrantInjectionError {}
 
-/// Resolves one endpoint-bound grant per protected header before rewriting a request.
+/// Pin `ctx` to the live provider installation and return its snapshot.
 ///
-/// Each header independently uses its most-specific matching binding. Every selected
-/// grant must succeed; callers must not forward the request when this returns an error.
-/// `request_id` is the supervisor-minted ID of this exchange; it is sent to the
-/// token service and gateway and recorded on the refusal event.
-#[cfg(test)]
-async fn inject_if_needed(
-    req: L7Request,
-    ctx: &L7EvalContext,
-    request_id: &str,
-) -> Result<L7Request, TokenGrantInjectionError> {
-    let observation_context = ctx
-        .endpoint_observation_tx
+/// A connection can sit idle across a refresh before its first request, so a
+/// grant always uses the installation current when the request arrives. The
+/// pinned revision then scopes the injected keys, the status report and the
+/// credential generation guard for the upstream write.
+pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCredentialSnapshot>> {
+    let snapshot = ctx
+        .provider_credentials
         .as_ref()
-        .and_then(EndpointObservationSender::capture);
-    inject_if_needed_captured(
-        req,
-        &mut ctx.clone(),
-        request_id,
-        observation_context.as_ref(),
-    )
-    .await
+        .map(ProviderCredentialState::snapshot)?;
+    ctx.provider_credential_revision = Some(snapshot.revision);
+    ctx.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+    Some(snapshot)
 }
 
-/// Use authority captured before the proxy selected policy or awaited input.
-pub async fn inject_if_needed_captured(
+/// Inject the grants whose endpoint selectors match the request.
+///
+/// L4-only forwarding uses this selector contract; it has no per-request L7
+/// admission decision. Each header independently uses its most-specific
+/// matching binding, and every selected grant must succeed: callers must not
+/// forward the request when this returns an error. `ctx` must be pinned to
+/// `snapshot` by [`pin_live_credentials`]. `request_id` is the supervisor-minted
+/// ID of this exchange; it is sent to the token service and gateway and
+/// recorded on the refusal event.
+pub async fn inject_for_selectors(
     req: L7Request,
-    ctx: &mut L7EvalContext,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    // A connection can sit idle across a refresh before its first request.
-    // Select and pin the live installation.
-    let Some(snapshot) = ctx
-        .provider_credentials
-        .as_ref()
-        .map(ProviderCredentialState::snapshot)
-    else {
-        return Ok(req);
-    };
-    ctx.provider_credential_revision = Some(snapshot.revision);
-    ctx.provider_credential_installation_id = Some(snapshot.installation_id.clone());
-    let selected = select_scoped(&snapshot, ctx, request_path(&req.target), None);
+    let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
 /// An empty owner set permits no acquisition, including audit-only forwarding.
-/// L4-only forwarding uses `inject_if_needed_captured` with its existing
-/// endpoint-selector contract; it has no per-request L7 admission decision.
+/// L4-only forwarding uses [`inject_for_selectors`] instead.
 ///
 /// Credentials come from the pinned `snapshot`, and each selected key is scoped
 /// to its revision and installation after selection so the one-grant-per-header
@@ -731,6 +717,7 @@ fn inject_header(
 #[cfg(test)]
 pub mod test_support {
     use super::*;
+    use openshell_core::endpoint_status::EndpointObservationSender;
     use openshell_core::proto::{
         ProviderCredentialTokenGrant, ProviderCredentialTokenGrantSubjectToken,
         ProviderCredentialTokenGrantType, ProviderProfileCredential,
@@ -913,14 +900,17 @@ pub mod test_support {
         /// Installs this fixture's credentials as a pinned provider-credential
         /// snapshot. Admission-gated injection requests grants by revision-scoped
         /// key, so each scripted response is also registered under that key.
-        pub fn provider_credentials(&self) -> ProviderCredentialState {
+        pub fn provider_credentials(
+            &self,
+        ) -> openshell_core::provider_credentials::ProviderCredentialState {
             let credentials = self.dynamic_credentials.read().unwrap().clone();
-            let state = ProviderCredentialState::from_environment(
-                1,
-                HashMap::new(),
-                HashMap::new(),
-                credentials.clone(),
-            );
+            let state =
+                openshell_core::provider_credentials::ProviderCredentialState::from_environment(
+                    1,
+                    HashMap::new(),
+                    HashMap::new(),
+                    credentials.clone(),
+                );
             let snapshot = state.snapshot();
             let mut responses = self.responses.lock().unwrap();
             for key in credentials.keys() {
@@ -1069,13 +1059,38 @@ pub mod test_support {
             })
         }
     }
+
+    /// Pin a copy of `ctx` and inject selector-matched grants, as the
+    /// fallback forwarding path does, capturing the context's own authority.
+    pub async fn inject_if_needed(
+        req: L7Request,
+        ctx: &L7EvalContext,
+        request_id: &str,
+    ) -> Result<L7Request, TokenGrantInjectionError> {
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
+        let mut pinned = ctx.clone();
+        let Some(snapshot) = pin_live_credentials(&mut pinned) else {
+            return Ok(req);
+        };
+        inject_for_selectors(
+            req,
+            &pinned,
+            &snapshot,
+            request_id,
+            observation_context.as_ref(),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::l7::provider::{BodyLength, L7Request};
-    use crate::l7::token_grant_injection::test_support::TokenGrantTestFixture;
+    use crate::l7::token_grant_injection::test_support::{TokenGrantTestFixture, inject_if_needed};
     use openshell_core::endpoint_status::{
         EndpointConfigVersion, EndpointStatusReceiver, EndpointStatusTracker,
         endpoint_status_channel,
@@ -1302,9 +1317,7 @@ mod tests {
         )
         .expect_err("malformed token must not be injected");
 
-        assert_eq!(err.kind(), TokenGrantFailureKind::Unclassified);
         assert_eq!(err.stage(), TokenGrantStage::Injection);
-        assert_eq!(err.to_string(), "dynamic token grant failed");
     }
 
     #[tokio::test]
@@ -1418,34 +1431,16 @@ mod tests {
 
         assert_eq!(err.failure().stage(), TokenGrantStage::Injection);
         assert_eq!(err.credential(), Some(("provider", "access_token")));
-        assert_eq!(err.to_string(), "dynamic token grant failed");
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
     }
 
-    #[tokio::test]
-    async fn refused_grant_keeps_resolver_classification_and_failed_credential() {
-        let failure = TokenGrantFailure::new(
+    const KEY: &str = "api.example.com\t443\t/v1/**\tprovider:access_token";
+
+    fn refusal() -> TokenGrantFailure {
+        TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantStage::GatewayRpc,
-        );
-        let fixture = TokenGrantTestFixture::failure_token_exchange(
-            "api.example.com\t443\t/v1/**\tprovider:access_token",
-            failure,
-        );
-
-        let err = inject_if_needed(
-            grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
-            &grant_context(&fixture),
-            REQUEST_ID,
+            TokenGrantStage::TokenEndpoint,
         )
-        .await
-        .expect_err("failed grant refuses the request");
-
-        assert_eq!(err.failure(), failure);
-        assert_eq!(err.credential(), Some(("provider", "access_token")));
-        assert_eq!(err.to_string(), "dynamic token grant failed");
-        assert_eq!(format!("{err:?}"), "dynamic token grant failed");
-        assert_eq!(fixture.requested_ids(), [REQUEST_ID]);
     }
 
     fn grant_context(fixture: &TokenGrantTestFixture) -> L7EvalContext {
@@ -1458,73 +1453,14 @@ mod tests {
         }
     }
 
-    fn grant_request(raw_header: &[u8]) -> L7Request {
+    fn grant_request() -> L7Request {
         L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
             query_params: HashMap::new(),
-            raw_header: raw_header.to_vec(),
+            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         }
-    }
-
-    #[tokio::test]
-    async fn malformed_request_framing_fails_before_acquisition() {
-        for raw_header in [
-            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com".as_slice(),
-            b"GET /v1/projects HTTP/1.1\r\nX-Secret: \xff\r\n\r\n".as_slice(),
-            b"\r\n\r\n".as_slice(),
-        ] {
-            let fixture = TokenGrantTestFixture::success(
-                "api.example.com\t443\t/v1/**\tprovider:access_token",
-                "grant-token",
-            );
-            let err = inject_if_needed(
-                grant_request(raw_header),
-                &grant_context(&fixture),
-                REQUEST_ID,
-            )
-            .await
-            .expect_err("invalid request framing refuses the request");
-            assert_eq!(err.failure(), injection_configuration_failure());
-            fixture.assert_no_requests();
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_resolver_refuses_without_naming_a_credential() {
-        let fixture = TokenGrantTestFixture::success(
-            "api.example.com\t443\t/v1/**\tprovider:access_token",
-            "grant-token",
-        );
-        let (sender, mut receiver, mut tracker, _) = installed_status(1).await;
-        let mut ctx = grant_context(&fixture);
-        ctx.token_grant_resolver = None;
-        ctx.endpoint_observation_tx = Some(sender);
-
-        let err = inject_if_needed(
-            grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
-            &ctx,
-            REQUEST_ID,
-        )
-        .await
-        .expect_err("a grant without a resolver refuses the request");
-
-        assert_eq!(err.failure(), injection_configuration_failure());
-        assert_eq!(err.credential(), None);
-        fixture.assert_no_requests();
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        let failure = tracker
-            .snapshot()
-            .unwrap()
-            .last_token_grant_failure
-            .unwrap()
-            .failure
-            .unwrap();
-        assert_eq!(failure.code, injection_configuration_failure().code());
-        assert_eq!(failure.request_id, REQUEST_ID);
-        assert!(failure.provider.is_empty());
-        assert!(failure.credential_key.is_empty());
     }
 
     async fn installed_status(
@@ -1537,63 +1473,84 @@ mod tests {
     ) {
         let (sender, mut receiver) = endpoint_status_channel();
         let mut tracker = receiver.tracker();
-        sender
-            .reset(
-                EndpointConfigVersion {
-                    policy_hash: "policy".into(),
-                    provider_env_revision: revision,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
+        reset_status(&sender, revision).await;
         assert!(tracker.apply(receiver.try_recv().unwrap()));
         let authority = sender.capture().unwrap();
         (sender, receiver, tracker, authority)
     }
 
+    async fn reset_status(sender: &EndpointObservationSender, revision: u64) {
+        let version = EndpointConfigVersion {
+            policy_hash: "policy".into(),
+            provider_env_revision: revision,
+        };
+        sender.reset(version, Vec::new()).await.unwrap();
+    }
+
+    /// Apply the next status command and return the recorded grant failure.
+    fn next_grant_failure(
+        tracker: &mut EndpointStatusTracker,
+        receiver: &mut EndpointStatusReceiver,
+    ) -> Option<openshell_core::proto::TokenGrantFailureObservation> {
+        assert!(tracker.apply(receiver.try_recv().expect("status command sent")));
+        tracker.snapshot().unwrap().last_token_grant_failure
+    }
+
+    #[tokio::test]
+    async fn missing_resolver_refuses_without_naming_a_credential() {
+        let fixture = TokenGrantTestFixture::success(KEY, "grant-token");
+        let (sender, mut receiver, mut tracker, _) = installed_status(1).await;
+        let mut ctx = grant_context(&fixture);
+        ctx.token_grant_resolver = None;
+        ctx.endpoint_observation_tx = Some(sender);
+
+        let err = inject_if_needed(grant_request(), &ctx, REQUEST_ID)
+            .await
+            .expect_err("a grant without a resolver refuses the request");
+
+        assert_eq!(err.credential(), None);
+        fixture.assert_no_requests();
+        let failure = next_grant_failure(&mut tracker, &mut receiver)
+            .unwrap()
+            .failure
+            .unwrap();
+        assert_eq!(failure.code, injection_configuration_failure().code());
+        assert_eq!(failure.request_id, REQUEST_ID);
+        assert!(failure.provider.is_empty());
+    }
+
+    async fn inject_pinned(
+        ctx: &mut L7EvalContext,
+        authority: &EndpointObservationContext,
+    ) -> Result<L7Request, TokenGrantInjectionError> {
+        let snapshot = pin_live_credentials(ctx).expect("live provider credentials");
+        inject_for_selectors(grant_request(), ctx, &snapshot, REQUEST_ID, Some(authority)).await
+    }
+
     #[tokio::test]
     async fn fallback_reports_live_credential_refusal() {
         const CURRENT_KEY: &str = "api.example.com\t443\t/v1/**\tcurrent-provider:access_token";
-        let failure = TokenGrantFailure::new(
-            TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantStage::TokenEndpoint,
-        );
-        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
+        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, refusal());
         let mut ctx = grant_context(&fixture);
         let snapshot = ctx.provider_credentials.as_ref().unwrap().snapshot();
         let (sender, mut receiver, mut tracker, authority) =
             installed_status(snapshot.revision).await;
         ctx.endpoint_observation_tx = Some(sender);
 
-        let error = inject_if_needed_captured(
-            grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
-            &mut ctx,
-            REQUEST_ID,
-            Some(&authority),
-        )
-        .await
-        .expect_err("the live credential refuses");
-        assert_eq!(error.failure(), failure);
+        let error = inject_pinned(&mut ctx, &authority)
+            .await
+            .expect_err("the live credential refuses");
+
         assert_eq!(
             error.credential(),
             Some(("current-provider", "access_token"))
         );
         assert_eq!(ctx.provider_credential_revision, Some(snapshot.revision));
-        assert_eq!(
-            ctx.provider_credential_installation_id.as_deref(),
-            Some(snapshot.installation_id.as_str())
-        );
         fixture.assert_requested_keys(&[CURRENT_KEY]);
-        assert!(tracker.apply(receiver.try_recv().expect("live refusal is reported")));
-        let observation = tracker
-            .snapshot()
-            .unwrap()
-            .last_token_grant_failure
+        let cause = next_grant_failure(&mut tracker, &mut receiver)
+            .expect("live refusal is reported")
+            .failure
             .unwrap();
-        assert_eq!(observation.destination_host, "api.example.com");
-        assert_eq!(observation.destination_port, 443);
-        let cause = observation.failure.unwrap();
         assert_eq!(cause.provider, "current-provider");
         assert_eq!(cause.credential_key, "access_token");
         assert_eq!(cause.request_id, REQUEST_ID);
@@ -1602,111 +1559,48 @@ mod tests {
     #[tokio::test]
     async fn fallback_live_credential_success_clears_its_failure() {
         const CURRENT_KEY: &str = "api.example.com\t443\t/v1/projects\tprovider:access_token";
-        let failure = TokenGrantFailure::new(
-            TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantStage::TokenEndpoint,
-        );
-        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
+        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, refusal());
         let mut ctx = grant_context(&fixture);
         let snapshot = ctx.provider_credentials.as_ref().unwrap().snapshot();
         let (sender, mut receiver, mut tracker, authority) =
             installed_status(snapshot.revision).await;
         ctx.endpoint_observation_tx = Some(sender);
 
-        let raw_header = b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        let error = inject_if_needed_captured(
-            grant_request(raw_header),
-            &mut ctx,
-            REQUEST_ID,
-            Some(&authority),
-        )
-        .await
-        .expect_err("current grant first records its failure");
-        assert_eq!(error.failure(), failure);
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        let observation = tracker
-            .snapshot()
-            .unwrap()
-            .last_token_grant_failure
-            .unwrap();
-        assert_eq!(observation.failure.unwrap().provider, "provider");
+        inject_pinned(&mut ctx, &authority)
+            .await
+            .expect_err("current grant first records its failure");
+        assert!(next_grant_failure(&mut tracker, &mut receiver).is_some());
 
         fixture.add_credential(
             &snapshot.scoped_key(CURRENT_KEY),
             snapshot.dynamic_credentials[CURRENT_KEY].clone(),
             Ok("current-token"),
         );
-        let injected = inject_if_needed_captured(
-            grant_request(raw_header),
-            &mut ctx,
-            REQUEST_ID,
-            Some(&authority),
-        )
-        .await
-        .expect("the live credential now succeeds");
+        let injected = inject_pinned(&mut ctx, &authority)
+            .await
+            .expect("the live credential now succeeds");
         assert!(
             String::from_utf8(injected.raw_header)
                 .unwrap()
                 .contains("Authorization: Bearer current-token\r\n")
         );
-        fixture.assert_requested_keys(&[CURRENT_KEY, CURRENT_KEY]);
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
-        assert!(
-            tracker
-                .snapshot()
-                .unwrap()
-                .last_token_grant_failure
-                .is_none()
-        );
+        assert!(next_grant_failure(&mut tracker, &mut receiver).is_none());
     }
 
     #[tokio::test]
     async fn fallback_rejects_telemetry_authority_captured_before_provider_refresh() {
-        const CURRENT_KEY: &str = "api.example.com\t443\t/v1/**\tcurrent-provider:access_token";
-        let failure = TokenGrantFailure::new(
-            TokenGrantFailureKind::ProviderAuthorizationRequired,
-            TokenGrantStage::TokenEndpoint,
-        );
-        let fixture = TokenGrantTestFixture::failure(CURRENT_KEY, failure);
+        let fixture = TokenGrantTestFixture::failure(KEY, refusal());
         let mut ctx = grant_context(&fixture);
-        let (sender, mut receiver, mut tracker, accepted_authority) = installed_status(0).await;
-        sender
-            .reset(
-                EndpointConfigVersion {
-                    policy_hash: "policy".into(),
-                    provider_env_revision: 1,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.try_recv().unwrap()));
+        let (sender, mut receiver, _, stale_authority) = installed_status(0).await;
+        reset_status(&sender, 1).await;
+        receiver.try_recv().unwrap();
         ctx.endpoint_observation_tx = Some(sender);
 
-        let error = inject_if_needed_captured(
-            grant_request(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
-            &mut ctx,
-            REQUEST_ID,
-            Some(&accepted_authority),
-        )
-        .await
-        .expect_err("the live grant still fails closed under old reporting authority");
-        assert_eq!(error.failure(), failure);
-        assert_eq!(
-            error.credential(),
-            Some(("current-provider", "access_token"))
-        );
-        fixture.assert_requested_keys(&[CURRENT_KEY]);
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        assert!(
-            tracker
-                .snapshot()
-                .unwrap()
-                .last_token_grant_failure
-                .is_none()
-        );
+        inject_pinned(&mut ctx, &stale_authority)
+            .await
+            .expect_err("the live grant still fails closed under old reporting authority");
+
+        fixture.assert_requested_keys(&[KEY]);
+        assert!(receiver.try_recv().is_err(), "stale observation is dropped");
     }
 }

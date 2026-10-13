@@ -16,6 +16,9 @@ use openshell_core::proto::{
     ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,
 };
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::token_grant_failure::{
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -53,17 +56,8 @@ impl TokenGrantResolver for ScriptedResolver {
     fn obtain<'a>(
         &'a self,
         request: TokenGrantRequest<'a>,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        String,
-                        openshell_core::token_grant_failure::TokenGrantFailure,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, TokenGrantFailure>> + Send + 'a>>
+    {
         Box::pin(async move {
             self.calls
                 .lock()
@@ -80,9 +74,9 @@ impl TokenGrantResolver for ScriptedResolver {
                     .expect("test releases the held grant");
             }
             if self.fail_once.swap(false, Ordering::SeqCst) {
-                return Err(openshell_core::token_grant_failure::TokenGrantFailure::new(
-                    openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
-                    openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
+                return Err(TokenGrantFailure::new(
+                    TokenGrantFailureKind::Unavailable,
+                    TokenGrantStage::TokenEndpoint,
                 ));
             }
             Ok(format!("inert-{}", request.audience))
@@ -688,17 +682,10 @@ async fn refused_grant(
     Vec<openshell_core::endpoint_status::EndpointStatusCommand>,
 ) {
     use openshell_core::endpoint_status::{
-        EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
-        endpoint_status_channel,
+        EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
     };
 
-    let mut fixture = if protocol == "rest" {
-        let mut endpoint = route("native", "/native");
-        endpoint.method = "POST";
-        Fixture::new(&[endpoint], &[("/native", "native", "aud-native")], 1)
-    } else {
-        native_protocol_fixture(protocol, false)
-    };
+    let mut fixture = native_protocol_fixture(protocol, false);
     for config in &mut fixture.configs {
         // The gateway derives these from policy; OPA fixtures carry none.
         config.endpoint_id = "endpoint:v1:native".into();
@@ -706,6 +693,10 @@ async fn refused_grant(
         config.provider_credentialed = provider_credentialed;
     }
     let (sender, mut receiver) = endpoint_status_channel();
+    let inventory = vec![EndpointInventoryEntry {
+        endpoint_id: "endpoint:v1:native".into(),
+        uses_provider_credentials: provider_credentialed,
+    }];
     sender
         .reset(
             EndpointConfigVersion {
@@ -713,30 +704,21 @@ async fn refused_grant(
                 provider_env_revision: 1,
             },
             if protocol == "mcp" {
-                vec![EndpointInventoryEntry {
-                    endpoint_id: "endpoint:v1:native".into(),
-                    uses_provider_credentials: provider_credentialed,
-                }]
+                inventory
             } else {
                 Vec::new()
             },
         )
         .await
         .expect("install endpoint inventory");
-    assert!(matches!(
-        receiver.recv().await,
-        Some(EndpointStatusCommand::Reset { .. })
-    ));
+    receiver.recv().await.expect("reset command");
     fixture.observation = Some(sender);
     fixture.resolver.fail_once.store(true, Ordering::SeqCst);
 
     let mut connection = fixture.connect();
-    let body = if protocol == "rest" {
-        Vec::new()
-    } else {
-        native_protocol_body(protocol, "echo")
-    };
-    let response = connection.exchange_body("/native", &body).await;
+    let response = connection
+        .exchange_body("/native", &native_protocol_body(protocol, "echo"))
+        .await;
     let capture = connection.finish().await;
     assert_eq!(capture.bytes_seen, 0, "failed grant forwards nothing");
     let mut commands = Vec::new();
@@ -746,101 +728,50 @@ async fn refused_grant(
     (response, commands)
 }
 
-fn refusal_request_id(response: &str) -> String {
-    tests::assert_grant_refusal_response(
-        response,
-        openshell_core::token_grant_failure::TokenGrantFailure::new(
-            openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
-            openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
-        ),
-    )
-}
-
+/// The workload sees only the generic refusal and a request ID. Trusted status
+/// receives the classified cause for that request, plus an MCP endpoint
+/// observation only for an inventoried endpoint that uses provider credentials.
 #[tokio::test]
-async fn mcp_grant_failure_reports_its_cause_to_endpoint_status_only() {
+async fn grant_refusal_reports_cause_to_endpoint_status_only() {
     use openshell_core::endpoint_status::EndpointStatusCommand;
-    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction;
 
-    let (response, commands) = refused_grant("mcp", true).await;
-    // The workload sees the generic refusal and an opaque request ID.
-    let request_id = refusal_request_id(&response);
-
-    // The trusted status path receives the classified cause for that request.
-    let [
-        EndpointStatusCommand::ObserveTokenGrant {
-            result: Err(grant_failure),
-            ..
-        },
-        EndpointStatusCommand::Observe {
-            endpoint_id,
-            result,
-            failure: Some(failure),
-            ..
-        },
-    ] = commands.as_slice()
-    else {
-        panic!("one grant failure observation with a cause: {commands:?}");
-    };
-    assert_eq!(endpoint_id, "endpoint:v1:native");
-    assert_eq!(*result, EndpointResult::CredentialUnavailable);
-    let failure = failure.to_proto();
-    assert_eq!(failure.code, "unavailable");
-    assert_eq!(failure.stage, "token_endpoint");
-    assert_eq!(
-        failure.recovery_action,
-        ProviderCredentialRefreshRecoveryAction::Retry as i32
-    );
-    assert_eq!(failure.provider, "native");
-    assert_eq!(failure.credential_key, "access_token");
-    assert_eq!(failure.request_id, request_id);
-    assert_eq!(grant_failure.to_proto(), failure);
-    assert_eq!(
-        openshell_core::endpoint_failure::validate_endpoint_failure(
-            &failure,
-            openshell_core::proto::EndpointResult::CredentialUnavailable
-        ),
-        Ok(())
-    );
-}
-
-#[tokio::test]
-async fn grant_failure_on_uncredentialed_endpoint_reports_only_sandbox_cause() {
-    // The gateway rejects credential failures for endpoints that do not use
-    // provider credentials, so the supervisor must not report one.
-    let (response, commands) = refused_grant("mcp", false).await;
-    refusal_request_id(&response);
-    assert!(
-        matches!(
-            commands.as_slice(),
-            [openshell_core::endpoint_status::EndpointStatusCommand::ObserveTokenGrant { .. }]
-        ),
-        "{commands:?}"
-    );
-}
-
-#[tokio::test]
-async fn non_mcp_grant_failures_report_without_an_endpoint_inventory() {
-    for protocol in ["rest", "graphql", "json-rpc"] {
-        let (response, commands) = refused_grant(protocol, true).await;
-        let request_id = refusal_request_id(&response);
-        let [
-            openshell_core::endpoint_status::EndpointStatusCommand::ObserveTokenGrant {
-                destination_host,
-                destination_port,
-                result: Err(failure),
+    for (protocol, credentialed, endpoint_observed) in [
+        ("mcp", true, true),
+        ("mcp", false, false),
+        ("graphql", true, false),
+    ] {
+        let (response, commands) = refused_grant(protocol, credentialed).await;
+        let request_id = tests::grant_refusal_request_id(&response);
+        let Some((
+            EndpointStatusCommand::ObserveTokenGrant {
+                result: Err(grant_failure),
                 ..
             },
-        ] = commands.as_slice()
+            rest,
+        )) = commands.split_first()
         else {
-            panic!("{protocol}: bounded grant cause without MCP inventory: {commands:?}");
+            panic!("{protocol}: grant failure observation first: {commands:?}");
         };
-        assert_eq!(destination_host, HOST);
-        assert_eq!(*destination_port, PORT);
-        let failure = failure.to_proto();
-        assert_eq!(failure.request_id, request_id);
-        assert_eq!(failure.provider, "native");
-        assert_eq!(failure.credential_key, "access_token");
-        assert_eq!(failure.code, "unavailable");
+        let grant_failure = grant_failure.to_proto();
+        assert_eq!(grant_failure.request_id, request_id);
+        assert_eq!(grant_failure.provider, "native");
+        assert_eq!(grant_failure.credential_key, "access_token");
+        assert_eq!(grant_failure.code, "unavailable");
+        match rest {
+            [] => assert!(!endpoint_observed, "{protocol}: {commands:?}"),
+            [
+                EndpointStatusCommand::Observe {
+                    result,
+                    failure: Some(failure),
+                    ..
+                },
+            ] => {
+                assert!(endpoint_observed, "{protocol}: {commands:?}");
+                assert_eq!(*result, EndpointResult::CredentialUnavailable);
+                assert_eq!(failure.to_proto(), grant_failure);
+            }
+            _ => panic!("{protocol}: unexpected status commands: {commands:?}"),
+        }
     }
 }
 

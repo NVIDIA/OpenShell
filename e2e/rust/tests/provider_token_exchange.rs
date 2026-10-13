@@ -3,9 +3,6 @@
 
 #![cfg(feature = "e2e-podman")]
 
-#[path = "provider_token_exchange/closure.rs"]
-mod closure;
-
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -146,14 +143,10 @@ struct SpiffeWorkloadApi {
     subject: Arc<str>,
     jwks: Arc<Vec<u8>>,
     encoding_key: Arc<EncodingKey>,
-    deny_identity: Arc<AtomicBool>,
 }
 
 impl SpiffeWorkloadApi {
     fn jwt_svid(&self, audience: &[String]) -> Result<String, Status> {
-        if self.deny_identity.load(Ordering::SeqCst) {
-            return Err(Status::permission_denied("identity-secret-canary"));
-        }
         let now = unix_timestamp();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(KEY_ID.to_string());
@@ -321,14 +314,6 @@ fn jwks() -> Vec<u8> {
 }
 
 async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle {
-    start_controlled_spiffe_workload_api(path, subject, Arc::default()).await
-}
-
-async fn start_controlled_spiffe_workload_api(
-    path: &Path,
-    subject: &str,
-    deny_identity: Arc<AtomicBool>,
-) -> FixtureHandle {
     let api = SpiffeWorkloadApi {
         subject: Arc::<str>::from(subject),
         jwks: Arc::new(jwks()),
@@ -336,7 +321,6 @@ async fn start_controlled_spiffe_workload_api(
             EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes())
                 .expect("test RSA key should parse"),
         ),
-        deny_identity,
     };
     let endpoint = path.to_string_lossy();
     if endpoint.starts_with("tcp:") {
@@ -1021,8 +1005,8 @@ async fn podman_provider_token_exchange_injects_independent_grants_across_sandbo
 
 // Read one whole fixture request without consuming the following keepalive
 // request. OAuth forms can arrive separately from their headers.
-async fn read_route_fixture_request<S: tokio::io::AsyncRead + Unpin>(
-    stream: &mut S,
+async fn read_route_fixture_request(
+    stream: &mut TcpStream,
     observed_bytes: Option<&AtomicUsize>,
 ) -> Result<Option<String>, String> {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1251,6 +1235,39 @@ async fn start_route_target(
     }
 }
 
+async fn exec_within(sandbox: &SandboxGuard, script: &str) -> Result<String, String> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        sandbox.exec(&["python3", "-c", script]),
+    )
+    .await
+    .map_err(|_| "route workload timed out".to_owned())?
+}
+
+/// Poll `sandbox get` until the last token-grant failure is present or absent.
+async fn wait_for_token_grant_failure(
+    name: &str,
+    present: bool,
+) -> Result<serde_json::Value, String> {
+    for _ in 0..30 {
+        let output = openshell_cmd()
+            .args(["sandbox", "get", name, "--output", "json"])
+            .output()
+            .await
+            .map_err(|_| "could not spawn openshell CLI".to_owned())?;
+        if output.status.success()
+            && let Ok(sandbox) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && sandbox["last_token_grant_failure"].is_null() != present
+        {
+            return Ok(sandbox["last_token_grant_failure"].clone());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!(
+        "last token-grant failure present={present} not observed"
+    ))
+}
+
 #[tokio::test]
 async fn podman_provider_routes_recover_and_select_a_b_a_on_one_connection() {
     let _fixture_guard = SPIFFE_FIXTURE_LOCK.lock().await;
@@ -1327,11 +1344,9 @@ async fn podman_provider_routes_recover_and_select_a_b_a_on_one_connection() {
         grants.fail_next_b.store(true, Ordering::SeqCst);
         // The supervisor mediates direct workload connections as CONNECT.
         // HTTPConnection keeps one client socket for the successful A/B/A run.
-        let script = format!(
+        let failure_script = format!(
             r#"import http.client, uuid
-host = 'host.openshell.internal'
-port = {target_port}
-first = http.client.HTTPConnection(host, port, timeout=10)
+first = http.client.HTTPConnection('host.openshell.internal', {target_port}, timeout=10)
 first.request('GET', '/b/failure', headers={{'Authorization': 'Bearer stale-value'}})
 failed = first.getresponse()
 failed.read()
@@ -1341,6 +1356,12 @@ assert str(uuid.UUID(request_id)) == request_id, 'the refusal must carry a canon
 print('failed-request-id=' + request_id)
 assert failed.will_close, 'the failed tunnel must close'
 first.close()
+"#
+        );
+        let recovery_script = format!(
+            r#"import http.client
+host = 'host.openshell.internal'
+port = {target_port}
 recovered = http.client.HTTPConnection(host, port, timeout=10)
 connection = None
 for path in ['/a/first', '/b/second', '/a/third']:
@@ -1356,14 +1377,19 @@ recovered.close()
 print('route-recovery-a-b-a-ok')
 "#
         );
-        let output = tokio::time::timeout(
-            Duration::from_secs(60),
-            sandbox.exec(&["python3", "-c", &script]),
-        )
-        .await
-        .map_err(|_| "route workload timed out".to_owned());
+        let output = async {
+            let mut output = exec_within(&sandbox, &failure_script).await?;
+            // An authorized reader sees the cause of the refused grant.
+            let failure = wait_for_token_grant_failure(&sandbox.name, true).await?;
+            output.push_str(&format!("reported-failure={failure}\n"));
+            output.push_str(&exec_within(&sandbox, &recovery_script).await?);
+            // The matching grant's later success clears it.
+            wait_for_token_grant_failure(&sandbox.name, false).await?;
+            Ok::<_, String>(output)
+        }
+        .await;
         sandbox.cleanup().await;
-        output?
+        output
     }
     .await;
     for name in &names {
@@ -1386,6 +1412,22 @@ print('route-recovery-a-b-a-ok')
         Some(response_request_id),
         "the token service and refused response must identify the same exchange"
     );
+    let reported: serde_json::Value = serde_json::from_str(
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("reported-failure="))
+            .expect("the refused grant reached sandbox status"),
+    )
+    .expect("reported failure is JSON");
+    assert_eq!(reported["destination_port"], u64::from(target_port));
+    let failure = &reported["failure"];
+    assert_eq!(failure["request_id"], response_request_id);
+    assert_eq!(failure["code"], "unavailable");
+    assert_eq!(failure["recovery_action"], "retry");
+    assert_eq!(failure["stage"], "token_endpoint");
+    assert_eq!(failure["upstream_http_status"], 503);
+    assert_eq!(failure["provider"], names[1].as_str());
+    assert_eq!(failure["credential_key"], "access_token");
     let requests = observed.lock().expect("route target observations lock");
     assert_eq!(requests.len(), 3, "failed grant must not reach the target");
     assert_eq!(

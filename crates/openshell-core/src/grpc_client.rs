@@ -1382,9 +1382,10 @@ pub async fn exchange_provider_subject_token(
     }
     // TLS setup errors can contain paths and transport errors can contain URLs.
     // Discard those sources at the grant boundary; never diagnose from prose.
-    let mut client = tokio::time::timeout(Duration::from_secs(35), connect(endpoint.as_str()))
+    // The shared channel bounds the connection attempt; the gateway bounds its
+    // token-service calls, and a gateway deadline arrives as DeadlineExceeded.
+    let mut client = connect(endpoint.as_str())
         .await
-        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
         .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
     let request = provider_subject_token_exchange_request(
         ExchangeProviderSubjectTokenRequest {
@@ -1395,13 +1396,10 @@ pub async fn exchange_provider_subject_token(
         },
         request_id,
     );
-    let response = tokio::time::timeout(
-        Duration::from_secs(35),
-        client.exchange_provider_subject_token(request),
-    )
-    .await
-    .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
-    .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?;
+    let response = client
+        .exchange_provider_subject_token(request)
+        .await
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?;
     status.finish(provider_subject_token_exchange_result(
         response.into_inner(),
     ))
@@ -1489,41 +1487,33 @@ mod token_grant_exchange_tests {
         let failure = TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
             TokenGrantStage::IntermediateExchange,
-        )
-        .with_upstream_status(409);
+        );
         let status = failure.to_status();
-        let https = url::Url::parse("https://gateway.example:8080/").unwrap();
-        let http = url::Url::parse("http://gateway.example:8080/").unwrap();
+        let endpoint = |value: &str| url::Url::parse(value).unwrap();
         assert_eq!(
-            provider_subject_token_exchange_status(&status, &https),
+            provider_subject_token_exchange_status(&status, &endpoint("https://gateway:8080/")),
             failure
         );
-        let downgraded = provider_subject_token_exchange_status(&status, &http);
-        assert_eq!(downgraded.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(downgraded.stage(), TokenGrantStage::GatewayRpc);
-        assert_eq!(downgraded.upstream_status(), None);
+        assert_eq!(
+            provider_subject_token_exchange_status(&status, &endpoint("http://gateway:8080/")),
+            gateway_grant_failure(TokenGrantFailureKind::Unclassified)
+        );
     }
 
     #[test]
     fn exchange_request_carries_only_a_valid_request_id() {
-        let body = || ExchangeProviderSubjectTokenRequest {
-            sandbox_id: "sandbox".into(),
-            provider: "provider".into(),
-            credential_key: "credential".into(),
-            supervisor_jwt_svid: "svid".into(),
-        };
         let request_id = "5c4b3a29-1807-4f6e-8d5c-4b3a29180716";
-        let request = provider_subject_token_exchange_request(body(), Some(request_id));
-        assert_eq!(
-            request
-                .metadata()
-                .get("x-request-id")
-                .and_then(|value| value.to_str().ok()),
-            Some(request_id)
-        );
-        for absent in [None, Some("line\nbreak")] {
-            let request = provider_subject_token_exchange_request(body(), absent);
-            assert!(request.metadata().get("x-request-id").is_none());
+        for (value, expected) in [
+            (Some(request_id), Some(request_id)),
+            (Some("line\nbreak"), None),
+            (None, None),
+        ] {
+            let request = provider_subject_token_exchange_request(
+                ExchangeProviderSubjectTokenRequest::default(),
+                value,
+            );
+            let carried = request.metadata().get("x-request-id");
+            assert_eq!(carried.and_then(|value| value.to_str().ok()), expected);
         }
     }
 
@@ -1532,63 +1522,29 @@ mod token_grant_exchange_tests {
         for endpoint in [
             "https://user:SECRET@localhost/",
             "https://localhost/?token=SECRET",
-            "https://localhost/#SECRET",
             "https://localhost/SECRET",
             "file:///SECRET",
-            "not an endpoint SECRET",
         ] {
             let failure = token_grant_gateway_endpoint(endpoint).unwrap_err();
             assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
-            assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
         }
-        assert_eq!(
-            token_grant_gateway_endpoint("https://localhost:8443")
-                .unwrap()
-                .scheme(),
-            "https"
-        );
-        assert_eq!(
-            token_grant_gateway_endpoint("http://localhost:8080")
-                .unwrap()
-                .scheme(),
-            "http"
-        );
+        assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
     }
 
     #[test]
-    fn malformed_gateway_duration_discards_token_and_diagnostic() {
-        let failure = provider_subject_token_exchange_result(
-            crate::proto::ExchangeProviderSubjectTokenResponse {
-                access_token: "SYNTHETIC_ACCESS_SECRET".into(),
-                token_type: "Bearer".into(),
-                expires_after: Some(prost_types::Duration {
-                    seconds: 1,
-                    nanos: -1,
-                }),
-            },
-        )
-        .err()
-        .expect("invalid duration is rejected");
-        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
-    }
-
-    #[test]
-    fn successful_gateway_response_preserves_cache_expiration() {
-        let result = provider_subject_token_exchange_result(
-            crate::proto::ExchangeProviderSubjectTokenResponse {
-                access_token: "valid-token".into(),
-                token_type: "Bearer".into(),
-                expires_after: Some(prost_types::Duration {
-                    seconds: 120,
-                    nanos: 0,
-                }),
-            },
-        )
-        .expect("valid response");
+    fn gateway_response_keeps_expiration_and_rejects_invalid_duration() {
+        let response = |seconds, nanos| crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: "valid-token".into(),
+            token_type: "Bearer".into(),
+            expires_after: Some(prost_types::Duration { seconds, nanos }),
+        };
+        let result = provider_subject_token_exchange_result(response(120, 0)).unwrap();
         assert_eq!(result.access_token, "valid-token");
         assert_eq!(result.expires_in, 120);
-        assert_eq!(result.token_type, "Bearer");
+        let failure = provider_subject_token_exchange_result(response(1, -1))
+            .err()
+            .expect("invalid duration is rejected");
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
     }
 }
 

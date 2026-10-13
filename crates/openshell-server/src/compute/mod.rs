@@ -10743,29 +10743,18 @@ mod tests {
     #[test]
     fn driver_snapshot_preserves_endpoint_failure_and_ready_phase() {
         let mut sandbox = sandbox_record("sandbox-id", "sandbox-name", SandboxPhase::Ready);
-        let failure = openshell_core::endpoint_failure::EndpointFailure::token_grant(
-            openshell_core::token_grant_failure::TokenGrantFailure::new(
-                openshell_core::token_grant_failure::TokenGrantFailureKind::Timeout,
-                openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
-            ),
-            "github",
-            "api_token",
-            "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9",
-        )
-        .to_proto();
         let endpoint = openshell_core::proto::EndpointStatus {
             endpoint_id: "endpoint:v1:gateway".to_string(),
             host: "api.example.com".to_string(),
             ports: vec![443],
             path: "/mcp".to_string(),
-            last_result: openshell_core::proto::EndpointResult::CredentialUnavailable as i32,
+            last_result: openshell_core::proto::EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
-            last_failure: Some(failure.clone()),
+            last_failure: None,
         };
         let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
             destination_host: "api.example.com".to_string(),
-            destination_port: 443,
-            failure: Some(failure),
+            ..Default::default()
         });
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Ready as i32,

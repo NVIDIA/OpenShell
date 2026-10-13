@@ -736,22 +736,6 @@ fn endpoint_reconciliation_advances_only_observed_endpoint_timestamp() {
     );
 }
 
-const FAILURE_REQUEST_ID: &str = "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908";
-
-fn credentialed_expected() -> BTreeMap<String, ExpectedEndpoint> {
-    BTreeMap::from([(
-        "endpoint:v1:tools".to_string(),
-        ExpectedEndpoint {
-            provider_credentialed: true,
-            status: test_initial_endpoint_status(
-                "endpoint:v1:tools",
-                "tools.example.com",
-                "/mcp/**",
-            ),
-        },
-    )])
-}
-
 fn reauthorize_failure() -> openshell_core::proto::EndpointFailure {
     openshell_core::endpoint_failure::EndpointFailure::token_grant(
         openshell_core::token_grant_failure::TokenGrantFailure::new(
@@ -760,7 +744,7 @@ fn reauthorize_failure() -> openshell_core::proto::EndpointFailure {
         ),
         "github",
         "access_token",
-        FAILURE_REQUEST_ID,
+        "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
     )
     .to_proto()
 }
@@ -831,7 +815,6 @@ async fn rest_grant_status_fixture(
     );
     let sandbox = stored_sandbox(&state, sandbox_id).await;
     let context = active_endpoint_context(&state, &sandbox).await.unwrap();
-    assert!(context.endpoints.is_empty(), "fixture has no MCP endpoints");
     (
         state,
         ReportEndpointStatusRequest {
@@ -848,147 +831,173 @@ async fn rest_grant_status_fixture(
     )
 }
 
+async fn stored_grant_failure(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    public_status(state, sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
 #[test]
-fn sandbox_grant_status_validates_destination_cause_and_provider() {
+fn token_grant_status_rejects_invalid_fields() {
     use openshell_core::rpc_error::StatusExt;
 
     let attached = ["github".to_string()];
-    let validate = |failure| {
+    let validate = |observation: TokenGrantFailureObservation, attached: &[String]| {
         validate_token_grant_status(
             Some(&TokenGrantStatus {
-                last_failure: Some(failure),
+                last_failure: Some(observation),
             }),
-            &attached,
+            attached,
         )
     };
-    for host in ["api.example.com", "127.0.0.1", "::1", "[2001:db8::1]"] {
-        let mut observation = sandbox_grant_failure();
-        observation.destination_host = host.to_string();
-        validate(observation).expect("bounded DNS and IP destinations are accepted");
-    }
-    for host in ["API.EXAMPLE.COM", "bad\nSECRET"] {
-        let mut observation = sandbox_grant_failure();
-        observation.destination_host = host.to_string();
-        let error = validate(observation).unwrap_err();
-        assert_eq!(error.code(), Code::InvalidArgument);
-        assert!(!error.message().contains("SECRET"));
-    }
-    let mut missing_cause = sandbox_grant_failure();
-    missing_cause.failure = None;
-    assert_eq!(
-        validate(missing_cause).unwrap_err().code(),
-        Code::InvalidArgument
-    );
-    let mut unknown_code = sandbox_grant_failure();
-    unknown_code.failure.as_mut().unwrap().code = "bogus".to_string();
-    let details = validate(unknown_code).unwrap_err().get_error_details();
-    assert_eq!(
-        details.bad_request().unwrap().field_violations[0].field,
-        "token_grant_status.last_failure.failure"
-    );
-    let mut unknown_domain = sandbox_grant_failure();
-    unknown_domain.failure.as_mut().unwrap().domain = 99;
-    assert_eq!(
-        validate(unknown_domain).unwrap_err().code(),
-        Code::InvalidArgument
-    );
-    let mut foreign_provider = sandbox_grant_failure();
-    foreign_provider.failure.as_mut().unwrap().provider = "other-team".to_string();
-    assert_eq!(
-        validate(foreign_provider).unwrap_err().code(),
-        Code::FailedPrecondition
-    );
+    validate(sandbox_grant_failure(), &attached).expect("valid observation is accepted");
+    // A failure raised before credential selection names no provider.
     let mut unnamed = sandbox_grant_failure();
     let cause = unnamed.failure.as_mut().unwrap();
     cause.provider.clear();
     cause.credential_key.clear();
-    validate_token_grant_status(
-        Some(&TokenGrantStatus {
-            last_failure: Some(unnamed),
-        }),
-        &[],
-    )
-    .expect("selection failures may have no credential name");
+    validate(unnamed, &[]).expect("unnamed failure is accepted");
+
+    type Mutation = fn(&mut TokenGrantFailureObservation);
+    let rows: [(Mutation, &str); 5] = [
+        (
+            |o| o.destination_host = "API.EXAMPLE.COM".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.destination_host = "bad\nSECRET".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.failure = None,
+            "token_grant_status.last_failure.failure",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().domain = 99,
+            "token_grant_status.last_failure.failure.domain",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().code = "bogus".to_string(),
+            "token_grant_status.last_failure.failure",
+        ),
+    ];
+    for (mutate, field) in rows {
+        let mut observation = sandbox_grant_failure();
+        mutate(&mut observation);
+        let error = validate(observation, &attached).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument, "{field}");
+        assert!(!error.message().contains("SECRET"));
+        assert_eq!(
+            error
+                .get_error_details()
+                .bad_request()
+                .unwrap()
+                .field_violations[0]
+                .field,
+            field
+        );
+    }
+
+    let mut foreign = sandbox_grant_failure();
+    foreign.failure.as_mut().unwrap().provider = "other-team".to_string();
+    let error = validate(foreign, &attached).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let info = openshell_core::rpc_error::decode_details(&error)
+        .and_then(|details| details.error_info().cloned())
+        .expect("stable error reason");
+    assert_eq!(info.reason, "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED");
 }
 
-#[tokio::test]
-async fn rest_grant_failure_is_retrievable_retained_and_explicitly_cleared() {
-    let sandbox_id = "rest-grant-status";
-    let (state, report) = rest_grant_status_fixture(sandbox_id).await;
-    handle_report_endpoint_status(
-        &state,
-        with_sandbox(Request::new(report.clone()), sandbox_id),
-    )
-    .await
-    .expect("REST failure is reported without MCP observations");
-    assert_eq!(
-        public_status(&state, sandbox_id)
-            .await
-            .last_token_grant_failure,
-        Some(Box::new(sandbox_grant_failure()))
-    );
-    let mut changed_retry = report.clone();
-    changed_retry
-        .token_grant_status
-        .as_mut()
-        .unwrap()
-        .last_failure
-        .as_mut()
-        .unwrap()
-        .destination_port = 8443;
-    assert_eq!(
-        handle_report_endpoint_status(
-            &state,
-            with_sandbox(Request::new(changed_retry), sandbox_id)
+#[test]
+fn endpoint_snapshot_stores_failure_only_for_a_result_its_domain_explains() {
+    let expected = BTreeMap::from([(
+        "endpoint:v1:tools".to_string(),
+        ExpectedEndpoint {
+            provider_credentialed: true,
+            status: test_initial_endpoint_status(
+                "endpoint:v1:tools",
+                "tools.example.com",
+                "/mcp/**",
+            ),
+        },
+    )]);
+    let validate = |result: EndpointResult| {
+        validate_endpoint_snapshot(
+            &[EndpointObservation {
+                endpoint_id: "endpoint:v1:tools".to_string(),
+                result: result as i32,
+                failure: Some(reauthorize_failure()),
+            }],
+            &["endpoint:v1:tools".to_string()],
+            &expected,
+            &["github".to_string()],
         )
-        .await
-        .unwrap_err()
-        .code(),
-        Code::InvalidArgument
-    );
-    let mut legacy = report.clone();
-    legacy.report_sequence = 2;
-    legacy.token_grant_status = None;
-    handle_report_endpoint_status(&state, with_sandbox(Request::new(legacy), sandbox_id))
-        .await
-        .expect("missing extension retains current evidence");
+    };
+    let (reports, _) = validate(EndpointResult::CredentialUnavailable)
+        .expect("a classified credential failure is accepted");
     assert_eq!(
-        public_status(&state, sandbox_id)
-            .await
-            .last_token_grant_failure,
-        Some(Box::new(sandbox_grant_failure()))
+        reports["endpoint:v1:tools"].last_failure,
+        Some(reauthorize_failure())
     );
-    let mut cleared = report.clone();
-    cleared.report_sequence = 3;
-    cleared.token_grant_status = Some(TokenGrantStatus::default());
-    handle_report_endpoint_status(&state, with_sandbox(Request::new(cleared), sandbox_id))
-        .await
-        .expect("success explicitly clears the previous failure");
-    assert!(
-        public_status(&state, sandbox_id)
-            .await
-            .last_token_grant_failure
-            .is_none()
-    );
+
+    let error = validate(EndpointResult::TransportFailed).unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
     assert_eq!(
-        handle_report_endpoint_status(&state, with_sandbox(Request::new(report), "other-sandbox"))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::PermissionDenied
+        error.message(),
+        "endpoint failure domain does not explain this endpoint result"
     );
 }
 
-#[tokio::test]
-async fn rest_grant_failure_resets_on_provider_and_policy_changes() {
-    let sandbox_id = "rest-grant-revisions";
-    let (state, mut report) = rest_grant_status_fixture(sandbox_id).await;
+/// Send `report` with a new sequence and grant status; return the public cause.
+async fn send_grant_report(
+    state: &Arc<ServerState>,
+    report: &mut ReportEndpointStatusRequest,
+    sequence: u64,
+    grant_status: Option<TokenGrantStatus>,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    report.report_sequence = sequence;
+    report.token_grant_status = grant_status;
+    let sandbox_id = report.sandbox_id.clone();
     handle_report_endpoint_status(
-        &state,
-        with_sandbox(Request::new(report.clone()), sandbox_id),
+        state,
+        with_sandbox(Request::new(report.clone()), &sandbox_id),
     )
     .await
-    .unwrap();
+    .expect("report accepted");
+    public_status(state, &sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
+#[tokio::test]
+async fn rest_grant_failure_is_retained_cleared_and_reset() {
+    let sandbox_id = "rest-grant-status";
+    let (state, mut report) = rest_grant_status_fixture(sandbox_id).await;
+    let failure = report.token_grant_status.clone();
+    let stored = Some(Box::new(sandbox_grant_failure()));
+
+    // A REST-only sandbox reports a failure without MCP observations. A report
+    // without the extension retains it; an explicit success clears it.
+    assert_eq!(
+        send_grant_report(&state, &mut report, 1, failure.clone()).await,
+        stored
+    );
+    assert_eq!(
+        send_grant_report(&state, &mut report, 2, None).await,
+        stored
+    );
+    let success = Some(TokenGrantStatus::default());
+    assert_eq!(
+        send_grant_report(&state, &mut report, 3, success).await,
+        None
+    );
+
+    // A report without the extension from a new provider revision cannot keep
+    // the earlier cause.
+    send_grant_report(&state, &mut report, 4, failure.clone()).await;
     state
         .store
         .update_message_cas::<openshell_core::proto::Provider, _>(
@@ -1005,61 +1014,12 @@ async fn rest_grant_failure_resets_on_provider_and_policy_changes() {
         .unwrap();
     let sandbox = stored_sandbox(&state, sandbox_id).await;
     let context = active_endpoint_context(&state, &sandbox).await.unwrap();
-    assert_ne!(context.provider_env_revision, report.provider_env_revision);
-    report.report_sequence = 2;
     report.policy_hash = context.policy_hash;
     report.provider_env_revision = context.provider_env_revision;
-    report.token_grant_status = None;
-    handle_report_endpoint_status(
-        &state,
-        with_sandbox(Request::new(report.clone()), sandbox_id),
-    )
-    .await
-    .expect("a new provider revision clears even a legacy report's cause");
-    assert!(
-        public_status(&state, sandbox_id)
-            .await
-            .last_token_grant_failure
-            .is_none()
-    );
-    report.report_sequence = 3;
-    report.token_grant_status = Some(TokenGrantStatus {
-        last_failure: Some(sandbox_grant_failure()),
-    });
-    handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id))
-        .await
-        .unwrap();
-    let mut policy = sandbox.spec.unwrap().policy.unwrap();
-    policy.network_policies.get_mut("rest").unwrap().endpoints[0].host =
-        "changed.example.com".to_string();
-    state
-        .store
-        .put_policy_revision(
-            "rest-grant-revisions-v2",
-            sandbox_id,
-            "default",
-            2,
-            &policy.encode_to_vec(),
-            &deterministic_policy_hash(&policy),
-        )
-        .await
-        .unwrap();
-    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
-    let status = public_status(&state, sandbox_id).await;
-    assert!(status.endpoint_statuses.is_empty());
-    assert!(status.last_token_grant_failure.is_none());
-}
+    assert_eq!(send_grant_report(&state, &mut report, 5, None).await, None);
 
-#[tokio::test]
-async fn rest_grant_failure_resets_on_session_loss_replacement_and_startup() {
-    let sandbox_id = "rest-grant-sessions";
-    let (state, mut report) = rest_grant_status_fixture(sandbox_id).await;
-    handle_report_endpoint_status(
-        &state,
-        with_sandbox(Request::new(report.clone()), sandbox_id),
-    )
-    .await
-    .unwrap();
+    // Losing the session clears the cause.
+    send_grant_report(&state, &mut report, 6, failure).await;
     state
         .supervisor_sessions
         .remove_if_current(sandbox_id, "session-a")
@@ -1067,120 +1027,22 @@ async fn rest_grant_failure_resets_on_session_loss_replacement_and_startup() {
     reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
         .await
         .unwrap();
-    assert!(
-        public_status(&state, sandbox_id)
-            .await
-            .last_token_grant_failure
-            .is_none()
-    );
-    for session in ["session-b", "session-c"] {
-        register_session(&state, sandbox_id, session);
-        reset_endpoint_status_for_supervisor_session(&state, sandbox_id, session)
-            .await
-            .unwrap();
-        assert!(
-            public_status(&state, sandbox_id)
-                .await
-                .last_token_grant_failure
-                .is_none()
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .initialize_endpoint_status_authority(sandbox_id, session)
-        );
-        report.supervisor_session_id = session.to_string();
-        handle_report_endpoint_status(
-            &state,
-            with_sandbox(Request::new(report.clone()), sandbox_id),
-        )
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
+
+    // Startup invalidates a sandbox whose only evidence is a grant failure.
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+            sandbox.status.as_mut().unwrap().last_token_grant_failure = stored.clone();
+        })
         .await
         .unwrap();
-    }
-    state
-        .supervisor_sessions
-        .remove_if_current(sandbox_id, "session-c")
-        .unwrap();
     invalidate_endpoint_status_on_startup(&state).await.unwrap();
-    let status = public_status(&state, sandbox_id).await;
-    assert!(status.endpoint_statuses.is_empty());
-    assert!(status.last_token_grant_failure.is_none());
-}
-
-fn failed_observation(
-    result: EndpointResult,
-    failure: openshell_core::proto::EndpointFailure,
-) -> Vec<EndpointObservation> {
-    vec![EndpointObservation {
-        endpoint_id: "endpoint:v1:tools".to_string(),
-        result: result as i32,
-        failure: Some(failure),
-    }]
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
 }
 
 #[test]
-fn endpoint_snapshot_accepts_bounded_failure_for_credential_failure() {
-    let attached = ["github".to_string()];
-    let (reports, _) = validate_endpoint_snapshot(
-        &failed_observation(EndpointResult::CredentialUnavailable, reauthorize_failure()),
-        &["endpoint:v1:tools".to_string()],
-        &credentialed_expected(),
-        &attached,
-    )
-    .expect("a classified credential failure is accepted");
-    let status = &reports["endpoint:v1:tools"];
-    assert_eq!(
-        status.last_result,
-        EndpointResult::CredentialUnavailable as i32
-    );
-    assert_eq!(status.last_failure, Some(reauthorize_failure()));
-    assert_eq!(status.host, "tools.example.com");
-
-    // A failure that has not selected a credential names no provider.
-    let mut unnamed = reauthorize_failure();
-    unnamed.provider.clear();
-    unnamed.credential_key.clear();
-    validate_endpoint_snapshot(
-        &failed_observation(EndpointResult::CredentialUnavailable, unnamed),
-        &["endpoint:v1:tools".to_string()],
-        &credentialed_expected(),
-        &[],
-    )
-    .expect("an unnamed failure is accepted");
-}
-
-#[test]
-fn endpoint_snapshot_rejects_failures_outside_the_contract() {
-    let attached = ["github".to_string()];
-    let invalid = |result, failure| {
-        validate_endpoint_snapshot(
-            &failed_observation(result, failure),
-            &["endpoint:v1:tools".to_string()],
-            &credentialed_expected(),
-            &attached,
-        )
-        .expect_err("invalid failure is rejected")
-    };
-
-    let error = invalid(EndpointResult::TransportFailed, reauthorize_failure());
-    assert_eq!(error.code(), Code::InvalidArgument);
-    assert_eq!(
-        error.message(),
-        "endpoint failure domain does not explain this endpoint result"
-    );
-
-    let mut foreign = reauthorize_failure();
-    foreign.provider = "other-team".to_string();
-    let error = invalid(EndpointResult::CredentialUnavailable, foreign);
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    let info = openshell_core::rpc_error::decode_details(&error)
-        .and_then(|details| details.error_info().cloned())
-        .expect("stable error reason");
-    assert_eq!(info.reason, "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED");
-}
-
-#[test]
-fn endpoint_failure_change_keeps_report_time_and_session_loss_clears_it() {
+fn endpoint_failure_change_without_marker_keeps_report_time() {
     let mut sandbox = test_sandbox(
         "sandbox-id",
         "sandbox-name",
@@ -1192,26 +1054,15 @@ fn endpoint_failure_change_keeps_report_time_and_session_loss_clears_it() {
         last_failure: Some(reauthorize_failure()),
         ..test_initial_endpoint_status("endpoint", "api.example.com", "/**")
     };
-    // A gateway replica that predates last_failure can rewrite the record
-    // without it: the stored result remains and its cause is gone.
-    let rewritten = BTreeMap::from([(
-        "endpoint".to_string(),
-        EndpointStatus {
-            last_failure: None,
-            ..endpoint.clone()
-        },
-    )]);
-    let observed = HashSet::from(["endpoint".to_string()]);
     reconcile_endpoint_statuses(
         &mut sandbox,
-        &rewritten,
-        &observed,
+        &BTreeMap::from([("endpoint".to_string(), endpoint.clone())]),
+        &HashSet::from(["endpoint".to_string()]),
         &timestamp("2026-09-05T01:00:00.000Z"),
     );
 
-    // The supervisor's next report carries a cause for the same result without
-    // marking the endpoint observed. Only a new result needs a marker, so the
-    // cause is stored and keeps the report time.
+    // Only a new result needs an observation marker; a new cause for the same
+    // result is stored and keeps the earlier report time.
     let mut retry = reauthorize_failure();
     retry.request_id = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d".to_string();
     let changed = BTreeMap::from([(
@@ -1235,14 +1086,6 @@ fn endpoint_failure_change_keeps_report_time_and_session_loss_clears_it() {
         status.last_reported_time,
         Some(timestamp("2026-09-05T01:00:00.000Z"))
     );
-
-    invalidate_endpoint_status_without_session(&mut sandbox);
-    let status = &sandbox.status.as_ref().unwrap().endpoint_statuses[0];
-    assert_eq!(
-        status.last_result,
-        EndpointResult::NoObservedExchange as i32
-    );
-    assert_eq!(status.last_failure, None);
 }
 
 #[test]

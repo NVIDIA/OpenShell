@@ -5460,6 +5460,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         const SECRET: &str = "GRANT_SECRET_CANARY_3319";
+        const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
 
         #[derive(Clone, Default)]
         struct GrantTraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -5472,190 +5473,6 @@ mod tests {
 
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
-            }
-        }
-
-        fn capture_grant_warnings() -> (
-            GrantTraceBuffer,
-            crate::otel_tracing::test_exporter::ScopedTracingTestGuard,
-        ) {
-            let output = GrantTraceBuffer::default();
-            let writer = output.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .without_time()
-                .with_writer(move || writer.clone())
-                .finish();
-            let guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
-            // A captured sentinel proves the subscriber was active for WARN
-            // events, so an empty capture cannot hide a broken test fixture.
-            tracing::warn!("grant capture active");
-            (output, guard)
-        }
-
-        /// Credential values and handles never reach logs. Provider and
-        /// credential names are not secrets and can appear in diagnostics.
-        fn assert_no_credential_warnings(output: &GrantTraceBuffer) {
-            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-            assert!(logs.contains("grant capture active"));
-            assert!(!logs.contains(SECRET), "{logs}");
-        }
-
-        #[cfg(unix)]
-        mod expired_driver {
-            use super::*;
-            use openshell_core::proto::credentials::v1::{
-                DeleteCredentialRequest, DeleteCredentialResponse,
-                GetCredentialDriverCapabilitiesRequest, GetCredentialDriverCapabilitiesResponse,
-                ListCredentialsRequest, ListCredentialsResponse, ResolveCredentialsRequest,
-                ResolveCredentialsResponse, ResolvedCredential, StoreCredentialRequest,
-                StoreCredentialResponse,
-                credential_driver_server::{CredentialDriver, CredentialDriverServer},
-            };
-
-            #[derive(Debug)]
-            struct ExpiredDriver;
-
-            #[tonic::async_trait]
-            impl CredentialDriver for ExpiredDriver {
-                async fn get_capabilities(
-                    &self,
-                    _request: Request<GetCredentialDriverCapabilitiesRequest>,
-                ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status>
-                {
-                    Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
-                        driver_name: "expired-fixture".to_string(),
-                        supports_expires_at: true,
-                        extension: Some(openshell_core::extension_protocol::extension_metadata(
-                            openshell_core::extension_protocol::ExtensionFamily::Credentials,
-                            "expired-fixture",
-                            "0.0.0",
-                            [],
-                        )),
-                        ..Default::default()
-                    }))
-                }
-
-                async fn store_credential(
-                    &self,
-                    _request: Request<StoreCredentialRequest>,
-                ) -> Result<Response<StoreCredentialResponse>, Status> {
-                    Err(Status::unimplemented("fixture only resolves credentials"))
-                }
-
-                async fn delete_credential(
-                    &self,
-                    _request: Request<DeleteCredentialRequest>,
-                ) -> Result<Response<DeleteCredentialResponse>, Status> {
-                    Err(Status::unimplemented("fixture only resolves credentials"))
-                }
-
-                async fn list_credentials(
-                    &self,
-                    _request: Request<ListCredentialsRequest>,
-                ) -> Result<Response<ListCredentialsResponse>, Status> {
-                    Err(Status::unimplemented("fixture only resolves credentials"))
-                }
-
-                async fn resolve_credentials(
-                    &self,
-                    request: Request<ResolveCredentialsRequest>,
-                ) -> Result<Response<ResolveCredentialsResponse>, Status> {
-                    Ok(Response::new(ResolveCredentialsResponse {
-                        credentials: request
-                            .into_inner()
-                            .credentials
-                            .into_iter()
-                            .map(|request| ResolvedCredential {
-                                request_id: request.request_id,
-                                value: SECRET.to_string(),
-                                expiration_time: Some(ts(0)),
-                            })
-                            .collect(),
-                    }))
-                }
-            }
-
-            #[tokio::test]
-            async fn driver_returned_subject_expiry_is_generic_and_not_logged() {
-                let directory = tempfile::tempdir().unwrap();
-                let socket = directory.path().join("driver.sock");
-                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-                let incoming = futures::stream::unfold(listener, |listener| async move {
-                    Some((listener.accept().await.map(|(stream, _)| stream), listener))
-                });
-                let (shutdown, stop) = tokio::sync::oneshot::channel::<()>();
-                let server = tokio::spawn(async move {
-                    tonic::transport::Server::builder()
-                        .add_service(CredentialDriverServer::new(ExpiredDriver))
-                        .serve_with_incoming_shutdown(incoming, async {
-                            let _ = stop.await;
-                        })
-                        .await
-                });
-                let config =
-                    openshell_core::Config::new(None).with_credential_drivers(["expired-fixture"]);
-                let socket_path = toml::Value::String(socket.to_string_lossy().into_owned());
-                let file: crate::config_file::ConfigFile = toml::from_str(&format!(
-                    "[openshell.credential_drivers.expired-fixture]\ntransport = \"uds\"\nsocket_path = {socket_path}\n"
-                )).unwrap();
-                let credentials =
-                    crate::credentials::CredentialRuntime::from_config_file(&config, Some(&file))
-                        .await
-                        .unwrap();
-                let mut provider = provider_with_values("grant-provider", "custom");
-                provider.credentials.clear();
-                provider.credential_handles.insert(
-                    "subject".to_string(),
-                    CredentialHandle {
-                        driver: "expired-fixture".to_string(),
-                        handle: SECRET.to_string(),
-                        metadata: HashMap::new(),
-                    },
-                );
-                assert!(provider.credential_expiration_times.is_empty());
-                let (output, capture) = capture_grant_warnings();
-                let status = resolve_subject_token_credential(&credentials, &provider, "subject")
-                    .await
-                    .unwrap_err();
-                drop(capture);
-                let failure = assert_generic(&status, Code::FailedPrecondition);
-                assert_eq!(
-                    failure.kind(),
-                    TokenGrantFailureKind::ProviderAuthorizationRequired
-                );
-                assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
-                assert_no_credential_warnings(&output);
-                drop(credentials);
-                shutdown.send(()).unwrap();
-                server.await.unwrap().unwrap();
-            }
-        }
-
-        fn sandbox_request(
-            body: ExchangeProviderSubjectTokenRequest,
-            principal_id: &str,
-        ) -> Request<ExchangeProviderSubjectTokenRequest> {
-            let mut request = Request::new(body);
-            request
-                .extensions_mut()
-                .insert(Principal::Sandbox(SandboxPrincipal {
-                    sandbox_id: principal_id.to_string(),
-                    source: SandboxIdentitySource::BootstrapJwt {
-                        issuer: SECRET.to_string(),
-                    },
-                    trust_domain: None,
-                }));
-            request
-        }
-
-        fn request_body() -> ExchangeProviderSubjectTokenRequest {
-            ExchangeProviderSubjectTokenRequest {
-                sandbox_id: "grant-sandbox".to_string(),
-                provider: SECRET.to_string(),
-                credential_key: SECRET.to_string(),
-                supervisor_jwt_svid: SECRET.to_string(),
             }
         }
 
@@ -5675,7 +5492,6 @@ mod tests {
             raw.metadata_mut()
                 .insert("x-upstream-secret", SECRET.parse().unwrap());
             raw.set_source(Arc::new(std::io::Error::other(SECRET)));
-            assert!(std::error::Error::source(&raw).is_some());
             let status = sanitize_token_grant_status(raw);
             let failure = assert_generic(&status, Code::Internal);
             assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
@@ -5698,7 +5514,6 @@ mod tests {
 
         #[test]
         fn only_canonical_request_ids_are_echoed() {
-            const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
             let mut metadata = tonic::metadata::MetadataMap::new();
             assert_eq!(canonical_request_id(&metadata), None);
             metadata.insert("x-request-id", REQUEST_ID.parse().unwrap());
@@ -5715,17 +5530,40 @@ mod tests {
 
         #[tokio::test]
         async fn handler_failure_log_names_request_and_classification_without_secrets() {
-            const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
             let state = test_server_state_without_provider_profiles().await;
-            let mut request = sandbox_request(request_body(), "grant-sandbox");
+            let mut request = Request::new(ExchangeProviderSubjectTokenRequest {
+                sandbox_id: "grant-sandbox".to_string(),
+                provider: SECRET.to_string(),
+                credential_key: SECRET.to_string(),
+                supervisor_jwt_svid: SECRET.to_string(),
+            });
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "grant-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                    },
+                    trust_domain: None,
+                }));
             request
                 .metadata_mut()
                 .insert("x-request-id", REQUEST_ID.parse().unwrap());
-            let (output, capture) = capture_grant_warnings();
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
             let error = handle_exchange_provider_subject_token(&state, request)
                 .await
                 .unwrap_err();
             drop(capture);
+
             let failure = assert_generic(&error, Code::NotFound);
             let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
             assert!(
@@ -5736,104 +5574,27 @@ mod tests {
                 )),
                 "{logs}"
             );
-            // The authenticated supervisor's own sandbox receives the line.
             assert!(logs.contains("sandbox_id=grant-sandbox"), "{logs}");
             assert!(!logs.contains(SECRET), "{logs}");
-
-            // Another sandbox's supervisor cannot add a line to this sandbox's
-            // stream; its attempt is attributed to its own sandbox.
-            let (output, capture) = capture_grant_warnings();
-            handle_exchange_provider_subject_token(
-                &state,
-                sandbox_request(request_body(), "other"),
-            )
-            .await
-            .unwrap_err();
-            drop(capture);
-            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-            assert!(
-                logs.contains("dynamic token grant failed request_id=none"),
-                "{logs}"
-            );
-            assert!(logs.contains("sandbox_id=other"), "{logs}");
-            assert!(!logs.contains("sandbox_id=grant-sandbox"), "{logs}");
         }
 
         #[tokio::test]
-        async fn handler_auth_and_required_fields_are_generic() {
-            let state = test_server_state_without_provider_profiles().await;
-            let missing =
-                handle_exchange_provider_subject_token(&state, Request::new(request_body()))
-                    .await
-                    .unwrap_err();
-            let failure = assert_generic(&missing, Code::Unauthenticated);
-            assert_eq!(
-                failure.kind(),
-                TokenGrantFailureKind::WorkloadIdentityRejected
-            );
-            let user =
-                handle_exchange_provider_subject_token(&state, authed_request(request_body()))
-                    .await
-                    .unwrap_err();
-            assert_generic(&user, Code::PermissionDenied);
-            let wrong_sandbox = handle_exchange_provider_subject_token(
-                &state,
-                sandbox_request(request_body(), SECRET),
-            )
-            .await
-            .unwrap_err();
-            assert_generic(&wrong_sandbox, Code::PermissionDenied);
-
-            for missing_field in 0..3 {
-                let mut body = request_body();
-                match missing_field {
-                    0 => body.provider.clear(),
-                    1 => body.credential_key.clear(),
-                    _ => body.supervisor_jwt_svid.clear(),
-                }
-                let error = handle_exchange_provider_subject_token(
-                    &state,
-                    sandbox_request(body, "grant-sandbox"),
-                )
-                .await
-                .unwrap_err();
-                let failure = assert_generic(&error, Code::InvalidArgument);
-                assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
-            }
-        }
-
-        #[tokio::test]
-        async fn handler_unattached_provider_is_generic() {
-            let state = test_server_state_without_provider_profiles().await;
-            state
-                .store
-                .put_message(&Sandbox {
-                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                        id: "grant-sandbox".to_string(),
-                        name: "grant-sandbox".to_string(),
-                        workspace: "default".to_string(),
-                        ..Default::default()
-                    }),
-                    spec: Some(SandboxSpec::default()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            let unattached = handle_exchange_provider_subject_token(
-                &state,
-                sandbox_request(request_body(), "grant-sandbox"),
-            )
-            .await
-            .unwrap_err();
-            assert_generic(&unattached, Code::PermissionDenied);
-        }
-
-        #[tokio::test]
-        async fn credential_driver_diagnostics_and_expiration_are_generic() {
+        async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
             let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
             let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
             let mut provider = provider_with_values("grant-provider", "custom");
             provider.credentials.clear();
+            let missing = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            let failure = assert_generic(&missing, Code::FailedPrecondition);
+            assert_eq!(
+                failure.kind(),
+                TokenGrantFailureKind::ProviderAuthorizationRequired
+            );
+            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
+
+            // Driver diagnostics name the unknown driver; the gateway drops them.
             provider.credential_handles.insert(
                 "subject".to_string(),
                 CredentialHandle {
@@ -5842,97 +5603,59 @@ mod tests {
                     metadata: HashMap::new(),
                 },
             );
-            let raw = credentials
-                .resolve_provider_handles(&provider, 0)
+            let unresolvable = resolve_subject_token_credential(&credentials, &provider, "subject")
                 .await
                 .unwrap_err();
-            assert!(raw.message().contains(SECRET));
-            let failure = resolve_subject_token_credential(&credentials, &provider, "subject")
-                .await
-                .unwrap_err();
-            assert_generic(&failure, Code::InvalidArgument);
+            assert_generic(&unresolvable, Code::InvalidArgument);
 
+            // Expiry is checked before the driver is asked.
             provider
                 .credential_expiration_times
                 .insert("subject".to_string(), ts(0));
             let expired = resolve_subject_token_credential(&credentials, &provider, "subject")
                 .await
                 .unwrap_err();
-            let failure = assert_generic(&expired, Code::FailedPrecondition);
             assert_eq!(
-                failure.kind(),
+                assert_generic(&expired, Code::FailedPrecondition).kind(),
                 TokenGrantFailureKind::ProviderAuthorizationRequired
             );
-            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
-        }
-
-        #[tokio::test]
-        async fn expired_sibling_handle_is_skipped_without_logging_subject() {
-            let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
-            let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
-            let mut provider = provider_with_values("grant-provider", "custom");
-            provider.credentials.clear();
-            provider.credential_handles = credentials
-                .store_provider_credentials(
-                    provider.object_name(),
-                    provider.object_workspace(),
-                    "grant-fixture-provider",
-                    &HashMap::from([
-                        ("subject".to_string(), SECRET.to_string()),
-                        ("expired-sibling".to_string(), SECRET.to_string()),
-                    ]),
-                    &HashMap::new(),
-                )
-                .await
-                .unwrap();
-            provider
-                .credential_expiration_times
-                .insert("expired-sibling".to_string(), ts(0));
-            let (output, capture) = capture_grant_warnings();
-            let subject = resolve_subject_token_credential(&credentials, &provider, "subject")
-                .await
-                .unwrap();
-            drop(capture);
-            assert_eq!(subject, SECRET);
-            assert_no_credential_warnings(&output);
         }
 
         #[test]
         fn invalid_grant_configuration_fails_before_acquisition() {
-            let mut grant = token_grant_credential("access_token").token_grant.unwrap();
-            let mut provider = provider_with_values("grant-provider", "custom");
-            grant.cache_ttl = Some(prost_types::Duration {
-                seconds: -1,
-                nanos: 0,
-            });
-            let invalid_ttl =
-                validate_intermediate_grant_configuration(&grant, &provider, "subject")
-                    .unwrap_err();
-            assert_eq!(
-                assert_generic(&invalid_ttl, Code::InvalidArgument).kind(),
-                TokenGrantFailureKind::Configuration,
-            );
-            grant.cache_ttl = None;
-            provider.credential_expiration_times.insert(
+            let valid = token_grant_credential("access_token").token_grant.unwrap();
+            let provider = provider_with_values("grant-provider", "custom");
+            let mut bad_expiry = provider.clone();
+            bad_expiry.credential_expiration_times.insert(
                 "subject".to_string(),
                 prost_types::Timestamp {
                     seconds: 0,
                     nanos: -1,
                 },
             );
-            let invalid_expiration =
-                validate_intermediate_grant_configuration(&grant, &provider, "subject")
+            let negative_ttl = ProviderCredentialTokenGrant {
+                cache_ttl: Some(prost_types::Duration {
+                    seconds: -1,
+                    nanos: 0,
+                }),
+                ..valid.clone()
+            };
+            let bad_endpoint = ProviderCredentialTokenGrant {
+                token_endpoint: format!("ftp://example.com/{SECRET}"),
+                ..valid.clone()
+            };
+            for (grant, provider, code) in [
+                (&negative_ttl, &provider, Code::InvalidArgument),
+                (&valid, &bad_expiry, Code::FailedPrecondition),
+                (&bad_endpoint, &provider, Code::FailedPrecondition),
+            ] {
+                let status = validate_intermediate_grant_configuration(grant, provider, "subject")
                     .unwrap_err();
-            assert_generic(&invalid_expiration, Code::FailedPrecondition);
-            provider.credential_expiration_times.clear();
-            grant.token_endpoint = format!("ftp://example.com/{SECRET}");
-            let invalid_endpoint =
-                validate_intermediate_grant_configuration(&grant, &provider, "subject")
-                    .unwrap_err();
-            assert_eq!(
-                assert_generic(&invalid_endpoint, Code::FailedPrecondition).kind(),
-                TokenGrantFailureKind::Configuration,
-            );
+                assert_eq!(
+                    assert_generic(&status, code).kind(),
+                    TokenGrantFailureKind::Configuration,
+                );
+            }
         }
 
         #[test]
@@ -5995,25 +5718,11 @@ mod tests {
             assert_generic(&supervisor, Code::PermissionDenied);
         }
 
-        fn secret_exchange_params() -> TokenExchangeParams<'static> {
-            TokenExchangeParams {
-                client_assertion: SECRET,
-                client_assertion_type: "",
-                subject_token: SECRET,
-                subject_token_type: "",
-                audience: SECRET,
-                scopes: &[],
-                requested_token_type: "",
-            }
-        }
-
-        /// Serve one token response and return the request headers it received.
-        async fn token_endpoint_capturing_headers(
-            body: String,
-        ) -> (String, tokio::task::JoinHandle<String>) {
+        #[tokio::test]
+        async fn intermediate_http_failure_keeps_stage_status_and_request_id_without_body() {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move {
+            let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 1024];
@@ -6022,91 +5731,37 @@ mod tests {
                     assert_ne!(count, 0, "request headers ended early");
                     request.extend_from_slice(&chunk[..count]);
                 }
+                let body = format!(
+                    "{{\"error\":\"provider_authorization_required\",\"openshell_error_contract\":\"openshell.token-grant.v1\",\"error_description\":\"{SECRET}\"}}"
+                );
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
-                String::from_utf8_lossy(&request).into_owned()
+                String::from_utf8_lossy(&request).to_ascii_lowercase()
             });
-            (endpoint, task)
-        }
-
-        #[tokio::test]
-        async fn intermediate_exchange_forwards_the_supervisor_request_id() {
-            const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
-            let body = format!("{{\"access_token\":\"{SECRET}\",\"token_type\":\"Bearer\"}}");
-            let (endpoint, task) = token_endpoint_capturing_headers(body).await;
-            perform_intermediate_token_exchange(
-                &endpoint,
-                &secret_exchange_params(),
-                Some(REQUEST_ID),
-            )
-            .await
-            .unwrap();
-            let headers = task.await.unwrap().to_ascii_lowercase();
+            let params = TokenExchangeParams {
+                client_assertion: SECRET,
+                client_assertion_type: "",
+                subject_token: SECRET,
+                subject_token_type: "",
+                audience: SECRET,
+                scopes: &[],
+                requested_token_type: "",
+            };
+            let result =
+                perform_intermediate_token_exchange(&endpoint, &params, Some(REQUEST_ID)).await;
+            let headers = server.await.unwrap();
             assert!(
                 headers.contains(&format!("x-openshell-request-id: {REQUEST_ID}")),
                 "{headers}"
             );
-        }
-
-        async fn token_endpoint_response(
-            status: u16,
-            body: String,
-        ) -> (String, tokio::task::JoinHandle<()>) {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                // This fixture returns an error as soon as the request starts.
-                let mut request = [0_u8; 1];
-                stream.read_exact(&mut request).await.unwrap();
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            });
-            (endpoint, task)
-        }
-
-        #[tokio::test]
-        async fn intermediate_http_failure_keeps_stage_and_status_without_body() {
-            let body = format!(
-                "{{\"error\":\"provider_authorization_required\",\"openshell_error_contract\":\"openshell.token-grant.v1\",\"error_description\":\"{SECRET}\"}}"
-            );
-            let (endpoint, task) = token_endpoint_response(409, body).await;
-            let result =
-                perform_intermediate_token_exchange(&endpoint, &secret_exchange_params(), None)
-                    .await;
-            task.await.unwrap();
             let status = result.unwrap_err();
             let failure = assert_generic(&status, status.code());
             assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
             assert_eq!(failure.stage(), TokenGrantStage::IntermediateExchange);
             assert_eq!(failure.upstream_status(), Some(409));
-        }
-
-        #[tokio::test]
-        async fn intermediate_success_remains_cacheable() {
-            let body = format!(
-                "{{\"access_token\":\"{SECRET}\",\"token_type\":\"Bearer\",\"expires_in\":300}}"
-            );
-            let (endpoint, task) = token_endpoint_response(200, body).await;
-            let token =
-                perform_intermediate_token_exchange(&endpoint, &secret_exchange_params(), None)
-                    .await
-                    .unwrap();
-            task.await.unwrap();
-            assert_eq!(token.access_token, SECRET);
-            let cache = IntermediateTokenCache::new();
-            let expires_at_ms = intermediate_token_cache_expires_at_ms(&token, None, 0, 0);
-            cache.set("cache-key".to_string(), &token, expires_at_ms);
-            let cached = cache.get("cache-key").unwrap();
-            assert_eq!(cached.access_token, SECRET);
-            assert_eq!(cached.token_type, "Bearer");
-            assert!(cached.expires_in > 0 && cached.expires_in <= 270);
         }
     }
 

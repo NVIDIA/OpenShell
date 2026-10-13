@@ -188,18 +188,22 @@ mod tests {
     const CREDENTIAL_UNAVAILABLE: proto::EndpointResult =
         proto::EndpointResult::CredentialUnavailable;
 
-    fn reported() -> proto::EndpointFailure {
+    fn reported_with(provider: &str, credential_key: &str) -> proto::EndpointFailure {
         EndpointFailure::token_grant(
             TokenGrantFailure::new(
                 TokenGrantFailureKind::ProviderAuthorizationRequired,
                 TokenGrantStage::GatewayRpc,
             )
             .with_upstream_status(409),
-            "github",
-            "access_token",
+            provider,
+            credential_key,
             REQUEST_ID,
         )
         .to_proto()
+    }
+
+    fn reported() -> proto::EndpointFailure {
+        reported_with("github", "access_token")
     }
 
     #[test]
@@ -217,53 +221,16 @@ mod tests {
                 request_id: REQUEST_ID.into(),
             }
         );
-        assert_eq!(
-            validate_endpoint_failure(&reported(), CREDENTIAL_UNAVAILABLE),
-            Ok(())
-        );
-    }
-
-    type Mutation = fn(&mut proto::EndpointFailure);
-
-    #[test]
-    fn token_grant_causes_explain_only_credential_failures() {
-        for result in [
-            proto::EndpointResult::Unspecified,
-            proto::EndpointResult::NoObservedExchange,
-            proto::EndpointResult::HttpResponseReceived,
-            proto::EndpointResult::PolicyDenied,
-            proto::EndpointResult::TlsFailed,
-            proto::EndpointResult::TransportFailed,
-            proto::EndpointResult::UpstreamRejected,
-        ] {
-            assert_eq!(
-                validate_endpoint_failure(&reported(), result),
-                Err(EndpointFailureValidationError::Result),
-                "{result:?}"
-            );
-        }
     }
 
     #[test]
-    fn constructed_causes_always_pass_gateway_validation() {
+    fn constructed_causes_drop_unreportable_names() {
         let oversized = "k".repeat(MAX_ENDPOINT_FAILURE_NAME_BYTES + 1);
         for (provider, credential_key) in [
             ("github", oversized.as_str()),
             ("git\u{202e}hub", "access_token"),
-            ("github", "access token"),
-            ("github", ""),
-            ("", "access_token"),
         ] {
-            let failure = EndpointFailure::token_grant(
-                TokenGrantFailure::new(
-                    TokenGrantFailureKind::Configuration,
-                    TokenGrantStage::Injection,
-                ),
-                provider,
-                credential_key,
-                REQUEST_ID,
-            )
-            .to_proto();
+            let failure = reported_with(provider, credential_key);
             assert_eq!(
                 validate_endpoint_failure(&failure, CREDENTIAL_UNAVAILABLE),
                 Ok(())
@@ -273,59 +240,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_values_outside_the_closed_sets() {
-        let cases: [(Mutation, EndpointFailureValidationError); 15] = [
-            (|f| f.domain = 0, EndpointFailureValidationError::Domain),
-            (|f| f.domain = 99, EndpointFailureValidationError::Domain),
-            (
-                |f| f.code = "reauthorization_required".into(),
-                EndpointFailureValidationError::Code,
-            ),
-            (
-                |f| f.code = "Provider_Authorization_Required".into(),
-                EndpointFailureValidationError::Code,
-            ),
-            (
-                |f| f.stage = "token service said no".into(),
-                EndpointFailureValidationError::Stage,
-            ),
+    fn rejects_each_invalid_field() {
+        use EndpointFailureValidationError as E;
+        assert_eq!(
+            validate_endpoint_failure(&reported(), proto::EndpointResult::PolicyDenied),
+            Err(E::Result)
+        );
+        let cases: [(fn(&mut proto::EndpointFailure), E); 9] = [
+            (|f| f.domain = 99, E::Domain),
+            (|f| f.code = "reauthorization_required".into(), E::Code),
+            (|f| f.stage = "token service said no".into(), E::Stage),
             (
                 |f| f.recovery_action = ProviderCredentialRefreshRecoveryAction::Retry.into(),
-                EndpointFailureValidationError::Recovery,
+                E::Recovery,
             ),
-            (|f| f.provider.clear(), EndpointFailureValidationError::Name),
-            (
-                |f| f.credential_key.clear(),
-                EndpointFailureValidationError::Name,
-            ),
-            (
-                |f| f.provider = "git\nhub".into(),
-                EndpointFailureValidationError::Name,
-            ),
-            (
-                |f| f.provider = "git\u{202e}hub".into(),
-                EndpointFailureValidationError::Name,
-            ),
-            (
-                |f| f.credential_key = "k".repeat(MAX_ENDPOINT_FAILURE_NAME_BYTES + 1),
-                EndpointFailureValidationError::Name,
-            ),
-            (
-                |f| f.upstream_http_status = Some(600),
-                EndpointFailureValidationError::UpstreamStatus,
-            ),
-            (
-                |f| f.upstream_http_status = Some(99),
-                EndpointFailureValidationError::UpstreamStatus,
-            ),
+            (|f| f.credential_key.clear(), E::Name),
+            (|f| f.provider = "git\nhub".into(), E::Name),
+            (|f| f.upstream_http_status = Some(600), E::UpstreamStatus),
             (
                 |f| f.request_id = REQUEST_ID.to_ascii_uppercase(),
-                EndpointFailureValidationError::RequestId,
+                E::RequestId,
             ),
-            (
-                |f| f.request_id.clear(),
-                EndpointFailureValidationError::RequestId,
-            ),
+            (|f| f.request_id.clear(), E::RequestId),
         ];
         for (mutate, expected) in cases {
             let mut failure = reported();

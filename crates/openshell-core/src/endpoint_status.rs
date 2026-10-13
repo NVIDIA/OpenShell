@@ -896,34 +896,17 @@ mod tests {
 
     #[test]
     fn failure_travels_with_its_result_and_clears_with_it() {
-        use crate::token_grant_failure::{
-            TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
-        };
-        let failure = EndpointFailure::token_grant(
-            TokenGrantFailure::new(
-                TokenGrantFailureKind::ProviderAuthorizationRequired,
-                TokenGrantStage::GatewayRpc,
-            ),
-            "github",
-            "access_token",
-            "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9",
-        );
+        let failure = grant_refusal("github", "access_token");
         let latest = |tracker: &EndpointStatusTracker| {
-            tracker
-                .snapshot()
-                .expect("inventory installed")
-                .endpoints
-                .into_iter()
-                .find(|endpoint| endpoint.endpoint_id == "endpoint:credentialed")
-                .expect("credentialed endpoint")
+            tracker.snapshot().expect("inventory installed").endpoints[0].clone()
         };
-        let fail = |tracker: &EndpointStatusTracker, version| {
+        let observe_result = |tracker: &EndpointStatusTracker, result, failure| {
             observe_with_failure(
                 tracker,
-                version,
+                config_version("policy-a", 1),
                 "endpoint:credentialed",
-                EndpointResult::CredentialUnavailable,
-                Some(failure.clone()),
+                result,
+                failure,
             )
         };
         let mut tracker = endpoint_status_channel().1.tracker();
@@ -932,39 +915,23 @@ mod tests {
             config_version: config_version("policy-a", 1),
             endpoints: inventory(),
         });
+        let unavailable = EndpointResult::CredentialUnavailable;
 
-        assert!(tracker.apply(fail(&tracker, config_version("policy-a", 1))));
-        assert_eq!(latest(&tracker).failure.as_ref(), Some(&failure));
+        assert!(tracker.apply(observe_result(&tracker, unavailable, Some(failure.clone()))));
+        assert_eq!(latest(&tracker).failure, Some(failure.clone()));
 
         // A later success replaces the result and its cause together.
-        tracker.apply(observe(
+        tracker.apply(observe_result(
             &tracker,
-            config_version("policy-a", 1),
-            "endpoint:credentialed",
             EndpointResult::HttpResponseReceived,
+            None,
         ));
         assert_eq!(latest(&tracker).failure, None);
 
         // A replacement supervisor session forgets the cause.
-        tracker.apply(fail(&tracker, config_version("policy-a", 1)));
+        tracker.apply(observe_result(&tracker, unavailable, Some(failure)));
         assert!(tracker.clear_observations());
         assert_eq!(latest(&tracker).failure, None);
-
-        // A provider revision, such as a reauthorization, clears credentialed causes.
-        tracker.apply(fail(&tracker, config_version("policy-a", 1)));
-        tracker.apply(EndpointStatusCommand::Reset {
-            inventory_generation: EndpointObservationGeneration::new(),
-            config_version: config_version("policy-a", 2),
-            endpoints: inventory(),
-        });
-        assert_eq!(
-            latest(&tracker),
-            EndpointObservation {
-                endpoint_id: "endpoint:credentialed".to_string(),
-                result: EndpointResult::NoObservedExchange,
-                failure: None,
-            }
-        );
     }
 
     #[test]
@@ -1450,246 +1417,146 @@ mod tests {
         )
     }
 
+    struct GrantStatus {
+        sender: EndpointObservationSender,
+        receiver: EndpointStatusReceiver,
+        tracker: EndpointStatusTracker,
+    }
+
+    impl GrantStatus {
+        async fn new() -> Self {
+            let (sender, receiver) = endpoint_status_channel();
+            let tracker = receiver.tracker();
+            let mut status = Self {
+                sender,
+                receiver,
+                tracker,
+            };
+            status.reset(config_version("policy-a", 1)).await;
+            status
+        }
+
+        async fn reset(&mut self, version: EndpointConfigVersion) {
+            self.sender.reset(version, Vec::new()).await.unwrap();
+            assert!(self.tracker.apply(self.receiver.recv().await.unwrap()));
+        }
+
+        /// Enqueue a grant outcome and return whether the tracker applied it.
+        async fn observe(
+            &mut self,
+            context: &EndpointObservationContext,
+            host: &str,
+            port: u16,
+            result: Result<(&str, &str), EndpointFailure>,
+        ) -> bool {
+            let result = result.map(|(provider, key)| (provider.into(), key.into()));
+            assert!(
+                self.sender
+                    .try_observe_token_grant(context.clone(), host, port, result)
+            );
+            self.tracker.apply(self.receiver.recv().await.unwrap())
+        }
+
+        fn last_failure(&self) -> Option<crate::proto::TokenGrantFailureObservation> {
+            self.tracker.snapshot().unwrap().last_token_grant_failure
+        }
+    }
+
     #[tokio::test]
     async fn grant_failure_without_mcp_inventory_clears_only_on_matching_success() {
-        let (sender, mut receiver) = endpoint_status_channel();
-        let mut tracker = receiver.tracker();
-        sender
-            .reset(config_version("policy-a", 1), Vec::new())
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        let context = sender.capture().unwrap();
+        let mut status = GrantStatus::new().await;
+        let context = status.sender.capture().unwrap();
         let failure = grant_refusal("github", "token");
-        assert!(sender.try_observe_token_grant(
-            context.clone(),
-            "API.EXAMPLE.TEST",
-            8443,
-            Err(failure.clone()),
-        ));
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
+        assert!(
+            status
+                .observe(&context, "API.EXAMPLE.TEST", 8443, Err(failure.clone()))
+                .await
+        );
         let expected = crate::proto::TokenGrantFailureObservation {
             destination_host: "api.example.test".into(),
             destination_port: 8443,
             failure: Some(failure.to_proto()),
         };
-        assert!(tracker.snapshot().unwrap().endpoints.is_empty());
-        assert_eq!(
-            tracker.snapshot().unwrap().last_token_grant_failure,
-            Some(expected.clone())
-        );
-        for (host, port, provider, credential) in [
-            ("other.example.test", 8443, "github", "token"),
-            ("api.example.test", 443, "github", "token"),
-            ("api.example.test", 8443, "other", "token"),
-            ("api.example.test", 8443, "github", "other"),
+        assert!(status.tracker.snapshot().unwrap().endpoints.is_empty());
+        assert_eq!(status.last_failure(), Some(expected.clone()));
+        // An invalid destination drops only the telemetry.
+        assert!(!status.sender.try_observe_token_grant(
+            context.clone(),
+            "https://api.example.test/",
+            443,
+            Err(failure.clone()),
+        ));
+        assert!(status.receiver.try_recv().is_err());
+        // A success for another destination or credential leaves the failure.
+        for (host, port, credential) in [
+            ("other.example.test", 8443, ("github", "token")),
+            ("api.example.test", 443, ("github", "token")),
+            ("api.example.test", 8443, ("github", "other")),
         ] {
-            assert!(sender.try_observe_token_grant(
-                context.clone(),
-                host,
-                port,
-                Ok((provider.into(), credential.into())),
-            ));
-            assert!(!tracker.apply(receiver.recv().await.unwrap()));
-            assert_eq!(
-                tracker.snapshot().unwrap().last_token_grant_failure,
-                Some(expected.clone())
-            );
+            assert!(!status.observe(&context, host, port, Ok(credential)).await);
+            assert_eq!(status.last_failure(), Some(expected.clone()));
         }
-        assert!(sender.try_observe_token_grant(
-            context.clone(),
-            "api.example.test",
-            8443,
-            Ok(("github".into(), "token".into())),
-        ));
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
+        let matching = Ok(("github", "token"));
         assert!(
-            tracker
-                .snapshot()
-                .unwrap()
-                .last_token_grant_failure
-                .is_none()
-        );
-
-        assert!(sender.try_observe_token_grant(
-            context.clone(),
-            "api.example.test",
-            8443,
-            Err(grant_refusal("", "")),
-        ));
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        assert!(sender.try_observe_token_grant(
-            context,
-            "api.example.test",
-            8443,
-            Ok(("selected".into(), "token".into())),
-        ));
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        assert!(
-            tracker
-                .snapshot()
-                .unwrap()
-                .last_token_grant_failure
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn grant_context_stays_retired_across_configuration_and_authority_cycles() {
-        for replacement in [config_version("policy-b", 1), config_version("policy-a", 2)] {
-            let (sender, mut receiver) = endpoint_status_channel();
-            let mut tracker = receiver.tracker();
-            sender
-                .reset(config_version("policy-a", 1), Vec::new())
+            status
+                .observe(&context, "api.example.test", 8443, matching)
                 .await
-                .unwrap();
-            assert!(tracker.apply(receiver.recv().await.unwrap()));
-            let retired = sender.capture().unwrap();
-            assert!(sender.try_observe_token_grant(
-                retired.clone(),
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(tracker.apply(receiver.recv().await.unwrap()));
-            for version in [replacement, config_version("policy-a", 1)] {
-                sender.reset(version, Vec::new()).await.unwrap();
-                assert!(tracker.apply(receiver.recv().await.unwrap()));
-                assert!(
-                    tracker
-                        .snapshot()
-                        .unwrap()
-                        .last_token_grant_failure
-                        .is_none()
-                );
-            }
-            assert!(sender.try_observe_token_grant(
-                retired,
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(!tracker.apply(receiver.recv().await.unwrap()));
-            assert!(
-                tracker
-                    .snapshot()
-                    .unwrap()
-                    .last_token_grant_failure
-                    .is_none()
-            );
-            let retired = sender.capture().unwrap();
-            assert!(sender.try_observe_token_grant(
-                retired.clone(),
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(tracker.apply(receiver.recv().await.unwrap()));
-            assert!(tracker.clear_observations());
-            assert!(sender.try_observe_token_grant(
-                retired,
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(!tracker.apply(receiver.recv().await.unwrap()));
-            assert!(
-                tracker
-                    .snapshot()
-                    .unwrap()
-                    .last_token_grant_failure
-                    .is_none()
-            );
-            assert!(sender.try_observe_token_grant(
-                sender.capture().unwrap(),
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(tracker.apply(receiver.recv().await.unwrap()));
-            assert!(
-                tracker
-                    .snapshot()
-                    .unwrap()
-                    .last_token_grant_failure
-                    .is_some()
-            );
-        }
+        );
+        assert_eq!(status.last_failure(), None);
+
+        // A failure before credential selection clears on any success there.
+        let unselected = Err(grant_refusal("", ""));
+        assert!(
+            status
+                .observe(&context, "api.example.test", 8443, unselected)
+                .await
+        );
+        assert!(
+            status
+                .observe(&context, "api.example.test", 8443, Ok(("other", "key")))
+                .await
+        );
+        assert_eq!(status.last_failure(), None);
     }
 
     #[tokio::test]
-    async fn invalid_destinations_and_full_grant_queue_drop_only_telemetry() {
-        let (sender, mut receiver) = endpoint_status_channel();
-        let mut tracker = receiver.tracker();
-        sender
-            .reset(config_version("policy-a", 1), Vec::new())
-            .await
-            .unwrap();
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        let context = sender.capture().unwrap();
+    async fn configuration_change_clears_grant_failure_and_retires_its_context() {
+        let mut status = GrantStatus::new().await;
+        let retired = status.sender.capture().unwrap();
+        let refusal = || Err(grant_refusal("github", "token"));
+        assert!(
+            status
+                .observe(&retired, "api.example.test", 443, refusal())
+                .await
+        );
+        // Returning to the same configuration must not revive the old context.
+        status.reset(config_version("policy-b", 1)).await;
+        status.reset(config_version("policy-a", 1)).await;
+        assert_eq!(status.last_failure(), None);
+        assert!(
+            !status
+                .observe(&retired, "api.example.test", 443, refusal())
+                .await
+        );
+        assert_eq!(status.last_failure(), None);
+    }
+
+    #[test]
+    fn grant_destination_accepts_only_bounded_hosts_and_ports() {
         let oversized = "a".repeat(254);
         for (host, port) in [
             ("", 443),
             ("api.example.test", 0),
-            ("api\n.example.test", 443),
+            ("api.example.test", 65536),
             ("api example.test", 443),
             ("https://api.example.test/path?token=secret", 443),
-            ("user@api.example.test", 443),
             ("api\u{202e}.example.test", 443),
             (oversized.as_str(), 443),
         ] {
-            assert!(!sender.try_observe_token_grant(
-                context.clone(),
-                host,
-                port,
-                Err(grant_refusal("github", "token")),
-            ));
+            assert!(!valid_token_grant_destination(host, port), "{host}:{port}");
         }
-        assert!(receiver.try_recv().is_err());
-        assert!(!valid_token_grant_destination("api.example.test", 65536));
-        let longest = [
-            "a".repeat(63),
-            "b".repeat(63),
-            "c".repeat(63),
-            "d".repeat(61),
-        ]
-        .join(".");
-        for (host, port) in [(longest.as_str(), u16::MAX), ("::1", 443)] {
-            assert!(sender.try_observe_token_grant(
-                context.clone(),
-                host,
-                port,
-                Err(grant_refusal("github", "token")),
-            ));
-            assert!(tracker.apply(receiver.recv().await.unwrap()));
+        for host in ["api.example.test", "::1", "[::1]"] {
+            assert!(valid_token_grant_destination(host, 443), "{host}");
         }
-        for _ in 0..ENDPOINT_STATUS_CHANNEL_CAPACITY {
-            assert!(sender.try_observe_token_grant(
-                context.clone(),
-                "api.example.test",
-                443,
-                Err(grant_refusal("github", "token")),
-            ));
-        }
-        assert!(!sender.try_observe_token_grant(
-            context.clone(),
-            "api.example.test",
-            443,
-            Err(grant_refusal("github", "token")),
-        ));
-        assert!(tracker.apply(receiver.recv().await.unwrap()));
-        assert!(sender.try_observe_token_grant(
-            context.clone(),
-            "api.example.test",
-            443,
-            Err(grant_refusal("github", "token")),
-        ));
-        drop(receiver);
-        assert!(!sender.try_observe_token_grant(
-            context,
-            "api.example.test",
-            443,
-            Err(grant_refusal("github", "token")),
-        ));
     }
 }

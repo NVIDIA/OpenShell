@@ -687,7 +687,7 @@ The stage names the step that observed the failure: `configuration`, `workload_i
 - Without a recognized extension code, any other failed HTTP status is `unclassified`, including 401, 403, and 409. OpenShell never infers `provider_authorization_required` from a 401.
 - For `token_exchange` grants, the gateway reports `provider_authorization_required` when the user's stored subject credential is missing or expired, and `workload_identity_rejected` when it rejects the supervisor's JWT-SVID. The supervisor accepts these causes only over its verified TLS connection to the gateway.
 
-OpenShell keeps only the code, stage, and HTTP status. It discards response descriptions, headers, endpoint diagnostics, and error chains. A successful response without a nonempty header-compatible `access_token` is `unclassified`.
+Sandbox status and the workload response keep only the code, stage, and HTTP status. When a token service returns an `OAuth` error body, the log of the component that called it, the gateway or the supervisor, also records its `error` and `error_description`, limited to 256 characters each, with the request ID. The workload cannot read either log. A successful response without a nonempty header-compatible `access_token` is `unclassified`.
 
 A token service can also state a cause by adopting the `openshell.token-grant.v1` error extension. For example, a service that requires the user to authorize a provider returns HTTP 409 with:
 

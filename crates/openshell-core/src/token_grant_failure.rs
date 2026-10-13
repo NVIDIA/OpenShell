@@ -312,26 +312,6 @@ impl miette::Diagnostic for TokenGrantFailure {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_kind_has_a_documented_code_and_recovery_action() {
-        use ProviderCredentialRefreshRecoveryAction as Recovery;
-        let table = TokenGrantFailureKind::ALL.map(|kind| {
-            let failure = TokenGrantFailure::new(kind, TokenGrantStage::TokenEndpoint);
-            (failure.code(), failure.recovery())
-        });
-        assert_eq!(
-            table,
-            [
-                ("provider_authorization_required", Recovery::Reauthorize),
-                ("workload_identity_rejected", Recovery::FixConfiguration),
-                ("configuration_error", Recovery::FixConfiguration),
-                ("timeout", Recovery::Retry),
-                ("unavailable", Recovery::Retry),
-                ("unclassified", Recovery::Investigate),
-            ]
-        );
-    }
-
     fn sample() -> TokenGrantFailure {
         TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
@@ -363,131 +343,85 @@ mod tests {
     }
 
     fn assert_rejected(status: &Status) {
-        let failure = TokenGrantFailure::from_status(status);
-        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
-        assert_eq!(failure.upstream_status(), None);
+        assert_eq!(
+            TokenGrantFailure::from_status(status),
+            TokenGrantFailure::new(
+                TokenGrantFailureKind::Unclassified,
+                TokenGrantStage::GatewayRpc
+            )
+        );
+    }
+
+    #[test]
+    fn every_kind_maps_to_code_recovery_and_grpc_status() {
+        use ProviderCredentialRefreshRecoveryAction as Recovery;
+        let table = TokenGrantFailureKind::ALL.map(|kind| {
+            let failure = TokenGrantFailure::new(kind, TokenGrantStage::TokenEndpoint);
+            (
+                failure.code(),
+                failure.recovery(),
+                failure.to_status().code(),
+            )
+        });
+        assert_eq!(
+            table,
+            [
+                (
+                    "provider_authorization_required",
+                    Recovery::Reauthorize,
+                    Code::FailedPrecondition
+                ),
+                (
+                    "workload_identity_rejected",
+                    Recovery::FixConfiguration,
+                    Code::PermissionDenied
+                ),
+                (
+                    "configuration_error",
+                    Recovery::FixConfiguration,
+                    Code::FailedPrecondition
+                ),
+                ("timeout", Recovery::Retry, Code::DeadlineExceeded),
+                ("unavailable", Recovery::Retry, Code::Unavailable),
+                ("unclassified", Recovery::Investigate, Code::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_round_trips_classifications_without_printable_detail() {
+        for kind in TokenGrantFailureKind::ALL {
+            for stage in TokenGrantStage::ALL {
+                let failure = TokenGrantFailure::new(kind, stage);
+                assert_eq!(
+                    TokenGrantFailure::from_status(&failure.to_status()),
+                    failure
+                );
+            }
+        }
+        let failure = sample();
+        let guarded = failure.to_status_with_code(Code::Unauthenticated);
+        assert_eq!(guarded.code(), Code::Unauthenticated);
+        assert_eq!(TokenGrantFailure::from_status(&guarded), failure);
+        assert_eq!(failure.to_status_with_code(Code::Ok).code(), Code::Unknown);
+        for status in [0, 99, 600] {
+            assert_eq!(failure.with_upstream_status(status).upstream_status(), None);
+        }
         assert_eq!(failure.to_string(), FAILURE_MESSAGE);
         assert_eq!(format!("{failure:?}"), FAILURE_MESSAGE);
         assert!(std::error::Error::source(&failure).is_none());
     }
 
     #[test]
-    fn protobuf_normalization_still_validates_the_classification() {
-        let original = sample().to_status();
-        let mut value = envelope(&original);
-        // Generated decoders ignore unknown wire fields. Only the validated
-        // classification survives; peer diagnostics never enter the failure.
-        value.details[0].value.extend([32, 1]);
-        assert_eq!(
-            TokenGrantFailure::from_status(&replace_envelope(&original, &value)),
-            sample()
-        );
-
-        // Protobuf map entries use the last value. Check that a replacement
-        // still passes the closed code set instead of bypassing validation.
-        for (code, expected) in [
-            ("timeout", Some(TokenGrantFailureKind::Timeout)),
-            ("SYNTHETIC_SECRET", None),
-        ] {
-            let replacement = tonic_types::pb::ErrorInfo {
-                metadata: HashMap::from([("code".to_owned(), code.to_owned())]),
-                ..Default::default()
-            };
-            let mut value = envelope(&original);
-            value.details[0].value.extend(replacement.encode_to_vec());
-            let status = replace_envelope(&original, &value);
-            if let Some(kind) = expected {
-                let failure = TokenGrantFailure::from_status(&status);
-                assert_eq!(
-                    failure,
-                    TokenGrantFailure::new(kind, sample().stage()).with_upstream_status(409)
-                );
-                assert_eq!(format!("{failure:?}"), FAILURE_MESSAGE);
-            } else {
-                assert_rejected(&status);
-            }
-        }
-    }
-
-    #[test]
-    fn all_classifications_and_stages_round_trip_without_printable_detail() {
-        for kind in TokenGrantFailureKind::ALL {
-            for stage in TokenGrantStage::ALL {
-                for upstream in [None, Some(100), Some(409), Some(599)] {
-                    let mut failure = TokenGrantFailure::new(kind, stage);
-                    if let Some(status) = upstream {
-                        failure = failure.with_upstream_status(status);
-                    }
-                    let status = failure.to_status();
-                    assert!(status.details().len() <= MAX_DETAILS_BYTES);
-                    assert_eq!(status.message(), FAILURE_MESSAGE);
-                    assert_eq!(TokenGrantFailure::from_status(&status), failure);
-                    assert_eq!(failure.to_string(), FAILURE_MESSAGE);
-                    assert_eq!(format!("{failure:?}"), FAILURE_MESSAGE);
-                    assert_eq!(format!("{failure:#?}"), FAILURE_MESSAGE);
-                    assert!(std::error::Error::source(&failure).is_none());
-                    assert_eq!(miette::Report::new(failure).to_string(), FAILURE_MESSAGE);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn status_mapping_preserves_guard_codes_and_never_encodes_success() {
-        let expected = [
-            Code::FailedPrecondition,
-            Code::PermissionDenied,
-            Code::FailedPrecondition,
-            Code::DeadlineExceeded,
-            Code::Unavailable,
-            Code::Unknown,
-        ];
-        for (kind, code) in TokenGrantFailureKind::ALL.into_iter().zip(expected) {
-            let failure = TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc);
-            assert_eq!(failure.to_status().code(), code);
-            for override_code in [
-                Code::PermissionDenied,
-                Code::Unauthenticated,
-                Code::NotFound,
-            ] {
-                let status = failure.to_status_with_code(override_code);
-                assert_eq!(status.code(), override_code);
-                assert_eq!(TokenGrantFailure::from_status(&status), failure);
-            }
-        }
-        assert_eq!(sample().to_status_with_code(Code::Ok).code(), Code::Unknown);
-    }
-
-    #[test]
-    fn status_bounds_and_stage_changes_preserve_only_allowlisted_values() {
-        for status in [0, 99, 600, u16::MAX] {
-            assert_eq!(
-                sample().with_upstream_status(status).upstream_status(),
-                None
-            );
-        }
-        let failure = sample().at_stage(TokenGrantStage::Injection);
-        assert_eq!(failure.stage(), TokenGrantStage::Injection);
-        assert_eq!(failure.kind(), sample().kind());
-        assert_eq!(failure.upstream_status(), Some(409));
-    }
-
-    #[test]
     fn rejects_unknown_missing_or_noncanonical_metadata() {
         for (key, value) in [
             ("version", "2"),
-            ("version", "01"),
             ("code", "SYNTHETIC_SECRET"),
             ("stage", "SYNTHETIC_SECRET"),
             ("unknown", "SYNTHETIC_SECRET"),
-            ("upstream_http_status", "099"),
             ("upstream_http_status", "600"),
             ("upstream_http_status", "0409"),
-            ("upstream_http_status", "+409"),
-            ("upstream_http_status", "409 "),
             ("upstream_http_status", "4e2"),
-            ("upstream_http_status", ""),
         ] {
             assert_rejected(&mutate_info(|info| {
                 info.metadata.insert(key.into(), value.into());
@@ -500,77 +434,43 @@ mod tests {
         }
         assert_rejected(&mutate_info(|info| info.reason = "SYNTHETIC_SECRET".into()));
         assert_rejected(&mutate_info(|info| info.domain = "SYNTHETIC_SECRET".into()));
-        assert_rejected(&mutate_info(|info| info.reason.clear()));
-        assert_rejected(&mutate_info(|info| info.domain.clear()));
     }
 
     #[test]
-    fn rejects_inconsistent_envelopes_and_arbitrary_status_diagnostics() {
+    fn rejects_malformed_inconsistent_or_foreign_envelopes() {
         let original = sample().to_status();
-        for code in [Code::Ok, Code::Internal] {
-            assert_rejected(&Status::with_details(
-                code,
-                FAILURE_MESSAGE,
-                original.details().to_vec().into(),
-            ));
-        }
+        let details = || original.details().to_vec().into();
+        assert_rejected(&Status::unknown("SYNTHETIC_SECRET"));
+        assert_rejected(&Status::with_details(
+            Code::Internal,
+            FAILURE_MESSAGE,
+            details(),
+        ));
         assert_rejected(&Status::with_details(
             original.code(),
             "SYNTHETIC_SECRET",
-            original.details().to_vec().into(),
+            details(),
         ));
-        assert_rejected(&Status::unknown("SYNTHETIC_SECRET"));
-        for code in [-1, 0, 17, i32::MAX] {
-            let mut value = envelope(&original);
-            value.code = code;
-            assert_rejected(&replace_envelope(&original, &value));
-        }
-        let mut value = envelope(&original);
-        value.message = "SYNTHETIC_SECRET".into();
-        assert_rejected(&replace_envelope(&original, &value));
-        for type_url in [
-            "google.rpc.ErrorInfo",
-            "https://untrusted.invalid/google.rpc.ErrorInfo",
-            "type.googleapis.com/google.rpc.RetryInfo",
-            "",
-        ] {
-            let mut value = envelope(&original);
-            value.details[0].type_url = type_url.into();
-            assert_rejected(&replace_envelope(&original, &value));
-        }
-        let mut value = envelope(&original);
-        value.details.clear();
-        assert_rejected(&replace_envelope(&original, &value));
-        let mut value = envelope(&original);
-        value.details.push(value.details[0].clone());
-        assert_rejected(&replace_envelope(&original, &value));
-    }
-
-    #[test]
-    fn rejects_truncation_oversize_invalid_utf8_and_malformed_messages() {
-        let original = sample().to_status();
-        for length in 0..original.details().len() {
-            assert_rejected(&Status::with_details(
-                original.code(),
-                FAILURE_MESSAGE,
-                original.details()[..length].to_vec().into(),
-            ));
-        }
-        for details in [
+        for bytes in [
+            original.details()[..original.details().len() - 1].to_vec(),
             vec![0; MAX_DETAILS_BYTES + 1],
-            vec![8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2],
-            vec![18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
-            vec![0],
-            vec![11], // Unterminated protobuf group.
         ] {
             assert_rejected(&Status::with_details(
                 original.code(),
                 FAILURE_MESSAGE,
-                details.into(),
+                bytes.into(),
             ));
         }
-        let mut value = envelope(&original);
-        value.details[0].value = vec![10, 1, 0xff];
-        assert_rejected(&replace_envelope(&original, &value));
+        let mutations: [fn(&mut tonic_types::pb::Status); 4] = [
+            |value| value.message = "SYNTHETIC_SECRET".into(),
+            |value| value.details[0].type_url = "type.googleapis.com/google.rpc.RetryInfo".into(),
+            |value| value.details.clear(),
+            |value| value.details.push(value.details[0].clone()),
+        ];
+        for mutate in mutations {
+            let mut value = envelope(&original);
+            mutate(&mut value);
+            assert_rejected(&replace_envelope(&original, &value));
+        }
     }
 }

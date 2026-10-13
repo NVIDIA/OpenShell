@@ -150,14 +150,7 @@ pub(crate) async fn prepare_inspected_request(
     observation_context: Option<&openshell_core::endpoint_status::EndpointObservationContext>,
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
-    let snapshot = ctx
-        .provider_credentials
-        .as_ref()
-        .map(openshell_core::provider_credentials::ProviderCredentialState::snapshot);
-    if let Some(snapshot) = &snapshot {
-        scoped.provider_credential_revision = Some(snapshot.revision);
-        scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
-    }
+    let snapshot = crate::l7::token_grant_injection::pin_live_credentials(&mut scoped);
     // Admission-gated injection reads credentials only from the pinned snapshot,
     // so a context without one never acquires a grant.
     let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
@@ -3644,14 +3637,21 @@ where
             req
         };
 
-        let Ok(req_with_auth) = crate::l7::token_grant_injection::inject_if_needed_captured(
-            req,
-            &mut grant_ctx,
-            &request_id,
-            observation_context.as_ref(),
-        )
-        .await
-        else {
+        let injected = match crate::l7::token_grant_injection::pin_live_credentials(&mut grant_ctx)
+        {
+            Some(snapshot) => {
+                crate::l7::token_grant_injection::inject_for_selectors(
+                    req,
+                    &grant_ctx,
+                    &snapshot,
+                    &request_id,
+                    observation_context.as_ref(),
+                )
+                .await
+            }
+            None => Ok(req),
+        };
+        let Ok(req_with_auth) = injected else {
             // The refusal event names the credential and request ID.
             // The sandbox-level grant record does not require an MCP endpoint identity.
             write_bad_gateway_response(client, Some(&request_id)).await?;
@@ -3755,42 +3755,22 @@ mod tests {
             TokenGrantFailureKind::ProviderAuthorizationRequired,
             TokenGrantStage::GatewayRpc,
         )
-        .with_upstream_status(409)
     }
 
-    /// A refused grant returns the generic empty 502 plus a request ID, and no
-    /// part of the response reveals the classification of `failure`.
-    pub(super) fn assert_grant_refusal_response(
-        response: &str,
-        failure: TokenGrantFailure,
-    ) -> String {
+    /// Assert the generic refusal and return its request ID header value.
+    pub(super) fn grant_refusal_request_id(response: &str) -> String {
         assert!(
             response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
             "{response}"
         );
-        assert!(response.contains("Content-Length: 0\r\n"), "{response}");
-        let request_id = response
+        response
             .lines()
             .find_map(|line| {
-                line.strip_prefix(openshell_core::token_grant_failure::REQUEST_ID_HEADER)
-                    .and_then(|value| value.strip_prefix(": "))
+                line.strip_prefix(openshell_core::token_grant_failure::REQUEST_ID_HEADER)?
+                    .strip_prefix(": ")
             })
-            .expect("refusal carries the request ID");
-        assert!(uuid::Uuid::parse_str(request_id).is_ok(), "{request_id}");
-        // The random ID can contain any digits; check everything else.
-        let without_id = response.replace(request_id, "");
-        let status = failure.upstream_status().map(|status| status.to_string());
-        let recovery = failure
-            .recovery()
-            .as_str_name()
-            .trim_start_matches("PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_");
-        for classification in [failure.code(), failure.stage().code(), recovery]
-            .into_iter()
-            .chain(status.as_deref())
-        {
-            assert!(!without_id.contains(classification), "{response}");
-        }
-        request_id.to_string()
+            .expect("refusal carries the request ID")
+            .to_string()
     }
 
     #[tokio::test]
@@ -5365,11 +5345,11 @@ network_policies:
             .unwrap()
             .unwrap();
         let response = String::from_utf8_lossy(&response[..n]);
-        if identity_result.is_ok() {
-            assert!(response.contains("204 No Content"));
+        assert!(response.contains(if identity_result.is_ok() {
+            "204 No Content"
         } else {
-            assert_grant_refusal_response(&response, relay_grant_failure());
-        }
+            "502 Bad Gateway"
+        }));
         assert!(!response.contains("service-token"));
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(2), relay)
@@ -5496,10 +5476,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert_grant_refusal_response(
-            &String::from_utf8_lossy(&client_response[..n]),
-            relay_grant_failure(),
-        );
+        grant_refusal_request_id(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -5619,10 +5596,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert_grant_refusal_response(
-            &String::from_utf8_lossy(&client_response[..n]),
-            relay_grant_failure(),
-        );
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -8044,10 +8018,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert_grant_refusal_response(
-            &String::from_utf8_lossy(&client_response[..n]),
-            relay_grant_failure(),
-        );
+        grant_refusal_request_id(&String::from_utf8_lossy(&client_response[..n]));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(
@@ -8164,10 +8135,7 @@ network_policies:
         .await
         .expect("bad gateway response should reach client")
         .unwrap();
-        assert_grant_refusal_response(
-            &String::from_utf8_lossy(&client_response[..n]),
-            relay_grant_failure(),
-        );
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(

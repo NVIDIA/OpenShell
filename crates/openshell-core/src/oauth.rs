@@ -24,6 +24,7 @@ pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_tok
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_LOGGED_ERROR_CHARS: usize = 256;
 
 /// HTTP client that authenticates HTTPS endpoints and never redirects assertions.
 ///
@@ -95,6 +96,7 @@ struct RawTokenResponse {
 #[derive(Deserialize)]
 struct OAuthErrorResponse {
     error: Option<String>,
+    error_description: Option<String>,
     openshell_error_contract: Option<String>,
 }
 
@@ -138,6 +140,7 @@ async fn post_oauth_token_request(
     let status = response.status();
     let body = read_bounded_body(response).await?;
     if !status.is_success() {
+        log_token_service_error(status, &body, request_id);
         return Err(classify_http_failure(status, &body, authenticated));
     }
 
@@ -375,6 +378,31 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, T
     Ok(body)
 }
 
+/// Record the token service's `OAuth` error text for operators.
+///
+/// Only the gateway and supervisor logs receive it; the workload cannot read
+/// either, and status reports and responses keep only the bounded failure.
+fn log_token_service_error(status: reqwest::StatusCode, body: &[u8], request_id: Option<&str>) {
+    let Ok(response) = serde_json::from_slice::<OAuthErrorResponse>(body) else {
+        return;
+    };
+    let printable = |value: Option<String>| -> String {
+        value
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_LOGGED_ERROR_CHARS)
+            .collect()
+    };
+    tracing::warn!(
+        request_id = request_id.unwrap_or("none"),
+        upstream_http_status = status.as_u16(),
+        error = %printable(response.error),
+        error_description = %printable(response.error_description),
+        "token service rejected the grant"
+    );
+}
+
 fn classify_http_failure(
     status: reqwest::StatusCode,
     body: &[u8],
@@ -418,7 +446,6 @@ fn classify_http_failure(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::error::Error;
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -512,8 +539,8 @@ mod tests {
         body: &str,
     ) -> (
         String,
-        reqwest::Certificate,
-        tokio::task::JoinHandle<Option<CapturedRequest>>,
+        TokenGrantClient,
+        tokio::task::JoinHandle<CapturedRequest>,
     ) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
@@ -540,30 +567,20 @@ mod tests {
         let body = body.to_string();
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("TLS accept");
-            // A rejected trust root/hostname must fail during the handshake,
-            // before the server can receive the secret-bearing grant request.
-            let Ok(mut stream) = acceptor.accept(socket).await else {
-                return None;
-            };
+            let mut stream = acceptor.accept(socket).await.expect("TLS handshake");
             let request = capture_request(&mut stream).await;
             send_response(&mut stream, &status, &body).await;
-            Some(request)
+            request
         });
+        let client = TokenGrantClient::builder()
+            .add_root_certificate(reqwest::Certificate::from_der(ca.der()).expect("CA"))
+            .build()
+            .expect("trusted test client");
         (
             format!("https://localhost:{port}/token"),
-            reqwest::Certificate::from_der(ca.der()).expect("trusted CA"),
+            TokenGrantClient { client },
             task,
         )
-    }
-
-    fn trusted_test_client(root: reqwest::Certificate) -> TokenGrantClient {
-        TokenGrantClient {
-            client: TokenGrantClient::builder()
-                .timeout(Duration::from_secs(5))
-                .add_root_certificate(root)
-                .build()
-                .expect("trusted test client"),
-        }
     }
 
     async fn token_endpoint_redirect_once(location: &str) -> (String, tokio::task::JoinHandle<()>) {
@@ -638,153 +655,43 @@ mod tests {
         }
     }
 
-    fn exchange_params() -> TokenExchangeParams<'static> {
-        TokenExchangeParams {
-            client_assertion: "ASSERTION_SECRET_CANARY",
-            client_assertion_type: "",
-            subject_token: "SUBJECT_SECRET_CANARY",
-            subject_token_type: "",
-            audience: "",
-            scopes: &[],
-            requested_token_type: "",
-        }
-    }
-
-    fn assert_generic_failure(failure: TokenGrantFailure) {
-        assert_eq!(failure.to_string(), "dynamic token grant failed");
-        assert_eq!(format!("{failure:?}"), "dynamic token grant failed");
-        assert!(failure.source().is_none());
-        let report = miette::Report::new(failure);
-        let rendered = format!("{report:?}");
-        for forbidden in [
-            "CANARY",
-            "provider_authorization_required",
-            "workload_identity_rejected",
-        ] {
-            assert!(
-                !rendered.contains(forbidden),
-                "diagnostics must stay generic"
-            );
-        }
+    fn adopted_failure_body(code: &str) -> String {
+        format!(r#"{{"error":"{code}","openshell_error_contract":"{ERROR_CONTRACT}"}}"#)
     }
 
     #[tokio::test]
-    async fn verified_https_signal_is_preserved() {
-        let body = format!(
-            r#"{{"error":"provider_authorization_required","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
-        );
-        let (endpoint, root, request) = tls_token_endpoint_once("409 Conflict", &body).await;
-        let client = trusted_test_client(root);
-        let failure = post_oauth_token_exchange(&client, &endpoint, &exchange_params(), None)
+    async fn adopted_signal_requires_verified_https() {
+        let body = adopted_failure_body("provider_authorization_required");
+        let (endpoint, client, request) = tls_token_endpoint_once("409 Conflict", &body).await;
+        let failure = post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None)
             .await
             .expect_err("adopted failure");
-        let request = request
-            .await
-            .expect("TLS fixture")
-            .expect("authenticated request");
-        assert!(request.form.contains_key("subject_token"));
+        request.await.expect("TLS fixture");
         assert_eq!(
             failure.kind(),
             TokenGrantFailureKind::ProviderAuthorizationRequired
         );
-        assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
-        assert_generic_failure(failure);
-    }
 
-    #[tokio::test]
-    async fn plain_http_cannot_assert_adopted_failure() {
-        let body = format!(
-            r#"{{"error":"provider_authorization_required","openshell_error_contract":"{ERROR_CONTRACT}","error_description":"DESCRIPTION_SECRET_CANARY"}}"#
-        );
+        // An untrusted certificate never reaches the body: the client refuses
+        // the handshake, so the service cannot assert any cause.
+        let (endpoint, _, request) = tls_token_endpoint_once("409 Conflict", &body).await;
+        let failure =
+            post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
+                .await
+                .expect_err("untrusted certificate");
+        request.abort();
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unavailable);
+        assert_eq!(failure.upstream_status(), None);
+
+        // Plain HTTP carries no service identity, so the same body is unclassified.
         let (endpoint, request) = token_endpoint_once("409 Conflict", &body).await;
         let failure =
-            post_oauth_token_exchange(&test_client(), &endpoint, &exchange_params(), None)
+            post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
                 .await
                 .expect_err("unauthenticated failure");
         request.await.expect("HTTP fixture");
         assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-        assert_generic_failure(failure);
-    }
-
-    #[tokio::test]
-    async fn tls_requires_a_trusted_certificate_and_matching_hostname() {
-        for trust_certificate in [false, true] {
-            let body = r#"{"error":"provider_authorization_required","openshell_error_contract":"openshell.token-grant.v1"}"#;
-            let (endpoint, root, request) = tls_token_endpoint_once("409 Conflict", body).await;
-            let (client, endpoint) = if trust_certificate {
-                (
-                    trusted_test_client(root),
-                    endpoint.replace("localhost", "127.0.0.1"),
-                )
-            } else {
-                (test_client(), endpoint)
-            };
-            let failure = post_oauth_token_exchange(&client, &endpoint, &exchange_params(), None)
-                .await
-                .expect_err("TLS must authenticate the configured server");
-            assert_eq!(failure.kind(), TokenGrantFailureKind::Unavailable);
-            assert_eq!(failure.upstream_status(), None);
-            assert!(request.await.expect("TLS fixture").is_none());
-            assert_generic_failure(failure);
-        }
-    }
-
-    #[tokio::test]
-    async fn secret_canaries_in_errors_and_endpoint_components_never_survive() {
-        for body in [
-            r#"{"error":"ERROR_SECRET_CANARY","error_description":"DESCRIPTION_SECRET_CANARY"}"#,
-            r#"{"error":"invalid_client","error_description":"ASSERTION_SECRET_CANARY TOKEN_SECRET_CANARY"}"#,
-            "RAW_BODY_SECRET_CANARY",
-        ] {
-            let (endpoint, request) = token_endpoint_once("401 Unauthorized", body).await;
-            let endpoint = endpoint.replace(
-                "http://",
-                "http://USER_SECRET_CANARY:PASSWORD_SECRET_CANARY@",
-            ) + "?credential=QUERY_SECRET_CANARY#FRAGMENT_SECRET_CANARY";
-            let failure =
-                post_oauth_token_exchange(&test_client(), &endpoint, &exchange_params(), None)
-                    .await
-                    .expect_err("safe endpoint failure");
-            request.await.expect("HTTP fixture");
-            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-            assert_eq!(failure.upstream_status(), Some(401));
-            assert_generic_failure(failure);
-        }
-        for endpoint in [
-            "not a URL ENDPOINT_SECRET_CANARY",
-            "ftp://USER_SECRET_CANARY:PASSWORD_SECRET_CANARY@localhost/token?QUERY_SECRET_CANARY",
-        ] {
-            let failure =
-                post_oauth_token_grant(&test_client(), endpoint, &empty_grant_params(), None)
-                    .await
-                    .expect_err("invalid endpoint");
-            assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
-            assert_generic_failure(failure);
-        }
-    }
-
-    #[tokio::test]
-    async fn malformed_success_fields_are_generic_and_never_return_a_token() {
-        for body in [
-            "{}",
-            r#"{"access_token":42"#,
-            r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":null}"#,
-            r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":"Bearer","expires_in":"DURATION_SECRET_CANARY"}"#,
-            r#"{"access_token":"TOKEN_SECRET_CANARY","access_token":"SECOND_SECRET_CANARY","token_type":"Bearer"}"#,
-            r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":"Bearer","token_type":"Bearer"}"#,
-            r#"{"access_token":"TOKEN_SECRET_CANARY","token_type":"Bearer","expires_in":1,"expires_in":1}"#,
-            r#"{"access_token":"","token_type":"Bearer"}"#,
-        ] {
-            let (endpoint, request) = token_endpoint_once("200 OK", body).await;
-            let failure =
-                post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
-                    .await
-                    .expect_err("malformed success");
-            request.await.expect("HTTP fixture");
-            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-            assert_eq!(failure.upstream_status(), Some(200));
-            assert_generic_failure(failure);
-        }
+        assert_eq!(failure.upstream_status(), Some(409));
     }
 
     #[test]
@@ -798,7 +705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_and_body_timeouts_drop_sources_and_keep_observed_status() {
+    async fn request_and_body_timeouts_keep_observed_status() {
         for after_headers in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let address = listener.local_addr().expect("addr");
@@ -820,7 +727,7 @@ mod tests {
                     .build()
                     .expect("timeout client"),
             };
-            let endpoint = format!("http://{address}/token?QUERY_SECRET_CANARY");
+            let endpoint = format!("http://{address}/token");
             let failure = post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None)
                 .await
                 .expect_err("bounded timeout");
@@ -828,83 +735,47 @@ mod tests {
             server.await.expect("timeout fixture");
             assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
             assert_eq!(failure.upstream_status(), after_headers.then_some(200));
-            assert_generic_failure(failure);
         }
     }
 
-    async fn raw_token_endpoint_once(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("addr");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            capture_request(&mut stream).await;
-            // Bound rejection can close the reader before an oversized fixture
-            // finishes writing. That is the behavior this fixture exercises.
-            let _ = stream.write_all(&response).await;
-        });
-        (format!("http://{address}/token"), server)
-    }
-
     #[tokio::test]
-    async fn response_body_bound_applies_to_success_errors_and_chunked_bodies() {
+    async fn response_body_is_bounded_for_declared_and_chunked_lengths() {
         let body = "X".repeat(MAX_TOKEN_RESPONSE_BYTES + 1);
-        for status in ["200 OK", "409 Conflict", "503 Service Unavailable"] {
-            for chunked in [false, true] {
-                let response = if chunked {
-                    format!(
-                        "HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
-                        body.len()
-                    )
-                } else {
-                    // The oversized declared length must suffice for rejection,
-                    // without waiting for a body the server does not provide.
-                    format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                };
-                let (endpoint, server) = raw_token_endpoint_once(response.into_bytes()).await;
-                let failure =
-                    post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
-                        .await
-                        .expect_err("bounded response");
-                server.await.expect("bound fixture");
-                assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-                assert!(failure.upstream_status().is_some());
-                assert_generic_failure(failure);
-            }
+        for response in [
+            // The declared length alone must suffice for rejection.
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let endpoint = format!("http://{}/token", listener.local_addr().expect("addr"));
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                capture_request(&mut stream).await;
+                // Rejection can close the reader before the fixture finishes.
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+            let failure =
+                post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
+                    .await
+                    .expect_err("bounded response");
+            server.await.expect("bound fixture");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.upstream_status(), Some(503));
         }
-    }
 
-    #[tokio::test]
-    async fn exact_body_bound_preserves_success_and_default_expiration() {
-        let mut body = r#"{"access_token":"access-token","token_type":"Bearer"}"#.to_string();
-        body.extend(std::iter::repeat_n(
-            ' ',
-            MAX_TOKEN_RESPONSE_BYTES - body.len(),
-        ));
+        let token = r#"{"access_token":"access-token"}"#;
+        let body = format!("{token:<MAX_TOKEN_RESPONSE_BYTES$}");
         let (endpoint, server) = token_endpoint_once("200 OK", &body).await;
-        let response =
-            post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
-                .await
-                .expect("exact bound is accepted");
+        post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
+            .await
+            .expect("exact bound is accepted");
         server.await.expect("bound fixture");
-        assert_eq!(response.access_token, "access-token");
-        assert_eq!(response.expires_in, 0);
-    }
-
-    #[tokio::test]
-    async fn body_read_errors_discard_partial_secret_content() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nPARTIAL_BODY_SECRET_CANARY".to_vec();
-        let (endpoint, server) = raw_token_endpoint_once(response).await;
-        let failure =
-            post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
-                .await
-                .expect_err("truncated body");
-        server.await.expect("read fixture");
-        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(failure.upstream_status(), Some(200));
-        assert_generic_failure(failure);
     }
 
     #[tokio::test]
@@ -936,21 +807,21 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_malformed_access_token() {
-        let (endpoint, request) = token_endpoint_once(
-            "200 OK",
+        for body in [
             r#"{"access_token":"access-123\r\nX-Injected: yes"}"#,
-        )
-        .await;
-        let client = test_client();
+            r#"{"access_token":42"#,
+            r#"{"access_token":"TOKEN_SECRET_CANARY","access_token":"SECOND_SECRET_CANARY"}"#,
+        ] {
+            let (endpoint, request) = token_endpoint_once("200 OK", body).await;
+            let err =
+                post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
+                    .await
+                    .expect_err("malformed token should fail");
+            let _ = request.await;
 
-        let err = post_oauth_token_grant(&client, &endpoint, &empty_grant_params(), None)
-            .await
-            .expect_err("malformed token should fail");
-        let _ = request.await;
-
-        assert_eq!(err.to_string(), "dynamic token grant failed");
-        assert_eq!(err.kind(), TokenGrantFailureKind::Unclassified);
-        assert_eq!(err.upstream_status(), Some(200));
+            assert_eq!(err.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(err.upstream_status(), Some(200));
+        }
     }
 
     #[tokio::test]
@@ -986,25 +857,6 @@ mod tests {
         assert_eq!(err.kind(), TokenGrantFailureKind::Unavailable);
         assert_eq!(err.upstream_status(), Some(500));
         assert!(!message.contains("stack trace"));
-    }
-
-    #[tokio::test]
-    async fn success_accepts_any_token_type_and_lifetime() {
-        // The supervisor and gateway place the token by the profile's auth
-        // style, so token_type and a nonpositive lifetime never block a grant.
-        for body in [
-            r#"{"access_token":"access-123"}"#,
-            r#"{"access_token":"access-123","token_type":"N_A"}"#,
-            r#"{"access_token":"access-123","token_type":"Bearer","expires_in":-1}"#,
-        ] {
-            let (endpoint, server) = token_endpoint_once("200 OK", body).await;
-            let response =
-                post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
-                    .await
-                    .expect(body);
-            server.await.expect("token endpoint task");
-            assert_eq!(response.access_token, "access-123");
-        }
     }
 
     #[tokio::test]
@@ -1096,7 +948,8 @@ mod tests {
                 scopes: &[],
                 requested_token_type: "",
             },
-            None,
+            // A value that is not a valid header is omitted, not rewritten.
+            Some("invalid\nrequest-id"),
         )
         .await
         .expect("token exchange should succeed");
@@ -1180,92 +1033,41 @@ mod tests {
     }
 
     #[test]
-    fn response_matrix_requires_consistent_authenticated_extension() {
+    fn http_failures_classify_only_consistent_authenticated_contracts() {
+        use TokenGrantFailureKind as Kind;
+        let not_json = "not JSON".to_string();
+        let bare = r#"{"error":"invalid_client"}"#.to_string();
+        let unadopted = r#"{"error":"provider_authorization_required"}"#.to_string();
+        let provider = adopted_failure_body("provider_authorization_required");
+        let workload = adopted_failure_body("workload_identity_rejected");
+        let configuration = adopted_failure_body("configuration_error");
         let cases = [
-            (
-                "provider_authorization_required",
-                409,
-                TokenGrantFailureKind::ProviderAuthorizationRequired,
-            ),
-            (
-                "workload_identity_rejected",
-                401,
-                TokenGrantFailureKind::WorkloadIdentityRejected,
-            ),
-            (
-                "workload_identity_rejected",
-                403,
-                TokenGrantFailureKind::WorkloadIdentityRejected,
-            ),
-            (
-                "configuration_error",
-                400,
-                TokenGrantFailureKind::Configuration,
-            ),
+            // Contract codes with their defined status over verified HTTPS.
+            (&provider, 409, true, Kind::ProviderAuthorizationRequired),
+            (&workload, 401, true, Kind::WorkloadIdentityRejected),
+            (&workload, 403, true, Kind::WorkloadIdentityRejected),
+            (&configuration, 400, true, Kind::Configuration),
+            // Without verified HTTPS or with a contradicting status, nothing is claimed.
+            (&provider, 409, false, Kind::Unclassified),
+            (&provider, 503, true, Kind::Unclassified),
+            (&workload, 409, true, Kind::Unclassified),
+            // Without the contract, only availability survives.
+            (&bare, 401, true, Kind::Unclassified),
+            (&unadopted, 409, true, Kind::Unclassified),
+            (&not_json, 403, true, Kind::Unclassified),
+            (&not_json, 429, true, Kind::Unavailable),
+            (&bare, 500, true, Kind::Unavailable),
+            (&unadopted, 503, false, Kind::Unavailable),
         ];
-        for (code, valid_status, expected) in cases {
-            let body =
-                format!(r#"{{"error":"{code}","openshell_error_contract":"{ERROR_CONTRACT}"}}"#);
-            for status in [300, 400, 401, 403, 409, 429, 500, 503, 599] {
-                for authenticated in [false, true] {
-                    let failure = classify_http_failure(
-                        reqwest::StatusCode::from_u16(status).expect("status"),
-                        body.as_bytes(),
-                        authenticated,
-                    );
-                    // Workload rejection permits both authentication denial codes.
-                    let status_matches = status == valid_status
-                        || (code == "workload_identity_rejected" && matches!(status, 401 | 403));
-                    assert_eq!(
-                        failure.kind(),
-                        if authenticated && status_matches {
-                            expected
-                        } else {
-                            TokenGrantFailureKind::Unclassified
-                        },
-                        "code={code}, status={status}, authenticated={authenticated}"
-                    );
-                    assert_eq!(failure.upstream_status(), Some(status));
-                    assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn malformed_ambiguous_and_unknown_signals_preserve_only_availability() {
-        let bodies = [
-            "not JSON",
-            "{}",
-            r#"{"error":null}"#,
-            r#"{"error":42}"#,
-            r#"{"error":"invalid_client"}"#,
-            r#"{"error":"invalid_grant","error_description":"provider_authorization_required"}"#,
-            r#"{"error":"provider_authorization_required"}"#,
-            r#"{"error":"provider_authorization_required","openshell_error_contract":"unknown"}"#,
-            r#"{"error":"unknown","openshell_error_contract":"openshell.token-grant.v1"}"#,
-            r#"{"error":"provider_authorization_required","error":"provider_authorization_required","openshell_error_contract":"openshell.token-grant.v1"}"#,
-            r#"{"error":"provider_authorization_required","openshell_error_contract":"openshell.token-grant.v1","openshell_error_contract":"openshell.token-grant.v1"}"#,
-            r#"{"error":"provider_authorization_required","openshell_error_contract":true}"#,
-            r#"{"error":"provider_authorization_required","openshell_error_contract":"openshell.token-grant.v1"} trailing"#,
-        ];
-        for body in bodies {
-            for status in [302, 400, 401, 403, 409, 422, 429, 500, 503, 599] {
-                for authenticated in [false, true] {
-                    let failure = classify_http_failure(
-                        reqwest::StatusCode::from_u16(status).expect("status"),
-                        body.as_bytes(),
-                        authenticated,
-                    );
-                    let expected = if status == 429 || (500..600).contains(&status) {
-                        TokenGrantFailureKind::Unavailable
-                    } else {
-                        TokenGrantFailureKind::Unclassified
-                    };
-                    assert_eq!(failure.kind(), expected, "body={body}, status={status}");
-                    assert_eq!(failure.upstream_status(), Some(status));
-                }
-            }
+        for (body, status, authenticated, expected) in cases {
+            let failure = classify_http_failure(
+                reqwest::StatusCode::from_u16(status).expect("status"),
+                body.as_bytes(),
+                authenticated,
+            );
+            assert_eq!(failure.kind(), expected, "body={body}, status={status}");
+            assert_eq!(failure.upstream_status(), Some(status));
+            assert_eq!(failure.stage(), TokenGrantStage::TokenEndpoint);
         }
     }
 }

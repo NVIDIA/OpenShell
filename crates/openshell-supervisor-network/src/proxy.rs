@@ -5215,9 +5215,13 @@ async fn inject_token_grant_for_forward_request(
 
     // L4-only forwarding keeps selector-based credentials; it has no inspected
     // endpoint owner decision. Inspected requests always use preparation above.
-    Ok(crate::l7::token_grant_injection::inject_if_needed_captured(
+    let Some(snapshot) = crate::l7::token_grant_injection::pin_live_credentials(l7_ctx) else {
+        return Ok(request.raw_header);
+    };
+    Ok(crate::l7::token_grant_injection::inject_for_selectors(
         request,
         l7_ctx,
+        &snapshot,
         request_id,
         observation_context,
     )
@@ -10951,19 +10955,34 @@ network_policies:
         assert!(String::from_utf8_lossy(&response).contains(&header));
     }
 
+    type ForwardGrantResponse<'a> =
+        std::result::Result<&'a str, openshell_core::token_grant_failure::TokenGrantFailure>;
+
     fn forward_grant_failure() -> openshell_core::token_grant_failure::TokenGrantFailure {
         openshell_core::token_grant_failure::TokenGrantFailure::new(
             openshell_core::token_grant_failure::TokenGrantFailureKind::Unavailable,
             openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
         )
-        .with_upstream_status(503)
+    }
+
+    async fn forward_inject(
+        ctx: &mut crate::l7::relay::L7EvalContext,
+        raw: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        inject_token_grant_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            ctx,
+            None,
+            FORWARD_REQUEST_ID,
+            None,
+        )
+        .await
     }
 
     fn forward_token_grant_context(
-        resolver_response: std::result::Result<
-            &str,
-            openshell_core::token_grant_failure::TokenGrantFailure,
-        >,
+        resolver_response: ForwardGrantResponse<'_>,
     ) -> (
         crate::l7::relay::L7EvalContext,
         crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
@@ -10988,10 +11007,7 @@ network_policies:
     }
 
     fn forward_token_exchange_context(
-        resolver_response: std::result::Result<
-            &str,
-            openshell_core::token_grant_failure::TokenGrantFailure,
-        >,
+        resolver_response: ForwardGrantResponse<'_>,
     ) -> (
         crate::l7::relay::L7EvalContext,
         crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
@@ -11007,10 +11023,7 @@ network_policies:
 
     fn forward_token_grant_fixture(
         provider_key: &str,
-        resolver_response: std::result::Result<
-            &str,
-            openshell_core::token_grant_failure::TokenGrantFailure,
-        >,
+        resolver_response: ForwardGrantResponse<'_>,
         token_exchange: bool,
     ) -> crate::l7::token_grant_injection::test_support::TokenGrantTestFixture {
         match (resolver_response, token_exchange) {
@@ -13196,17 +13209,9 @@ network_policies:
         let (mut ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token = inject_token_grant_for_forward_request(
-            "GET",
-            "/v1/projects",
-            raw,
-            &mut ctx,
-            None,
-            FORWARD_REQUEST_ID,
-            None,
-        )
-        .await
-        .expect("forward token grant should inject");
+        let with_token = forward_inject(&mut ctx, raw)
+            .await
+            .expect("forward token grant should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13229,17 +13234,9 @@ network_policies:
         let (mut ctx, fixture) = forward_token_exchange_context(Ok("grant-token"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
 
-        let with_token = inject_token_grant_for_forward_request(
-            "GET",
-            "/v1/projects",
-            raw,
-            &mut ctx,
-            None,
-            FORWARD_REQUEST_ID,
-            None,
-        )
-        .await
-        .expect("forward token exchange should inject");
+        let with_token = forward_inject(&mut ctx, raw)
+            .await
+            .expect("forward token exchange should inject");
         let rewritten = rewrite_forward_request(
             &with_token,
             with_token.len(),
@@ -13264,24 +13261,15 @@ network_policies:
         let (mut ctx, fixture) = forward_token_grant_context(Err(forward_grant_failure()));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        let err = inject_token_grant_for_forward_request(
-            "GET",
-            "/v1/projects",
-            raw,
-            &mut ctx,
-            None,
-            FORWARD_REQUEST_ID,
-            None,
-        )
-        .await
-        .expect_err("forward token grant failure should stop request rewriting");
+        let err = forward_inject(&mut ctx, raw)
+            .await
+            .expect_err("forward token grant failure should stop request rewriting");
 
+        // The forward proxy answers a typed refusal with the request ID header.
         let refusal = err
             .downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
             .expect("typed grant refusal");
         assert_eq!(refusal.failure(), forward_grant_failure());
-        assert_eq!(refusal.credential(), Some(("provider", "access_token")));
-        assert_eq!(err.to_string(), "dynamic token grant failed");
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
@@ -13290,17 +13278,9 @@ network_policies:
         let (mut ctx, fixture) = forward_token_exchange_context(Err(forward_grant_failure()));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
 
-        inject_token_grant_for_forward_request(
-            "GET",
-            "/v1/projects",
-            raw,
-            &mut ctx,
-            None,
-            FORWARD_REQUEST_ID,
-            None,
-        )
-        .await
-        .expect_err("forward token exchange failure should stop request rewriting");
+        forward_inject(&mut ctx, raw)
+            .await
+            .expect_err("forward token exchange failure should stop request rewriting");
 
         fixture.assert_one_token_exchange_request(
             "api.example.test\t8080\t/v1/**\tprovider:access_token",

@@ -3258,18 +3258,7 @@ mod tests {
             last_result: EndpointResult::CredentialUnavailable as i32,
             last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
             // Evidence without live authority must drop its cause with the result.
-            last_failure: Some(
-                openshell_core::endpoint_failure::EndpointFailure::token_grant(
-                    openshell_core::token_grant_failure::TokenGrantFailure::new(
-                        openshell_core::token_grant_failure::TokenGrantFailureKind::Timeout,
-                        openshell_core::token_grant_failure::TokenGrantStage::TokenEndpoint,
-                    ),
-                    "github",
-                    "access_token",
-                    "3e2d1c0b-9a8f-4e7d-b6c5-a4f3e2d1c0b9",
-                )
-                .to_proto(),
-            ),
+            last_failure: Some(openshell_core::proto::EndpointFailure::default()),
         };
         let ready = SandboxCondition {
             r#type: "Ready".to_string(),
@@ -3278,8 +3267,7 @@ mod tests {
         };
         let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
             destination_host: "api.example.com".to_string(),
-            destination_port: 443,
-            failure: endpoint.last_failure.clone(),
+            ..Default::default()
         });
         sandbox.status = Some(SandboxStatus {
             endpoint_statuses: vec![endpoint.clone()],

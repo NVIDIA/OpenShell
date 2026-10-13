@@ -22,7 +22,6 @@ pub struct ManagedGateway {
     log: PathBuf,
     pid_file: PathBuf,
     supervisor_image: Option<String>,
-    native_ca_bundle: Option<PathBuf>,
 }
 
 impl ManagedGateway {
@@ -39,7 +38,6 @@ impl ManagedGateway {
             log: log.into(),
             pid_file: pid_file.into(),
             supervisor_image: None,
-            native_ca_bundle: None,
         }
     }
 
@@ -58,18 +56,12 @@ impl ManagedGateway {
             log: env_path("OPENSHELL_E2E_GATEWAY_LOG")?,
             pid_file: env_path("OPENSHELL_E2E_GATEWAY_PID_FILE")?,
             supervisor_image: None,
-            native_ca_bundle: None,
         }))
     }
 
     /// Override the supervisor image for gateways started by this handle.
     pub fn set_supervisor_image(&mut self, image: &str) {
         self.supervisor_image = Some(image.to_owned());
-    }
-
-    /// Set the native TLS roots for this fixture's gateway child process.
-    pub fn set_native_ca_bundle(&mut self, path: impl Into<PathBuf>) {
-        self.native_ca_bundle = Some(path.into());
     }
 
     /// Start the gateway if it is not already running.
@@ -103,9 +95,6 @@ impl ManagedGateway {
             .stderr(Stdio::from(stderr));
         if let Some(image) = &self.supervisor_image {
             command.env("OPENSHELL_SUPERVISOR_IMAGE", image);
-        }
-        if let Some(bundle) = &self.native_ca_bundle {
-            command.env("SSL_CERT_FILE", bundle);
         }
         let child = command
             .spawn()

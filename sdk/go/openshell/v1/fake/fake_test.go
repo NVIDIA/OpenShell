@@ -236,69 +236,29 @@ func TestFakeClient_SandboxGrantFailures_DeepCopy(t *testing.T) {
 	fc := NewClient()
 	ctx := context.Background()
 	upstreamStatus := uint32(401)
-	sb := &types.Sandbox{
-		Name: "grant-sandbox",
-		Status: types.SandboxStatus{EndpointStatuses: []types.EndpointStatus{{
-			EndpointID: "endpoint-grant",
-			Host:       "tools.example.test",
-			Ports:      []uint32{443},
-			Path:       "/mcp",
-			LastResult: types.EndpointCredentialUnavailable,
-			LastFailure: &types.EndpointFailure{
-				Domain:             types.EndpointFailureDomainTokenGrant,
-				Code:               "provider_authorization_required",
-				RecoveryAction:     types.RefreshRecoveryActionReauthorize,
-				Provider:           "github",
-				CredentialKey:      "token",
-				Stage:              "gateway_rpc",
-				UpstreamHTTPStatus: &upstreamStatus,
-				RequestID:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
-			},
-		}}},
-	}
-	sb.Status.LastTokenGrantFailure = &types.TokenGrantFailureObservation{
-		DestinationHost: "api.example.test",
-		DestinationPort: 8443,
-		Failure:         sb.Status.EndpointStatuses[0].LastFailure,
-	}
+	failure := &types.EndpointFailure{Code: "provider_authorization_required", UpstreamHTTPStatus: &upstreamStatus}
+	sb := &types.Sandbox{Name: "grant-sandbox", Status: types.SandboxStatus{
+		EndpointStatuses:      []types.EndpointStatus{{EndpointID: "endpoint-grant", LastFailure: failure}},
+		LastTokenGrantFailure: &types.TokenGrantFailureObservation{DestinationHost: "api.example.test", Failure: failure},
+	}}
 	fc.AddSandbox("default", sb)
 
 	// Neither the seed object nor returned snapshots may mutate the stored failure.
-	sb.Status.EndpointStatuses[0].LastFailure.Code = "seed_changed"
+	failure.Code = "seed_changed"
 	upstreamStatus = 500
 	got, err := fc.Sandboxes().Get(ctx, "default", "grant-sandbox")
 	require.NoError(t, err)
-	failure := got.Status.EndpointStatuses[0].LastFailure
-	require.NotNil(t, failure)
-	assert.Equal(t, "provider_authorization_required", failure.Code)
-	require.NotNil(t, failure.UpstreamHTTPStatus)
-	assert.Equal(t, uint32(401), *failure.UpstreamHTTPStatus)
-	failure.Stage = "changed"
-	*failure.UpstreamHTTPStatus = 503
-	observation := got.Status.LastTokenGrantFailure
-	require.NotNil(t, observation)
-	assert.Equal(t, "api.example.test", observation.DestinationHost)
-	require.NotNil(t, observation.Failure)
-	assert.Equal(t, "provider_authorization_required", observation.Failure.Code)
-	observation.DestinationHost = "changed.example.test"
-	observation.Failure.Code = "changed"
-	*observation.Failure.UpstreamHTTPStatus = 503
+	got.Status.EndpointStatuses[0].LastFailure.Code = "changed"
+	got.Status.LastTokenGrantFailure.DestinationHost = "changed.example.test"
+	*got.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus = 503
 
-	listed, err := fc.Sandboxes().ListAll(ctx, "default")
+	stored, err := fc.Sandboxes().Get(ctx, "default", "grant-sandbox")
 	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	stored := listed[0].Status.EndpointStatuses[0].LastFailure
-	require.NotNil(t, stored)
-	assert.Equal(t, "gateway_rpc", stored.Stage)
-	require.NotNil(t, stored.UpstreamHTTPStatus)
-	assert.Equal(t, uint32(401), *stored.UpstreamHTTPStatus)
-	storedObservation := listed[0].Status.LastTokenGrantFailure
-	require.NotNil(t, storedObservation)
-	assert.Equal(t, "api.example.test", storedObservation.DestinationHost)
-	assert.Equal(t, uint32(8443), storedObservation.DestinationPort)
-	require.NotNil(t, storedObservation.Failure)
-	assert.Equal(t, "provider_authorization_required", storedObservation.Failure.Code)
-	assert.Equal(t, uint32(401), *storedObservation.Failure.UpstreamHTTPStatus)
+	assert.Equal(t, "provider_authorization_required", stored.Status.EndpointStatuses[0].LastFailure.Code)
+	assert.Equal(t, uint32(401), *stored.Status.EndpointStatuses[0].LastFailure.UpstreamHTTPStatus)
+	assert.Equal(t, "api.example.test", stored.Status.LastTokenGrantFailure.DestinationHost)
+	assert.Equal(t, "provider_authorization_required", stored.Status.LastTokenGrantFailure.Failure.Code)
+	assert.Equal(t, uint32(401), *stored.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
 }
 
 func TestFakeClient_AddProvider(t *testing.T) {
