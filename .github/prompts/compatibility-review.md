@@ -86,6 +86,16 @@ train violation or replace required notice and migration guidance.
 Account for every surface: `rust-sdk`, `python-sdk`, `go-sdk`, `typescript-sdk`,
 `api-behavior`, `cli`, `configuration`, `policy`, `helm`, and `state`.
 
+Scope `rust-sdk` to the public API reachable through `openshell-sdk`, including
+its `raw` module and transitive public re-exports. Trace the export path before
+reporting a Rust source break; a public item in an internal crate or a dependency
+alone does not establish SDK exposure. Exclude internal isolation APIs and
+gateway configuration structs that the SDK does not expose. Evaluate gateway
+configuration compatibility through existing user-authored TOML. Include
+generated server-trait changes reachable through `raw::proto`, identifying
+mock/server implementers as affected consumers and distinguishing them from
+unaffected client callers.
+
 Check exported signatures/types, generated and handwritten SDK behavior,
 serialization and error contracts, command flags and documented machine-readable
 output, config/default semantics, policy formats, chart values, and persisted
